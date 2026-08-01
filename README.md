@@ -15,6 +15,7 @@ F:\benchmark
 ├── L3_Advanced/                  # Level 3: 高级 3D 引擎与物理仿真类 (12 个项目 / 12 Projects)
 ├── L4_Expert/                    # Level 4: 专家级原生引擎与硬件协议类 (9 个项目 / 9 Projects)
 ├── INDEX.md                      # 双语全景索引 / Master Bilingual Index
+├── LICENSE                       # MIT 开源许可证 / MIT License
 └── README.md                     # 主说明文档 / Primary Readme
 ```
 
@@ -131,7 +132,7 @@ Targeting native Python/C++/OpenGL rendering engines, DSP audio synthesis, UDP t
 - [`CFD`](./L4_Expert/CFD): CFD：超拟真流体计算与物理渲染 Benchmark (Ultra-realistic SPH fluid simulation & refraction shader)
 - [`DeepSWE`](./L4_Expert/DeepSWE): DeepSWE：软件工程与代码演进 Benchmark (Repository-level software engineering & code refactoring benchmark)
 - [`EngineSIM`](./L4_Expert/EngineSIM): EngineSIM：引擎声浪与 DSP 音频合成 Benchmark (Engine sound procedural DSP synthesis & spectrogram analysis)
-- [`osuMania`](./osuMania): osu!mania：Python OpenGL 高效视频渲染工具 Benchmark (Python OpenGL high-performance video renderer with 480p skin.ini mapping & FFMPEG pipe)
+- [`osuMania`](./L4_Expert/osuMania): osu!mania：Python OpenGL 高效视频渲染工具 Benchmark (Python OpenGL high-performance video renderer with 480p skin.ini mapping & FFMPEG pipe)
 - [`PSMCP`](./L4_Expert/PSMCP): PSMCP：Adobe Photoshop MCP 服务端 Benchmark (Adobe Photoshop MCP server integration & COM automation)
 - [`SketchUpMCP`](./L4_Expert/SketchUpMCP): 草图大师MCP：SketchUp MCP 桥接器 Benchmark (SketchUp CAD MCP bridge integration & SSE transport)
 - [`Telemetry`](./L4_Expert/Telemetry): 遥测：RAC 赛车实时遥测与距离空间重采样分析 Benchmark (RAC car real-time telemetry receiver, distance-based resampling & delta crosshair UI)
@@ -149,3 +150,10 @@ Targeting native Python/C++/OpenGL rendering engines, DSP audio synthesis, UDP t
    Submit the prompt text to the target LLM under test without modifying technical constraints.
 4. 对照该项目 `README.md` 中定义的验收与评分标准进行客观评估。
    Evaluate the generated outputs against the rubric specified in the project's `README.md`.
+
+---
+
+## 6. 开源协议 (License)
+
+本项目基于 [MIT 许可证](LICENSE) 开源。
+This project is licensed under the [MIT License](LICENSE).
