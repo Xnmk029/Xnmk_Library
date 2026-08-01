@@ -54,15 +54,16 @@ This repository establishes a multi-dimensional benchmark suite for auditing LLM
 | 30 | [`Sokoban`](./Sokoban) | **推箱子：Three.js 草地 Shader 与推箱子 Benchmark**<br>*Three.js Shader Grass & Sokoban Game* | Web Games & Interactive Logic | `L2` | [Prompt](./Sokoban/README.md) \| [README](./Sokoban/README.md) |
 | 31 | [`Telemetry`](./Telemetry) | **遥测：RAC 赛车实时遥测与距离空间重采样分析 Benchmark**<br>*RAC Telemetry & Distance-based Resampling Analysis* | Python Tools & Native Engines | `L4` | [Prompt](./Telemetry/PROJECT_PROMPT.md) \| [README](./Telemetry/README.md) |
 | 32 | [`USP`](./USP) | **USP：Match 配重手枪机械分解 Benchmark**<br>*USP Match Gun Disassembly & Low-Poly Scene* | 3D Graphics, Physics & Shaders | `L3` | [Prompt](./USP/README.md) \| [README](./USP/README.md) |
-| 33 | [`WeChatCheckinExcel`](./WeChatCheckinExcel) | **签到：微信打卡预约消息自动导入 Excel 系统 Benchmark**<br>*WeChat Message Parser & Excel Importer* | System Integration & MCP Protocol | `L1` | [Prompt](./WeChatCheckinExcel/README.md) \| [README](./WeChatCheckinExcel/README.md) |
-| 34 | [`cloth`](./cloth) | **cloth：3D 质点-弹簧布料物理仿真 Benchmark**<br>*3D Mass-Spring Cloth Physics Simulation* | 3D Graphics, Physics & Shaders | `L3` | [Prompt](./cloth/PROJECT_PROMPT.md) \| [README](./cloth/README.md) |
-| 35 | [`osuMania`](./osuMania) | **osu!mania：Python OpenGL 高效视频渲染工具 Benchmark**<br>*osu!mania Python OpenGL High-Perf Video Renderer* | Python Tools & Native Engines | `L4` | [Prompt](./osuMania/PROJECT_PROMPT.md) \| [README](./osuMania/README.md) |
-| 36 | [`teardown`](./teardown) | **teardown：硬表面机械与微体素场景 Benchmark**<br>*Teardown Voxel Diorama & Mechanical Disassembly* | 3D Graphics, Physics & Shaders | `L3` | [Prompt](./teardown/README.md) \| [README](./teardown/README.md) |
-| 37 | [`前端`](./前端) | **前端**<br>*前端* | System Integration & MCP Protocol | `L2` | [Prompt](./前端/README.md) \| [README](./前端/README.md) |
-| 38 | [`双叉臂`](./双叉臂) | **双叉臂**<br>*双叉臂* | System Integration & MCP Protocol | `L2` | [Prompt](./双叉臂/README.md) \| [README](./双叉臂/README.md) |
-| 39 | [`小丑牌`](./小丑牌) | **小丑牌**<br>*小丑牌* | System Integration & MCP Protocol | `L2` | [Prompt](./小丑牌/README.md) \| [README](./小丑牌/README.md) |
-| 40 | [`推箱子`](./推箱子) | **推箱子**<br>*推箱子* | System Integration & MCP Protocol | `L2` | [Prompt](./推箱子/README.md) \| [README](./推箱子/README.md) |
-| 41 | [`池核`](./池核) | **池核**<br>*池核* | System Integration & MCP Protocol | `L2` | [Prompt](./池核/README.md) \| [README](./池核/README.md) |
+| 33 | [`UnifiedInputManager`](./UnifiedInputManager) | **UnifiedInputManager**<br>*UnifiedInputManager* | System Integration & MCP Protocol | `L2` | [Prompt](./UnifiedInputManager/PROJECT_PROMPT.md) \| [README](./UnifiedInputManager/README.md) |
+| 34 | [`WeChatCheckinExcel`](./WeChatCheckinExcel) | **签到：微信打卡预约消息自动导入 Excel 系统 Benchmark**<br>*WeChat Message Parser & Excel Importer* | System Integration & MCP Protocol | `L1` | [Prompt](./WeChatCheckinExcel/README.md) \| [README](./WeChatCheckinExcel/README.md) |
+| 35 | [`cloth`](./cloth) | **cloth：3D 质点-弹簧布料物理仿真 Benchmark**<br>*3D Mass-Spring Cloth Physics Simulation* | 3D Graphics, Physics & Shaders | `L3` | [Prompt](./cloth/PROJECT_PROMPT.md) \| [README](./cloth/README.md) |
+| 36 | [`osuMania`](./osuMania) | **osu!mania：Python OpenGL 高效视频渲染工具 Benchmark**<br>*osu!mania Python OpenGL High-Perf Video Renderer* | Python Tools & Native Engines | `L4` | [Prompt](./osuMania/PROJECT_PROMPT.md) \| [README](./osuMania/README.md) |
+| 37 | [`teardown`](./teardown) | **teardown：硬表面机械与微体素场景 Benchmark**<br>*Teardown Voxel Diorama & Mechanical Disassembly* | 3D Graphics, Physics & Shaders | `L3` | [Prompt](./teardown/README.md) \| [README](./teardown/README.md) |
+| 38 | [`前端`](./前端) | **前端**<br>*前端* | System Integration & MCP Protocol | `L2` | [Prompt](./前端/README.md) \| [README](./前端/README.md) |
+| 39 | [`双叉臂`](./双叉臂) | **双叉臂**<br>*双叉臂* | System Integration & MCP Protocol | `L2` | [Prompt](./双叉臂/README.md) \| [README](./双叉臂/README.md) |
+| 40 | [`小丑牌`](./小丑牌) | **小丑牌**<br>*小丑牌* | System Integration & MCP Protocol | `L2` | [Prompt](./小丑牌/README.md) \| [README](./小丑牌/README.md) |
+| 41 | [`推箱子`](./推箱子) | **推箱子**<br>*推箱子* | System Integration & MCP Protocol | `L2` | [Prompt](./推箱子/README.md) \| [README](./推箱子/README.md) |
+| 42 | [`池核`](./池核) | **池核**<br>*池核* | System Integration & MCP Protocol | `L2` | [Prompt](./池核/README.md) \| [README](./池核/README.md) |
 
 ---
 
