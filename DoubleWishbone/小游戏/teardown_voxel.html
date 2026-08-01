@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>Teardown 风格 · 微体素城市沙盘</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #0d1117; }
+canvas { display: block; }
+#info {
+  position: absolute; top: 14px; left: 50%; transform: translateX(-50%);
+  color: #fff; font-family: 'Segoe UI', sans-serif; font-size: 13px;
+  background: rgba(0,0,0,0.55); padding: 7px 16px; border-radius: 16px;
+  pointer-events: none; letter-spacing: 0.3px; white-space: nowrap;
+}
+#loading {
+  position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+  color: #fff; font-family: 'Segoe UI', sans-serif; font-size: 16px;
+  text-align: center;
+}
+</style>
+</head>
+<body>
+<div id="info">微体素城市沙盘 · Tilt-Shift | 拖拽旋转 · 滚轮缩放 · 右键平移</div>
+<div id="loading">正在加载 Three.js 模块...</div>
+
+<script>
+// 加载超时检测
+window.__loadTimer = setTimeout(function() {
+  var el = document.getElementById('loading');
+  if (el) el.innerHTML = '加载超时：无法连接 CDN，请检查网络<br><small>需要访问 cdn.jsdelivr.net</small>';
+}, 15000);
+window.addEventListener('error', function(e) {
+  var el = document.getElementById('loading');
+  if (el && e.message) el.innerHTML = '加载错误：' + e.message;
+});
+</script>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.162.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.162.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { SSAOPass } from 'three/addons/postprocessing/SSAOPass.js';
+import { BokehPass } from 'three/addons/postprocessing/BokehPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+clearTimeout(window.__loadTimer);
+document.getElementById('loading').textContent = '正在构建城市...';
+
+try {
+
+// ===================== CONFIG =====================
+const V = 0.4; // voxel size
+const CITY = 30; // city grid size in voxels
+const HALF = CITY / 2;
+
+// ===================== RENDERER =====================
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.15;
+document.body.appendChild(renderer.domElement);
+
+// ===================== SCENE =====================
+const scene = new THREE.Scene();
+
+// ===================== PIXEL SKY (Procedural Canvas) =====================
+function createPixelSky() {
+  const w = 256, h = 128;
+  const canvas = document.createElement('canvas');
+  canvas.width = w; canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  // Gradient sky
+  const grad = ctx.createLinearGradient(0, 0, 0, h);
+  grad.addColorStop(0, '#1a2a6c');
+  grad.addColorStop(0.3, '#4a90d9');
+  grad.addColorStop(0.55, '#87CEEB');
+  grad.addColorStop(0.75, '#b8e4f0');
+  grad.addColorStop(1, '#ffecd2');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, w, h);
+  // Pixel clouds
+  const px = 4;
+  ctx.fillStyle = 'rgba(255,255,255,0.85)';
+  const clouds = [[20,30,12,3],[60,22,16,4],[110,35,10,3],[160,25,14,4],[210,32,11,3],[240,20,8,2]];
+  for (const [cx, cy, cw, ch] of clouds) {
+    for (let x = 0; x < cw; x++) {
+      for (let y = 0; y < ch; y++) {
+        if (Math.random() > 0.3) {
+          ctx.fillRect((cx + x) * px / 2, (cy + y) * px / 2, px / 2, px / 2);
+        }
+      }
+    }
+  }
+  // Sun glow
+  ctx.fillStyle = 'rgba(255,240,180,0.6)';
+  ctx.beginPath();
+  ctx.arc(200, 20, 12, 0, Math.PI * 2);
+  ctx.fill();
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.mapping = THREE.EquirectangularReflectionMapping;
+  tex.magFilter = THREE.NearestFilter;
+  tex.minFilter = THREE.NearestFilter;
+  return tex;
+}
+const skyTex = createPixelSky();
+scene.background = skyTex;
+scene.environment = skyTex;
+
+// Environment for PBR
+const pmrem = new THREE.PMREMGenerator(renderer);
+const envRT = pmrem.fromScene(new RoomEnvironment(), 0.04);
+scene.environment = envRT.texture;
+
+// ===================== CAMERA =====================
+const camera = new THREE.PerspectiveCamera(35, window.innerWidth / window.innerHeight, 0.1, 300);
+camera.position.set(18, 22, 18);
+
+// ===================== CONTROLS =====================
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 1.5, 0);
+controls.enableDamping = true;
+controls.dampingFactor = 0.06;
+controls.minDistance = 10;
+controls.maxDistance = 55;
+controls.maxPolarAngle = Math.PI / 2.15;
+controls.update();
+
+// ===================== LIGHTING =====================
+const hemi = new THREE.HemisphereLight(0x87CEEB, 0x445522, 0.5);
+scene.add(hemi);
+
+const sun = new THREE.DirectionalLight(0xFFF4E0, 3.2);
+sun.position.set(12, 22, 8);
+sun.castShadow = true;
+sun.shadow.mapSize.set(4096, 4096);
+sun.shadow.camera.near = 1;
+sun.shadow.camera.far = 70;
+sun.shadow.camera.left = -20;
+sun.shadow.camera.right = 20;
+sun.shadow.camera.top = 20;
+sun.shadow.camera.bottom = -20;
+sun.shadow.bias = -0.0001;
+sun.shadow.normalBias = 0.02;
+scene.add(sun);
+
+const fill = new THREE.DirectionalLight(0xA0C0E0, 0.4);
+fill.position.set(-8, 6, -8);
+scene.add(fill);
+
+// ===================== VOXEL SYSTEM =====================
+const boxGeo = new THREE.BoxGeometry(V, V, V);
+const groups = {};
+function regGroup(name, matOpts) {
+  groups[name] = { mat: new THREE.MeshPhysicalMaterial(matOpts), voxels: [] };
+}
+regGroup('brick', { roughness: 0.92, metalness: 0 });
+regGroup('concrete', { roughness: 0.88, metalness: 0 });
+regGroup('wood', { roughness: 0.82, metalness: 0 });
+regGroup('metal', { roughness: 0.12, metalness: 1.0, clearcoat: 0.4 });
+regGroup('glass', { roughness: 0.05, metalness: 0, transmission: 0.92, ior: 1.52, thickness: 0.2, transparent: true });
+regGroup('water', { roughness: 0.1, metalness: 0, transmission: 0.7, ior: 1.33, thickness: 0.5, transparent: true, opacity: 0.85 });
+regGroup('road', { roughness: 0.95, metalness: 0 });
+regGroup('ground', { roughness: 0.9, metalness: 0 });
+regGroup('leaf', { roughness: 0.78, metalness: 0 });
+regGroup('table', { roughness: 0.7, metalness: 0 });
+regGroup('lamp', { roughness: 0.3, metalness: 0.8, emissive: new THREE.Color(0xFFDD88), emissiveIntensity: 2.0 });
+regGroup('car', { roughness: 0.15, metalness: 0.9, clearcoat: 0.8 });
+
+function addVox(group, x, y, z, color) {
+  groups[group].voxels.push({ x, y, z, c: new THREE.Color(color) });
+}
+function addVoxC(group, x, y, z, col) {
+  groups[group].voxels.push({ x, y, z, c: col });
+}
+
+// ===================== BUILD CITY =====================
+const gy = 0; // ground level Y
+
+// --- TABLE BASE (solid top + walls for performance) ---
+const tableExt = 3;
+const tableH = 5;
+const tHalf = HALF + tableExt;
+for (let x = -tHalf; x < tHalf; x++) {
+  for (let z = -tHalf; z < tHalf; z++) {
+    // Top surface (always visible)
+    const shade = 0.35 + Math.random()*0.05;
+    addVoxC('table', x*V, -V*0.5, z*V, new THREE.Color(shade*1.3, shade*0.85, shade*0.4));
+    // Walls (only edges, 4 deep)
+    const isEdge = (Math.abs(x) >= tHalf-1 || Math.abs(z) >= tHalf-1);
+    if (isEdge) {
+      for (let y = -tableH; y < -1; y++) {
+        const s2 = 0.22 + Math.random()*0.04;
+        addVoxC('table', x*V, y*V, z*V, new THREE.Color(s2*1.2, s2*0.8, s2*0.4));
+      }
+    }
+  }
+}
+// Table rim (raised border around city area)
+for (let x = -(HALF+1); x < HALF+1; x++) {
+  for (let z = -(HALF+1); z < HALF+1; z++) {
+    const isBorder = Math.abs(x)>=HALF || Math.abs(z)>=HALF;
+    if (isBorder) {
+      addVoxC('table', x*V, 0, z*V, new THREE.Color(0.32, 0.22, 0.1));
+      addVoxC('table', x*V, V*0.5, z*V, new THREE.Color(0.28, 0.19, 0.09));
+    }
+  }
+}
+
+// --- GROUND / GRASS (skip river area) ---
+const riverX = 5;
+const riverW = 3;
+for (let x = -HALF+1; x < HALF-1; x++) {
+  for (let z = -HALF+1; z < HALF-1; z++) {
+    // Skip river channel
+    if (Math.abs(x - riverX) <= riverW) continue;
+    const g = 0.28 + Math.random()*0.1;
+    addVoxC('ground', x*V, -V*0.5, z*V, new THREE.Color(g*0.5, g, g*0.3));
+  }
+}
+
+// --- RIVER (flows along Z axis) ---
+for (let z = -HALF+1; z < HALF-1; z++) {
+  for (let dx = -riverW; dx <= riverW; dx++) {
+    const x = riverX + dx;
+    if (x <= -HALF+1 || x >= HALF-2) continue;
+    // Water surface (slightly below ground level, visible)
+    const blue = 0.45 + Math.random()*0.15;
+    const waveY = -V*0.2 + Math.sin(z*0.5+dx)*V*0.05;
+    addVoxC('water', x*V, waveY, z*V, new THREE.Color(0.05, blue*0.55, blue));
+    // River bed (dark, below water)
+    addVoxC('ground', x*V, -V*0.7, z*V, new THREE.Color(0.15, 0.2, 0.12));
+  }
+  // River banks (raised edges)
+  for (const side of [-riverW-1, riverW+1]) {
+    const bx = riverX + side;
+    addVoxC('ground', bx*V, -V*0.25, z*V, new THREE.Color(0.5, 0.42, 0.22));
+  }
+}
+
+// --- ROADS ---
+function buildRoadH(z, xStart, xEnd) {
+  for (let x = xStart; x <= xEnd; x++) {
+    for (let dz = -1; dz <= 1; dz++) {
+      const shade = 0.22 + Math.random()*0.04;
+      addVoxC('road', x*V, -V*0.25, (z+dz)*V, new THREE.Color(shade, shade, shade*1.1));
+    }
+    // Center dashes
+    if (x % 3 === 0) addVoxC('road', x*V, -V*0.2, z*V, new THREE.Color(0.8, 0.75, 0.2));
+  }
+}
+function buildRoadV(x, zStart, zEnd) {
+  for (let z = zStart; z <= zEnd; z++) {
+    for (let dx = -1; dx <= 1; dx++) {
+      const shade = 0.22 + Math.random()*0.04;
+      addVoxC('road', (x+dx)*V, -V*0.25, z*V, new THREE.Color(shade, shade, shade*1.1));
+    }
+    if (z % 3 === 0) addVoxC('road', x*V, -V*0.2, z*V, new THREE.Color(0.8, 0.75, 0.2));
+  }
+}
+// Main roads (avoid river area)
+buildRoadH(-5, -HALF+1, riverX-riverW-2);
+buildRoadH(-5, riverX+riverW+2, HALF-2);
+buildRoadH(6, -HALF+1, riverX-riverW-2);
+buildRoadH(6, riverX+riverW+2, HALF-2);
+buildRoadV(-8, -HALF+1, HALF-2);
+buildRoadV(0, -HALF+1, HALF-2);
+
+// --- BRIDGE over river ---
+for (let z = -6; z <= -4; z++) {
+  for (let x = riverX-riverW-1; x <= riverX+riverW+1; x++) {
+    addVoxC('wood', x*V, -V*0.1, z*V, new THREE.Color(0.5, 0.35, 0.15));
+  }
+  // Railings
+  addVoxC('metal', (riverX-riverW-1)*V, V*0.4, z*V, new THREE.Color(0.5,0.5,0.55));
+  addVoxC('metal', (riverX+riverW+1)*V, V*0.4, z*V, new THREE.Color(0.5,0.5,0.55));
+}
+// Second bridge
+for (let z = 5; z <= 7; z++) {
+  for (let x = riverX-riverW-1; x <= riverX+riverW+1; x++) {
+    addVoxC('concrete', x*V, -V*0.1, z*V, new THREE.Color(0.6,0.6,0.6));
+  }
+  addVoxC('metal', (riverX-riverW-1)*V, V*0.4, z*V, new THREE.Color(0.45,0.45,0.5));
+  addVoxC('metal', (riverX+riverW+1)*V, V*0.4, z*V, new THREE.Color(0.45,0.45,0.5));
+}
+
+// --- BUILDINGS ---
+function buildBuilding(ox, oz, w, d, h, type) {
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      for (let z = 0; z < d; z++) {
+        const isWall = x===0||x===w-1||z===0||z===d-1;
+        if (!isWall && y < h-1) continue;
+        const wx = (ox+x)*V, wy = y*V, wz = (oz+z)*V;
+        if (type === 'office') {
+          if (y > 0 && y < h-1 && isWall && (x+z)%2===0) {
+            addVox('glass', wx, wy, wz, 0xAADDFF);
+          } else {
+            const s = 0.5+Math.random()*0.1;
+            addVoxC('concrete', wx, wy, wz, new THREE.Color(s*0.8, s*0.82, s*0.9));
+          }
+        } else if (type === 'brick') {
+          const s = 0.5+Math.random()*0.15;
+          addVoxC('brick', wx, wy, wz, new THREE.Color(s, s*0.45, s*0.3));
+        } else if (type === 'metal') {
+          const s = 0.55+Math.random()*0.15;
+          addVoxC('metal', wx, wy, wz, new THREE.Color(s*0.7, s*0.75, s*0.85));
+        } else {
+          const s = 0.45+Math.random()*0.1;
+          addVoxC('wood', wx, wy, wz, new THREE.Color(s, s*0.65, s*0.3));
+        }
+      }
+    }
+  }
+  // Roof accent
+  for (let x = 0; x < w; x++) {
+    for (let z = 0; z < d; z++) {
+      addVoxC('concrete', (ox+x)*V, h*V, (oz+z)*V, new THREE.Color(0.4,0.4,0.42));
+    }
+  }
+}
+
+// City blocks (left of river)
+buildBuilding(-13, -12, 5, 4, 10, 'office');
+buildBuilding(-13, -6, 4, 4, 6, 'brick');
+buildBuilding(-12, 1, 5, 5, 14, 'office');
+buildBuilding(-13, 8, 4, 4, 5, 'wood');
+buildBuilding(-7, -12, 4, 3, 7, 'brick');
+buildBuilding(-6, 8, 4, 4, 8, 'metal');
+// Right of river
+buildBuilding(10, -12, 5, 5, 12, 'office');
+buildBuilding(10, -4, 4, 3, 5, 'brick');
+buildBuilding(10, 2, 4, 4, 9, 'metal');
+buildBuilding(10, 8, 5, 4, 6, 'wood');
+
+// --- TREES ---
+function buildTree(ox, oz, height) {
+  for (let y = 0; y < height; y++) {
+    addVoxC('wood', ox*V, y*V, oz*V, new THREE.Color(0.4, 0.25, 0.1));
+  }
+  const r = 2;
+  for (let x = -r; x <= r; x++) {
+    for (let y = -1; y <= 2; y++) {
+      for (let z = -r; z <= r; z++) {
+        if (x*x+y*y+z*z > r*r+1) continue;
+        const g = 0.3+Math.random()*0.25;
+        addVoxC('leaf', (ox+x)*V, (height+y)*V, (oz+z)*V, new THREE.Color(g*0.4, g, g*0.25));
+      }
+    }
+  }
+}
+// Park area trees
+buildTree(-3, 10, 4); buildTree(-1, 12, 5); buildTree(1, 10, 4);
+buildTree(-4, -9, 4); buildTree(2, -10, 5);
+buildTree(12, -8, 4); buildTree(-10, 4, 5);
+
+// --- CARS on roads ---
+function buildCar(ox, oz, dir, color) {
+  const c = new THREE.Color(color);
+  for (let i = 0; i < 3; i++) {
+    const cx = dir === 'x' ? (ox+i) : ox;
+    const cz = dir === 'z' ? (oz+i) : oz;
+    addVoxC('car', cx*V, V*0.1, cz*V, c);
+  }
+  // Cabin
+  const mx = dir === 'x' ? ox+1 : ox;
+  const mz = dir === 'z' ? oz+1 : oz;
+  addVoxC('glass', mx*V, V*0.6, mz*V, 0xCCEEFF);
+}
+buildCar(-10, -5, 'x', 0xDD3333);
+buildCar(-4, -5, 'x', 0x3355DD);
+buildCar(9, 6, 'x', 0xEECC22);
+buildCar(-8, 3, 'z', 0x33AA55);
+buildCar(0, -9, 'z', 0xFFFFFF);
+buildCar(11, -1, 'z', 0x8833CC);
+
+// --- STREET LAMPS ---
+function buildLamp(ox, oz) {
+  for (let y = 0; y < 5; y++) {
+    addVoxC('metal', ox*V, y*V, oz*V, new THREE.Color(0.3,0.3,0.35));
+  }
+  addVox('lamp', ox*V, 5*V, oz*V, 0xFFEE99);
+}
+buildLamp(-9, -3); buildLamp(-9, 4); buildLamp(2, -3);
+buildLamp(2, 4); buildLamp(9, -3); buildLamp(9, 5);
+
+// --- SMALL DETAILS: benches, hydrants ---
+function buildBench(ox, oz) {
+  for (let i = 0; i < 3; i++) addVoxC('wood', (ox+i)*V, V*0.2, oz*V, new THREE.Color(0.5,0.35,0.15));
+  addVoxC('metal', ox*V, 0, oz*V, new THREE.Color(0.3,0.3,0.3));
+  addVoxC('metal', (ox+2)*V, 0, oz*V, new THREE.Color(0.3,0.3,0.3));
+}
+buildBench(-2, 11); buildBench(1, 12);
+
+// ===================== INSTANCED MESHES =====================
+const dummy = new THREE.Object3D();
+for (const key in groups) {
+  const g = groups[key];
+  if (g.voxels.length === 0) continue;
+  const mesh = new THREE.InstancedMesh(boxGeo, g.mat, g.voxels.length);
+  mesh.castShadow = (key !== 'ground' && key !== 'water');
+  mesh.receiveShadow = true;
+  for (let i = 0; i < g.voxels.length; i++) {
+    const v = g.voxels[i];
+    dummy.position.set(v.x, v.y, v.z);
+    dummy.updateMatrix();
+    mesh.setMatrixAt(i, dummy.matrix);
+    mesh.setColorAt(i, v.c);
+  }
+  mesh.instanceMatrix.needsUpdate = true;
+  if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+  scene.add(mesh);
+}
+
+// ===================== POST-PROCESSING =====================
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+
+// SSAO
+const ssao = new SSAOPass(scene, camera, window.innerWidth, window.innerHeight);
+ssao.kernelRadius = 0.6;
+ssao.minDistance = 0.001;
+ssao.maxDistance = 0.12;
+composer.addPass(ssao);
+
+// Tilt-Shift DOF (strong bokeh)
+const camDist = camera.position.distanceTo(controls.target);
+const bokeh = new BokehPass(scene, camera, {
+  focus: camDist,
+  aperture: 0.012,
+  maxblur: 0.012
+});
+composer.addPass(bokeh);
+
+// Vignette shader for extra tilt-shift feel
+const VignetteShader = {
+  uniforms: {
+    tDiffuse: { value: null },
+    offset: { value: 1.0 },
+    darkness: { value: 1.2 }
+  },
+  vertexShader: `varying vec2 vUv; void main(){ vUv=uv; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0); }`,
+  fragmentShader: `
+    uniform sampler2D tDiffuse; uniform float offset; uniform float darkness;
+    varying vec2 vUv;
+    void main(){
+      vec4 texel=texture2D(tDiffuse,vUv);
+      vec2 uv=(vUv-vec2(0.5))*vec2(offset);
+      float vig=clamp(1.0-dot(uv,uv),0.0,1.0);
+      texel.rgb*=mix(1.0-darkness*0.3, 1.0, vig);
+      gl_FragColor=texel;
+    }`
+};
+composer.addPass(new ShaderPass(VignetteShader));
+composer.addPass(new OutputPass());
+
+// ===================== ANIMATE =====================
+document.getElementById('loading').style.display = 'none';
+let time = 0;
+function animate() {
+  requestAnimationFrame(animate);
+  time += 0.016;
+  controls.update();
+  // Update bokeh focus as camera moves
+  const d = camera.position.distanceTo(controls.target);
+  bokeh.uniforms['focus'].value = d;
+  composer.render();
+}
+animate();
+
+// ===================== RESIZE =====================
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  composer.setSize(window.innerWidth, window.innerHeight);
+  ssao.setSize(window.innerWidth, window.innerHeight);
+});
+
+} catch (e) {
+  const el = document.getElementById('loading');
+  if (el) { el.style.display = 'block'; el.innerHTML = '初始化失败：' + e.message; }
+  console.error(e);
+}
+</script>
+</body>
+</html>

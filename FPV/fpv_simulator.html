@@ -1,0 +1,672 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>FPV Freestyle Simulator</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { overflow: hidden; background: #000; font-family: 'Courier New', monospace; }
+canvas { display: block; }
+#hud { position: fixed; top: 10px; left: 10px; color: #0f0; font-size: 13px; z-index: 100; text-shadow: 0 0 4px #0f0; pointer-events: none; line-height: 1.6; }
+#warn { position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%); color: #f00; font-size: 28px; font-weight: bold; z-index: 100; display: none; text-shadow: 0 0 10px #f00; animation: blink 0.5s infinite; }
+@keyframes blink { 50% { opacity: 0.3; } }
+#info { position: fixed; bottom: 10px; left: 10px; color: #aaa; font-size: 11px; z-index: 100; pointer-events: none; }
+</style>
+</head>
+<body>
+<div id="hud"></div>
+<div id="warn">⚠ SIGNAL LOST ⚠</div>
+<div id="info">Gamepad: 连接USB遥控器 | 键盘: WASD=Pitch/Roll, Q/E=Yaw, Shift/Space=Throttle | R=重置</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.155.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.155.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+
+// ==================== SO(3) / se(3) 李群李代数工具 ====================
+class SO3 {
+  // 旋转矩阵用 THREE.Matrix3 表示
+  static exp(omega, dt) {
+    // 指数映射: exp(hat(omega)*dt) 使用 Rodrigues 公式
+    const angle = omega.length() * dt;
+    const m = new THREE.Matrix3();
+    if (angle < 1e-10) {
+      m.identity();
+      return m;
+    }
+    const axis = omega.clone().normalize();
+    const K = SO3.hat(axis);
+    const s = Math.sin(angle);
+    const c = Math.cos(angle);
+    // R = I + sin(θ)*K + (1-cos(θ))*K²
+    const K2 = K.clone().multiply(K);
+    const I = new THREE.Matrix3().identity();
+    m.identity();
+    const e = m.elements, ie = I.elements, ke = K.elements, k2e = K2.elements;
+    for (let i = 0; i < 9; i++) {
+      e[i] = ie[i] + s * ke[i] + (1 - c) * k2e[i];
+    }
+    return m;
+  }
+
+  static hat(v) {
+    // 将向量映射为反对称矩阵 (so(3) 李代数)
+    const m = new THREE.Matrix3();
+    m.set(0, -v.z, v.y, v.z, 0, -v.x, -v.y, v.x, 0);
+    return m;
+  }
+
+  static rotateVector(R, v) {
+    return v.clone().applyMatrix3(R);
+  }
+}
+
+// ==================== PID 控制器 ====================
+class PIDController {
+  constructor(kp, ki, kd, maxOutput) {
+    this.kp = kp; this.ki = ki; this.kd = kd;
+    this.maxOutput = maxOutput;
+    this.integral = new THREE.Vector3();
+    this.prevError = new THREE.Vector3();
+  }
+
+  compute(error, dt) {
+    this.integral.add(error.clone().multiplyScalar(dt));
+    // 积分限幅
+    const iLimit = this.maxOutput * 0.3;
+    this.integral.clampScalar(-iLimit, iLimit);
+    const derivative = error.clone().sub(this.prevError).divideScalar(Math.max(dt, 1e-6));
+    this.prevError.copy(error);
+    const output = error.clone().multiplyScalar(this.kp)
+      .add(this.integral.clone().multiplyScalar(this.ki))
+      .add(derivative.multiplyScalar(this.kd));
+    output.clampScalar(-this.maxOutput, this.maxOutput);
+    return output;
+  }
+
+  reset() {
+    this.integral.set(0, 0, 0);
+    this.prevError.set(0, 0, 0);
+  }
+}
+
+// ==================== 无人机物理引擎 ====================
+class DronePhysics {
+  constructor() {
+    this.reset();
+    this.mass = 0.8; // kg
+    this.gravity = new THREE.Vector3(0, -9.81, 0);
+    this.dragCoeff = 0.15; // 空气阻尼系数
+    this.maxThrust = 25; // 最大推力 N
+    this.inertia = new THREE.Vector3(0.005, 0.005, 0.009); // 转动惯量
+    this.pid = new PIDController(8.0, 2.0, 0.4, 50);
+    this.crashed = false;
+  }
+
+  reset() {
+    this.position = new THREE.Vector3(0, 1.5, 0);
+    this.velocity = new THREE.Vector3();
+    this.R = new THREE.Matrix3().identity(); // SO(3) 姿态
+    this.omega = new THREE.Vector3(); // 机体角速度 (rad/s)
+    this.crashed = false;
+    if (this.pid) this.pid.reset();
+  }
+
+  update(input, dt) {
+    if (this.crashed) {
+      // 坠毁后自由落体
+      this.velocity.add(this.gravity.clone().multiplyScalar(dt));
+      this.position.add(this.velocity.clone().multiplyScalar(dt));
+      if (this.position.y < 0.1) { this.position.y = 0.1; this.velocity.set(0,0,0); }
+      return;
+    }
+
+    // === 姿态控制 (Acro 模式) ===
+    // 摇杆映射为目标角速度 (rad/s)
+    const maxRate = new THREE.Vector3(6.0, 6.0, 4.0); // pitch, roll, yaw 最大角速度
+    const targetOmega = new THREE.Vector3(
+      input.pitch * maxRate.x,
+      input.yaw * maxRate.z,
+      -input.roll * maxRate.y
+    );
+
+    // PID 计算力矩
+    const error = targetOmega.clone().sub(this.omega);
+    const torque = this.pid.compute(error, dt);
+
+    // 角加速度 = torque / inertia (简化为对角惯量张量)
+    const angAccel = new THREE.Vector3(
+      torque.x / this.inertia.x,
+      torque.y / this.inertia.y,
+      torque.z / this.inertia.z
+    );
+
+    // 更新角速度
+    this.omega.add(angAccel.clone().multiplyScalar(dt));
+    // 角速度阻尼
+    this.omega.multiplyScalar(0.998);
+
+    // === SO(3) 姿态积分: R_{t+dt} = R_t * exp(hat(omega)*dt) ===
+    const dR = SO3.exp(this.omega, dt);
+    this.R.multiply(dR);
+    // 正交化防止数值漂移 (极分解近似)
+    this.orthonormalize();
+
+    // === 平动动力学 ===
+    // 推力沿机体 Z 轴（上方）
+    const bodyUp = new THREE.Vector3(0, 0, 1).applyMatrix3(this.R);
+    const thrust = bodyUp.multiplyScalar(input.throttle * this.maxThrust);
+
+    // 空气阻尼 F_drag = -c * |v| * v
+    const speed = this.velocity.length();
+    const drag = this.velocity.clone().multiplyScalar(-this.dragCoeff * speed);
+
+    // 合力
+    const force = new THREE.Vector3()
+      .add(this.gravity.clone().multiplyScalar(this.mass))
+      .add(thrust)
+      .add(drag);
+
+    // 加速度 & 积分
+    const accel = force.divideScalar(this.mass);
+    this.velocity.add(accel.multiplyScalar(dt));
+    this.position.add(this.velocity.clone().multiplyScalar(dt));
+
+    // 地面碰撞
+    if (this.position.y < 0.15) {
+      if (this.velocity.y < -5 || input.throttle < 0.1) {
+        this.crashed = true;
+      }
+      this.position.y = 0.15;
+      this.velocity.y = Math.max(0, this.velocity.y);
+    }
+  }
+
+  orthonormalize() {
+    // Gram-Schmidt 正交化
+    const e = this.R.elements;
+    let x = new THREE.Vector3(e[0], e[1], e[2]);
+    let y = new THREE.Vector3(e[3], e[4], e[5]);
+    let z = new THREE.Vector3(e[6], e[7], e[8]);
+    x.normalize();
+    z.crossVectors(x, y).normalize();
+    y.crossVectors(z, x).normalize();
+    e[0]=x.x; e[1]=x.y; e[2]=x.z;
+    e[3]=y.x; e[4]=y.y; e[5]=y.z;
+    e[6]=z.x; e[7]=z.y; e[8]=z.z;
+  }
+
+  getQuaternion() {
+    const e = this.R.elements;
+    const m = new THREE.Matrix4();
+    m.set(e[0],e[3],e[6],0, e[1],e[4],e[7],0, e[2],e[5],e[8],0, 0,0,0,1);
+    const q = new THREE.Quaternion();
+    q.setFromRotationMatrix(m);
+    return q;
+  }
+}
+
+// ==================== 输入系统 ====================
+class InputSystem {
+  constructor() {
+    this.state = { pitch: 0, roll: 0, yaw: 0, throttle: 0 };
+    this.keys = {};
+    this.gamepadIndex = null;
+    window.addEventListener('keydown', e => { this.keys[e.code] = true; });
+    window.addEventListener('keyup', e => { this.keys[e.code] = false; });
+    window.addEventListener('gamepadconnected', e => {
+      this.gamepadIndex = e.gamepad.index;
+      console.log('Gamepad connected:', e.gamepad.id);
+    });
+    window.addEventListener('gamepaddisconnected', e => {
+      if (e.gamepad.index === this.gamepadIndex) this.gamepadIndex = null;
+    });
+  }
+
+  update() {
+    // Gamepad 优先
+    if (this.gamepadIndex !== null) {
+      const gp = navigator.getGamepads()[this.gamepadIndex];
+      if (gp) {
+        const db = 0.08; // 死区
+        const axis = (i) => { let v = gp.axes[i] || 0; return Math.abs(v) < db ? 0 : v; };
+        // 标准映射: axes[0]=Roll, axes[1]=Pitch, axes[2]=Yaw, axes[3]=Throttle
+        this.state.roll = axis(0);
+        this.state.pitch = -axis(1);
+        this.state.yaw = axis(2);
+        this.state.throttle = (1 - axis(3)) / 2; // [-1,1] -> [0,1]
+        return;
+      }
+    }
+    // 键盘回退
+    const k = this.keys;
+    const rate = 0.04;
+    if (k['KeyW']) this.state.pitch = Math.min(1, this.state.pitch + rate);
+    else if (k['KeyS']) this.state.pitch = Math.max(-1, this.state.pitch - rate);
+    else this.state.pitch *= 0.9;
+
+    if (k['KeyD']) this.state.roll = Math.min(1, this.state.roll + rate);
+    else if (k['KeyA']) this.state.roll = Math.max(-1, this.state.roll - rate);
+    else this.state.roll *= 0.9;
+
+    if (k['KeyE']) this.state.yaw = Math.min(1, this.state.yaw + rate);
+    else if (k['KeyQ']) this.state.yaw = Math.max(-1, this.state.yaw - rate);
+    else this.state.yaw *= 0.9;
+
+    if (k['Space']) this.state.throttle = Math.min(1, this.state.throttle + rate * 0.7);
+    else if (k['ShiftLeft'] || k['ShiftRight']) this.state.throttle = Math.max(0, this.state.throttle - rate * 0.7);
+  }
+}
+
+// ==================== VTX 图传衰弱着色器 ====================
+const VTXShader = {
+  uniforms: {
+    tDiffuse: { value: null },
+    uTime: { value: 0 },
+    uSignal: { value: 1.0 }, // 1=满信号, 0=完全失联
+    uResolution: { value: new THREE.Vector2(1, 1) }
+  },
+  vertexShader: `
+    varying vec2 vUv;
+    void main() {
+      vUv = uv;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+  `,
+  fragmentShader: `
+    uniform sampler2D tDiffuse;
+    uniform float uTime;
+    uniform float uSignal;
+    uniform vec2 uResolution;
+    varying vec2 vUv;
+
+    float rand(vec2 co) {
+      return fract(sin(dot(co, vec2(12.9898, 78.233))) * 43758.5453);
+    }
+
+    float noise(vec2 p) {
+      vec2 i = floor(p);
+      vec2 f = fract(p);
+      f = f * f * (3.0 - 2.0 * f);
+      float a = rand(i);
+      float b = rand(i + vec2(1.0, 0.0));
+      float c = rand(i + vec2(0.0, 1.0));
+      float d = rand(i + vec2(1.0, 1.0));
+      return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+    }
+
+    void main() {
+      vec2 uv = vUv;
+      float signal = clamp(uSignal, 0.0, 1.0);
+      float degradation = 1.0 - signal;
+
+      // === 横向撕裂 (Horizontal Tearing) ===
+      float tearStrength = degradation * degradation * 0.08;
+      float tearLine = step(0.97, rand(vec2(floor(uv.y * 80.0), floor(uTime * 20.0))));
+      uv.x += tearLine * tearStrength * (rand(vec2(uTime, uv.y)) - 0.5) * 2.0;
+
+      // === 滚动条纹 (Rolling Bands) ===
+      float bandFreq = 3.0 + degradation * 5.0;
+      float band = sin((uv.y + uTime * 0.3) * bandFreq * 6.2831) * 0.5 + 0.5;
+      float bandMask = smoothstep(0.4, 0.6, degradation) * band * 0.4;
+
+      // === 采样颜色 ===
+      vec4 color = texture2D(tDiffuse, uv);
+
+      // === 色彩饱和度降低 ===
+      float gray = dot(color.rgb, vec3(0.299, 0.587, 0.114));
+      float desat = mix(1.0, 0.3, degradation * 0.8);
+      color.rgb = mix(vec3(gray), color.rgb, desat);
+
+      // === 雪花噪声 (Static Noise) ===
+      float staticNoise = rand(uv * uResolution + uTime * 100.0);
+      float noiseAmount = degradation * degradation * 0.7;
+      // 随机横向雪花条纹
+      float hLine = step(0.995 - degradation * 0.03, rand(vec2(floor(uv.y * 200.0), floor(uTime * 60.0))));
+      float staticMask = noiseAmount * (0.5 + 0.5 * hLine);
+      color.rgb = mix(color.rgb, vec3(staticNoise), staticMask);
+
+      // === 滚动黑色条纹 ===
+      color.rgb *= (1.0 - bandMask);
+
+      // === 信号完全丧失 ===
+      float totalLoss = smoothstep(0.0, 0.05, signal);
+      vec3 pureStatic = vec3(rand(uv * uResolution * 2.0 + uTime * 500.0));
+      color.rgb = mix(pureStatic, color.rgb, totalLoss);
+
+      // === 模拟模拟图传的轻微扫描线 ===
+      float scanline = sin(uv.y * uResolution.y * 1.5) * 0.03 * (0.5 + degradation);
+      color.rgb -= scanline;
+
+      // === 边缘暗角 ===
+      float vignette = 1.0 - dot((uv - 0.5) * 1.2, (uv - 0.5) * 1.2);
+      color.rgb *= vignette;
+
+      gl_FragColor = color;
+    }
+  `
+};
+
+// ==================== 场景构建 ====================
+function createGrassTexture() {
+  const size = 256;
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#2d5a1b';
+  ctx.fillRect(0, 0, size, size);
+  for (let i = 0; i < 8000; i++) {
+    const x = Math.random() * size;
+    const y = Math.random() * size;
+    const g = 60 + Math.random() * 80;
+    ctx.fillStyle = `rgb(${20+Math.random()*30},${g},${10+Math.random()*20})`;
+    ctx.fillRect(x, y, 1 + Math.random() * 2, 1 + Math.random() * 3);
+  }
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.repeat.set(100, 100);
+  return tex;
+}
+
+function createSkyGradient() {
+  const canvas = document.createElement('canvas');
+  canvas.width = 2; canvas.height = 512;
+  const ctx = canvas.getContext('2d');
+  const grad = ctx.createLinearGradient(0, 0, 0, 512);
+  grad.addColorStop(0, '#0a1a3f');
+  grad.addColorStop(0.3, '#1e5799');
+  grad.addColorStop(0.5, '#7db9e8');
+  grad.addColorStop(0.7, '#a8d4f0');
+  grad.addColorStop(1.0, '#e8f4f8');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, 2, 512);
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.mapping = THREE.EquirectangularReflectionMapping;
+  return tex;
+}
+
+function buildScene(scene) {
+  // 天空
+  const skyTex = createSkyGradient();
+  scene.background = skyTex;
+  scene.environment = skyTex;
+
+  // 光照
+  const sun = new THREE.DirectionalLight(0xfff5e0, 2.0);
+  sun.position.set(50, 80, 30);
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(2048, 2048);
+  sun.shadow.camera.near = 1; sun.shadow.camera.far = 200;
+  sun.shadow.camera.left = -60; sun.shadow.camera.right = 60;
+  sun.shadow.camera.top = 60; sun.shadow.camera.bottom = -60;
+  scene.add(sun);
+  scene.add(new THREE.AmbientLight(0x88aacc, 0.5));
+  scene.add(new THREE.HemisphereLight(0x87ceeb, 0x2d5a1b, 0.6));
+
+  // 地面
+  const groundGeo = new THREE.PlaneGeometry(500, 500);
+  const groundMat = new THREE.MeshStandardMaterial({ map: createGrassTexture(), roughness: 0.9 });
+  const ground = new THREE.Mesh(groundGeo, groundMat);
+  ground.rotation.x = -Math.PI / 2;
+  ground.receiveShadow = true;
+  scene.add(ground);
+
+  // === 花飞训练场 ===
+  const gateMat = new THREE.MeshStandardMaterial({ color: 0xff3300, emissive: 0x441100, metalness: 0.3, roughness: 0.5 });
+  const gateMat2 = new THREE.MeshStandardMaterial({ color: 0x0066ff, emissive: 0x001144, metalness: 0.3, roughness: 0.5 });
+  const pillarMat = new THREE.MeshStandardMaterial({ color: 0xffcc00, emissive: 0x332200, metalness: 0.4, roughness: 0.4 });
+  const wallMat = new THREE.MeshStandardMaterial({ color: 0x888888, roughness: 0.8 });
+  const bridgeMat = new THREE.MeshStandardMaterial({ color: 0x994400, roughness: 0.7 });
+
+  // 环形门 (Torus)
+  const gatePositions = [
+    { pos: [0, 4, -15], rot: [0, 0, 0], r: 3, mat: gateMat },
+    { pos: [10, 5, -25], rot: [0, 0.5, 0], r: 2.5, mat: gateMat2 },
+    { pos: [-12, 3.5, -20], rot: [0, -0.4, 0], r: 2.8, mat: gateMat },
+    { pos: [5, 6, -40], rot: [0.3, 0, 0], r: 3.2, mat: gateMat2 },
+    { pos: [-8, 4.5, -35], rot: [0, 0.8, 0.2], r: 2.5, mat: gateMat },
+  ];
+  gatePositions.forEach(g => {
+    const torus = new THREE.Mesh(new THREE.TorusGeometry(g.r, 0.25, 16, 32), g.mat);
+    torus.position.set(...g.pos);
+    torus.rotation.set(...g.rot);
+    torus.castShadow = true;
+    scene.add(torus);
+  });
+
+  // 垂直立柱 (Cylinder)
+  const pillarPositions = [[6, 0, -10], [-6, 0, -10], [15, 0, -30], [-15, 0, -30], [0, 0, -50]];
+  pillarPositions.forEach(p => {
+    const h = 8 + Math.random() * 6;
+    const cyl = new THREE.Mesh(new THREE.CylinderGeometry(0.4, 0.5, h, 12), pillarMat);
+    cyl.position.set(p[0], h / 2, p[2]);
+    cyl.castShadow = true;
+    scene.add(cyl);
+    // 顶部球
+    const sphere = new THREE.Mesh(new THREE.SphereGeometry(0.7, 12, 12), gateMat);
+    sphere.position.set(p[0], h, p[2]);
+    scene.add(sphere);
+  });
+
+  // 桥梁/废墟墙 (Box组合) - 可钻越
+  function createWallWithHole(x, z, rotY) {
+    const group = new THREE.Group();
+    // 左墙
+    const left = new THREE.Mesh(new THREE.BoxGeometry(3, 8, 0.5), wallMat);
+    left.position.set(-3.5, 4, 0);
+    group.add(left);
+    // 右墙
+    const right = new THREE.Mesh(new THREE.BoxGeometry(3, 8, 0.5), wallMat);
+    right.position.set(3.5, 4, 0);
+    group.add(right);
+    // 顶部横梁
+    const top = new THREE.Mesh(new THREE.BoxGeometry(10, 2, 0.5), wallMat);
+    top.position.set(0, 7, 0);
+    group.add(top);
+    // 底部
+    const bottom = new THREE.Mesh(new THREE.BoxGeometry(10, 1, 0.5), wallMat);
+    bottom.position.set(0, 0.5, 0);
+    group.add(bottom);
+    group.position.set(x, 0, z);
+    group.rotation.y = rotY;
+    group.traverse(m => { if (m.isMesh) m.castShadow = true; });
+    scene.add(group);
+  }
+  createWallWithHole(0, -22, 0);
+  createWallWithHole(12, -18, 0.6);
+  createWallWithHole(-10, -28, -0.3);
+
+  // 桥梁结构
+  function createBridge(x, z, rotY) {
+    const group = new THREE.Group();
+    const deck = new THREE.Mesh(new THREE.BoxGeometry(8, 0.4, 2.5), bridgeMat);
+    deck.position.y = 4;
+    group.add(deck);
+    const leg1 = new THREE.Mesh(new THREE.BoxGeometry(0.5, 4, 0.5), bridgeMat);
+    leg1.position.set(-3.5, 2, 0);
+    group.add(leg1);
+    const leg2 = new THREE.Mesh(new THREE.BoxGeometry(0.5, 4, 0.5), bridgeMat);
+    leg2.position.set(3.5, 2, 0);
+    group.add(leg2);
+    group.position.set(x, 0, z);
+    group.rotation.y = rotY;
+    group.traverse(m => { if (m.isMesh) m.castShadow = true; });
+    scene.add(group);
+  }
+  createBridge(8, -35, 0.2);
+  createBridge(-5, -45, -0.5);
+
+  // 起飞平台
+  const pad = new THREE.Mesh(new THREE.CylinderGeometry(1.5, 1.5, 0.1, 24),
+    new THREE.MeshStandardMaterial({ color: 0x333333, roughness: 0.6 }));
+  pad.position.set(0, 0.05, 0);
+  pad.receiveShadow = true;
+  scene.add(pad);
+
+  return { gatePositions };
+}
+
+// ==================== 无人机模型 ====================
+function createDroneModel() {
+  const group = new THREE.Group();
+  // 机架
+  const bodyMat = new THREE.MeshStandardMaterial({ color: 0x222222, metalness: 0.7, roughness: 0.3 });
+  const body = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.08, 0.35), bodyMat);
+  group.add(body);
+  // 机臂和电机
+  const armMat = new THREE.MeshStandardMaterial({ color: 0x444444, metalness: 0.5 });
+  const propMat = new THREE.MeshStandardMaterial({ color: 0x00ccff, emissive: 0x004466, transparent: true, opacity: 0.7 });
+  const armPos = [[0.18, 0, 0.18], [-0.18, 0, 0.18], [0.18, 0, -0.18], [-0.18, 0, -0.18]];
+  armPos.forEach(p => {
+    const arm = new THREE.Mesh(new THREE.CylinderGeometry(0.015, 0.015, 0.25, 6), armMat);
+    arm.position.set(p[0] * 0.5, 0, p[2] * 0.5);
+    arm.rotation.z = Math.PI / 2 * Math.sign(p[0]);
+    group.add(arm);
+    const motor = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.035, 0.04, 8), bodyMat);
+    motor.position.set(p[0], 0.03, p[2]);
+    group.add(motor);
+    const prop = new THREE.Mesh(new THREE.TorusGeometry(0.09, 0.008, 4, 16), propMat);
+    prop.position.set(p[0], 0.05, p[2]);
+    prop.rotation.x = Math.PI / 2;
+    group.add(prop);
+  });
+  // 摄像头
+  const cam = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.06, 0.06),
+    new THREE.MeshStandardMaterial({ color: 0x111111 }));
+  cam.position.set(0, 0.02, 0.2);
+  group.add(cam);
+  group.scale.set(1.5, 1.5, 1.5);
+  return group;
+}
+
+// ==================== 主程序 ====================
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.2;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(110, window.innerWidth / window.innerHeight, 0.1, 1000);
+
+// 后处理
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+const vtxPass = new ShaderPass(VTXShader);
+vtxPass.uniforms.uResolution.value.set(window.innerWidth, window.innerHeight);
+composer.addPass(vtxPass);
+
+// 构建世界
+buildScene(scene);
+const droneModel = createDroneModel();
+scene.add(droneModel);
+
+// 物理 & 输入
+const physics = new DronePhysics();
+const input = new InputSystem();
+
+// 信号参数
+const SIGNAL_MAX_DIST = 120; // 极限距离
+const SIGNAL_WARN_DIST = 50; // 开始衰弱距离
+const origin = new THREE.Vector3(0, 0, 0); // 天线位置
+
+// 重置
+window.addEventListener('keydown', e => {
+  if (e.code === 'KeyR') {
+    physics.reset();
+  }
+});
+
+// HUD
+const hud = document.getElementById('hud');
+const warn = document.getElementById('warn');
+
+// 时钟
+const clock = new THREE.Clock();
+let elapsed = 0;
+
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.033); // 限制最大步长
+  elapsed += dt;
+
+  // 输入
+  input.update();
+
+  // 物理更新 (子步进)
+  const subSteps = 3;
+  const subDt = dt / subSteps;
+  for (let i = 0; i < subSteps; i++) {
+    physics.update(input.state, subDt);
+  }
+
+  // 计算信号强度
+  const dist = physics.position.distanceTo(origin);
+  let signal = 1.0;
+  if (dist > SIGNAL_WARN_DIST) {
+    signal = 1.0 - (dist - SIGNAL_WARN_DIST) / (SIGNAL_MAX_DIST - SIGNAL_WARN_DIST);
+  }
+  signal = Math.max(0, Math.min(1, signal));
+
+  // 完全失联 -> 坠毁
+  if (signal <= 0 && !physics.crashed) {
+    physics.crashed = true;
+  }
+
+  // 更新无人机模型
+  droneModel.position.copy(physics.position);
+  droneModel.quaternion.copy(physics.getQuaternion());
+
+  // FPV 相机 (安装在机体前方, 略微上仰)
+  const camOffset = new THREE.Vector3(0, 0.08, 0.25);
+  camOffset.applyMatrix3(physics.R);
+  camera.position.copy(physics.position).add(camOffset);
+  const lookDir = new THREE.Vector3(0, 0.15, 1).applyMatrix3(physics.R).normalize();
+  camera.lookAt(camera.position.clone().add(lookDir));
+  camera.up.copy(new THREE.Vector3(0, 0, 1).applyMatrix3(physics.R));
+
+  // 更新 VTX shader
+  vtxPass.uniforms.uTime.value = elapsed;
+  vtxPass.uniforms.uSignal.value = signal;
+
+  // 渲染
+  composer.render();
+
+  // HUD 更新
+  const speed = physics.velocity.length();
+  const alt = physics.position.y;
+  hud.innerHTML = `
+    ALT: ${alt.toFixed(1)}m | SPD: ${speed.toFixed(1)}m/s<br>
+    DIST: ${dist.toFixed(1)}m | SIG: ${(signal * 100).toFixed(0)}%<br>
+    THR: ${(input.state.throttle * 100).toFixed(0)}% | ${physics.crashed ? '<span style="color:#f00">CRASHED</span>' : '<span style="color:#0f0">ARMED</span>'}<br>
+    ω: [${physics.omega.x.toFixed(1)}, ${physics.omega.y.toFixed(1)}, ${physics.omega.z.toFixed(1)}] rad/s
+  `;
+  warn.style.display = (signal < 0.2 && !physics.crashed) ? 'block' : 'none';
+}
+
+animate();
+
+// 窗口自适应
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  composer.setSize(window.innerWidth, window.innerHeight);
+  vtxPass.uniforms.uResolution.value.set(window.innerWidth, window.innerHeight);
+});
+</script>
+</body>
+</html>

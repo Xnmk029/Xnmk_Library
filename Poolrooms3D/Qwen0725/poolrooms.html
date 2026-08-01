@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>Poolrooms - 池核模拟器</title>
+<style>
+*{margin:0;padding:0;overflow:hidden}
+body{background:#000}
+canvas{display:block;width:100vw;height:100vh}
+#blocker{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);display:flex;align-items:center;justify-content:center;z-index:10;cursor:pointer}
+#blocker p{color:#fff;font-family:sans-serif;font-size:1.2em;text-align:center;opacity:0.8}
+</style>
+</head>
+<body>
+<div id="blocker"><p>点击进入池核空间<br><small>WASD移动 | 鼠标视角 | Shift加速</small></p></div>
+<script type="importmap">
+{"imports":{"three":"https://unpkg.com/three@0.162.0/build/three.module.js","three/addons/":"https://unpkg.com/three@0.162.0/examples/jsm/"}}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import {PointerLockControls} from 'three/addons/controls/PointerLockControls.js';
+import {EffectComposer} from 'three/addons/postprocessing/EffectComposer.js';
+import {RenderPass} from 'three/addons/postprocessing/RenderPass.js';
+import {UnrealBloomPass} from 'three/addons/postprocessing/UnrealBloomPass.js';
+import {ShaderPass} from 'three/addons/postprocessing/ShaderPass.js';
+import {FXAAShader} from 'three/addons/shaders/FXAAShader.js';
+
+// ===== RENDERER =====
+const renderer = new THREE.WebGLRenderer({antialias:true, powerPreference:'high-performance'});
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.1;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(0x8faabc, 0.012);
+scene.background = new THREE.Color(0x8faabc);
+
+const camera = new THREE.PerspectiveCamera(70, window.innerWidth/window.innerHeight, 0.1, 200);
+camera.position.set(0, 1.7, 0);
+
+// ===== CONTROLS =====
+const controls = new PointerLockControls(camera, document.body);
+const blocker = document.getElementById('blocker');
+blocker.addEventListener('click', ()=> controls.lock());
+controls.addEventListener('lock', ()=> blocker.style.display='none');
+controls.addEventListener('unlock', ()=> blocker.style.display='flex');
+scene.add(controls.getObject());
+
+const keys = {};
+document.addEventListener('keydown', e=> keys[e.code]=true);
+document.addEventListener('keyup', e=> keys[e.code]=false);
+
+// ===== PROCEDURAL TEXTURES =====
+function createTileTexture(size, tileCount, baseColor, groutColor) {
+  const c = document.createElement('canvas'); c.width=c.height=size;
+  const ctx = c.getContext('2d');
+  const ts = size/tileCount;
+  ctx.fillStyle = groutColor; ctx.fillRect(0,0,size,size);
+  for(let i=0;i<tileCount;i++) for(let j=0;j<tileCount;j++){
+    const v = 0.92 + Math.random()*0.08;
+    ctx.fillStyle = baseColor;
+    ctx.globalAlpha = v;
+    ctx.fillRect(i*ts+1.5, j*ts+1.5, ts-3, ts-3);
+    ctx.globalAlpha = 1;
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.wrapS=tex.wrapT=THREE.RepeatWrapping;
+  return tex;
+}
+
+function createNormalMap(size, tileCount) {
+  const c = document.createElement('canvas'); c.width=c.height=size;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle='#8080ff'; ctx.fillRect(0,0,size,size);
+  const ts=size/tileCount;
+  for(let i=0;i<tileCount;i++) for(let j=0;j<tileCount;j++){
+    ctx.fillStyle='#8888ff';
+    ctx.fillRect(i*ts+2,j*ts+2,ts-4,ts-4);
+    ctx.fillStyle='#7070ff'; ctx.fillRect(i*ts,j*ts,ts,2);
+    ctx.fillStyle='#9090ff'; ctx.fillRect(i*ts,j*ts+ts-2,ts,2);
+    ctx.fillStyle='#7878ff'; ctx.fillRect(i*ts,j*ts,2,ts);
+    ctx.fillStyle='#8888ff'; ctx.fillRect(i*ts+ts-2,j*ts,2,ts);
+  }
+  const tex=new THREE.CanvasTexture(c);
+  tex.wrapS=tex.wrapT=THREE.RepeatWrapping;
+  return tex;
+}
+
+function createConcreteTexture(size){
+  const c=document.createElement('canvas');c.width=c.height=size;
+  const ctx=c.getContext('2d');
+  ctx.fillStyle='#b8b4a8';ctx.fillRect(0,0,size,size);
+  for(let i=0;i<8000;i++){
+    const x=Math.random()*size,y=Math.random()*size;
+    const v=Math.random()*30-15;
+    ctx.fillStyle=`rgba(${128+v},${125+v},${118+v},0.3)`;
+    ctx.fillRect(x,y,Math.random()*4+1,Math.random()*4+1);
+  }
+  for(let i=0;i<20;i++){
+    ctx.strokeStyle='rgba(80,75,70,0.1)';ctx.lineWidth=Math.random()*2;
+    ctx.beginPath();ctx.moveTo(Math.random()*size,Math.random()*size);
+    ctx.lineTo(Math.random()*size,Math.random()*size);ctx.stroke();
+  }
+  const tex=new THREE.CanvasTexture(c);tex.wrapS=tex.wrapT=THREE.RepeatWrapping;return tex;
+}
+
+function createRoughnessMap(size,tileCount){
+  const c=document.createElement('canvas');c.width=c.height=size;
+  const ctx=c.getContext('2d');
+  ctx.fillStyle='#333';ctx.fillRect(0,0,size,size);
+  const ts=size/tileCount;
+  for(let i=0;i<tileCount;i++)for(let j=0;j<tileCount;j++){
+    const v=Math.floor(40+Math.random()*30);
+    ctx.fillStyle=`rgb(${v},${v},${v})`;
+    ctx.fillRect(i*ts+2,j*ts+2,ts-4,ts-4);
+  }
+  const tex=new THREE.CanvasTexture(c);tex.wrapS=tex.wrapT=THREE.RepeatWrapping;return tex;
+}
+
+// ===== MATERIALS =====
+const tileTex = createTileTexture(512,8,'#d4e8e0','#9ab8ac');
+tileTex.repeat.set(4,4);
+const tileNorm = createNormalMap(512,8);
+tileNorm.repeat.set(4,4);
+const tileRough = createRoughnessMap(512,8);
+tileRough.repeat.set(4,4);
+
+const tileMat = new THREE.MeshStandardMaterial({
+  map:tileTex, normalMap:tileNorm, roughnessMap:tileRough,
+  roughness:0.3, metalness:0.0, normalScale:new THREE.Vector2(0.5,0.5),
+  envMapIntensity:0.8
+});
+
+const wallTileTex = createTileTexture(512,12,'#e8f0ec','#c0d4cc');
+wallTileTex.repeat.set(3,2);
+const wallNorm = createNormalMap(512,12);
+wallNorm.repeat.set(3,2);
+const wallMat = new THREE.MeshStandardMaterial({
+  map:wallTileTex, normalMap:wallNorm,
+  roughness:0.25, metalness:0.0, normalScale:new THREE.Vector2(0.4,0.4),
+  envMapIntensity:0.6
+});
+
+const concTex = createConcreteTexture(512);
+concTex.repeat.set(2,2);
+const concreteMat = new THREE.MeshStandardMaterial({
+  map:concTex, roughness:0.85, metalness:0.0, envMapIntensity:0.3
+});
+
+const ceilMat = new THREE.MeshStandardMaterial({
+  color:0xf5f2ea, roughness:0.9, metalness:0.0
+});
+
+// ===== WATER SHADER =====
+const waterVert = `
+varying vec3 vWorldPos;
+varying vec3 vNormal;
+varying vec2 vUv;
+uniform float uTime;
+void main(){
+  vUv = uv;
+  vec3 pos = position;
+  float w1 = sin(pos.x*1.5+uTime*0.8)*0.02 + sin(pos.z*2.0+uTime*1.2)*0.015;
+  float w2 = sin((pos.x+pos.z)*1.0+uTime*0.5)*0.01;
+  pos.y += w1+w2;
+  float dx = cos(pos.x*1.5+uTime*0.8)*1.5*0.02 + cos((pos.x+pos.z)*1.0+uTime*0.5)*1.0*0.01;
+  float dz = cos(pos.z*2.0+uTime*1.2)*2.0*0.015 + cos((pos.x+pos.z)*1.0+uTime*0.5)*1.0*0.01;
+  vNormal = normalize(vec3(-dx, 1.0, -dz));
+  vec4 wp = modelMatrix * vec4(pos,1.0);
+  vWorldPos = wp.xyz;
+  gl_Position = projectionMatrix * viewMatrix * wp;
+}`;
+
+const waterFrag = `
+uniform float uTime;
+uniform vec3 uCameraPos;
+uniform vec3 uSunDir;
+uniform vec3 uDeepColor;
+uniform vec3 uShallowColor;
+uniform samplerCube uEnvMap;
+varying vec3 vWorldPos;
+varying vec3 vNormal;
+varying vec2 vUv;
+
+float caustic(vec2 p, float t){
+  vec2 i = p; float c = 1.0; float inten = 0.005;
+  for(int n=0;n<5;n++){
+    float tt = t*(1.0-(3.5/float(n+1)));
+    i = p + vec2(cos(tt-i.x)+sin(tt+i.y), sin(tt-i.y)+cos(tt+i.x));
+    c += 1.0/length(vec2(p.x/(sin(i.x+tt)/inten), p.y/(cos(i.y+tt)/inten)));
+  }
+  c /= 5.0; c = 1.17-pow(c,1.4);
+  return pow(abs(c),8.0);
+}
+
+void main(){
+  vec3 viewDir = normalize(uCameraPos - vWorldPos);
+  vec3 N = normalize(vNormal);
+  float fresnel = pow(1.0-max(dot(viewDir,N),0.0), 3.0);
+  fresnel = mix(0.04, 1.0, fresnel);
+  vec3 reflDir = reflect(-viewDir, N);
+  vec3 envColor = textureCube(uEnvMap, reflDir).rgb;
+  float depth = smoothstep(0.0, 2.5, vWorldPos.y);
+  vec3 waterCol = mix(uDeepColor, uShallowColor, 0.5+0.5*depth);
+  float caust = caustic(vWorldPos.xz*0.5, uTime*0.4);
+  waterCol += vec3(caust*0.3, caust*0.35, caust*0.25);
+  vec3 halfDir = normalize(viewDir + uSunDir);
+  float spec = pow(max(dot(N, halfDir),0.0), 256.0);
+  vec3 color = mix(waterCol, envColor*1.2, fresnel);
+  color += vec3(spec*1.5);
+  color += vec3(0.02,0.04,0.03)*(1.0-fresnel);
+  gl_FragColor = vec4(color, 0.85+fresnel*0.15);
+}`;
+
+// Generate simple env cubemap
+function generateEnvCube(){
+  const size=128;
+  const faces=[];
+  const colors=[[0.6,0.75,0.85],[0.6,0.75,0.85],[0.9,0.95,1.0],[0.4,0.45,0.4],[0.65,0.78,0.88],[0.65,0.78,0.88]];
+  for(let f=0;f<6;f++){
+    const c=document.createElement('canvas');c.width=c.height=size;
+    const ctx=c.getContext('2d');
+    const [r,g,b]=colors[f];
+    const grad=ctx.createLinearGradient(0,0,0,size);
+    grad.addColorStop(0,`rgb(${r*255|0},${g*255|0},${b*255|0})`);
+    grad.addColorStop(1,`rgb(${r*200|0},${g*210|0},${b*220|0})`);
+    ctx.fillStyle=grad;ctx.fillRect(0,0,size,size);
+    faces.push(c);
+  }
+  const ct=new THREE.CubeTexture(faces);ct.needsUpdate=true;return ct;
+}
+const envCube = generateEnvCube();
+scene.environment = envCube;
+
+const waterUniforms = {
+  uTime:{value:0}, uCameraPos:{value:new THREE.Vector3()},
+  uSunDir:{value:new THREE.Vector3(0.5,0.8,0.3).normalize()},
+  uDeepColor:{value:new THREE.Color(0x0a3d4a)},
+  uShallowColor:{value:new THREE.Color(0x2d8a7a)},
+  uEnvMap:{value:envCube}
+};
+const waterMat = new THREE.ShaderMaterial({
+  vertexShader:waterVert, fragmentShader:waterFrag,
+  uniforms:waterUniforms, transparent:true, side:THREE.DoubleSide
+});
+
+// ===== LIGHTING =====
+const ambLight = new THREE.HemisphereLight(0xc8dce8, 0x4a6058, 0.6);
+scene.add(ambLight);
+
+const sunLight = new THREE.DirectionalLight(0xfff5e0, 2.0);
+sunLight.position.set(20, 40, 15);
+sunLight.castShadow = true;
+sunLight.shadow.mapSize.set(2048,2048);
+sunLight.shadow.camera.near=0.5; sunLight.shadow.camera.far=100;
+sunLight.shadow.camera.left=-40; sunLight.shadow.camera.right=40;
+sunLight.shadow.camera.top=40; sunLight.shadow.camera.bottom=-40;
+sunLight.shadow.bias=-0.001;
+scene.add(sunLight);
+
+// Soft fill lights for indoor pool feel
+const fill1 = new THREE.PointLight(0xd4f0ff, 0.5, 30);
+fill1.position.set(0,4,0); scene.add(fill1);
+
+// ===== PROCEDURAL GENERATION =====
+const CHUNK_SIZE = 24;
+const RENDER_DIST = 3;
+const chunks = new Map();
+const chunkGroup = new THREE.Group();
+scene.add(chunkGroup);
+
+function seededRandom(x,z){
+  let s = x*374761393 + z*668265263;
+  s = (s^(s>>13))*1274126177;
+  s = s^(s>>16);
+  return (s&0x7fffffff)/0x7fffffff;
+}
+
+function createPool(cx, cz, w, d, depth){
+  const g = new THREE.Group();
+  // Pool basin
+  const floorGeo = new THREE.PlaneGeometry(w, d);
+  const floor = new THREE.Mesh(floorGeo, tileMat);
+  floor.rotation.x = -Math.PI/2;
+  floor.position.set(cx, -depth, cz);
+  floor.receiveShadow = true;
+  g.add(floor);
+  // Walls
+  const wallH = depth;
+  const wallGeoX = new THREE.PlaneGeometry(w, wallH);
+  const wallGeoZ = new THREE.PlaneGeometry(d, wallH);
+  const walls = [
+    {geo:wallGeoX, pos:[cx,-wallH/2,cz-d/2], rot:[0,0,0]},
+    {geo:wallGeoX, pos:[cx,-wallH/2,cz+d/2], rot:[0,Math.PI,0]},
+    {geo:wallGeoZ, pos:[cx-w/2,-wallH/2,cz], rot:[0,Math.PI/2,0]},
+    {geo:wallGeoZ, pos:[cx+w/2,-wallH/2,cz], rot:[0,-Math.PI/2,0]}
+  ];
+  walls.forEach(wl=>{
+    const m=new THREE.Mesh(wl.geo, wallMat);
+    m.position.set(...wl.pos); m.rotation.set(...wl.rot);
+    m.receiveShadow=true; g.add(m);
+  });
+  // Water surface
+  const waterGeo = new THREE.PlaneGeometry(w-0.1, d-0.1, 32, 32);
+  const water = new THREE.Mesh(waterGeo, waterMat);
+  water.rotation.x = -Math.PI/2;
+  water.position.set(cx, -0.15, cz);
+  g.add(water);
+  return g;
+}
+
+function createRoom(ox, oz, seed){
+  const g = new THREE.Group();
+  const r = seededRandom;
+  const roomW = 16 + r(seed,1)*10;
+  const roomD = 16 + r(seed,2)*10;
+  const roomH = 4 + r(seed,3)*3;
+  // Floor
+  const floorGeo = new THREE.PlaneGeometry(roomW, roomD);
+  const floor = new THREE.Mesh(floorGeo, tileMat.clone());
+  floor.material.map = tileTex.clone();
+  floor.material.map.repeat.set(roomW/4, roomD/4);
+  floor.material.map.needsUpdate=true;
+  floor.rotation.x=-Math.PI/2; floor.position.set(ox,0,oz);
+  floor.receiveShadow=true; g.add(floor);
+  // Ceiling
+  const ceil = new THREE.Mesh(new THREE.PlaneGeometry(roomW,roomD), ceilMat);
+  ceil.rotation.x=Math.PI/2; ceil.position.set(ox,roomH,oz);
+  g.add(ceil);
+  // Walls with openings
+  const wallConfigs = [
+    {w:roomW, pos:[ox,roomH/2,oz-roomD/2], rot:[0,0,0]},
+    {w:roomW, pos:[ox,roomH/2,oz+roomD/2], rot:[0,Math.PI,0]},
+    {w:roomD, pos:[ox-roomW/2,roomH/2,oz], rot:[0,Math.PI/2,0]},
+    {w:roomD, pos:[ox+roomW/2,roomH/2,oz], rot:[0,-Math.PI/2,0]}
+  ];
+  wallConfigs.forEach((wc,i)=>{
+    const hasOpening = r(seed, 10+i) > 0.4;
+    if(hasOpening){
+      const openW = 3 + r(seed,20+i)*2;
+      const sideW = (wc.w - openW)/2;
+      if(sideW > 0.5){
+        const sg = new THREE.PlaneGeometry(sideW, roomH);
+        const m1=new THREE.Mesh(sg, wallMat);
+        const m2=new THREE.Mesh(sg, wallMat);
+        const offset = (openW+sideW)/2;
+        if(i<2){
+          m1.position.set(wc.pos[0]-offset, wc.pos[1], wc.pos[2]);
+          m2.position.set(wc.pos[0]+offset, wc.pos[1], wc.pos[2]);
+        } else {
+          m1.position.set(wc.pos[0], wc.pos[1], wc.pos[2]-offset);
+          m2.position.set(wc.pos[0], wc.pos[1], wc.pos[2]+offset);
+        }
+        m1.rotation.set(...wc.rot); m2.rotation.set(...wc.rot);
+        m1.receiveShadow=true; m2.receiveShadow=true;
+        g.add(m1,m2);
+        // Header above opening
+        const hGeo=new THREE.PlaneGeometry(openW, roomH-2.8);
+        const header=new THREE.Mesh(hGeo, wallMat);
+        header.position.set(wc.pos[0], roomH-(roomH-2.8)/2, wc.pos[2]);
+        header.rotation.set(...wc.rot);
+        g.add(header);
+      }
+    } else {
+      const wg=new THREE.PlaneGeometry(wc.w, roomH);
+      const wall=new THREE.Mesh(wg, wallMat);
+      wall.position.set(...wc.pos); wall.rotation.set(...wc.rot);
+      wall.receiveShadow=true; g.add(wall);
+    }
+  });
+  // Pool in room
+  const poolType = r(seed, 30);
+  if(poolType > 0.25){
+    const pw = 4 + r(seed,31)*6;
+    const pd = 4 + r(seed,32)*6;
+    const pdepth = 0.8 + r(seed,33)*2.0;
+    const px = ox + (r(seed,34)-0.5)*(roomW-pw-4);
+    const pz = oz + (r(seed,35)-0.5)*(roomD-pd-4);
+    g.add(createPool(px, pz, pw, pd, pdepth));
+  }
+  // Columns
+  const numCols = Math.floor(r(seed,40)*4);
+  for(let i=0;i<numCols;i++){
+    const colGeo=new THREE.CylinderGeometry(0.3,0.35,roomH,12);
+    const col=new THREE.Mesh(colGeo, concreteMat);
+    col.position.set(ox+(r(seed,41+i)-0.5)*(roomW-3), roomH/2, oz+(r(seed,51+i)-0.5)*(roomD-3));
+    col.castShadow=true; col.receiveShadow=true;
+    g.add(col);
+  }
+  // Ceiling lights (emissive panels)
+  const numLights = 2+Math.floor(r(seed,60)*3);
+  for(let i=0;i<numLights;i++){
+    const lGeo=new THREE.PlaneGeometry(1.5,1.5);
+    const lMat=new THREE.MeshStandardMaterial({color:0xffffff,emissive:0xeef8ff,emissiveIntensity:2.0});
+    const lp=new THREE.Mesh(lGeo,lMat);
+    lp.rotation.x=Math.PI/2;
+    lp.position.set(ox+(r(seed,61+i)-0.5)*(roomW-4), roomH-0.05, oz+(r(seed,71+i)-0.5)*(roomD-4));
+    g.add(lp);
+    const pl=new THREE.PointLight(0xeef4ff,0.4,12);
+    pl.position.copy(lp.position); pl.position.y-=0.2;
+    g.add(pl);
+  }
+  // Stairs/platforms
+  if(r(seed,80)>0.6){
+    const steps=4+Math.floor(r(seed,81)*4);
+    const stepH=0.2, stepD=0.4, stepW=2+r(seed,82)*2;
+    for(let s=0;s<steps;s++){
+      const sg=new THREE.BoxGeometry(stepW, stepH, stepD);
+      const sm=new THREE.Mesh(sg, tileMat);
+      sm.position.set(ox+roomW/2-stepW/2-1, stepH/2+s*stepH, oz-roomD/2+2+s*stepD);
+      sm.castShadow=true; sm.receiveShadow=true;
+      g.add(sm);
+    }
+  }
+  return g;
+}
+
+function getChunkKey(cx,cz){return `${cx},${cz}`;}
+
+function generateChunk(cx,cz){
+  const key=getChunkKey(cx,cz);
+  if(chunks.has(key))return;
+  const ox=cx*CHUNK_SIZE, oz=cz*CHUNK_SIZE;
+  const seed=cx*1000+cz;
+  const room=createRoom(ox,oz,seed);
+  chunkGroup.add(room);
+  chunks.set(key,room);
+}
+
+function removeChunk(key){
+  const obj=chunks.get(key);
+  if(obj){chunkGroup.remove(obj);chunks.delete(key);}
+}
+
+function updateChunks(){
+  const pcx=Math.round(camera.position.x/CHUNK_SIZE);
+  const pcz=Math.round(camera.position.z/CHUNK_SIZE);
+  for(let dx=-RENDER_DIST;dx<=RENDER_DIST;dx++)
+    for(let dz=-RENDER_DIST;dz<=RENDER_DIST;dz++)
+      generateChunk(pcx+dx, pcz+dz);
+  for(const [key] of chunks){
+    const [cx,cz]=key.split(',').map(Number);
+    if(Math.abs(cx-pcx)>RENDER_DIST+1||Math.abs(cz-pcz)>RENDER_DIST+1)
+      removeChunk(key);
+  }
+}
+updateChunks();
+
+// ===== VOLUMETRIC FOG PARTICLES =====
+const fogGeo=new THREE.BufferGeometry();
+const fogCount=500;
+const fogPos=new Float32Array(fogCount*3);
+for(let i=0;i<fogCount;i++){
+  fogPos[i*3]=(Math.random()-0.5)*80;
+  fogPos[i*3+1]=Math.random()*5;
+  fogPos[i*3+2]=(Math.random()-0.5)*80;
+}
+fogGeo.setAttribute('position',new THREE.BufferAttribute(fogPos,3));
+const fogMat=new THREE.PointsMaterial({color:0xc8dce8,size:0.8,transparent:true,opacity:0.08,depthWrite:false});
+const fogParticles=new THREE.Points(fogGeo,fogMat);
+scene.add(fogParticles);
+
+// ===== POST PROCESSING =====
+const composer=new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene,camera));
+const bloom=new UnrealBloomPass(new THREE.Vector2(window.innerWidth,window.innerHeight),0.15,0.4,0.85);
+composer.addPass(bloom);
+const fxaa=new ShaderPass(FXAAShader);
+fxaa.uniforms['resolution'].value.set(1/window.innerWidth,1/window.innerHeight);
+composer.addPass(fxaa);
+
+// SSR-like screen space reflection via custom pass
+const SSRShader={
+  uniforms:{tDiffuse:{value:null},uTime:{value:0},uResolution:{value:new THREE.Vector2()}},
+  vertexShader:`varying vec2 vUv;void main(){vUv=uv;gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0);}`,
+  fragmentShader:`
+  uniform sampler2D tDiffuse;uniform float uTime;uniform vec2 uResolution;varying vec2 vUv;
+  void main(){
+    vec4 col=texture2D(tDiffuse,vUv);
+    // Subtle vignette + color grading for realism
+    float vig=1.0-0.3*length(vUv-0.5);
+    col.rgb*=vig;
+    // Slight warm/cool contrast
+    col.r*=1.02; col.b*=1.03;
+    gl_FragColor=col;
+  }`
+};
+const ssrPass=new ShaderPass(SSRShader);
+composer.addPass(ssrPass);
+
+// ===== MOVEMENT =====
+const velocity=new THREE.Vector3();
+const direction=new THREE.Vector3();
+let prevTime=performance.now();
+
+function updateMovement(dt){
+  const speed=keys['ShiftLeft']?12:5;
+  velocity.x-=velocity.x*8*dt;
+  velocity.z-=velocity.z*8*dt;
+  direction.z=Number(keys['KeyW']||keys['ArrowUp']||false)-Number(keys['KeyS']||keys['ArrowDown']||false);
+  direction.x=Number(keys['KeyD']||keys['ArrowRight']||false)-Number(keys['KeyA']||keys['ArrowLeft']||false);
+  direction.normalize();
+  if(keys['KeyW']||keys['ArrowUp']||keys['KeyS']||keys['ArrowDown']) velocity.z-=direction.z*speed*dt;
+  if(keys['KeyA']||keys['ArrowLeft']||keys['KeyD']||keys['ArrowRight']) velocity.x-=direction.x*speed*dt;
+  controls.moveRight(-velocity.x*dt);
+  controls.moveForward(-velocity.z*dt);
+  camera.position.y=1.7;
+}
+
+// ===== ANIMATION LOOP =====
+let chunkTimer=0;
+function animate(){
+  requestAnimationFrame(animate);
+  const now=performance.now();
+  const dt=Math.min((now-prevTime)/1000, 0.05);
+  prevTime=now;
+  waterUniforms.uTime.value=now*0.001;
+  waterUniforms.uCameraPos.value.copy(camera.position);
+  updateMovement(dt);
+  chunkTimer+=dt;
+  if(chunkTimer>0.5){updateChunks();chunkTimer=0;}
+  // Move fog with player
+  fogParticles.position.x=camera.position.x;
+  fogParticles.position.z=camera.position.z;
+  // Update sun shadow to follow player
+  sunLight.position.set(camera.position.x+20,40,camera.position.z+15);
+  sunLight.target.position.set(camera.position.x,0,camera.position.z);
+  sunLight.target.updateMatrixWorld();
+  fill1.position.set(camera.position.x,4,camera.position.z);
+  composer.render();
+}
+animate();
+
+// ===== RESIZE =====
+window.addEventListener('resize',()=>{
+  camera.aspect=window.innerWidth/window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth,window.innerHeight);
+  composer.setSize(window.innerWidth,window.innerHeight);
+  fxaa.uniforms['resolution'].value.set(1/window.innerWidth,1/window.innerHeight);
+});
+</script>
+</body>
+</html>

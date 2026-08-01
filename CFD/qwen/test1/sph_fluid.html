@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>SPH 粒子流体仿真 - 半圆碗</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #1a1a2e; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; font-family: 'Segoe UI', sans-serif; overflow: hidden; }
+canvas { border-radius: 8px; background: #0f0f23; box-shadow: 0 0 30px rgba(0,100,255,0.15); }
+#hud { position: fixed; top: 12px; left: 12px; color: #aef; font-size: 13px; line-height: 1.7; background: rgba(0,0,0,0.6); padding: 10px 16px; border-radius: 6px; }
+#controls { position: fixed; top: 12px; right: 12px; color: #ddd; font-size: 13px; background: rgba(0,0,0,0.6); padding: 10px 16px; border-radius: 6px; }
+#controls button { margin: 4px 2px; padding: 4px 10px; border: none; border-radius: 4px; cursor: pointer; font-size: 12px; }
+.btn-water { background: #2196F3; color: #fff; }
+.btn-wax { background: #FF9800; color: #fff; }
+.btn-reset { background: #666; color: #fff; }
+</style>
+</head>
+<body>
+<div id="hud">FPS: <span id="fps">0</span><br>粒子: <span id="pcount">0</span></div>
+<div id="controls">
+  <button class="btn-water" onclick="addFluid('water')">+水(200)</button>
+  <button class="btn-wax" onclick="addFluid('wax')">+蜡(200)</button>
+  <button class="btn-reset" onclick="resetSim()">重置</button>
+  <br><small>点击画布添加粒子</small>
+</div>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+// ===== 配置 =====
+const W = 800, H = 700;
+const canvas = document.getElementById('c');
+canvas.width = W; canvas.height = H;
+const ctx = canvas.getContext('2d');
+
+// 半圆碗参数
+const bowlCX = W / 2, bowlCY = H * 0.38;
+const bowlR = 280;
+const bowlThickness = 8;
+
+// SPH 参数
+const SMOOTH_R = 22;          // 平滑半径
+const SMOOTH_R2 = SMOOTH_R * SMOOTH_R;
+const REST_DENSITY = 1.8;
+const GAS_K = 280;            // 压力刚度
+const GRAVITY = 0.45;
+const DT = 0.85;
+const DAMPING = 0.98;
+const BOUND_DAMPING = 0.35;
+const MAX_PARTICLES = 1200;
+
+// 流体类型
+const FLUIDS = {
+  water: { mass: 1.2, viscosity: 8,  color: [33, 150, 243], name: '水' },
+  wax:   { mass: 0.6, viscosity: 80, color: [255, 152, 0],  name: '蜡' }
+};
+
+// SPH 核函数系数
+const POLY6 = 315 / (64 * Math.PI * Math.pow(SMOOTH_R, 9));
+const SPIKY_GRAD = -45 / (Math.PI * Math.pow(SMOOTH_R, 6));
+const VISC_LAP = 45 / (Math.PI * Math.pow(SMOOTH_R, 6));
+
+// ===== 粒子数据 (SoA) =====
+let N = 0;
+let px = new Float32Array(MAX_PARTICLES);
+let py = new Float32Array(MAX_PARTICLES);
+let vx = new Float32Array(MAX_PARTICLES);
+let vy = new Float32Array(MAX_PARTICLES);
+let fx = new Float32Array(MAX_PARTICLES);
+let fy = new Float32Array(MAX_PARTICLES);
+let density = new Float32Array(MAX_PARTICLES);
+let pressure = new Float32Array(MAX_PARTICLES);
+let ptype = new Uint8Array(MAX_PARTICLES); // 0=water, 1=wax
+
+// ===== 空间哈希网格 =====
+const CELL = SMOOTH_R;
+const GRID_W = Math.ceil(W / CELL) + 2;
+const GRID_H = Math.ceil(H / CELL) + 2;
+const gridHead = new Int32Array(GRID_W * GRID_H);
+const gridNext = new Int32Array(MAX_PARTICLES);
+
+function buildGrid() {
+  gridHead.fill(-1);
+  for (let i = 0; i < N; i++) {
+    const cx = Math.max(0, Math.min(GRID_W - 1, (px[i] / CELL) | 0));
+    const cy = Math.max(0, Math.min(GRID_H - 1, (py[i] / CELL) | 0));
+    const idx = cy * GRID_W + cx;
+    gridNext[i] = gridHead[idx];
+    gridHead[idx] = i;
+  }
+}
+
+// ===== SPH 计算 =====
+function computeDensityPressure() {
+  for (let i = 0; i < N; i++) {
+    let rho = 0;
+    const xi = px[i], yi = py[i];
+    const cx = Math.max(0, Math.min(GRID_W - 1, (xi / CELL) | 0));
+    const cy = Math.max(0, Math.min(GRID_H - 1, (yi / CELL) | 0));
+    const mi = ptype[i] === 0 ? FLUIDS.water.mass : FLUIDS.wax.mass;
+
+    for (let gx = cx - 1; gx <= cx + 1; gx++) {
+      if (gx < 0 || gx >= GRID_W) continue;
+      for (let gy = cy - 1; gy <= cy + 1; gy++) {
+        if (gy < 0 || gy >= GRID_H) continue;
+        let j = gridHead[gy * GRID_W + gx];
+        while (j !== -1) {
+          const dx = xi - px[j], dy = yi - py[j];
+          const r2 = dx * dx + dy * dy;
+          if (r2 < SMOOTH_R2) {
+            const mj = ptype[j] === 0 ? FLUIDS.water.mass : FLUIDS.wax.mass;
+            const diff = SMOOTH_R2 - r2;
+            rho += mj * POLY6 * diff * diff * diff;
+          }
+          j = gridNext[j];
+        }
+      }
+    }
+    density[i] = Math.max(rho, 0.001);
+    pressure[i] = GAS_K * (density[i] - REST_DENSITY);
+  }
+}
+
+function computeForces() {
+  for (let i = 0; i < N; i++) {
+    let fpx = 0, fpy = 0, fvx = 0, fvy = 0;
+    const xi = px[i], yi = py[i];
+    const pi = pressure[i], di = density[i];
+    const ti = ptype[i];
+    const mi = ti === 0 ? FLUIDS.water.mass : FLUIDS.wax.mass;
+    const visc_i = ti === 0 ? FLUIDS.water.viscosity : FLUIDS.wax.viscosity;
+    const cx = Math.max(0, Math.min(GRID_W - 1, (xi / CELL) | 0));
+    const cy = Math.max(0, Math.min(GRID_H - 1, (yi / CELL) | 0));
+
+    for (let gx = cx - 1; gx <= cx + 1; gx++) {
+      if (gx < 0 || gx >= GRID_W) continue;
+      for (let gy = cy - 1; gy <= cy + 1; gy++) {
+        if (gy < 0 || gy >= GRID_H) continue;
+        let j = gridHead[gy * GRID_W + gx];
+        while (j !== -1) {
+          if (j !== i) {
+            const dx = xi - px[j], dy = yi - py[j];
+            const r2 = dx * dx + dy * dy;
+            if (r2 < SMOOTH_R2 && r2 > 0.0001) {
+              const r = Math.sqrt(r2);
+              const mj = ptype[j] === 0 ? FLUIDS.water.mass : FLUIDS.wax.mass;
+              const dj = density[j];
+              // 压力力 (Spiky梯度)
+              const pAvg = (pi + pressure[j]) * 0.5;
+              const spiky = SPIKY_GRAD * (SMOOTH_R - r) * (SMOOTH_R - r) / r;
+              const pScale = -mj * pAvg / dj * spiky;
+              fpx += pScale * dx;
+              fpy += pScale * dy;
+              // 粘度力
+              const visc_j = ptype[j] === 0 ? FLUIDS.water.viscosity : FLUIDS.wax.viscosity;
+              const viscAvg = (visc_i + visc_j) * 0.5;
+              const vScale = viscAvg * mj / dj * VISC_LAP * (SMOOTH_R - r);
+              fvx += vScale * (vx[j] - vx[i]);
+              fvy += vScale * (vy[j] - vy[i]);
+            }
+          }
+          j = gridNext[j];
+        }
+      }
+    }
+    fx[i] = fpx + fvx;
+    fy[i] = fpy + fvy + GRAVITY * di; // 重力
+  }
+}
+
+function integrate() {
+  for (let i = 0; i < N; i++) {
+    const di = density[i];
+    vx[i] += DT * fx[i] / di;
+    vy[i] += DT * fy[i] / di;
+    vx[i] *= DAMPING;
+    vy[i] *= DAMPING;
+    px[i] += DT * vx[i];
+    py[i] += DT * vy[i];
+    // 半圆碗碰撞
+    collideBowl(i);
+  }
+}
+
+function collideBowl(i) {
+  const dx = px[i] - bowlCX;
+  const dy = py[i] - bowlCY;
+  const dist = Math.sqrt(dx * dx + dy * dy);
+  const innerR = bowlR - 6;
+
+  // 只在下半部分（碗内）约束
+  if (dy > 0) {
+    if (dist > innerR) {
+      const nx = dx / dist, ny = dy / dist;
+      px[i] = bowlCX + nx * innerR;
+      py[i] = bowlCY + ny * innerR;
+      const vDotN = vx[i] * nx + vy[i] * ny;
+      if (vDotN > 0) {
+        vx[i] -= (1 + BOUND_DAMPING) * vDotN * nx;
+        vy[i] -= (1 + BOUND_DAMPING) * vDotN * ny;
+      }
+    }
+  } else {
+    // 上半部分：碗口平面约束（不能超出碗口宽度）
+    if (Math.abs(dx) > innerR) {
+      px[i] = bowlCX + Math.sign(dx) * innerR;
+      vx[i] *= -BOUND_DAMPING;
+    }
+    // 碗口边缘 - 如果粒子在碗口水平面以下且超出圆弧
+    if (dist > innerR && dy > -20) {
+      const nx = dx / dist, ny = dy / dist;
+      px[i] = bowlCX + nx * innerR;
+      py[i] = bowlCY + ny * innerR;
+      const vDotN = vx[i] * nx + vy[i] * ny;
+      if (vDotN > 0) {
+        vx[i] -= (1 + BOUND_DAMPING) * vDotN * nx;
+        vy[i] -= (1 + BOUND_DAMPING) * vDotN * ny;
+      }
+    }
+  }
+  // 全局边界
+  if (py[i] > H - 5) { py[i] = H - 5; vy[i] *= -BOUND_DAMPING; }
+  if (px[i] < 5) { px[i] = 5; vx[i] *= -BOUND_DAMPING; }
+  if (px[i] > W - 5) { px[i] = W - 5; vx[i] *= -BOUND_DAMPING; }
+}
+
+// ===== 粒子生成 =====
+function spawnParticles(type, count, sx, sy, spread) {
+  const t = type === 'water' ? 0 : 1;
+  for (let k = 0; k < count && N < MAX_PARTICLES; k++) {
+    const idx = N++;
+    px[idx] = sx + (Math.random() - 0.5) * spread;
+    py[idx] = sy + (Math.random() - 0.5) * spread;
+    vx[idx] = (Math.random() - 0.5) * 0.5;
+    vy[idx] = Math.random() * 0.5;
+    ptype[idx] = t;
+  }
+}
+
+function addFluid(type) {
+  const angle = Math.random() * Math.PI * 0.6 + Math.PI * 0.2;
+  const r = bowlR * 0.4;
+  const sx = bowlCX + Math.cos(angle) * r * (Math.random() > 0.5 ? 1 : -1);
+  const sy = bowlCY + Math.sin(angle) * r * 0.3 + bowlR * 0.3;
+  spawnParticles(type, 200, sx, sy, 80);
+}
+
+function resetSim() {
+  N = 0;
+  initParticles();
+}
+
+function initParticles() {
+  // 水：碗底左侧
+  spawnParticles('water', 300, bowlCX - 70, bowlCY + bowlR * 0.55, 130);
+  // 蜡：碗底右侧
+  spawnParticles('wax', 250, bowlCX + 70, bowlCY + bowlR * 0.5, 120);
+}
+
+// ===== 渲染 =====
+function drawBowl() {
+  ctx.save();
+  // 碗体（下半圆弧）
+  ctx.beginPath();
+  ctx.arc(bowlCX, bowlCY, bowlR, 0, Math.PI, false);
+  ctx.strokeStyle = '#8899aa';
+  ctx.lineWidth = bowlThickness;
+  ctx.lineCap = 'round';
+  ctx.stroke();
+
+  // 碗口装饰
+  ctx.beginPath();
+  ctx.arc(bowlCX - bowlR, bowlCY, 6, 0, Math.PI * 2);
+  ctx.fillStyle = '#aabbcc';
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(bowlCX + bowlR, bowlCY, 6, 0, Math.PI * 2);
+  ctx.fillStyle = '#aabbcc';
+  ctx.fill();
+
+  // 碗口横线装饰
+  ctx.beginPath();
+  ctx.moveTo(bowlCX - bowlR - 15, bowlCY);
+  ctx.lineTo(bowlCX - bowlR + 5, bowlCY);
+  ctx.moveTo(bowlCX + bowlR - 5, bowlCY);
+  ctx.lineTo(bowlCX + bowlR + 15, bowlCY);
+  ctx.strokeStyle = '#667788';
+  ctx.lineWidth = 3;
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawParticles() {
+  for (let i = 0; i < N; i++) {
+    const t = ptype[i];
+    const c = t === 0 ? FLUIDS.water.color : FLUIDS.wax.color;
+    // 根据速度调整亮度
+    const speed = Math.sqrt(vx[i] * vx[i] + vy[i] * vy[i]);
+    const bright = Math.min(1.4, 0.8 + speed * 0.08);
+    const r = Math.min(255, c[0] * bright) | 0;
+    const g = Math.min(255, c[1] * bright) | 0;
+    const b = Math.min(255, c[2] * bright) | 0;
+    ctx.fillStyle = `rgb(${r},${g},${b})`;
+    ctx.beginPath();
+    ctx.arc(px[i], py[i], t === 0 ? 4 : 5, 0, 6.2832);
+    ctx.fill();
+  }
+}
+
+// ===== 主循环 =====
+let lastTime = performance.now();
+let frameCount = 0, fpsDisplay = 0, fpsTimer = 0;
+
+function loop(now) {
+  requestAnimationFrame(loop);
+  // FPS
+  frameCount++;
+  fpsTimer += now - lastTime;
+  lastTime = now;
+  if (fpsTimer >= 500) {
+    fpsDisplay = Math.round(frameCount * 1000 / fpsTimer);
+    frameCount = 0; fpsTimer = 0;
+    document.getElementById('fps').textContent = fpsDisplay;
+    document.getElementById('pcount').textContent = N;
+  }
+
+  // 物理步进
+  buildGrid();
+  computeDensityPressure();
+  computeForces();
+  integrate();
+
+  // 渲染
+  ctx.clearRect(0, 0, W, H);
+  drawBowl();
+  drawParticles();
+}
+
+// ===== 鼠标交互 =====
+canvas.addEventListener('click', (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const mx = (e.clientX - rect.left) * (W / rect.width);
+  const my = (e.clientY - rect.top) * (H / rect.height);
+  // 检查是否在碗内
+  const dx = mx - bowlCX, dy = my - bowlCY;
+  if (dy > 0 && Math.sqrt(dx*dx + dy*dy) < bowlR - 10) {
+    spawnParticles(Math.random() > 0.5 ? 'water' : 'wax', 30, mx, my, 40);
+  }
+});
+
+// ===== 启动 =====
+initParticles();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

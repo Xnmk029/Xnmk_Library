@@ -1,0 +1,798 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>雨世界风格 质点弹簧软体生物物理模拟 — HTML5 Port (OPUS)</title>
+<style>
+  html,body{margin:0;height:100%;background:#0f1317;overflow:hidden}
+  canvas{display:block;width:100vw;height:100vh}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+"use strict";
+/* ============================================================================
+   Rain World–style soft-body creature — Phase 1, HTML5/Canvas port.
+
+   1:1 port of the Unity/C# prototype (RainWorldProto/Scripts). Same design
+   rules: NO physics engine, NO sprites. Everything is point-masses + spring
+   constraints simulated by a hand-written position-Verlet solver at a fixed
+   50 Hz step (Unity's FixedUpdate becomes an accumulator loop), colliding
+   against a boolean tile map, decorated with procedural 2-bone IK legs, and
+   rendered as debug circles/lines (the OnDrawGizmos equivalent).
+
+   The file is dual-mode: opened in a browser it boots the game; run under
+   Node (`node sim.js` after extracting this script block) it executes the
+   same behavioural test suite as the C# HeadlessTest.
+
+   Controls: A/D or ←/→ move · Space jump · R respawn
+   ========================================================================= */
+
+/* ============================ Module 1 — PhysicsNode ========================
+   Position Verlet stores NO explicit velocity; it lives implicitly in the
+   position pair:   v·dt = (x, y) − (ox, oy)
+   Constraints and collisions freely MOVE positions and momentum follows —
+   the property that makes relaxation-based creature physics stable.
+   Impulses rewrite history:  (ox,oy) −= Δv·dt.                              */
+class PhysicsNode {
+  constructor(x, y, mass, radius) {
+    this.x = x;  this.y = y;      // current position  (x_t)
+    this.ox = x; this.oy = y;     // old position      (x_{t-dt}) — encodes velocity
+    this.ax = 0; this.ay = 0;     // acceleration accumulator, cleared each step
+    this.mass = Math.max(1e-4, mass);
+    this.invMass = 1 / this.mass; // 0 ⇒ pinned (infinite mass)
+    this.radius = radius;
+    this.friction = 0.3;          // tangential velocity removed on contact (0..1)
+    this.bounce = 0;              // normal restitution — soft bodies squash, not bounce
+    this.gravityScale = 1;
+    this.airDrag = 0.01;          // per-step exponential velocity loss
+    this.collides = true;         // tail/decoration nodes may opt out
+    this.hasContact = false;      // contact bookkeeping, written by the solver
+    this.grounded = false;
+    this.nx = 0; this.ny = 1;     // last contact normal
+    this.color = [1, 1, 1];
+  }
+  /* Newton II: a = F/m */
+  addForce(fx, fy) { this.ax += fx * this.invMass; this.ay += fy * this.invMass; }
+  velX(dt) { return (this.x - this.ox) / dt; }
+  velY(dt) { return (this.y - this.oy) / dt; }
+  /* velocity lives in (ox,oy):  x_{t-dt} = x_t − v·dt */
+  setVelocity(vx, vy, dt) { this.ox = this.x - vx * dt; this.oy = this.y - vy * dt; }
+  addVelocity(dvx, dvy, dt) { this.ox -= dvx * dt; this.oy -= dvy * dt; }
+  moveTo(x, y) { this.x = x; this.y = y; this.ox = x; this.oy = y; }
+}
+
+/* ========================= Module 1 — SpringConstraint ======================
+   Jakobsen distance relaxation (GDC 2001 "Advanced Character Physics"):
+
+     C  = |B−A| − rest             (signed violation)
+     A += n̂·C·stiffness·wA/(wA+wB)      w = 1/mass  (heavy nodes budge less)
+     B −= n̂·C·stiffness·wB/(wA+wB)
+
+   stiffness≈1 + 8 iterations ⇒ bone;  ≈0.05 ⇒ cartilage.
+   Damping removes a fraction of relative velocity ALONG the axis once per
+   step (vRel' = vRel·(1−damping)) via mass-weighted OldPosition shifts.     */
+class SpringConstraint {
+  constructor(a, b, rest, stiffness, damping) {
+    this.a = a; this.b = b;
+    this.rest = rest >= 0 ? rest : Math.hypot(b.x - a.x, b.y - a.y);
+    this.stiffness = stiffness === undefined ? 1 : stiffness;
+    this.damping = damping === undefined ? 0 : damping;
+    this.helper = false;          // bend-helper springs draw faintly
+  }
+  strain() {
+    if (this.rest < 1e-5) return 0;
+    return (Math.hypot(this.b.x - this.a.x, this.b.y - this.a.y) - this.rest) / this.rest;
+  }
+  solvePosition() {
+    const dx = this.b.x - this.a.x, dy = this.b.y - this.a.y;
+    const dist = Math.hypot(dx, dy);
+    if (dist < 1e-6) return;                       // coincident: direction undefined
+    const w = this.a.invMass + this.b.invMass;
+    if (w <= 0) return;                            // both pinned
+    const k = (dist - this.rest) * this.stiffness / (dist * w);
+    const cx = dx * k, cy = dy * k;
+    this.a.x += cx * this.a.invMass; this.a.y += cy * this.a.invMass;
+    this.b.x -= cx * this.b.invMass; this.b.y -= cy * this.b.invMass;
+  }
+  solveDamping() {
+    if (this.damping <= 0) return;
+    const dx = this.b.x - this.a.x, dy = this.b.y - this.a.y;
+    const dist = Math.hypot(dx, dy);
+    if (dist < 1e-6) return;
+    const w = this.a.invMass + this.b.invMass;
+    if (w <= 0) return;
+    const axx = dx / dist, axy = dy / dist;
+    /* per-step implicit velocities (dt cancels — step units) */
+    const vax = this.a.x - this.a.ox, vay = this.a.y - this.a.oy;
+    const vbx = this.b.x - this.b.ox, vby = this.b.y - this.b.oy;
+    const vRel = (vbx - vax) * axx + (vby - vay) * axy;
+    const j = vRel * this.damping / w;
+    this.a.ox -= axx * j * this.a.invMass; this.a.oy -= axy * j * this.a.invMass;
+    this.b.ox += axx * j * this.b.invMass; this.b.oy += axy * j * this.b.invMass;
+  }
+}
+
+/* ============================ Module 2 — GridTerrain ========================
+   Static terrain as a boolean tile map, authored as ASCII rows (top first):
+   '#' solid · '.' air · 'S' spawn. Out-of-bounds counts as solid ⇒ a bordered
+   map is airtight. World origin (0,0) is the map's bottom-left corner.       */
+const MAP = [
+  "################################################",
+  "#..............................................#",
+  "#..............................................#",
+  "#..............................................#",
+  "#.................................########.....#",
+  "#..............................................#",
+  "#..............................................#",
+  "#.....S.............########...................#",
+  "#..............................................#",
+  "#..............................................#",
+  "#.........######...............................#",
+  "#...................................############",
+  "#..............................................#",
+  "#.......................##.....................#",
+  "#.......................##...............#######",
+  "#.......................##......################",
+  "##################....##########################",
+  "##################....##########################",
+  "################################################",
+  "################################################",
+];
+
+class GridTerrain {
+  constructor(rows) {
+    this.cellSize = 0.5;
+    this.height = rows.length;
+    this.width = Math.max(...rows.map(r => r.length));
+    this.solid = new Uint8Array(this.width * this.height);
+    this.spawnX = 1; this.spawnY = 1;
+    for (let r = 0; r < this.height; r++) {
+      const row = rows[r] || "";
+      const y = this.height - 1 - r;               // flip: text top row → highest y
+      for (let x = 0; x < row.length; x++) {
+        const c = row[x];
+        if (c === "#" || c === "X" || c === "x" || c === "1") this.solid[y * this.width + x] = 1;
+        else if (c === "S" || c === "s") {
+          this.spawnX = (x + 0.5) * this.cellSize;
+          this.spawnY = (y + 0.5) * this.cellSize;
+        }
+      }
+    }
+  }
+  isSolid(cx, cy) {
+    if (cx < 0 || cy < 0 || cx >= this.width || cy >= this.height) return true;
+    return this.solid[cy * this.width + cx] === 1;
+  }
+
+  /* Circle depenetration: closest-point-on-AABB per overlapping solid cell,
+     processed sequentially against the moving center (Gauss–Seidel).
+
+     Internal-edge filter: a push component may only point through a cell
+     face that borders AIR. Components pointing into another solid cell are
+     zeroed — kills the "ghost collision" snag on seams between floor tiles. */
+  resolveCircle(cx0, cy0, r) {
+    let x = cx0, y = cy0;
+    const cs = this.cellSize;
+    const minX = Math.floor((cx0 - r) / cs), maxX = Math.floor((cx0 + r) / cs);
+    const minY = Math.floor((cy0 - r) / cs), maxY = Math.floor((cy0 + r) / cs);
+    let touched = false;
+    for (let gy = minY; gy <= maxY; gy++) {
+      for (let gx = minX; gx <= maxX; gx++) {
+        if (!this.isSolid(gx, gy)) continue;
+        const x0 = gx * cs, y0 = gy * cs, x1 = x0 + cs, y1 = y0 + cs;
+        const px = Math.max(x0, Math.min(x, x1));
+        const py = Math.max(y0, Math.min(y, y1));
+        const dx = x - px, dy = y - py;
+        const d2 = dx * dx + dy * dy;
+        if (d2 > r * r) continue;
+        if (d2 > 1e-10) {
+          /* shallow contact — center outside the cell rectangle */
+          const d = Math.sqrt(d2);
+          let nx = dx / d, ny = dy / d;
+          if (nx > 0 && this.isSolid(gx + 1, gy)) nx = 0;
+          if (nx < 0 && this.isSolid(gx - 1, gy)) nx = 0;
+          if (ny > 0 && this.isSolid(gx, gy + 1)) ny = 0;
+          if (ny < 0 && this.isSolid(gx, gy - 1)) ny = 0;
+          const n2 = nx * nx + ny * ny;
+          if (n2 < 1e-10) continue;                // contact fully buried
+          const nl = Math.sqrt(n2); nx /= nl; ny /= nl;
+          const pen = r - (dx * nx + dy * ny);     // penetration along filtered normal
+          if (pen <= 0) continue;
+          x += nx * pen; y += ny * pen; touched = true;
+        } else {
+          /* deep contact — center INSIDE the cell: cheapest exposed face */
+          const pl = (x - x0) + r, pr = (x1 - x) + r, pd = (y - y0) + r, pu = (y1 - y) + r;
+          let best = Infinity, bx = 0, by = 0;
+          if (!this.isSolid(gx - 1, gy) && pl < best) { best = pl; bx = -pl; by = 0; }
+          if (!this.isSolid(gx + 1, gy) && pr < best) { best = pr; bx = pr; by = 0; }
+          if (!this.isSolid(gx, gy - 1) && pd < best) { best = pd; bx = 0; by = -pd; }
+          if (!this.isSolid(gx, gy + 1) && pu < best) { best = pu; bx = 0; by = pu; }
+          if (best === Infinity) continue;          // buried in solid mass
+          x += bx; y += by; touched = true;
+        }
+      }
+    }
+    if (!touched) return null;
+    const pxT = x - cx0, pyT = y - cy0;
+    const pl = Math.hypot(pxT, pyT);
+    return { px: pxT, py: pyT, nx: pl > 1e-6 ? pxT / pl : 0, ny: pl > 1e-6 ? pyT / pl : 1 };
+  }
+
+  /* Amanatides–Woo DDA: walk the ray cell-by-cell, always crossing whichever
+     gridline comes first. Exact for grids, allocation-free. The hit normal is
+     the axis of the crossed gridline, facing the ray.                        */
+  raycast(ox, oy, dx, dy, maxDist) {
+    const l = Math.hypot(dx, dy);
+    if (l < 1e-6 || maxDist <= 0) return null;
+    dx /= l; dy /= l;
+    const cs = this.cellSize;
+    let cx = Math.floor(ox / cs), cy = Math.floor(oy / cs);
+    if (this.isSolid(cx, cy)) return { x: ox, y: oy, nx: -dx, ny: -dy, dist: 0 };
+    const stepX = dx > 0 ? 1 : (dx < 0 ? -1 : 0);
+    const stepY = dy > 0 ? 1 : (dy < 0 ? -1 : 0);
+    const tdx = stepX !== 0 ? cs / Math.abs(dx) : Infinity;   // t between gridlines
+    const tdy = stepY !== 0 ? cs / Math.abs(dy) : Infinity;
+    let tmx = stepX !== 0 ? (((cx + (stepX > 0 ? 1 : 0)) * cs) - ox) / dx : Infinity;
+    let tmy = stepY !== 0 ? (((cy + (stepY > 0 ? 1 : 0)) * cs) - oy) / dy : Infinity;
+    let t = 0, nx = 0, ny = 0;
+    for (let g = 0; g < 4096 && t <= maxDist; g++) {
+      if (tmx < tmy) { t = tmx; tmx += tdx; cx += stepX; nx = -stepX; ny = 0; }
+      else           { t = tmy; tmy += tdy; cy += stepY; nx = 0; ny = -stepY; }
+      if (t > maxDist) break;
+      if (this.isSolid(cx, cy)) return { x: ox + dx * t, y: oy + dy * t, nx, ny, dist: t };
+    }
+    return null;
+  }
+}
+
+/* ========================= Modules 1+2 — VerletSolver =======================
+   One fixed step:
+     1. actors.prePhysicsStep()      gameplay forces (input, posture, jump)
+     2. gravity                      a += g·gravityScale
+     3. spring damping               bleed relative axial velocity
+     4. integrate                    x += (x−ox)·(1−drag) + a·dt²  (+ clamp)
+     5. N × [constraints → collide]  relaxation — walls get the last word
+     6. actors.postPhysicsStep()     grounded caching, IK stepping
+   Collision runs INSIDE the loop because each constraint pass can shove a
+   node back into a wall; after the loop all positions are legal.             */
+class VerletSolver {
+  constructor(terrain) {
+    this.terrain = terrain;
+    this.gravityX = 0; this.gravityY = -26;   // snappy game gravity, not 9.81
+    this.iterations = 8;
+    this.groundThreshold = 0.55;              // normal.y above this ⇒ "floor"
+    this.nodes = []; this.constraints = []; this.actors = [];
+  }
+  /* Anti-tunneling cap: < 1 cell per step ⇒ collision can never skip a wall.
+     Doubles as terminal velocity (0.48·cellSize / 0.02 s = 12 u/s).          */
+  get maxStep() { return this.terrain ? this.terrain.cellSize * 0.48 : 0.25; }
+
+  step(dt) {
+    for (const a of this.actors) a.prePhysicsStep(dt);
+    for (const n of this.nodes) {
+      if (n.invMass > 0) { n.ax += this.gravityX * n.gravityScale; n.ay += this.gravityY * n.gravityScale; }
+    }
+    for (const c of this.constraints) c.solveDamping();
+    for (const n of this.nodes) this.integrate(n, dt);
+    for (const n of this.nodes) { n.hasContact = false; n.grounded = false; }
+    for (let it = 0; it < this.iterations; it++) {
+      for (const c of this.constraints) c.solvePosition();
+      if (this.terrain) for (const n of this.nodes) this.collide(n);
+    }
+    for (const a of this.actors) a.postPhysicsStep(dt);
+  }
+
+  /* Störmer–Verlet:  x_{t+dt} = x_t + (x_t − x_{t−dt})·(1−drag) + a·dt²      */
+  integrate(n, dt) {
+    if (n.invMass <= 0) { n.ax = 0; n.ay = 0; return; }
+    let vx = (n.x - n.ox) * (1 - n.airDrag);
+    let vy = (n.y - n.oy) * (1 - n.airDrag);
+    const ms = this.maxStep, m2 = vx * vx + vy * vy;
+    if (m2 > ms * ms) { const s = ms / Math.sqrt(m2); vx *= s; vy *= s; }
+    n.ox = n.x; n.oy = n.y;
+    n.x += vx + n.ax * dt * dt;
+    n.y += vy + n.ay * dt * dt;
+    n.ax = 0; n.ay = 0;
+  }
+
+  /* Contact response:  v' = v_t·(1−friction) − v_n·bounce.
+     Applied only on the FIRST contact of the step — this method runs once per
+     relaxation iteration, and re-applying friction N times would compound it
+     to (1−f)^N. Later iterations correct position only (velocity preserved
+     by shifting the old position along with the push).                       */
+  collide(n) {
+    if (!n.collides || n.invMass <= 0) return;
+    const hit = this.terrain.resolveCircle(n.x, n.y, n.radius);
+    if (!hit) return;
+    const svx = n.x - n.ox, svy = n.y - n.oy;   // implicit velocity before push
+    n.x += hit.px; n.y += hit.py;
+    const first = !n.hasContact;
+    n.hasContact = true; n.nx = hit.nx; n.ny = hit.ny;
+    if (hit.ny > this.groundThreshold) n.grounded = true;
+    const vn = svx * hit.nx + svy * hit.ny;
+    if (first && vn < 0) {
+      const vnx = hit.nx * vn, vny = hit.ny * vn;   // normal part
+      const vtx = svx - vnx,  vty = svy - vny;      // tangential part
+      const nvx = vtx * (1 - n.friction) - vnx * n.bounce;
+      const nvy = vty * (1 - n.friction) - vny * n.bounce;
+      n.ox = n.x - nvx; n.oy = n.y - nvy;
+    } else {
+      n.ox += hit.px; n.oy += hit.py;               // carry velocity through
+    }
+  }
+}
+
+/* ============================= Module 5 — IKLimb ============================
+   One cosmetic leg: DDA-raycast foothold ahead of the hip, snapped to
+   half-cell grid vertices; a stepping FSM (PLANTED → STEPPING → PLANTED,
+   DANGLING when airborne/out of reach); analytic 2-bone IK for the knee:
+
+     cos α = (d² + L1² − L2²) / (2·d·L1)          (law of cosines)
+     knee  = hip + rotate(normalize(foot−hip), ±α)·L1
+
+   The ± bends the knee away from travel. Feet read the physics but do not
+   push back — that's the Phase 2 hook for real climbing.                     */
+class IKLimb {
+  constructor(anchor, terrain, s) {
+    this.anchor = anchor; this.terrain = terrain; this.s = s;
+    this.footX = 0; this.footY = 0; this.kneeX = 0; this.kneeY = 0;
+    this.plantX = 0; this.plantY = 0;
+    this.fromX = 0; this.fromY = 0; this.toX = 0; this.toY = 0;
+    this.stepT = 0; this.stepping = false; this.hasFoothold = false;
+    this.resetPose(anchor.x, anchor.y - (s.upper + s.lower) * 0.5);
+  }
+  get reach() { return this.s.upper + this.s.lower; }
+  resetPose(x, y) {
+    this.footX = x; this.footY = y; this.kneeX = x; this.kneeY = y;
+    this.plantX = x; this.plantY = y;
+    this.stepping = false; this.hasFoothold = false; this.stepT = 0;
+  }
+  tick(dt, facing, grounded, allowStep) {
+    const hx = this.anchor.x, hy = this.anchor.y;
+    const s = this.s, reach = this.reach;
+    if (!grounded) {
+      /* airborne: legs tuck and trail toward a relaxed pose */
+      this.hasFoothold = false; this.stepping = false;
+      const rx = hx - 0.15 * facing, ry = hy - reach * 0.55;
+      const k = 1 - Math.exp(-10 * dt);
+      this.footX += (rx - this.footX) * k; this.footY += (ry - this.footY) * k;
+    } else {
+      const target = this.findFoothold(hx, hy, facing);
+      if (this.hasFoothold && !this.stepping &&
+          Math.hypot(this.plantX - hx, this.plantY - hy) > reach * 0.97) {
+        this.hasFoothold = false;                  // body slid out of reach
+      }
+      if (!this.stepping && target) {
+        /* spec rule: torso drifted beyond threshold ⇒ relocate the foot */
+        const drift = Math.hypot(this.plantX - target.x, this.plantY - target.y);
+        const wantStep = !this.hasFoothold || drift > s.stepThreshold;
+        if (wantStep && (allowStep || !this.hasFoothold)) {
+          this.stepping = true; this.stepT = 0;
+          this.fromX = this.hasFoothold ? this.plantX : this.footX;
+          this.fromY = this.hasFoothold ? this.plantY : this.footY;
+          this.toX = target.x; this.toY = target.y;
+        }
+      }
+      if (this.stepping) {
+        this.stepT += dt / Math.max(0.01, s.stepDuration);
+        const u = Math.min(1, this.stepT);
+        /* linear travel + half-sine lift = readable step arc */
+        this.footX = this.fromX + (this.toX - this.fromX) * u;
+        this.footY = this.fromY + (this.toY - this.fromY) * u + s.arcHeight * Math.sin(u * Math.PI);
+        if (this.stepT >= 1) {
+          this.stepping = false; this.hasFoothold = true;
+          this.plantX = this.toX; this.plantY = this.toY;
+          this.footX = this.toX; this.footY = this.toY;
+        }
+      } else if (this.hasFoothold) {
+        this.footX = this.plantX; this.footY = this.plantY;  // glued to the world
+      } else if (!target) {
+        const rx = hx - 0.1 * facing, ry = hy - reach * 0.6; // ledge overhang: dangle
+        const k = 1 - Math.exp(-10 * dt);
+        this.footX += (rx - this.footX) * k; this.footY += (ry - this.footY) * k;
+      }
+    }
+    this.solveKnee(hx, hy, facing);
+  }
+  findFoothold(hx, hy, facing) {
+    const s = this.s, reach = this.reach;
+    const hit = this.terrain.raycast(hx + s.strideLead * facing, hy + 0.15, 0, -1, 0.15 + reach * 1.15);
+    if (!hit || hit.ny < 0.5) return null;               // walls are not footholds
+    if (Math.hypot(hit.x - hx, hit.y - hy) > reach * 0.98) return null;
+    const half = this.terrain.cellSize * 0.5;            // snap X to grid vertices
+    return { x: Math.round(hit.x / half) * half, y: hit.y };
+  }
+  solveKnee(hx, hy, facing) {
+    const s = this.s;
+    const tx = this.footX - hx, ty = this.footY - hy;
+    const minD = Math.abs(s.upper - s.lower) + 1e-4;
+    const maxD = s.upper + s.lower - 1e-4;
+    let d = Math.hypot(tx, ty);
+    let dx, dy;
+    if (d > 1e-6) { dx = tx / d; dy = ty / d; } else { dx = 0; dy = -1; }
+    d = Math.max(minD, Math.min(maxD, d));
+    /* law of cosines for the angle at the hip */
+    const cosA = Math.max(-1, Math.min(1,
+      (d * d + s.upper * s.upper - s.lower * s.lower) / (2 * d * s.upper)));
+    const alpha = Math.acos(cosA);
+    const side = -facing;                                 // knees point backwards
+    const sinA = Math.sin(alpha) * side, cA = Math.cos(alpha);
+    const ux = dx * cA - dy * sinA, uy = dx * sinA + dy * cA;
+    this.kneeX = hx + ux * s.upper; this.kneeY = hy + uy * s.upper;
+  }
+}
+
+/* ===================== Modules 3+4 — CreatureController =====================
+   Topology:
+          tail (5 nodes, mass ↓)            torso
+      o··· o ··· o ·· o ─ o ────── [HIPS] ══ [CHEST] ══ [HEAD]
+                                     ╲__ soft "skip" spring __╱
+   The controller NEVER writes positions during play — locomotion is a
+   proportional force motor, jumping is a velocity impulse, posture is
+   fractional gravity-cancel, traction is a small downward hip force.         */
+class CreatureController {
+  constructor(solver, terrain) {
+    this.solver = solver; this.terrain = terrain;
+    /* tuning — identical to the verified C# defaults */
+    this.torsoSpacing = 0.38;
+    this.spineStiffness = 0.95; this.spineDamping = 0.25;
+    this.bendResistance = 0.06;
+    this.tailCount = 5;
+    this.maxGroundSpeed = 5.5; this.driveGain = 14; this.maxDriveAccel = 60;
+    this.airControl = 0.35;
+    this.jumpSpeed = 11; this.jumpForwardBoost = 1.5; this.tailJumpShare = 0.7;
+    this.coyoteTime = 0.12; this.jumpBufferTime = 0.15;
+    this.movingFriction = 0.05; this.idleFriction = 0.4;
+    this.adhesionAccel = 4;
+    this.headLiftIdle = 0.65; this.headLiftMoving = 0.35; this.chestLiftIdle = 0.25;
+    /* state */
+    this.inputX = 0; this.facing = 1;
+    this.jumpBufferTimer = 0; this.coyoteTimer = 0; this.grounded = false;
+    this.torso = []; this.tail = []; this.limbs = [];
+    this.build();
+    this.layoutBody(terrain.spawnX, terrain.spawnY);
+    solver.actors.push(this);
+  }
+  get head()  { return this.torso[0]; }
+  get chest() { return this.torso[1]; }
+  get hips()  { return this.torso[this.torso.length - 1]; }
+
+  build() {
+    const S = this.solver;
+    const masses = [1.0, 1.6, 1.3];         // chest heaviest ⇒ the natural handle
+    const radii  = [0.17, 0.19, 0.17];
+    for (let i = 0; i < 3; i++) {
+      const n = new PhysicsNode(0, 0, masses[i], radii[i]);
+      n.friction = this.idleFriction; n.airDrag = 0.008;
+      const t = i / 2;
+      n.color = [0.98 - 0.23 * t, 0.96 - 0.18 * t, 0.90 - 0.05 * t];
+      this.torso.push(n); S.nodes.push(n);
+    }
+    /* stiff adjacent spine springs + weak anti-fold skip spring */
+    for (let i = 0; i < 2; i++)
+      S.constraints.push(new SpringConstraint(this.torso[i], this.torso[i + 1],
+        this.torsoSpacing, this.spineStiffness, this.spineDamping));
+    const skip = new SpringConstraint(this.torso[0], this.torso[2],
+      this.torsoSpacing * 2 * 0.97, this.bendResistance, 0.05);
+    skip.helper = true; S.constraints.push(skip);
+
+    /* tail: tapering mass is what produces the whip follow-through */
+    const segLen = [];
+    let prev = this.hips;
+    for (let i = 0; i < this.tailCount; i++) {
+      const t = i / (this.tailCount - 1);
+      segLen.push(0.26 + (0.16 - 0.26) * t);
+      const n = new PhysicsNode(0, 0, 0.30 + (0.05 - 0.30) * t, 0.11 + (0.045 - 0.11) * t);
+      n.friction = 0.05; n.airDrag = 0.03;  // extra drag ⇒ the tail "flows"
+      n.collides = true;                     // set false for spec-literal tail
+      n.color = [0.85 - 0.40 * t, 0.82 - 0.32 * t, 0.75 - 0.15 * t];
+      this.tail.push(n); S.nodes.push(n);
+      S.constraints.push(new SpringConstraint(prev, n, segLen[i], 0.85, 0.08));
+      prev = n;
+    }
+    const chain = [this.hips, ...this.tail];
+    for (let i = 0; i < chain.length - 2; i++) {
+      const c = new SpringConstraint(chain[i], chain[i + 2],
+        (segLen[i] + segLen[i + 1]) * 0.98, 0.04, 0.02);
+      c.helper = true; S.constraints.push(c);
+    }
+
+    /* Module 5: near + far leg on the hips; the allowStep gate alternates them */
+    const base = { upper: 0.26, lower: 0.30, stepThreshold: 0.42, stepDuration: 0.11, arcHeight: 0.14 };
+    this.limbs.push(new IKLimb(this.hips, this.terrain, { ...base, strideLead: 0.35, drawOffset: +0.03 }));
+    this.limbs.push(new IKLimb(this.hips, this.terrain, { ...base, strideLead: 0.12, drawOffset: -0.03 }));
+  }
+
+  /* the ONLY place positions are written — spawn/respawn, zero velocity */
+  layoutBody(ax, ay) {
+    this.facing = 1;
+    for (let i = 0; i < 3; i++) {
+      const fromHips = 2 - i;
+      this.torso[i].moveTo(ax + this.torsoSpacing * fromHips, ay + 0.03 * fromHips);
+    }
+    let px = ax, py = ay;
+    for (let i = 0; i < this.tail.length; i++) {
+      const t = i / (this.tail.length - 1);
+      px -= 0.26 + (0.16 - 0.26) * t; py -= 0.015;
+      this.tail[i].moveTo(px, py);
+    }
+    for (const l of this.limbs) l.resetPose(ax, ay - 0.25);
+    this.coyoteTimer = 0; this.jumpBufferTimer = 0; this.grounded = false;
+  }
+  respawn() { this.layoutBody(this.terrain.spawnX, this.terrain.spawnY); }
+  queueJump() { this.jumpBufferTimer = this.jumpBufferTime; }
+
+  prePhysicsStep(dt) {
+    /* coyote window refills while grounded, drains in the air */
+    if (this.grounded) this.coyoteTimer = this.coyoteTime; else this.coyoteTimer -= dt;
+    if (this.jumpBufferTimer > 0) this.jumpBufferTimer -= dt;
+
+    const moving = Math.abs(this.inputX) > 0.05;
+    if (moving) this.facing = this.inputX > 0 ? 1 : -1;
+
+    /* idle ⇒ plant hard (skid-stop); moving ⇒ glide over tiles */
+    const fr = moving ? this.movingFriction : this.idleFriction;
+    for (const n of this.torso) n.friction = fr;
+
+    /* proportional motor: a = clamp((v_target − v_x)·gain)·control — force
+       only, full authority only while grounded (Module 4 adhesion rule)     */
+    if (this.grounded || moving) {
+      const control = this.grounded ? 1 : this.airControl;
+      const target = this.inputX * this.maxGroundSpeed;
+      const vx = this.chest.velX(dt);
+      let accel = (target - vx) * this.driveGain;
+      accel = Math.max(-this.maxDriveAccel, Math.min(this.maxDriveAccel, accel)) * control;
+      this.chest.addForce(accel * this.chest.mass * 0.70, 0);
+      this.hips.addForce(accel * this.hips.mass * 0.45, 0);
+    }
+
+    /* posture: fractional gravity-cancel (< 1 ⇒ can never levitate) gives the
+       Slugcat "sit up"; hip adhesion presses the pelvis down for traction    */
+    if (this.grounded) {
+      const g = -this.solver.gravityY;
+      const lift = moving ? this.headLiftMoving : this.headLiftIdle;
+      this.head.addForce(0, g * this.head.mass * lift);
+      if (!moving) this.chest.addForce(0, g * this.chest.mass * this.chestLiftIdle);
+      if (this.jumpBufferTimer <= 0) this.hips.addForce(0, -this.adhesionAccel * this.hips.mass);
+    }
+
+    /* jump: velocity impulse across the whole body. The tail gets a reduced
+       share — a soft body conserves momentum, so an un-launched tail would
+       siphon ~20% of the jump through the constraints (measured), while a
+       full-strength tail would kill the whip-lag.                            */
+    if (this.jumpBufferTimer > 0 && this.coyoteTimer > 0) {
+      this.jumpBufferTimer = 0; this.coyoteTimer = 0; this.grounded = false;
+      const all = [...this.torso, ...this.tail];
+      for (const n of all) {
+        const ti = this.torso.indexOf(n);
+        const w = ti < 0 ? this.tailJumpShare : (ti === 0 ? 0.95 : (ti === 2 ? 0.85 : 1));
+        const vy = n.velY(dt);
+        if (vy < 0) n.setVelocity(n.velX(dt), 0, dt);   // consistent jump height
+        n.addVelocity(this.inputX * this.jumpForwardBoost, this.jumpSpeed * w, dt);
+      }
+    }
+  }
+
+  postPhysicsStep(dt) {
+    /* spec: groundedness is judged at the pelvis, not the face */
+    this.grounded = this.hips.grounded || this.chest.grounded;
+    this.limbs[0].tick(dt, this.facing, this.grounded, !this.limbs[1].stepping);
+    this.limbs[1].tick(dt, this.facing, this.grounded, !this.limbs[0].stepping);
+  }
+}
+
+/* ====================== Renderer — the OnDrawGizmos port ====================
+   Spheres → circles, constraint lines colored by strain (green at rest → red
+   stretched), grounded nodes tinted green, legs as stick-figures. Node render
+   positions are interpolated between the previous and current physics step
+   so 50 Hz simulation looks smooth at any display refresh rate.              */
+function boot() {
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d");
+  const terrain = new GridTerrain(MAP);
+  const solver = new VerletSolver(terrain);
+  const creature = new CreatureController(solver, terrain);
+
+  const worldW = terrain.width * terrain.cellSize;
+  const worldH = terrain.height * terrain.cellSize;
+  let W = 0, H = 0, dpr = 1;
+  function resize() {
+    dpr = window.devicePixelRatio || 1;
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = W * dpr; canvas.height = H * dpr;
+    canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  }
+  window.addEventListener("resize", resize); resize();
+
+  /* input */
+  const keys = {};
+  window.addEventListener("keydown", e => {
+    if (["ArrowLeft", "ArrowRight", "Space", "KeyA", "KeyD", "KeyR"].includes(e.code)) e.preventDefault();
+    if (e.repeat) return;
+    keys[e.code] = true;
+    if (e.code === "Space") creature.queueJump();
+    if (e.code === "KeyR") creature.respawn();
+  });
+  window.addEventListener("keyup", e => { keys[e.code] = false; });
+
+  /* smooth camera clamped to the map */
+  let camX = terrain.spawnX, camY = terrain.spawnY;
+
+  const col = (r, g, b, a) =>
+    `rgba(${(r * 255) | 0},${(g * 255) | 0},${(b * 255) | 0},${a === undefined ? 1 : a})`;
+  const lerp = (a, b, t) => a + (b - a) * t;
+
+  let fps = 60, fpsAcc = 0, fpsN = 0;
+
+  function draw(alpha, dtFrame) {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = "#0f1317"; ctx.fillRect(0, 0, W, H);
+
+    const scale = Math.min(H / 10.5, W / 16);
+    const viewW = W / scale, viewH = H / scale;
+    const fx = lerp(creature.chest.ox, creature.chest.x, alpha);
+    const fy = lerp(creature.chest.oy, creature.chest.y, alpha);
+    const k = 1 - Math.exp(-4 * dtFrame);
+    camX += (fx - camX) * k; camY += (fy - camY) * k;
+    const cx = viewW >= worldW ? worldW / 2 : Math.max(viewW / 2, Math.min(worldW - viewW / 2, camX));
+    const cy = viewH >= worldH ? worldH / 2 : Math.max(viewH / 2, Math.min(worldH - viewH / 2, camY));
+    const sx = wx => (wx - cx) * scale + W / 2;
+    const sy = wy => H / 2 - (wy - cy) * scale;
+
+    /* terrain cells */
+    const cs = terrain.cellSize, inset = cs * 0.02;
+    ctx.fillStyle = "#39455a";
+    for (let gy = 0; gy < terrain.height; gy++)
+      for (let gx = 0; gx < terrain.width; gx++)
+        if (terrain.solid[gy * terrain.width + gx])
+          ctx.fillRect(sx(gx * cs + inset), sy((gy + 1) * cs - inset),
+                       (cs - inset * 2) * scale, (cs - inset * 2) * scale);
+
+    /* spawn marker */
+    ctx.strokeStyle = col(0.3, 0.8, 1, 0.8); ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(sx(terrain.spawnX), sy(terrain.spawnY), cs * 0.4 * scale, 0, Math.PI * 2);
+    ctx.stroke();
+
+    /* constraints — strain-colored (the Gizmos.DrawLine pass) */
+    for (const c of solver.constraints) {
+      const s = Math.min(1, Math.abs(c.strain()) * 4);
+      const r = lerp(0.2, 1, s), g = lerp(0.9, 0.2, s), b = lerp(0.3, 0.15, s);
+      ctx.strokeStyle = col(r, g, b, c.helper ? 0.12 : 0.9);
+      ctx.lineWidth = c.helper ? 1 : 2;
+      ctx.beginPath();
+      ctx.moveTo(sx(lerp(c.a.ox, c.a.x, alpha)), sy(lerp(c.a.oy, c.a.y, alpha)));
+      ctx.lineTo(sx(lerp(c.b.ox, c.b.x, alpha)), sy(lerp(c.b.oy, c.b.y, alpha)));
+      ctx.stroke();
+    }
+
+    /* IK legs */
+    for (const l of creature.limbs) {
+      const o = l.s.drawOffset;
+      const hx = lerp(l.anchor.ox, l.anchor.x, alpha) + o;
+      const hy = lerp(l.anchor.oy, l.anchor.y, alpha);
+      ctx.strokeStyle = col(0.55, 0.85, 1, 0.9); ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(sx(hx), sy(hy));
+      ctx.lineTo(sx(l.kneeX + o), sy(l.kneeY));
+      ctx.lineTo(sx(l.footX + o), sy(l.footY));
+      ctx.stroke();
+      ctx.fillStyle = l.stepping ? col(1, 0.92, 0.2) : (l.hasFoothold ? col(0.3, 1, 0.4) : col(0.6, 0.6, 0.6));
+      ctx.beginPath();
+      ctx.arc(sx(l.footX + o), sy(l.footY), 0.05 * scale, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    /* nodes — the Gizmos.DrawSphere pass; grounded tint = green */
+    for (const n of solver.nodes) {
+      let [r, g, b] = n.color;
+      if (n.grounded) { r = lerp(r, 0.35, 0.6); g = lerp(g, 1, 0.6); b = lerp(b, 0.45, 0.6); }
+      else if (n.hasContact) { r = lerp(r, 1, 0.4); g = lerp(g, 0.92, 0.4); b = lerp(b, 0.02, 0.4); }
+      ctx.fillStyle = col(r, g, b);
+      ctx.beginPath();
+      ctx.arc(sx(lerp(n.ox, n.x, alpha)), sy(lerp(n.oy, n.y, alpha)), n.radius * scale, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    /* facing arrow above the head */
+    const hd = creature.head;
+    const ax0 = lerp(hd.ox, hd.x, alpha), ay0 = lerp(hd.oy, hd.y, alpha) + 0.45;
+    const tipX = ax0 + 0.28 * creature.facing;
+    ctx.strokeStyle = creature.grounded ? col(0.3, 1, 0.4) : col(1, 0.6, 0.2);
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(sx(ax0), sy(ay0)); ctx.lineTo(sx(tipX), sy(ay0));
+    ctx.moveTo(sx(tipX), sy(ay0)); ctx.lineTo(sx(tipX - 0.09 * creature.facing), sy(ay0 + 0.07));
+    ctx.moveTo(sx(tipX), sy(ay0)); ctx.lineTo(sx(tipX - 0.09 * creature.facing), sy(ay0 - 0.07));
+    ctx.stroke();
+
+    /* HUD */
+    ctx.fillStyle = "rgba(215,222,230,0.9)";
+    ctx.font = "600 14px ui-monospace, Menlo, monospace";
+    ctx.fillText("Rain World-style soft-body — Phase 1 (HTML5 port)", 14, 24);
+    ctx.fillStyle = "rgba(139,152,167,0.9)";
+    ctx.font = "12px ui-monospace, Menlo, monospace";
+    ctx.fillText("A/D or ←/→ move · Space jump · R respawn", 14, 42);
+    ctx.fillText(`fps ${fps | 0} · nodes ${solver.nodes.length} · springs ${solver.constraints.length}`
+      + ` · ${creature.grounded ? "grounded" : "airborne"}`, 14, 58);
+  }
+
+  /* fixed-timestep accumulator — the FixedUpdate equivalent */
+  const DT = 0.02;
+  let last = performance.now(), acc = 0;
+  function frame(now) {
+    let el = (now - last) / 1000; last = now;
+    fpsAcc += el; fpsN++;
+    if (fpsAcc >= 0.5) { fps = fpsN / fpsAcc; fpsAcc = 0; fpsN = 0; }
+    el = Math.min(el, 0.1);                       // clamp tab-switch spikes
+    creature.inputX = (keys.ArrowRight || keys.KeyD ? 1 : 0) - (keys.ArrowLeft || keys.KeyA ? 1 : 0);
+    acc += el;
+    while (acc >= DT) { solver.step(DT); acc -= DT; }
+    draw(acc / DT, el);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+}
+
+/* ===================== Headless test (Node) — parity suite ==================
+   Mirrors HeadlessTest/TestHarness.cs: settle, walk, jump, randomized soak.  */
+function headlessTest() {
+  const terrain = new GridTerrain(MAP);
+  const solver = new VerletSolver(terrain);
+  const creature = new CreatureController(solver, terrain);
+  const DT = 0.02;
+  let fails = 0;
+  const check = (ok, msg) => { console.log((ok ? "  PASS  " : "  FAIL  ") + msg); if (!ok) fails++; };
+  const stepN = n => { for (let i = 0; i < n; i++) solver.step(DT); };
+  const finite = () => solver.nodes.every(n => Number.isFinite(n.x) && Number.isFinite(n.y));
+  const hips = creature.hips;
+
+  console.log(`rig: ${solver.nodes.length} nodes, ${solver.constraints.length} constraints`);
+  check(solver.nodes.length === 8, "topology: 3 torso + 5 tail nodes");
+
+  stepN(200);
+  console.log(`settled hips=(${hips.x.toFixed(2)},${hips.y.toFixed(2)}) grounded=${creature.grounded}`);
+  check(finite(), "no NaN/Inf after settling");
+  check(creature.grounded, "creature reports grounded after landing");
+  check(hips.y > 2.0 && hips.y < 2.6, "hips resting just above floor line");
+
+  const x0 = hips.x;
+  creature.inputX = 1; stepN(125);
+  console.log(`walked ${(hips.x - x0).toFixed(2)} u in 2.5 s`);
+  check(finite(), "no NaN/Inf while walking");
+  check(hips.x - x0 > 2, "locomotion moved the creature (>2 u)");
+
+  creature.inputX = 0; stepN(50);
+  const y0 = hips.y;
+  creature.jumpBufferTimer = 0.15;
+  let peak = y0;
+  for (let i = 0; i < 60; i++) { solver.step(DT); peak = Math.max(peak, hips.y); }
+  console.log(`jump: rest y=${y0.toFixed(2)}, peak y=${peak.toFixed(2)} (rise ${(peak - y0).toFixed(2)} u)`);
+  check(peak - y0 > 1.2, "jump impulse lifts the body >1.2 u");
+  check(finite(), "no NaN/Inf after jump");
+
+  let rng = 1234;
+  const rnd = () => { rng = (rng * 48271) % 2147483647; return rng / 2147483647; };
+  for (let s = 0; s < 1500; s++) {
+    if (s % 200 === 0) creature.inputX = Math.floor(rnd() * 3) - 1;
+    if (s % 170 === 0) creature.jumpBufferTimer = 0.15;
+    solver.step(DT);
+  }
+  check(finite(), "30 s randomized soak stayed finite");
+  check(solver.nodes.every(n => n.x >= 0 && n.x <= 24 && n.y >= 0 && n.y <= 10),
+    "creature never escaped the sealed map");
+  check(creature.limbs.length === 2 &&
+    creature.limbs.every(l => Number.isFinite(l.footX) && Number.isFinite(l.kneeY)),
+    "IK limbs: 2 legs, finite output");
+
+  console.log(fails === 0 ? "\nALL CHECKS PASSED" : `\n${fails} CHECK(S) FAILED`);
+  if (typeof process !== "undefined") process.exitCode = fails === 0 ? 0 : 1;
+}
+
+if (typeof window === "undefined") headlessTest(); else boot();
+</script>
+</body>
+</html>

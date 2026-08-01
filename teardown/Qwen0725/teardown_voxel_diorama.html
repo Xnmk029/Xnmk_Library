@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>Teardown Micro-Voxel City Diorama</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;overflow:hidden;background:#0d1117}
+canvas{display:block}
+#info{position:fixed;top:14px;left:50%;transform:translateX(-50%);color:#fff;font-family:'Segoe UI',sans-serif;font-size:12px;background:rgba(0,0,0,.6);padding:7px 16px;border-radius:16px;pointer-events:none;z-index:10;backdrop-filter:blur(6px);white-space:nowrap}
+#loading{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#0d1117;color:#fff;font-family:'Segoe UI',sans-serif;z-index:100;transition:opacity .8s}
+#loading h2{font-size:20px;margin-bottom:12px;font-weight:400}
+#loading p{font-size:13px;color:#888}
+</style>
+</head>
+<body>
+<div id="info">Teardown Voxel City Diorama — 左键旋转 · 滚轮缩放 · 右键平移</div>
+<div id="loading"><h2>正在构建体素城市...</h2><p>Micro-Voxel PBR Rendering</p></div>
+
+<script type="importmap">
+{"imports":{"three":"https://esm.sh/three@0.160.0","three/addons/":"https://esm.sh/three@0.160.0/examples/jsm/"}}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { SSAOPass } from 'three/addons/postprocessing/SSAOPass.js';
+import { BokehPass } from 'three/addons/postprocessing/BokehPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+// ==================== RENDERER ====================
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.15;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+
+// ==================== PIXEL-ART SKY ====================
+function createPixelSky() {
+  const c = document.createElement('canvas');
+  c.width = 128; c.height = 64;
+  const ctx = c.getContext('2d');
+  const bands = [
+    [0,'#1a2a6c'],[0.15,'#2d4a9e'],[0.3,'#4a90d9'],[0.45,'#7ec8e3'],
+    [0.58,'#aee8f0'],[0.68,'#ffeaa7'],[0.78,'#fdcb6e'],[0.88,'#e17055'],[1,'#2d3436']
+  ];
+  for (let y = 0; y < 64; y++) {
+    const t = y / 63;
+    let color = bands[0][1];
+    for (let i = 0; i < bands.length - 1; i++) {
+      if (t >= bands[i][0] && t <= bands[i+1][0]) { color = bands[i][1]; break; }
+    }
+    ctx.fillStyle = color;
+    ctx.fillRect(0, y, 128, 1);
+  }
+  // Pixel clouds
+  ctx.fillStyle = 'rgba(255,255,255,0.5)';
+  const rng = (s) => { s ^= s<<13; s ^= s>>17; s ^= s<<5; return (s>>>0)/4294967296; };
+  let seed = 42;
+  for (let i = 0; i < 30; i++) {
+    seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+    const cx = (seed % 120) + 4;
+    seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+    const cy = 8 + (seed % 20);
+    const w = 4 + (seed % 8);
+    ctx.fillRect(cx, cy, w, 2);
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.magFilter = THREE.NearestFilter;
+  tex.minFilter = THREE.NearestFilter;
+  tex.mapping = THREE.EquirectangularReflectionMapping;
+  return tex;
+}
+const skyTex = createPixelSky();
+scene.background = skyTex;
+scene.environment = skyTex;
+
+// ==================== CAMERA (Tilt-shift style) ====================
+const camera = new THREE.PerspectiveCamera(32, window.innerWidth / window.innerHeight, 0.1, 300);
+camera.position.set(18, 16, 22);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 1.0, 0);
+controls.enableDamping = true;
+controls.dampingFactor = 0.05;
+controls.minDistance = 8;
+controls.maxDistance = 55;
+controls.maxPolarAngle = Math.PI / 2.15;
+controls.update();
+
+// ==================== VOXEL SYSTEM ====================
+const V = 0.22; // smaller voxel for finer city detail
+const H = V / 2;
+const voxelData = {};
+function addV(mat, x, y, z) {
+  if (!voxelData[mat]) voxelData[mat] = [];
+  voxelData[mat].push(x, y, z); // flat array for performance
+}
+
+// ==================== MATERIALS ====================
+const MAT = {
+  brick:    new THREE.MeshPhysicalMaterial({color:0xb5651d, roughness:0.92}),
+  brickDk:  new THREE.MeshPhysicalMaterial({color:0x8B4513, roughness:0.95}),
+  concrete: new THREE.MeshPhysicalMaterial({color:0x9e9e9e, roughness:0.85}),
+  concLight:new THREE.MeshPhysicalMaterial({color:0xc8c8c0, roughness:0.8}),
+  wood:     new THREE.MeshPhysicalMaterial({color:0xA0722A, roughness:0.88}),
+  woodDark: new THREE.MeshPhysicalMaterial({color:0x5C3317, roughness:0.9}),
+  metal:    new THREE.MeshPhysicalMaterial({color:0xd8d8d8, roughness:0.15, metalness:1.0, clearcoat:0.4}),
+  metalRed: new THREE.MeshPhysicalMaterial({color:0xcc2222, roughness:0.2, metalness:0.95, clearcoat:0.6}),
+  metalBlue:new THREE.MeshPhysicalMaterial({color:0x2255bb, roughness:0.18, metalness:0.95, clearcoat:0.5}),
+  metalWht: new THREE.MeshPhysicalMaterial({color:0xeeeeee, roughness:0.2, metalness:0.9, clearcoat:0.3}),
+  glass:    new THREE.MeshPhysicalMaterial({color:0xaaddff, roughness:0.05, transmission:0.9, ior:1.52, thickness:0.15, transparent:true}),
+  glassWarm:new THREE.MeshPhysicalMaterial({color:0xffeebb, roughness:0.1, transmission:0.7, ior:1.5, thickness:0.1, transparent:true, emissive:0x332200, emissiveIntensity:0.3}),
+  leaf:     new THREE.MeshPhysicalMaterial({color:0x3a7d2c, roughness:0.82}),
+  leafLt:   new THREE.MeshPhysicalMaterial({color:0x5da832, roughness:0.75}),
+  ground:   new THREE.MeshPhysicalMaterial({color:0x6b8f5e, roughness:0.95}),
+  sidewalk: new THREE.MeshPhysicalMaterial({color:0xb0a898, roughness:0.88}),
+  asphalt:  new THREE.MeshPhysicalMaterial({color:0x3a3a3a, roughness:0.92}),
+  roadLine: new THREE.MeshPhysicalMaterial({color:0xe8e8e0, roughness:0.7}),
+  water:    new THREE.MeshPhysicalMaterial({color:0x2288aa, roughness:0.1, metalness:0.0, transmission:0.6, ior:1.33, thickness:0.5, transparent:true}),
+  waterDeep:new THREE.MeshPhysicalMaterial({color:0x145566, roughness:0.15, transmission:0.4, ior:1.33, thickness:0.8, transparent:true}),
+  sand:     new THREE.MeshPhysicalMaterial({color:0xd4b896, roughness:0.9}),
+  table:    new THREE.MeshPhysicalMaterial({color:0x4a3728, roughness:0.7, metalness:0.0}),
+  tableTop: new THREE.MeshPhysicalMaterial({color:0x5c4033, roughness:0.6, metalness:0.0}),
+  white:    new THREE.MeshPhysicalMaterial({color:0xf5f5f0, roughness:0.7}),
+  yellow:   new THREE.MeshPhysicalMaterial({color:0xf0c020, roughness:0.4, metalness:0.3}),
+  tire:     new THREE.MeshPhysicalMaterial({color:0x1a1a1a, roughness:0.95}),
+  roofRed:  new THREE.MeshPhysicalMaterial({color:0x993333, roughness:0.8}),
+  roofGray: new THREE.MeshPhysicalMaterial({color:0x666666, roughness:0.75, metalness:0.2}),
+};
+
+// ==================== CITY LAYOUT ====================
+const CITY = 26; // half-extent in voxels (city is 52x52 voxels ~ 11.4 units)
+const RIVER_X = 6; // river center X (in voxel coords from center)
+const RIVER_W = 4; // river half-width
+
+// Seeded random
+let _seed = 12345;
+function srand() { _seed = (_seed * 1103515245 + 12345) & 0x7fffffff; return _seed / 0x7fffffff; }
+
+function buildTable() {
+  // Table top: solid slab under the city
+  const ext = CITY + 4;
+  const tableH = 3;
+  for (let x = -ext; x <= ext; x++) {
+    for (let z = -ext; z <= ext; z++) {
+      for (let y = -tableH; y < 0; y++) {
+        const mat = (y === -1) ? 'tableTop' : 'table';
+        addV(mat, x*V, y*V - H, z*V);
+      }
+    }
+  }
+  // Table legs (4 corners)
+  const legH = 12, legR = 2;
+  const legs = [[-ext+3,-ext+3],[ext-3,-ext+3],[-ext+3,ext-3],[ext-3,ext-3]];
+  for (const [lx,lz] of legs) {
+    for (let dx = -legR; dx <= legR; dx++) {
+      for (let dz = -legR; dz <= legR; dz++) {
+        for (let y = -tableH - legH; y < -tableH; y++) {
+          addV('table', (lx+dx)*V, y*V - H, (lz+dz)*V);
+        }
+      }
+    }
+  }
+}
+
+function buildCityGround() {
+  for (let x = -CITY; x <= CITY; x++) {
+    for (let z = -CITY; z <= CITY; z++) {
+      const wx = x*V, wz = z*V;
+      const inRiver = Math.abs(x - RIVER_X) <= RIVER_W;
+      // River bed
+      if (inRiver) {
+        addV('sand', wx, -H*1.5, wz);
+        continue;
+      }
+      // Roads: main horizontal (z=0±2) and vertical (x=-8±2, x=16±2)
+      const isRoadH = Math.abs(z) <= 2;
+      const isRoadV = (Math.abs(x + 8) <= 2) || (Math.abs(x - 16) <= 2);
+      if (isRoadH || isRoadV) {
+        addV('asphalt', wx, -H, wz);
+        // Center line
+        if (Math.abs(z) === 0 && isRoadH) addV('roadLine', wx, H*0.1, wz);
+        if ((Math.abs(x+8)===0 || Math.abs(x-16)===0) && isRoadV) addV('roadLine', wx, H*0.1, wz);
+      } else if (Math.abs(z) === 3 || Math.abs(x+8) === 3 || Math.abs(x-16) === 3) {
+        addV('sidewalk', wx, -H, wz); // sidewalk
+      } else {
+        addV('ground', wx, -H, wz);
+      }
+    }
+  }
+}
+
+function buildRiver() {
+  for (let x = RIVER_X - RIVER_W; x <= RIVER_X + RIVER_W; x++) {
+    for (let z = -CITY; z <= CITY; z++) {
+      const wx = x*V, wz = z*V;
+      const distFromCenter = Math.abs(x - RIVER_X);
+      const mat = distFromCenter <= 1 ? 'waterDeep' : 'water';
+      addV(mat, wx, -H*0.8, wz);
+      // River banks
+      if (distFromCenter === RIVER_W) {
+        addV('sand', wx, H*0.2, wz);
+      }
+    }
+  }
+}
+
+function buildBridge(bridgeZ) {
+  const bw = RIVER_W * 2 + 3;
+  for (let x = RIVER_X - RIVER_W - 1; x <= RIVER_X + RIVER_W + 1; x++) {
+    for (let z = bridgeZ - 2; z <= bridgeZ + 2; z++) {
+      addV('concrete', x*V, H*0.5, z*V);
+      // Railings
+      if (z === bridgeZ-2 || z === bridgeZ+2) {
+        addV('metal', x*V, H*0.5 + V, z*V);
+        addV('metal', x*V, H*0.5 + V*2, z*V);
+      }
+    }
+  }
+  // Support pillars
+  for (const px of [RIVER_X-2, RIVER_X+2]) {
+    for (let y = -3; y < 1; y++) {
+      addV('concrete', px*V, y*V, bridgeZ*V);
+    }
+  }
+}
+
+function buildBuilding(ox, oz, w, d, floors, style) {
+  const floorH = 6;
+  const wallMat = style === 0 ? 'brick' : style === 1 ? 'concLight' : 'brickDk';
+  const roofMat = style === 0 ? 'roofRed' : 'roofGray';
+  for (let f = 0; f < floors; f++) {
+    const baseY = f * floorH;
+    for (let y = 0; y < floorH; y++) {
+      for (let x = 0; x < w; x++) {
+        for (let z = 0; z < d; z++) {
+          const isWall = (x===0||x===w-1||z===0||z===d-1);
+          if (!isWall && y < floorH-1) continue;
+          const wx=(ox+x)*V, wy=(baseY+y)*V+H, wz=(oz+z)*V;
+          if (isWall && y>=2 && y<=4 && (x%3===1||z%3===1) && x>0&&x<w-1&&z>0&&z<d-1) {
+            addV(srand()>0.7?'glassWarm':'glass', wx, wy, wz);
+          } else if (y===floorH-1) {
+            addV('concrete', wx, wy, wz);
+          } else {
+            addV(wallMat, wx, wy, wz);
+          }
+        }
+      }
+    }
+  }
+  const ry = floors*floorH*V+H;
+  for (let x=-1;x<=w;x++) for(let z=-1;z<=d;z++) addV(roofMat,(ox+x)*V,ry,(oz+z)*V);
+}
+
+function buildCar(ox, oz, color, rot) {
+  const c = color === 0 ? 'metalRed' : color === 1 ? 'metalBlue' : 'metalWht';
+  const bW=10, bD=5, bH=3;
+  for (let x=0;x<bW;x++) for(let z=0;z<bD;z++) for(let y=0;y<bH;y++) {
+    if (x>0&&x<bW-1&&z>0&&z<bD-1&&y>0) continue;
+    const px = rot ? (oz+z) : (ox+x);
+    const pz = rot ? (ox+x) : (oz+z);
+    addV(c, px*V, (y+1)*V+H, pz*V);
+  }
+  // Cabin
+  for (let x=2;x<7;x++) for(let z=1;z<bD-1;z++) for(let y=bH;y<bH+2;y++) {
+    const px = rot ? (oz+z) : (ox+x);
+    const pz = rot ? (ox+x) : (oz+z);
+    addV('glass', px*V, (y+1)*V+H, pz*V);
+  }
+  // Wheels
+  for (const [wx,wz] of [[1,0],[1,bD-1],[bW-2,0],[bW-2,bD-1]]) {
+    const px = rot ? (oz+wz) : (ox+wx);
+    const pz = rot ? (ox+wx) : (oz+wz);
+    addV('tire', px*V, V*0.5, pz*V);
+  }
+}
+
+function buildTree(ox, oz, h) {
+  for (let y=0;y<h;y++) addV('woodDark', ox*V, y*V+H, oz*V);
+  const r = 3 + Math.floor(srand()*2);
+  const cy = h + 1;
+  for (let dx=-r;dx<=r;dx++) for(let dy=-r+1;dy<=r;dy++) for(let dz=-r;dz<=r;dz++) {
+    if (dx*dx+dy*dy+dz*dz <= r*r+1) {
+      addV((dx+dy+dz)%3===0?'leafLt':'leaf', (ox+dx)*V, (cy+dy)*V+H, (oz+dz)*V);
+    }
+  }
+}
+
+function buildLamp(ox, oz) {
+  for (let y=0;y<12;y++) addV('metal', ox*V, y*V+H, oz*V);
+  for (let dx=-1;dx<=1;dx++) for(let dz=-1;dz<=1;dz++) addV('yellow',(ox+dx)*V,12*V+H,(oz+dz)*V);
+}
+
+// ==================== GENERATE CITY ====================
+buildTable();
+buildCityGround();
+buildRiver();
+buildBridge(0);
+buildBridge(-14);
+
+// Buildings - left district (x < RIVER_X - RIVER_W)
+const bConfigs = [
+  [-22,-22, 8,7, 4, 0], [-22,-12, 7,6, 3, 1], [-22,-4, 6,6, 5, 2],
+  [-22, 5, 8,7, 3, 0], [-22, 14, 7,8, 4, 1],
+  [-12,-22, 6,6, 6, 2], [-12,-13, 7,7, 3, 0], [-12, 5, 6,6, 4, 1],
+  [-12, 13, 8,7, 5, 2],
+];
+// Right district
+const bConfigs2 = [
+  [12,-22, 7,7, 5, 1], [12,-12, 6,6, 3, 0], [12, 5, 8,7, 6, 2],
+  [12, 14, 6,6, 4, 0],
+  [21,-20, 6,8, 4, 2], [21,-8, 7,6, 7, 1], [21, 4, 6,7, 3, 0],
+  [21, 13, 7,7, 5, 1],
+];
+for (const [x,z,w,d,f,s] of [...bConfigs, ...bConfigs2]) buildBuilding(x,z,w,d,f,s);
+
+// Cars on roads
+buildCar(-18, -1, 0, false); buildCar(-5, 1, 1, false);
+buildCar(14, -1, 2, false); buildCar(-9, -18, 0, true);
+buildCar(-7, 10, 1, true); buildCar(17, 8, 2, true);
+
+// Trees in parks and along river
+const treePos = [[-16,8],[-14,10],[-18,12],[3,-16],[4,-18],[3,14],[4,16],
+  [-4,8],[-3,10],[10,10],[11,12],[-16,-6],[-14,-8],[20,-2],[22,0]];
+for (const [tx,tz] of treePos) buildTree(tx, tz, 6+Math.floor(srand()*4));
+
+// Lamps along roads
+for (let i=-20;i<=20;i+=8) { buildLamp(i, 4); buildLamp(i, -4); }
+for (let i=-20;i<=20;i+=10) { buildLamp(-6, i); buildLamp(18, i); }
+
+// ==================== INSTANCED MESHES ====================
+const boxGeo = new THREE.BoxGeometry(V*0.94, V*0.94, V*0.94);
+const dummy = new THREE.Object3D();
+
+for (const [matName, flat] of Object.entries(voxelData)) {
+  const count = flat.length / 3;
+  const mesh = new THREE.InstancedMesh(boxGeo, MAT[matName], count);
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  for (let i = 0; i < count; i++) {
+    dummy.position.set(flat[i*3], flat[i*3+1], flat[i*3+2]);
+    dummy.updateMatrix();
+    mesh.setMatrixAt(i, dummy.matrix);
+  }
+  mesh.instanceMatrix.needsUpdate = true;
+  scene.add(mesh);
+}
+
+// ==================== LIGHTING ====================
+const hemi = new THREE.HemisphereLight(0x87CEEB, 0x445522, 0.5);
+scene.add(hemi);
+
+const sun = new THREE.DirectionalLight(0xfff0d0, 3.5);
+sun.position.set(20, 28, 14);
+sun.castShadow = true;
+sun.shadow.mapSize.set(4096, 4096);
+sun.shadow.camera.left = -18; sun.shadow.camera.right = 18;
+sun.shadow.camera.top = 18; sun.shadow.camera.bottom = -18;
+sun.shadow.camera.near = 2; sun.shadow.camera.far = 70;
+sun.shadow.bias = -0.0004;
+sun.shadow.normalBias = 0.02;
+sun.shadow.radius = 2.5;
+scene.add(sun);
+
+const fill = new THREE.DirectionalLight(0xaaccff, 0.7);
+fill.position.set(-12, 10, -10);
+scene.add(fill);
+
+scene.add(new THREE.AmbientLight(0x404060, 0.25));
+
+// ==================== POST-PROCESSING ====================
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+
+const ssao = new SSAOPass(scene, camera, window.innerWidth, window.innerHeight);
+ssao.kernelRadius = 0.5;
+ssao.minDistance = 0.001;
+ssao.maxDistance = 0.12;
+composer.addPass(ssao);
+
+// Tilt-shift DOF: strong bokeh for miniature feel
+const bokeh = new BokehPass(scene, camera, {
+  focus: 28.0,
+  aperture: 0.006,
+  maxblur: 0.015
+});
+composer.addPass(bokeh);
+composer.addPass(new OutputPass());
+
+// ==================== ANIMATE ====================
+const loadEl = document.getElementById('loading');
+loadEl.style.opacity = '0';
+setTimeout(() => loadEl.remove(), 900);
+
+const clock = new THREE.Clock();
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  // Subtle water animation via time-based material tweaks
+  const t = clock.getElapsedTime();
+  MAT.water.color.setHSL(0.52, 0.55, 0.38 + Math.sin(t*1.5)*0.03);
+  MAT.waterDeep.color.setHSL(0.53, 0.6, 0.25 + Math.sin(t*1.2+1)*0.02);
+  composer.render();
+}
+animate();
+
+// ==================== RESIZE ====================
+window.addEventListener('resize', () => {
+  const w = window.innerWidth, h = window.innerHeight;
+  camera.aspect = w/h;
+  camera.updateProjectionMatrix();
+  renderer.setSize(w, h);
+  composer.setSize(w, h);
+  ssao.setSize(w, h);
+});
+</script>
+</body>
+</html>

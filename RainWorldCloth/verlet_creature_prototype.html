@@ -1,0 +1,807 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>VERLET CREATURE // Phase 1 Prototype</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: #0a0b0e;
+  color: #c8ccd4;
+  font-family: 'Consolas', 'Courier New', monospace;
+  overflow: hidden;
+  height: 100vh;
+  display: flex;
+}
+#viewport {
+  flex: 1;
+  position: relative;
+}
+canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+#hud {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  font-size: 11px;
+  line-height: 1.7;
+  color: #7a8290;
+  pointer-events: none;
+  text-shadow: 0 1px 2px rgba(0,0,0,0.8);
+}
+#hud .val { color: #a3e635; }
+#hud .warn { color: #f59e0b; }
+#hud .title {
+  color: #e2e8f0;
+  font-size: 12px;
+  letter-spacing: 2px;
+  margin-bottom: 6px;
+  border-bottom: 1px solid #1e293b;
+  padding-bottom: 4px;
+}
+#panel {
+  width: 260px;
+  background: #0f1114;
+  border-left: 1px solid #1e293b;
+  padding: 14px;
+  overflow-y: auto;
+  font-size: 11px;
+}
+#panel h2 {
+  font-size: 11px;
+  letter-spacing: 1.5px;
+  color: #64748b;
+  margin: 14px 0 8px;
+  text-transform: uppercase;
+}
+#panel h2:first-child { margin-top: 0; }
+#panel label {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin: 5px 0;
+  color: #94a3b8;
+}
+#panel input[type="range"] {
+  width: 110px;
+  accent-color: #a3e635;
+}
+#panel .num {
+  color: #a3e635;
+  min-width: 36px;
+  text-align: right;
+}
+#panel .keys {
+  margin-top: 16px;
+  padding-top: 10px;
+  border-top: 1px solid #1e293b;
+  color: #475569;
+  line-height: 1.8;
+}
+#panel .keys kbd {
+  background: #1e293b;
+  padding: 1px 5px;
+  border: 1px solid #334155;
+  color: #94a3b8;
+}
+</style>
+</head>
+<body>
+<div id="viewport">
+  <canvas id="cv"></canvas>
+  <div id="hud"></div>
+</div>
+<div id="panel">
+  <h2>Solver</h2>
+  <label>Iterations <input type="range" id="p_iter" min="1" max="12" value="5"><span class="num" id="v_iter">5</span></label>
+  <label>Damping <input type="range" id="p_damp" min="0" max="30" value="2"><span class="num" id="v_damp">.02</span></label>
+  <label>Gravity <input type="range" id="p_grav" min="5" max="50" value="25"><span class="num" id="v_grav">-25</span></label>
+  <h2>Locomotion</h2>
+  <label>Move Force <input type="range" id="p_move" min="10" max="100" value="45"><span class="num" id="v_move">45</span></label>
+  <label>Air Control <input type="range" id="p_air" min="2" max="40" value="12"><span class="num" id="v_air">12</span></label>
+  <label>Jump Impulse <input type="range" id="p_jump" min="3" max="16" value="8"><span class="num" id="v_jump">8</span></label>
+  <label>Max Speed <input type="range" id="p_spd" min="5" max="35" value="18"><span class="num" id="v_spd">.18</span></label>
+  <h2>Body</h2>
+  <label>Spine Stiff <input type="range" id="p_stiff" min="30" max="100" value="85"><span class="num" id="v_stiff">.85</span></label>
+  <label>Tail Stiff <input type="range" id="p_tail" min="10" max="70" value="35"><span class="num" id="v_tail">.35</span></label>
+  <h2>IK Legs</h2>
+  <label>Step Thresh <input type="range" id="p_step" min="30" max="120" value="70"><span class="num" id="v_step">.70</span></label>
+  <label>Step Speed <input type="range" id="p_stepspeed" min="4" max="20" value="10"><span class="num" id="v_stepspeed">.10</span></label>
+  <div class="keys">
+    <kbd>A</kbd><kbd>D</kbd> / <kbd>&larr;</kbd><kbd>&rarr;</kbd> Move<br>
+    <kbd>Space</kbd> / <kbd>W</kbd> / <kbd>&uarr;</kbd> Jump<br>
+    <kbd>R</kbd> Reset creature<br>
+    <kbd>G</kbd> Toggle grid draw
+  </div>
+</div>
+
+<script>
+"use strict";
+// ═══════════════════════════════════════════════════════════
+// Module 1: Verlet 物理节点 + 弹簧约束
+// ═══════════════════════════════════════════════════════════
+
+class VerletNode {
+  constructor(x, y, mass = 1, radius = 0.25) {
+    this.x = x; this.y = y;
+    this.ox = x; this.oy = y; // oldPosition
+    this.mass = Math.max(mass, 0.01);
+    this.radius = radius;
+    this.friction = 0.4;
+    this.gravityScale = 1;
+    this.pinned = false;
+    this.collides = true;
+    // runtime
+    this.fx = 0; this.fy = 0; // accumulated force
+    this.grounded = false;
+    this.gnx = 0; this.gny = 1; // ground normal
+  }
+  get vx() { return this.x - this.ox; }
+  get vy() { return this.y - this.oy; }
+  addForce(fx, fy) { if (!this.pinned) { this.fx += fx; this.fy += fy; } }
+  applyImpulse(ix, iy) { if (!this.pinned) { this.ox -= ix / this.mass; this.oy -= iy / this.mass; } }
+}
+
+class SpringConstraint {
+  constructor(a, b, restLength, stiffness = 0.8) {
+    this.a = a; this.b = b;
+    this.rest = restLength !== undefined ? restLength :
+      Math.hypot(b.x - a.x, b.y - a.y);
+    this.stiffness = stiffness;
+    this.maxStretch = 3;
+    this.tension = 1; // debug
+  }
+  satisfy() {
+    let dx = this.b.x - this.a.x;
+    let dy = this.b.y - this.a.y;
+    let dist = Math.hypot(dx, dy);
+    if (dist < 0.0001) { dx = 0.001; dy = 0; dist = 0.001; }
+    this.tension = dist / this.rest;
+    // stretch limit
+    let effRest = this.rest;
+    if (this.maxStretch > 0 && dist > this.rest * this.maxStretch) {
+      effRest = this.rest * this.maxStretch;
+    }
+    let diff = (dist - effRest) / dist;
+    let totalMass = this.a.mass + this.b.mass;
+    let wA = this.a.pinned ? 0 : this.b.mass / totalMass;
+    let wB = this.b.pinned ? 0 : this.a.mass / totalMass;
+    if (wA + wB < 0.0001) return;
+    let cx = dx * diff * this.stiffness;
+    let cy = dy * diff * this.stiffness;
+    this.a.x += cx * wA; this.a.y += cy * wA;
+    this.b.x -= cx * wB; this.b.y -= cy * wB;
+  }
+}
+// ═══════════════════════════════════════════════════════════
+// Module 2: 网格世界 + 圆-AABB 碰撞
+// ═══════════════════════════════════════════════════════════
+
+class GridWorld {
+  constructor(w, h, cellSize = 1) {
+    this.w = w; this.h = h;
+    this.cs = cellSize;
+    this.map = new Uint8Array(w * h); // 0=air, 1=solid
+  }
+  idx(cx, cy) { return cy * this.w + cx; }
+  isSolid(cx, cy) {
+    if (cx < 0 || cx >= this.w || cy < 0 || cy >= this.h) return true;
+    return this.map[this.idx(cx, cy)] === 1;
+  }
+  set(cx, cy, v) {
+    if (cx >= 0 && cx < this.w && cy >= 0 && cy < this.h)
+      this.map[this.idx(cx, cy)] = v ? 1 : 0;
+  }
+  fillRect(x0, y0, x1, y1, v) {
+    for (let x = Math.max(0, x0); x <= Math.min(this.w - 1, x1); x++)
+      for (let y = Math.max(0, y0); y <= Math.min(this.h - 1, y1); y++)
+        this.set(x, y, v);
+  }
+  // 圆-AABB 碰撞解析
+  resolveNode(node) {
+    if (!node.collides || node.radius <= 0) return false;
+    let hit = false;
+    const r = node.radius, cs = this.cs;
+    const minCX = Math.floor((node.x - r) / cs);
+    const maxCX = Math.floor((node.x + r) / cs);
+    const minCY = Math.floor((node.y - r) / cs);
+    const maxCY = Math.floor((node.y + r) / cs);
+    for (let cx = minCX; cx <= maxCX; cx++) {
+      for (let cy = minCY; cy <= maxCY; cy++) {
+        if (!this.isSolid(cx, cy)) continue;
+        const left = cx * cs, bottom = cy * cs;
+        const right = left + cs, top = bottom + cs;
+        // closest point on AABB
+        const clx = Math.max(left, Math.min(node.x, right));
+        const cly = Math.max(bottom, Math.min(node.y, top));
+        const dx = node.x - clx, dy = node.y - cly;
+        const distSq = dx * dx + dy * dy;
+        if (distSq >= r * r) continue;
+        hit = true;
+        let nx, ny, pen;
+        const dist = Math.sqrt(distSq);
+        if (dist < 0.0001) {
+          // center inside AABB: push to nearest edge
+          const dL = node.x - left, dR = right - node.x;
+          const dB = node.y - bottom, dT = top - node.y;
+          const minD = Math.min(dL, dR, dB, dT);
+          if (minD === dL) { nx = -1; ny = 0; pen = dL + r; }
+          else if (minD === dR) { nx = 1; ny = 0; pen = dR + r; }
+          else if (minD === dB) { nx = 0; ny = -1; pen = dB + r; }
+          else { nx = 0; ny = 1; pen = dT + r; }
+        } else {
+          nx = dx / dist; ny = dy / dist;
+          pen = r - dist;
+        }
+        // position correction
+        node.x += nx * pen;
+        node.y += ny * pen;
+        // friction: decompose velocity
+        const vx = node.x - node.ox, vy = node.y - node.oy;
+        const vn = vx * nx + vy * ny;
+        if (vn < 0) {
+          const tvx = vx - nx * vn, tvy = vy - ny * vn;
+          const f = 1 - node.friction;
+          node.ox = node.x - tvx * f;
+          node.oy = node.y - tvy * f;
+        }
+        // ground detection
+        if (ny > 0.5) { node.grounded = true; node.gnx = nx; node.gny = ny; }
+      }
+    }
+    return hit;
+  }
+  // 步进射线（IK 用）
+  raycast(ox, oy, dx, dy, maxDist) {
+    const step = this.cs * 0.25;
+    const steps = Math.ceil(maxDist / step);
+    let px = ox, py = oy;
+    for (let i = 1; i <= steps; i++) {
+      const cx = ox + dx * step * i, cy = oy + dy * step * i;
+      const gx = Math.floor(cx / this.cs), gy = Math.floor(cy / this.cs);
+      if (this.isSolid(gx, gy)) {
+        // estimate normal
+        const ccx = (gx + 0.5) * this.cs, ccy = (gy + 0.5) * this.cs;
+        const tx = px - ccx, ty = py - ccy;
+        let nx, ny;
+        if (Math.abs(tx) > Math.abs(ty)) { nx = Math.sign(tx); ny = 0; }
+        else { nx = 0; ny = Math.sign(ty); }
+        return { hit: true, x: px, y: py, nx, ny };
+      }
+      px = cx; py = cy;
+    }
+    return { hit: false, x: ox + dx * maxDist, y: oy + dy * maxDist, nx: 0, ny: 1 };
+  }
+  // 测试关卡
+  static createTestLevel() {
+    const g = new GridWorld(60, 30, 1);
+    g.fillRect(0, 0, 59, 2, true);    // ground
+    g.fillRect(0, 0, 1, 29, true);    // left wall
+    g.fillRect(58, 0, 59, 29, true);  // right wall
+    g.fillRect(10, 8, 18, 8, true);   // platform 1
+    g.fillRect(22, 12, 30, 12, true); // platform 2
+    g.fillRect(35, 16, 42, 16, true); // platform 3
+    g.fillRect(15, 20, 22, 20, true); // platform 4
+    g.fillRect(26, 0, 30, 2, false);  // pit
+    g.fillRect(45, 3, 46, 10, true);  // pillar 1
+    g.fillRect(50, 3, 51, 14, true);  // pillar 2
+    // extra: floating blocks for wall-jump testing
+    g.fillRect(5, 14, 7, 14, true);
+    g.fillRect(53, 8, 55, 8, true);
+    return g;
+  }
+}
+// ═══════════════════════════════════════════════════════════
+// Module 1 续: Verlet 求解器（积分 → 约束 → 碰撞）
+// ═══════════════════════════════════════════════════════════
+
+class VerletSolver {
+  constructor(grid) {
+    this.nodes = [];
+    this.constraints = [];
+    this.grid = grid;
+    this.iterations = 5;
+    this.damping = 0.02;
+    this.gravity = -25; // Y-up in world, but canvas is Y-down; handled in integrate
+  }
+  addNode(x, y, mass, radius) {
+    const n = new VerletNode(x, y, mass, radius);
+    this.nodes.push(n);
+    return n;
+  }
+  addConstraint(a, b, rest, stiff) {
+    const c = new SpringConstraint(a, b, rest, stiff);
+    this.constraints.push(c);
+    return c;
+  }
+  step(dt) {
+    const dtSq = dt * dt;
+    const grav = this.gravity; // negative = downward in world coords (Y-up)
+    // 1. Integrate
+    for (const n of this.nodes) {
+      if (n.pinned) continue;
+      n.grounded = false;
+      const vx = (n.x - n.ox) * (1 - this.damping);
+      const vy = (n.y - n.oy) * (1 - this.damping);
+      n.ox = n.x; n.oy = n.y;
+      const ax = n.fx / n.mass;
+      const ay = grav * n.gravityScale + n.fy / n.mass;
+      n.x += vx + ax * dtSq;
+      n.y += vy + ay * dtSq;
+      n.fx = 0; n.fy = 0;
+    }
+    // 2. Constraints (iterative relaxation)
+    for (let iter = 0; iter < this.iterations; iter++) {
+      for (const c of this.constraints) c.satisfy();
+    }
+    // 3. Collision
+    if (this.grid) {
+      for (const n of this.nodes) {
+        if (n.pinned || !n.collides) continue;
+        this.grid.resolveNode(n);
+      }
+    }
+  }
+}
+// ═══════════════════════════════════════════════════════════
+// Module 5: 两骨骼 IK 腿（余弦定理 + 程序化步态）
+// ═══════════════════════════════════════════════════════════
+
+class IKLeg {
+  constructor(upperLen, lowerLen, footOffX, poleDir) {
+    this.upper = upperLen;
+    this.lower = lowerLen;
+    this.footOffX = footOffX;
+    this.poleDir = poleDir; // +1 or -1
+    this.stepThresh = 0.7;
+    this.stepDur = 0.10;
+    this.stepHeight = 0.25;
+    // state
+    this.footX = 0; this.footY = 0;
+    this.kneeX = 0; this.kneeY = 0;
+    this.stepping = false;
+    this.stepT = 0;
+    this.sx = 0; this.sy = 0; // step start
+    this.ex = 0; this.ey = 0; // step end
+    this.inited = false;
+  }
+  update(hipX, hipY, velX, velY, grid, dt, facing) {
+    // ideal foot position: below hip + velocity prediction
+    const legLen = this.upper + this.lower;
+    let idealX = hipX + velX * 3 + this.footOffX * facing;
+    let idealY = hipY - legLen * 0.85;
+    // raycast down to find ground
+    const ray = grid.raycast(idealX, idealY + 2, 0, -1, 4);
+    let gx, gy;
+    if (ray.hit) { gx = ray.x + ray.nx * 0.05; gy = ray.y + ray.ny * 0.05; }
+    else { gx = hipX; gy = hipY - legLen * 0.7; }
+    if (!this.inited) {
+      this.footX = gx; this.footY = gy;
+      this.inited = true;
+    }
+    // step trigger
+    const d = Math.hypot(this.footX - gx, this.footY - gy);
+    if (!this.stepping && d > this.stepThresh) {
+      this.sx = this.footX; this.sy = this.footY;
+      this.ex = gx + velX * 1.5; this.ey = gy;
+      this.stepT = 0; this.stepping = true;
+    }
+    // step animation (parabolic)
+    if (this.stepping) {
+      this.stepT += dt;
+      let t = Math.min(1, this.stepT / this.stepDur);
+      this.footX = this.sx + (this.ex - this.sx) * t;
+      this.footY = this.sy + (this.ey - this.sy) * t + Math.sin(t * Math.PI) * this.stepHeight;
+      if (t >= 1) { this.stepping = false; this.footX = this.ex; this.footY = this.ey; }
+    }
+    // solve two-bone IK
+    this.solveIK(hipX, hipY, facing);
+  }
+  solveIK(hipX, hipY, facing) {
+    let dx = this.footX - hipX, dy = this.footY - hipY;
+    let d = Math.hypot(dx, dy);
+    const minR = Math.abs(this.upper - this.lower) + 0.01;
+    const maxR = this.upper + this.lower - 0.01;
+    d = Math.max(minR, Math.min(maxR, d));
+    // law of cosines: angle at hip
+    let cosA = (this.upper * this.upper + d * d - this.lower * this.lower) / (2 * this.upper * d);
+    cosA = Math.max(-1, Math.min(1, cosA));
+    const alpha = Math.acos(cosA);
+    const baseAngle = Math.atan2(dy, dx);
+    const bend = this.poleDir * facing >= 0 ? 1 : -1;
+    const ua = baseAngle + alpha * bend;
+    this.kneeX = hipX + Math.cos(ua) * this.upper;
+    this.kneeY = hipY + Math.sin(ua) * this.upper;
+    // clamp foot if out of reach
+    const ad = Math.hypot(this.footX - hipX, this.footY - hipY);
+    if (ad > maxR) {
+      const s = maxR / ad;
+      this.footX = hipX + (this.footX - hipX) * s;
+      this.footY = hipY + (this.footY - hipY) * s;
+    }
+  }
+}
+// ═══════════════════════════════════════════════════════════
+// Module 3+4: 生物 Rig + 程序化运动
+// ═══════════════════════════════════════════════════════════
+
+class Creature {
+  constructor(solver, grid, x, y) {
+    this.solver = solver;
+    this.grid = grid;
+    this.facing = 1;
+    this.grounded = false;
+    this.coyoteT = 0; this.jumpBufT = 0;
+    // params (tunable via panel)
+    this.moveForce = 45;
+    this.airForce = 12;
+    this.jumpImpulse = 8;
+    this.maxSpeed = 0.18;
+    this.groundDrag = 0.06;
+    this.spineStiff = 0.85;
+    this.tailStiff = 0.35;
+    // build body
+    this.buildBody(x, y);
+    this.buildLegs();
+  }
+  buildBody(x, y) {
+    const s = this.solver;
+    const seg = 0.55;
+    // torso: head(top) chest(mid) hip(bottom) — Y-up world
+    this.head = s.addNode(x, y + seg, 1.0, 0.22);
+    this.head.friction = 0.3;
+    this.chest = s.addNode(x, y, 1.5, 0.28);
+    this.chest.friction = 0.5;
+    this.hip = s.addNode(x, y - seg, 1.2, 0.24);
+    this.hip.friction = 0.5;
+    this.torso = [this.head, this.chest, this.hip];
+    // constraints
+    s.addConstraint(this.head, this.chest, seg, this.spineStiff);
+    s.addConstraint(this.chest, this.hip, seg, this.spineStiff);
+    s.addConstraint(this.head, this.hip, seg * 2 * 0.8, 0.3); // anti-fold
+    // tail (5 nodes, mass decreasing)
+    this.tail = [];
+    let prev = this.hip;
+    for (let i = 0; i < 5; i++) {
+      const t = i / 4;
+      const mass = 0.4 - t * 0.32;
+      const rad = 0.12 - t * 0.08;
+      const n = s.addNode(x, y - seg - 0.35 * (i + 1), mass, rad);
+      n.friction = 0.2;
+      n.gravityScale = 0.8 - t * 0.5;
+      n.collides = false;
+      const stiff = 0.5 - t * 0.3;
+      s.addConstraint(prev, n, 0.35, stiff);
+      this.tail.push(n);
+      prev = n;
+    }
+  }
+  buildLegs() {
+    const ul = 0.5, ll = 0.5;
+    this.legs = [
+      new IKLeg(ul, ll, -0.15, -1), // front-left
+      new IKLeg(ul, ll,  0.15,  1), // front-right
+      new IKLeg(ul, ll, -0.15, -1), // back-left
+      new IKLeg(ul, ll,  0.15,  1), // back-right
+    ];
+  }
+  reset(x, y) {
+    // reset all nodes to spawn
+    const seg = 0.55;
+    const positions = [
+      [x, y + seg], [x, y], [x, y - seg]
+    ];
+    this.torso.forEach((n, i) => {
+      n.x = positions[i][0]; n.y = positions[i][1];
+      n.ox = n.x; n.oy = n.y;
+      n.fx = 0; n.fy = 0;
+    });
+    this.tail.forEach((n, i) => {
+      n.x = x; n.y = y - seg - 0.35 * (i + 1);
+      n.ox = n.x; n.oy = n.y;
+    });
+    this.legs.forEach(l => { l.inited = false; l.stepping = false; });
+    this.facing = 1;
+  }
+  update(input, dt) {
+    // facing
+    if (input.x > 0.1) this.facing = 1;
+    else if (input.x < -0.1) this.facing = -1;
+    // grounded check
+    this.grounded = this.head.grounded || this.chest.grounded || this.hip.grounded;
+    // coyote time + jump buffer
+    if (this.grounded) this.coyoteT = 0.1;
+    else this.coyoteT -= dt;
+    if (input.jump) this.jumpBufT = 0.12;
+    else this.jumpBufT -= dt;
+    // horizontal force
+    if (Math.abs(input.x) > 0.01) {
+      const f = this.grounded ? this.moveForce : this.airForce;
+      this.chest.addForce(input.x * f, 0);
+      this.head.addForce(input.x * f * 0.6, 0);
+      if (!this.grounded) this.hip.addForce(input.x * f * 0.3, 0);
+    }
+    // jump
+    if (this.jumpBufT > 0 && this.coyoteT > 0) {
+      this.jumpBufT = 0; this.coyoteT = 0;
+      this.chest.applyImpulse(0, this.jumpImpulse);
+      this.head.applyImpulse(0, this.jumpImpulse * 0.85);
+      this.hip.applyImpulse(0, this.jumpImpulse * 0.7);
+    }
+    // ground drag (horizontal only)
+    if (this.grounded) {
+      for (const n of this.torso) {
+        const vx = n.vx * (1 - this.groundDrag);
+        n.ox = n.x - vx;
+      }
+    }
+    // speed clamp
+    for (const n of this.torso) {
+      const vx = n.vx;
+      if (Math.abs(vx) > this.maxSpeed) {
+        n.ox = n.x - Math.sign(vx) * this.maxSpeed;
+      }
+    }
+    // IK legs
+    const velX = this.chest.vx, velY = this.chest.vy;
+    this.legs[0].update(this.chest.x, this.chest.y, velX, velY, this.grid, dt, this.facing);
+    this.legs[1].update(this.chest.x, this.chest.y, velX, velY, this.grid, dt, this.facing);
+    this.legs[2].update(this.hip.x, this.hip.y, velX, velY, this.grid, dt, this.facing);
+    this.legs[3].update(this.hip.x, this.hip.y, velX, velY, this.grid, dt, this.facing);
+  }
+}
+// ═══════════════════════════════════════════════════════════
+// 渲染器（Canvas 2D，世界坐标 Y-up → 屏幕 Y-down 翻转）
+// ═══════════════════════════════════════════════════════════
+
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+let showGrid = true;
+const cam = { x: 5, y: 8, zoom: 40 }; // world units, pixels per unit
+
+function resize() {
+  cv.width = cv.clientWidth * devicePixelRatio;
+  cv.height = cv.clientHeight * devicePixelRatio;
+}
+window.addEventListener('resize', resize);
+resize();
+
+function w2s(wx, wy) {
+  // world (Y-up) → screen (Y-down)
+  const sx = (wx - cam.x) * cam.zoom + cv.width / 2;
+  const sy = -(wy - cam.y) * cam.zoom + cv.height / 2;
+  return [sx, sy];
+}
+
+function render(grid, solver, creature) {
+  const W = cv.width, H = cv.height;
+  ctx.fillStyle = '#0a0b0e';
+  ctx.fillRect(0, 0, W, H);
+
+  // grid
+  if (showGrid) {
+    const cs = grid.cs;
+    const x0 = Math.floor((cam.x - W / 2 / cam.zoom) / cs) - 1;
+    const x1 = Math.ceil((cam.x + W / 2 / cam.zoom) / cs) + 1;
+    const y0 = Math.floor((cam.y - H / 2 / cam.zoom) / cs) - 1;
+    const y1 = Math.ceil((cam.y + H / 2 / cam.zoom) / cs) + 1;
+    for (let gx = x0; gx <= x1; gx++) {
+      for (let gy = y0; gy <= y1; gy++) {
+        if (!grid.isSolid(gx, gy)) continue;
+        if (gx < 0 || gx >= grid.w || gy < 0 || gy >= grid.h) {
+          // boundary walls: darker
+          ctx.fillStyle = '#12141a';
+        } else {
+          ctx.fillStyle = '#1c2028';
+        }
+        const [sx, sy] = w2s(gx * cs, (gy + 1) * cs);
+        const size = cs * cam.zoom;
+        ctx.fillRect(sx + 0.5, sy + 0.5, size - 1, size - 1);
+      }
+    }
+    // grid lines (subtle)
+    ctx.strokeStyle = 'rgba(40,50,65,0.3)';
+    ctx.lineWidth = 0.5;
+    for (let gx = x0; gx <= x1; gx++) {
+      const [sx] = w2s(gx * cs, 0);
+      ctx.beginPath(); ctx.moveTo(sx, 0); ctx.lineTo(sx, H); ctx.stroke();
+    }
+    for (let gy = y0; gy <= y1; gy++) {
+      const [, sy] = w2s(0, gy * cs);
+      ctx.beginPath(); ctx.moveTo(0, sy); ctx.lineTo(W, sy); ctx.stroke();
+    }
+  }
+
+  // constraints (color by tension)
+  for (const c of solver.constraints) {
+    const [ax, ay] = w2s(c.a.x, c.a.y);
+    const [bx, by] = w2s(c.b.x, c.b.y);
+    const t = c.tension;
+    if (t < 1.05) ctx.strokeStyle = 'rgba(80,220,100,0.6)';
+    else if (t < 1.3) ctx.strokeStyle = 'rgba(230,220,60,0.7)';
+    else ctx.strokeStyle = 'rgba(240,60,40,0.8)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.stroke();
+  }
+
+  // IK legs
+  ctx.lineWidth = 2;
+  for (let i = 0; i < creature.legs.length; i++) {
+    const leg = creature.legs[i];
+    const hip = i < 2 ? creature.chest : creature.hip;
+    const [hx, hy] = w2s(hip.x, hip.y);
+    const [kx, ky] = w2s(leg.kneeX, leg.kneeY);
+    const [fx, fy] = w2s(leg.footX, leg.footY);
+    ctx.strokeStyle = 'rgba(180,190,210,0.7)';
+    ctx.beginPath(); ctx.moveTo(hx, hy); ctx.lineTo(kx, ky); ctx.lineTo(fx, fy); ctx.stroke();
+    // joints
+    ctx.fillStyle = '#f59e0b';
+    ctx.beginPath(); ctx.arc(kx, ky, 3, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#e2e8f0';
+    ctx.beginPath(); ctx.arc(fx, fy, 3.5, 0, Math.PI * 2); ctx.fill();
+  }
+
+  // tail nodes
+  for (let i = 0; i < creature.tail.length; i++) {
+    const n = creature.tail[i];
+    const [sx, sy] = w2s(n.x, n.y);
+    const t = i / 4;
+    const r = Math.max(n.radius * cam.zoom, 3);
+    ctx.fillStyle = `rgba(${60 + t * 20}, ${130 - t * 60}, ${240 - t * 80}, 0.9)`;
+    ctx.beginPath(); ctx.arc(sx, sy, r, 0, Math.PI * 2); ctx.fill();
+  }
+
+  // torso nodes
+  const torsoColors = ['#ef4444', '#f97316', '#eab308']; // head, chest, hip
+  const torsoNames = ['HEAD', 'CHEST', 'HIP'];
+  creature.torso.forEach((n, i) => {
+    const [sx, sy] = w2s(n.x, n.y);
+    const r = n.radius * cam.zoom;
+    // glow if grounded
+    if (n.grounded) {
+      ctx.fillStyle = 'rgba(163,230,53,0.15)';
+      ctx.beginPath(); ctx.arc(sx, sy, r + 6, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.fillStyle = torsoColors[i];
+    ctx.beginPath(); ctx.arc(sx, sy, r, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  });
+
+  // facing indicator
+  const [hx, hy] = w2s(creature.head.x, creature.head.y);
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(hx, hy);
+  ctx.lineTo(hx + creature.facing * 16, hy);
+  ctx.stroke();
+
+  // velocity vector (chest)
+  const [cx2, cy2] = w2s(creature.chest.x, creature.chest.y);
+  const vscale = 60;
+  ctx.strokeStyle = 'rgba(255,255,255,0.4)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(cx2, cy2);
+  ctx.lineTo(cx2 + creature.chest.vx * vscale, cy2 - creature.chest.vy * vscale);
+  ctx.stroke();
+}
+// ═══════════════════════════════════════════════════════════
+// 主循环 + 输入 + 参数面板
+// ═══════════════════════════════════════════════════════════
+
+const grid = GridWorld.createTestLevel();
+const solver = new VerletSolver(grid);
+const creature = new Creature(solver, grid, 5, 8);
+
+// input state
+const keys = {};
+window.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (e.code === 'KeyR') creature.reset(5, 8);
+  if (e.code === 'KeyG') showGrid = !showGrid;
+  if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code))
+    e.preventDefault();
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+function getInput() {
+  let x = 0;
+  if (keys['KeyA'] || keys['ArrowLeft']) x -= 1;
+  if (keys['KeyD'] || keys['ArrowRight']) x += 1;
+  const jump = !!(keys['Space'] || keys['KeyW'] || keys['ArrowUp']);
+  return { x, jump };
+}
+
+// parameter panel bindings
+function bindSlider(id, valId, setter, fmt) {
+  const el = document.getElementById(id);
+  const vel = document.getElementById(valId);
+  el.addEventListener('input', () => {
+    const v = parseFloat(el.value);
+    setter(v);
+    vel.textContent = fmt ? fmt(v) : v;
+  });
+}
+bindSlider('p_iter', 'v_iter', v => solver.iterations = v);
+bindSlider('p_damp', 'v_damp', v => solver.damping = v / 100, v => '.' + String(v).padStart(2, '0'));
+bindSlider('p_grav', 'v_grav', v => solver.gravity = -v, v => '-' + v);
+bindSlider('p_move', 'v_move', v => creature.moveForce = v);
+bindSlider('p_air', 'v_air', v => creature.airForce = v);
+bindSlider('p_jump', 'v_jump', v => creature.jumpImpulse = v);
+bindSlider('p_spd', 'v_spd', v => creature.maxSpeed = v / 100, v => '.' + String(v).padStart(2, '0'));
+bindSlider('p_stiff', 'v_stiff', v => {
+  creature.spineStiff = v / 100;
+  solver.constraints[0].stiffness = v / 100;
+  solver.constraints[1].stiffness = v / 100;
+}, v => '.' + String(v).padStart(2, '0'));
+bindSlider('p_tail', 'v_tail', v => {
+  creature.tailStiff = v / 100;
+  for (let i = 3; i < solver.constraints.length; i++)
+    solver.constraints[i].stiffness = v / 100;
+}, v => '.' + String(v).padStart(2, '0'));
+bindSlider('p_step', 'v_step', v => {
+  creature.legs.forEach(l => l.stepThresh = v / 100);
+}, v => '.' + String(v).padStart(2, '0'));
+bindSlider('p_stepspeed', 'v_stepspeed', v => {
+  creature.legs.forEach(l => l.stepDur = v / 100);
+}, v => '.' + String(v).padStart(2, '0'));
+
+// HUD
+const hud = document.getElementById('hud');
+let frameCount = 0, fps = 0, lastFpsTime = performance.now();
+
+function updateHUD() {
+  frameCount++;
+  const now = performance.now();
+  if (now - lastFpsTime > 500) {
+    fps = Math.round(frameCount / ((now - lastFpsTime) / 1000));
+    frameCount = 0; lastFpsTime = now;
+  }
+  const c = creature;
+  const state = c.grounded ? '<span class="val">GROUNDED</span>' : '<span class="warn">AIRBORNE</span>';
+  hud.innerHTML =
+    `<div class="title">VERLET CREATURE // PHASE-1</div>` +
+    `POS <span class="val">(${c.chest.x.toFixed(2)}, ${c.chest.y.toFixed(2)})</span><br>` +
+    `VEL <span class="val">(${c.chest.vx.toFixed(4)}, ${c.chest.vy.toFixed(4)})</span><br>` +
+    `STATE ${state} | FACE ${c.facing > 0 ? '&rarr;' : '&larr;'}<br>` +
+    `NODES <span class="val">${solver.nodes.length}</span> | CONSTRAINTS <span class="val">${solver.constraints.length}</span> | ITER <span class="val">${solver.iterations}</span><br>` +
+    `FPS <span class="val">${fps}</span> | DT 0.020s`;
+}
+
+// main loop (fixed timestep accumulator)
+const DT = 0.02; // 50Hz physics
+let accumulator = 0, lastTime = performance.now();
+
+function loop(now) {
+  requestAnimationFrame(loop);
+  let frameDt = (now - lastTime) / 1000;
+  lastTime = now;
+  if (frameDt > 0.1) frameDt = 0.1; // clamp spiral of death
+  accumulator += frameDt;
+
+  const input = getInput();
+
+  while (accumulator >= DT) {
+    creature.update(input, DT);
+    solver.step(DT);
+    accumulator -= DT;
+  }
+
+  // camera follow (smooth)
+  const tx = creature.chest.x, ty = creature.chest.y;
+  cam.x += (tx - cam.x) * 0.06;
+  cam.y += (ty - cam.y) * 0.06;
+
+  render(grid, solver, creature);
+  updateHUD();
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

