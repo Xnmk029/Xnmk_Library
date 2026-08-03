@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VOXEL TEARDOWN — 微缩城市沙盘</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #0e1116; }
+  #app { position: fixed; inset: 0; }
+  canvas { display: block; }
+  .hud {
+    position: fixed; left: 18px; top: 16px; z-index: 10; pointer-events: none;
+    font-family: "Consolas", "Sarasa Mono SC", monospace; color: #e8eaee;
+    text-shadow: 0 1px 4px rgba(0,0,0,.6);
+  }
+  .hud h1 { margin: 0 0 4px; font-size: 15px; letter-spacing: 3px; font-weight: 700; }
+  .hud h1 span { color: #ffb14d; }
+  .hud p { margin: 2px 0; font-size: 11px; color: #aab2c0; letter-spacing: 1px; }
+  .vignette {
+    position: fixed; inset: 0; pointer-events: none; z-index: 5;
+    background: radial-gradient(ellipse at center, transparent 55%, rgba(10,12,18,.42) 100%);
+  }
+  #loader {
+    position: fixed; inset: 0; z-index: 20; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 14px;
+    font-family: "Consolas", "Sarasa Mono SC", monospace; color: #cfd6e2;
+    background: #0e1116; transition: opacity .6s;
+  }
+  #loader .bar { width: 220px; height: 3px; background: #2a3140; overflow: hidden; border-radius: 2px; }
+  #loader .bar i { display: block; width: 40%; height: 100%; background: #ffb14d;
+    animation: slide 1.1s ease-in-out infinite; }
+  @keyframes slide { 0% { transform: translateX(-100%);} 100% { transform: translateX(300%);} }
+  #fatal {
+    position: fixed; inset: 0; z-index: 30; display: none; padding: 40px;
+    font-family: "Consolas", "Sarasa Mono SC", monospace; color: #ffd7d7;
+    background: rgba(14,17,22,.96); white-space: pre-wrap; line-height: 1.7; font-size: 13px;
+  }
+</style>
+<script>
+  /* 错误可视化：任何异常直接显示在屏幕上，避免"静默黑屏" */
+  window.__showFatal = function (msg) {
+    var d = document.getElementById('fatal');
+    if (!d) return;
+    d.style.display = 'block';
+    d.textContent = '【初始化失败】\n' + msg + '\n\n可能原因：\n' +
+      '1. 当前网络无法访问 CDN（unpkg / jsdelivr / npmmirror），请检查网络或代理；\n' +
+      '2. 浏览器过旧（需支持 WebGL2 与 ES Module，建议 Chrome / Edge 最新版）；\n' +
+      '3. 显卡驱动不支持 WebGL。';
+    var l = document.getElementById('loader');
+    if (l) l.style.display = 'none';
+  };
+  window.addEventListener('error', function (e) {
+    window.__showFatal((e && (e.message || (e.error && e.error.message))) || '脚本加载/执行错误');
+  });
+  window.addEventListener('unhandledrejection', function (e) {
+    window.__showFatal((e.reason && (e.reason.message || String(e.reason))) || '模块加载失败');
+  });
+</script>
+<script>
+  /* CDN 多源异步探测（非阻塞）：unpkg / jsdelivr / npmmirror（国内可用）。
+     探测成功后动态注入 importmap；全部失败则在屏幕上显示原因，不再静默黑屏 */
+  window.__CDN_READY = (function () {
+    var cdns = [
+      'https://unpkg.com/three@0.160.0',
+      'https://cdn.jsdelivr.net/npm/three@0.160.0',
+      'https://registry.npmmirror.com/three/0.160.0/files'
+    ];
+    function probe(url) {
+      var ctrl = new AbortController();
+      var timer = setTimeout(function () { ctrl.abort(); }, 6000);
+      return fetch(url, { method: 'HEAD', mode: 'cors', signal: ctrl.signal })
+        .then(function (r) { return r.ok; })
+        .catch(function () { return false; })
+        .finally(function () { clearTimeout(timer); });
+    }
+    return (async function () {
+      for (var i = 0; i < cdns.length; i++) {
+        if (await probe(cdns[i] + '/build/three.module.js')) {
+          window.__CDN__ = cdns[i];
+          var im = document.createElement('script');
+          im.type = 'importmap';
+          im.textContent = JSON.stringify({
+            imports: {
+              'three': cdns[i] + '/build/three.module.js',
+              'three/addons/': cdns[i] + '/examples/jsm/'
+            }
+          });
+          document.head.appendChild(im);
+          return cdns[i];
+        }
+      }
+      throw new Error('所有 CDN 均不可达（unpkg / jsdelivr / npmmirror）');
+    })();
+  })();
+  window.__CDN_READY.catch(function (e) { window.__showFatal(e.message); });
+</script>
+</head>
+<body>
+<div id="app"></div>
+<div class="vignette"></div>
+<div id="loader"><div>正在从 CDN 加载 three.js …</div><div class="bar"><i></i></div></div>
+<div id="fatal"></div>
+<div class="hud">
+  <h1>VOXEL <span>TEARDOWN</span></h1>
+  <p>微缩城市沙盘 · Micro-Voxel Diorama</p>
+  <p>左键旋转 · 滚轮缩放 · 右键平移</p>
+</div>
+
+<script type="module">
+/* 动态加载：等 CDN 探测完成并注入 importmap 后再 import，
+   任何一步失败都会在页面上显示具体原因 */
+let THREE;
+let OrbitControls, EffectComposer, RenderPass, SSAOPass, BokehPass, OutputPass;
+try {
+  await window.__CDN_READY;
+  THREE = await import('three');
+  ({ OrbitControls } = await import('three/addons/controls/OrbitControls.js'));
+  ({ EffectComposer } = await import('three/addons/postprocessing/EffectComposer.js'));
+  ({ RenderPass } = await import('three/addons/postprocessing/RenderPass.js'));
+  ({ SSAOPass } = await import('three/addons/postprocessing/SSAOPass.js'));
+  ({ BokehPass } = await import('three/addons/postprocessing/BokehPass.js'));
+  ({ OutputPass } = await import('three/addons/postprocessing/OutputPass.js'));
+} catch (err) {
+  window.__showFatal('three.js 加载失败：' + ((err && err.message) || err));
+  throw err;
+}
+
+/* ============================================================
+ * 0. 基础：渲染器 / 场景 / 相机 / 轨道控制
+ *    物理正确光照 + ACES 电影级色调映射 + PCFSoft 软阴影
+ * ============================================================ */
+const dbgParams = new URLSearchParams(location.search);
+const renderer = new THREE.WebGLRenderer({
+  antialias: true, powerPreference: 'high-performance',
+  preserveDrawingBuffer: dbgParams.has('dbg')   // 调试模式：允许 readPixels 回读画面
+});
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;      // 锐利但边缘微柔的软阴影
+renderer.toneMapping = THREE.ACESFilmicToneMapping;    // 电影级色调映射
+renderer.toneMappingExposure = 1.12;
+document.getElementById('app').appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+
+const camera = new THREE.PerspectiveCamera(42, window.innerWidth / window.innerHeight, 1, 600);
+// 初始 45° 俯视等轴测视角：水平距离 ≈ 垂直高度
+const TARGET = new THREE.Vector3(0, 2.5, 0);
+camera.position.set(44, 46, 44);
+camera.lookAt(TARGET);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.copy(TARGET);
+controls.enableDamping = true;
+controls.dampingFactor = 0.06;
+controls.minDistance = 14;
+controls.maxDistance = 170;
+controls.maxPolarAngle = Math.PI * 0.49;
+
+/* ============================================================
+ * 1. 程序化"像素风"天空盒（不依赖任何外部贴图文件）
+ *    色带渐变 + 方块云 + 太阳辉光，NearestFilter 保留像素颗粒
+ * ============================================================ */
+function mulberry32(seed) {
+  return function () {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+const rnd = mulberry32(20260804);
+
+function makePixelSky() {
+  const W = 256, H = 128;
+  const cv = document.createElement('canvas');
+  cv.width = W; cv.height = H;
+  const g = cv.getContext('2d');
+  // 色带渐变（离散化 => 像素画质感），v=0.5 为地平线
+  const bands = [
+    [0.00, '#16264d'], [0.16, '#27457f'], [0.30, '#4a76b8'],
+    [0.40, '#86aede'], [0.47, '#cfd9e6'], [0.50, '#ffdfae'],
+    [0.55, '#d8b98c'], [0.70, '#8c7a63'], [1.00, '#54483c']
+  ];
+  const rows = 32;
+  for (let r = 0; r < rows; r++) {
+    const v0 = r / rows, v1 = (r + 1) / rows, vm = (v0 + v1) / 2;
+    let c0 = bands[0][1], c1 = bands[bands.length - 1][1];
+    for (let i = 0; i < bands.length - 1; i++) {
+      if (vm >= bands[i][0] && vm <= bands[i + 1][0]) {
+        c0 = new THREE.Color(bands[i][1]);
+        c1 = new THREE.Color(bands[i + 1][1]);
+        const k = (vm - bands[i][0]) / (bands[i + 1][0] - bands[i][0]);
+        c0.lerp(c1, k);
+        c0 = '#' + c0.getHexString();
+        break;
+      }
+    }
+    g.fillStyle = c0;
+    g.fillRect(0, Math.floor(v0 * H), W, Math.ceil((v1 - v0) * H) + 1);
+  }
+  // 方块云（只出现在地平线上方）
+  for (let i = 0; i < 46; i++) {
+    const cx = rnd() * W, cy = H * (0.12 + rnd() * 0.30);
+    const cw = 5 + rnd() * 14, ch = 3 + rnd() * 4;
+    const a = 0.35 + rnd() * 0.5;
+    g.fillStyle = `rgba(${235 + (rnd() * 20 | 0)},${238 + (rnd() * 15 | 0)},250,${a})`;
+    g.fillRect(cx | 0, cy | 0, cw | 0, ch | 0);
+    if (rnd() > 0.5) g.fillRect((cx + cw * 0.3) | 0, (cy - ch) | 0, (cw * 0.55) | 0, ch | 0);
+  }
+  // 太阳辉光（方块化同心层，与平行光方向大致一致）
+  const sx = 205, sy = H * 0.30;
+  const glow = [[26, 'rgba(255,196,120,0.16)'], [18, 'rgba(255,214,150,0.22)'], [11, 'rgba(255,232,180,0.5)'], [6, 'rgba(255,246,214,0.95)']];
+  for (const [s, c] of glow) { g.fillStyle = c; g.fillRect((sx - s / 2) | 0, (sy - s / 2) | 0, s, s); }
+
+  const tex = new THREE.CanvasTexture(cv);
+  tex.mapping = THREE.EquirectangularReflectionMapping;
+  tex.magFilter = THREE.NearestFilter;   // 保持像素硬边缘
+  tex.minFilter = THREE.LinearFilter;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+const skyTex = makePixelSky();
+scene.background = skyTex;
+
+// 用天空生成 PMREM 环境反射（金属/玻璃的真实反射来源）
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromEquirectangular(skyTex).texture;
+pmrem.dispose();
+
+/* ============================================================
+ * 2. 影棚级光照：强平行光（高分辨率软阴影）+ 半球天光
+ * ============================================================ */
+const sun = new THREE.DirectionalLight(0xfff1dc, 3.2);
+sun.position.set(60, 90, 40);
+sun.castShadow = true;
+sun.shadow.mapSize.set(4096, 4096);      // 高分辨率阴影贴图
+sun.shadow.camera.near = 20;
+sun.shadow.camera.far = 260;
+sun.shadow.camera.left = -42;
+sun.shadow.camera.right = 42;
+sun.shadow.camera.top = 42;
+sun.shadow.camera.bottom = -42;
+sun.shadow.bias = -0.0004;
+sun.shadow.normalBias = 0.03;
+scene.add(sun);
+scene.add(sun.target);
+
+const hemi = new THREE.HemisphereLight(0xbcd4f5, 0x8a7a66, 0.55); // 天光
+scene.add(hemi);
+
+/* ============================================================
+ * 3. 材质体系：每种物理属性一档材质，全部共用一个 BoxGeometry
+ *    依靠 InstancedMesh + instanceColor 区分颜色
+ * ============================================================ */
+const MATS = {
+  concrete: new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.92, metalness: 0.0 }),
+  brick:    new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.96, metalness: 0.0 }),
+  wood:     new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.82, metalness: 0.0 }),
+  asphalt:  new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.98, metalness: 0.0 }),
+  foliage:  new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.90, metalness: 0.0 }),
+  dark:     new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.70, metalness: 0.05 }),
+  metal:    new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.25, metalness: 1.0 }), // 高金属低粗糙
+  rust:     new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.55, metalness: 0.85 }),
+  glass:    new THREE.MeshPhysicalMaterial({                                                     // 透射 + 折射
+              color: 0xffffff, roughness: 0.06, metalness: 0.0,
+              transmission: 1.0, ior: 1.5, thickness: 1.3, specularIntensity: 1.0
+            }),
+  water:    new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.14, metalness: 0.0,
+              transparent: true, opacity: 0.88 }),
+  glowWarm: new THREE.MeshStandardMaterial({ color: 0x3a2c12, emissive: 0xffcf7d, emissiveIntensity: 3.0 }),
+  glowCool: new THREE.MeshStandardMaterial({ color: 0x101c26, emissive: 0xbfe8ff, emissiveIntensity: 3.0 })
+};
+
+const VOXEL = new THREE.BoxGeometry(1, 1, 1);
+const buckets = new Map();   // 材质名 -> 实例数组
+function vox(matKey, x, y, z, color, sx = 1, sy = 1, sz = 1) {
+  if (!buckets.has(matKey)) buckets.set(matKey, []);
+  buckets.get(matKey).push({ x, y, z, c: color, sx, sy, sz });
+}
+function jit(hex, amt = 0.05) { // 明度抖动，让纯色体素也有"材质呼吸感"
+  const c = new THREE.Color(hex);
+  c.offsetHSL(0, (rnd() - 0.5) * 0.02, (rnd() - 0.5) * amt);
+  return c;
+}
+
+/* ============================================================
+ * 4. 城市生成逻辑（40×40 体素沙盘，循环 + 条件自动生成）
+ * ============================================================ */
+const N = 40;
+const city = new THREE.Group();
+city.position.set(-N / 2, 0, -N / 2);
+scene.add(city);
+
+const isRoadV = (x) => x >= 17 && x <= 20;            // 纵向道路 x=17..20
+const isRoadH = (z) => z >= 12 && z <= 15;            // 横向道路 z=12..15
+const isRiver = (x, z) => z >= 30 && z <= 35;         // 河流带 z=30..35
+const isBridge = (x, z) => isRiver(x, z) && isRoadV(x); // 桥面 = 跨河的纵向道路
+
+/* --- 4.1 地基层（灰白混凝土 / 沥青路 / 人行道 / 河道 / 水面） --- */
+const riverRecs = []; // 水面动画数据
+for (let x = 0; x < N; x++) {
+  for (let z = 0; z < N; z++) {
+    const road = isRoadV(x) || isRoadH(z);
+    if (isRiver(x, z) && !isBridge(x, z)) {
+      // 河道：下挖一层做河床，水面略低于地面并参与波动动画
+      vox('dark', x, -1, z, jit(0x3a4048, 0.06));
+      const rec = { x, z, phase: rnd() * Math.PI * 2 };
+      riverRecs.push(rec);
+      vox('water', x, -0.38, z, jit(0x3f7fd9, 0.12));
+      continue;
+    }
+    if (isBridge(x, z)) { vox('concrete', x, 0, z, jit(0xb9b4ac, 0.04)); continue; } // 桥面板
+    if (road) { vox('asphalt', x, 0, z, jit(0x3c3f45, 0.08)); continue; }
+    // 紧邻道路 → 人行道（更亮一档）
+    const nearRoad = isRoadV(x - 1) || isRoadV(x + 1) || isRoadH(z - 1) || isRoadH(z + 1);
+    vox('concrete', x, 0, z, jit(nearRoad ? 0xd6d1c8 : 0xc4bfb6, 0.05));
+  }
+}
+// 河床两侧补一层暗色护岸
+for (let x = 0; x < N; x++) { vox('dark', x, -1, 29, jit(0x565b63, 0.05)); vox('dark', x, -1, 36, jit(0x565b63, 0.05)); }
+
+// 路面白色虚线标线（压扁的薄片体素）
+for (let i = 1; i < N - 1; i += 3) {
+  if (!isRiver(18, i) || isBridge(18, i)) vox('concrete', 18.5, 1, i + 0.5, 0xf2efe6, 0.5, 0.08, 1.4);
+  if (i !== 18 && i !== 19) vox('concrete', i + 0.5, 1, 13.5, 0xf2efe6, 1.4, 0.08, 0.5);
+}
+
+/* --- 4.2 半毁的红砖墙（锯齿断口 + 瓦砾） --- */
+for (let x = 0; x < 10; x++) {
+  // 左半完整（高 6），右半被"拆掉一半"，断口按噪声锯齿化
+  const broken = x >= 5;
+  const hMax = broken ? Math.max(1, Math.round(6 - (x - 5) * 1.15 + (rnd() - 0.5) * 2)) : 6;
+  for (let y = 1; y <= hMax; y++) {
+    if (broken && y === hMax && rnd() > 0.5) continue; // 顶排随机崩缺
+    vox('brick', 3 + x, y, 4, jit(0xb5502f, 0.10));
+  }
+  if (broken && rnd() > 0.35) vox('brick', 3 + x, 1, 5 + (rnd() * 2 | 0), jit(0xa04828, 0.12)); // 瓦砾
+}
+
+/* --- 4.3 散落的金属管道（银色 + 锈色混拼） --- */
+function pipe(x0, z0, len, axis) {
+  for (let i = 0; i < len; i++) {
+    const rusted = rnd() > 0.62;
+    const x = axis === 'x' ? x0 + i : x0;
+    const z = axis === 'x' ? z0 : z0 + i;
+    vox(rusted ? 'rust' : 'metal', x, 1, z, jit(rusted ? 0x8a5a33 : 0xc8ccd2, 0.07));
+  }
+}
+pipe(3, 7, 7, 'x');                    // 长管
+vox('metal', 9, 2, 7, 0xc8ccd2);       // 端头立起的弯头
+vox('metal', 9, 3, 7, jit(0xbfc4ca, 0.06));
+pipe(12, 8, 4, 'x');                   // 短管
+pipe(13, 6, 3, 'z');                   // 垂直走向
+// 堆叠管垛（底 3 上 1）
+for (let i = 0; i < 3; i++) { const r0 = rnd() > 0.6; vox(r0 ? 'rust' : 'metal', 11 + i, 1, 10, jit(r0 ? 0x84552f : 0xcdd1d6, 0.07)); }
+vox('metal', 12, 2, 10, jit(0xc4c8ce, 0.07));
+
+/* --- 4.4 中央玻璃装置（半透明玻璃窗 + 发光核心，沙盘视觉焦点） --- */
+for (let z = 19; z <= 23; z++) for (let y = 1; y <= 4; y++) {
+  vox('glass', 26, y, z, jit(0x9fd8e8, 0.05));
+}
+for (let y = 1; y <= 3; y++) vox('glowCool', 28, y, 21, 0xbfe8ff);       // 发光核心柱
+vox('metal', 28, 0, 21, 0x55595f); vox('metal', 26, 0, 19, 0x55595f); vox('metal', 26, 0, 23, 0x55595f);
+
+/* --- 4.5 建筑群 --- */
+// 通用空心建筑外壳：墙面带规则开窗
+function building(x0, z0, w, d, h, wallMat, wallHex, winMat, winHex, roofMat, roofHex) {
+  for (let y = 1; y <= h; y++) {
+    for (let x = x0; x < x0 + w; x++) for (let z = z0; z < z0 + d; z++) {
+      const edgeX = x === x0 || x === x0 + w - 1;
+      const edgeZ = z === z0 || z === z0 + d - 1;
+      if (!edgeX && !edgeZ) continue;                     // 只砌外墙
+      const t = edgeX ? z - z0 : x - x0;                  // 沿墙面的横向坐标
+      const isWin = (t % 3 === 1) && (y % 3 === 2) && y > 1 && y < h; // 规律开窗
+      if (isWin) vox(winMat, x, y, z, jit(winHex, 0.05));
+      else vox(wallMat, x, y, z, jit(wallHex, 0.07));
+    }
+  }
+  for (let x = x0; x < x0 + w; x++) for (let z = z0; z < z0 + d; z++)
+    vox(roofMat, x, h + 1, z, jit(roofHex, 0.05));        // 屋顶板
+}
+// 混凝土高层（玻璃幕墙窗）
+building(26, 3, 8, 7, 12, 'concrete', 0xb8b2a8, 'glass', 0x8fd0e4, 'dark', 0x6d6a66);
+vox('metal', 28, 14, 5, jit(0xc4c8ce, 0.05)); vox('metal', 30, 14, 7, jit(0xb7bcc2, 0.05)); // 屋顶设备
+vox('glowCool', 31, 14, 4, 0xbfe8ff);
+// 红砖楼（暗窗）
+building(3, 18, 7, 7, 7, 'brick', 0xb0512e, 'dark', 0x232a33, 'wood', 0x8a5c34);
+// 金属厂房（掺锈斑）
+for (let x = 12; x <= 16; x++) for (let z = 20; z <= 26; z++) {
+  const edgeX = x === 12 || x === 16, edgeZ = z === 20 || z === 26;
+  if (!edgeX && !edgeZ) continue;
+  for (let y = 1; y <= 4; y++) {
+    const r = rnd() > 0.82;
+    vox(r ? 'rust' : 'metal', x, y, z, jit(r ? 0x8a5a33 : 0xb9bec5, 0.06));
+  }
+}
+for (let x = 12; x <= 16; x++) for (let z = 20; z <= 26; z++) vox('metal', x, 5, z, jit(0xa9aeb5, 0.05));
+// 木屋（阶梯式屋顶）
+for (let x = 32; x <= 36; x++) for (let z = 24; z <= 27; z++) {
+  const edge = x === 32 || x === 36 || z === 24 || z === 27;
+  if (edge) for (let y = 1; y <= 3; y++) vox('wood', x, y, z, jit(0x9a6a3f, 0.08));
+}
+vox('dark', 34, 1, 27, 0x2c2620); // 门
+for (let i = 0; i < 3; i++) {     // 收缩的木屋顶
+  for (let x = 32 + i; x <= 36 - i; x++) for (let z = 24 + (i > 1 ? 1 : 0); z <= 27 - (i > 1 ? 1 : 0); z++)
+    vox('wood', x, 4 + i, z, jit(0x7c5530, 0.08));
+}
+
+/* --- 4.6 桥梁栏杆 / 路灯 / 行道树 / 汽车 --- */
+for (let z = 29; z <= 36; z++) { vox('metal', 17, 1, z, jit(0xc0c5cb, 0.06)); vox('metal', 20, 1, z, jit(0xc0c5cb, 0.06)); }
+function lamp(x, z) {
+  for (let y = 1; y <= 3; y++) vox('metal', x, y, z, jit(0x9ba0a7, 0.05));
+  vox('glowWarm', x, 4, z, 0xffd27a);
+}
+lamp(16, 11); lamp(21, 11); lamp(16, 16); lamp(21, 16); lamp(24, 18); lamp(30, 24);
+function tree(x, z) {
+  for (let y = 1; y <= 2; y++) vox('wood', x, y, z, jit(0x6e4a28, 0.08));
+  for (let dx = -1; dx <= 1; dx++) for (let dz = -1; dz <= 1; dz++) for (let dy = 0; dy <= 1; dy++) {
+    if (dy === 1 && Math.abs(dx) + Math.abs(dz) > 1) continue;
+    if (rnd() > 0.12) vox('foliage', x + dx, 3 + dy, z + dz, jit(0x4f8f3a, 0.14));
+  }
+}
+tree(5, 37); tree(13, 38); tree(24, 37); tree(33, 38); tree(38, 8); tree(2, 26);
+function car(x, z, axis, hex) {
+  const body = jit(hex, 0.04);
+  for (let i = 0; i < 3; i++) {
+    const bx = axis === 'x' ? x + i : x;
+    const bz = axis === 'x' ? z : z + i;
+    vox('metal', bx, 1, bz, body);
+  }
+  vox('glass', axis === 'x' ? x + 1 : x, 2, axis === 'x' ? z : z + 1, 0x9fd8e8); // 座舱玻璃
+}
+car(24, 13, 'x', 0xc0392b); car(30, 14, 'x', 0xd8d5cf); car(18, 22, 'z', 0x2e6f9e);
+
+// 南侧河岸绿化带
+for (let z = 37; z <= 38; z++) for (let x = 18; x <= 21; x += 3) vox('foliage', x, 1, z, jit(0x57963f, 0.16), 1, 0.55, 1);
+
+/* --- 4.7 实心台座 + 地基裙边（沙盘的明确边界） --- */
+const pedestal = new THREE.Mesh(
+  new THREE.BoxGeometry(N + 7, 5.2, N + 7),
+  new THREE.MeshStandardMaterial({ color: 0x23262b, roughness: 0.6, metalness: 0.1 })
+);
+pedestal.position.set(0, -2.65, 0);
+pedestal.castShadow = pedestal.receiveShadow = true;
+scene.add(pedestal);
+const trim = new THREE.Mesh( // 台座金属包边
+  new THREE.BoxGeometry(N + 7.8, 0.5, N + 7.8),
+  new THREE.MeshStandardMaterial({ color: 0xb08d57, roughness: 0.3, metalness: 1.0 })
+);
+trim.position.set(0, -0.15, 0);
+trim.castShadow = trim.receiveShadow = true;
+scene.add(trim);
+for (let x = 0; x < N; x++) for (let z = 0; z < N; z++) { // 混凝土基座外露裙边
+  if (x === 0 || x === N - 1 || z === 0 || z === N - 1) vox('concrete', x, -1, z, jit(0x938e86, 0.05));
+}
+
+/* ============================================================
+ * 5. 实例化合批：所有体素按材质分桶 -> InstancedMesh
+ *    上万个体素仅占用十余个 draw call
+ * ============================================================ */
+const dummy = new THREE.Object3D();
+const waterMeshData = [];
+for (const [key, list] of buckets) {
+  const mesh = new THREE.InstancedMesh(VOXEL, MATS[key], list.length);
+  list.forEach((v, i) => {
+    dummy.position.set(v.x + 0.5 * v.sx, v.y + 0.5 * v.sy, v.z + 0.5 * v.sz);
+    dummy.scale.set(v.sx, v.sy, v.sz);
+    dummy.rotation.set(0, 0, 0);
+    dummy.updateMatrix();
+    mesh.setMatrixAt(i, dummy.matrix);
+    if (v.c !== null && v.c !== undefined && MATS[key].color) mesh.setColorAt(i, v.c instanceof THREE.Color ? v.c : new THREE.Color(v.c));
+  });
+  mesh.instanceMatrix.needsUpdate = true;
+  if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  if (key === 'water') waterMeshData.push({ mesh, list });
+  city.add(mesh);
+}
+
+/* ============================================================
+ * 6. 电影级后处理管线：SSAO -> 移轴景深(DOF) -> 输出
+ *    ?pass=raw|ssao|bokeh|full 可分层排查（默认 full）
+ * ============================================================ */
+const passMode = dbgParams.get('pass') || 'full';
+const composer = new EffectComposer(renderer);
+composer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+composer.setSize(window.innerWidth, window.innerHeight);
+
+// 关键：r160 的 SSAOPass 默认输出是从 readBuffer 拷贝 beauty 再乘遮蔽系数，
+// 因此必须由 RenderPass 先行提供底图，否则输出全黑
+composer.addPass(new RenderPass(scene, camera));
+
+// 屏幕空间环境光遮蔽：体素夹角处的浓重接触阴影，消除"塑料感"
+let ssao = null, bokeh = null;
+if (passMode !== 'raw') {
+  ssao = new SSAOPass(scene, camera, window.innerWidth, window.innerHeight);
+  ssao.kernelRadius = 8;
+  ssao.minDistance = 0.0012;
+  ssao.maxDistance = 0.12;
+  ssao.output = SSAOPass.OUTPUT.Default;
+  composer.addPass(ssao);
+}
+
+// 景深：焦点锁定沙盘中心，强化的"移轴"微缩镜头感
+if (passMode !== 'ssao' && passMode !== 'raw') {
+  bokeh = new BokehPass(scene, camera, {
+    focus: camera.position.distanceTo(TARGET),
+    aperture: 7.5e-5,   // 大光圈 => 强移轴感
+    maxblur: 0.012
+  });
+  composer.addPass(bokeh);
+}
+composer.addPass(new OutputPass());
+
+if (dbgParams.has('dbg')) window.__dbg = { renderer, scene, camera, composer, ssao, bokeh, SSAOPass, THREE };
+
+/* ============================================================
+ * 7. 主循环：水面波动 / 灯光呼吸 / 焦点跟随
+ * ============================================================ */
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  composer.setSize(window.innerWidth, window.innerHeight);
+});
+
+const clock = new THREE.Clock();
+let firstFrame = true;
+function animate() {
+  requestAnimationFrame(animate);
+  if (firstFrame) { // 首帧成功渲染 => 隐藏加载层
+    firstFrame = false;
+    const l = document.getElementById('loader');
+    if (l) { l.style.opacity = '0'; setTimeout(() => l.remove(), 700); }
+  }
+  const t = clock.getElapsedTime();
+
+  // 河流表面体素起伏
+  for (const { mesh, list } of waterMeshData) {
+    for (let i = 0; i < list.length; i++) {
+      const v = list[i];
+      dummy.position.set(v.x + 0.5, v.y + 0.5 + Math.sin(t * 1.8 + v.x * 0.7 + (riverRecs[i]?.phase ?? 0)) * 0.07 + 0.0, v.z + 0.5);
+      dummy.scale.set(1, 1, 1);
+      dummy.updateMatrix();
+      mesh.setMatrixAt(i, dummy.matrix);
+    }
+    mesh.instanceMatrix.needsUpdate = true;
+  }
+  // 发光体呼吸
+  MATS.glowWarm.emissiveIntensity = 2.7 + Math.sin(t * 2.1) * 0.5;
+  MATS.glowCool.emissiveIntensity = 2.7 + Math.sin(t * 2.1 + 1.3) * 0.5;
+  // 焦点始终锁定沙盘中心（移轴镜头的中轴清晰带）
+  if (bokeh) bokeh.uniforms['focus'].value = camera.position.distanceTo(controls.target);
+
+  controls.update();
+  composer.render();
+}
+animate();
+</script>
+</body>
+</html>

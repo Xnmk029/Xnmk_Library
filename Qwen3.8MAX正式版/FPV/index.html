@@ -1,0 +1,677 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>FPV 穿越机花飞模拟器</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; background:#000; font-family:'Consolas','Courier New',monospace; }
+  #gl { position:fixed; inset:0; width:100%; height:100%; display:block; }
+  /* ---------- FPV OSD ---------- */
+  #hud { position:fixed; left:14px; top:12px; color:#8dff9e; font-size:13px; line-height:1.75;
+         text-shadow:0 0 6px rgba(70,255,110,.8); pointer-events:none; z-index:5; white-space:pre; }
+  #cross { position:fixed; left:50%; top:50%; width:26px; height:26px; transform:translate(-50%,-50%);
+           border:1px solid rgba(141,255,158,.65); border-radius:50%; pointer-events:none; z-index:5; }
+  #cross::before,#cross::after { content:''; position:absolute; background:rgba(141,255,158,.65); }
+  #cross::before { left:50%; top:-7px; width:1px; height:8px; }
+  #cross::after  { left:50%; bottom:-7px; width:1px; height:8px; }
+  #sigbar { position:fixed; right:16px; top:14px; width:150px; z-index:5; pointer-events:none; }
+  #sigbar .lbl { color:#8dff9e; font-size:11px; text-shadow:0 0 6px rgba(70,255,110,.8); margin-bottom:3px; }
+  #sigbar .track { height:7px; border:1px solid rgba(141,255,158,.55); }
+  #sigbar .fill { height:100%; background:#8dff9e; box-shadow:0 0 8px rgba(70,255,110,.9); }
+  #failsafe { position:fixed; inset:0; display:none; align-items:center; justify-content:center; z-index:6;
+              color:#ff5d5d; font-size:30px; letter-spacing:6px; text-shadow:0 0 18px rgba(255,60,60,.9);
+              pointer-events:none; animation:fsblink 0.8s steps(2) infinite; }
+  @keyframes fsblink { 50% { opacity:.25; } }
+  #help { position:fixed; right:16px; bottom:12px; color:rgba(180,220,255,.55); font-size:11px;
+          text-align:right; line-height:1.7; z-index:5; pointer-events:none; }
+  /* ---------- 设置菜单 ---------- */
+  #menu { position:fixed; left:50%; top:50%; transform:translate(-50%,-50%); width:560px; max-height:86vh;
+          overflow-y:auto; background:rgba(8,14,12,.93); border:1px solid rgba(141,255,158,.4);
+          box-shadow:0 0 40px rgba(0,0,0,.8), inset 0 0 30px rgba(70,255,110,.05);
+          color:#cfe9d4; padding:18px 22px; z-index:9; font-size:13px; }
+  #menu.hidden { display:none; }
+  #menu h2 { font-size:15px; letter-spacing:4px; color:#8dff9e; border-bottom:1px solid rgba(141,255,158,.3);
+             padding-bottom:8px; margin-bottom:12px; }
+  #menu h3 { font-size:12px; letter-spacing:2px; color:#ffd21f; margin:14px 0 6px; }
+  .mrow { display:grid; grid-template-columns:130px 1fr 62px; align-items:center; gap:10px; margin:5px 0; }
+  .mrow label { color:rgba(210,235,220,.8); }
+  .mrow input[type=range] { width:100%; accent-color:#8dff9e; }
+  .mrow select { background:#0c1a14; color:#cfe9d4; border:1px solid rgba(141,255,158,.35); padding:2px 4px; }
+  .mrow .val { text-align:right; color:#8dff9e; }
+  .chrow { display:grid; grid-template-columns:110px 1fr 90px; align-items:center; gap:10px; margin:5px 0; }
+  .chrow input[type=checkbox] { accent-color:#8dff9e; }
+  #menu .hint { margin-top:14px; font-size:11px; color:rgba(180,210,195,.5); }
+  button.mbtn { background:rgba(141,255,158,.12); color:#8dff9e; border:1px solid rgba(141,255,158,.45);
+                padding:4px 12px; font-family:inherit; cursor:pointer; margin-right:8px; }
+  button.mbtn:hover { background:rgba(141,255,158,.25); }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="hud"></div>
+<div id="cross"></div>
+<div id="sigbar"><div class="lbl">VTX SIGNAL</div><div class="track"><div class="fill" id="sigfill"></div></div></div>
+<div id="failsafe">SIGNAL LOST · FAILSAFE</div>
+<div id="help">
+  手柄: 左杆油门/偏航 · 右杆俯仰/横滚 · A键解锁 | 键盘: ↑↓油门 ←→偏航 W/S俯仰 A/D横滚<br>
+  Enter 解锁 · R 复位 · ESC 设置菜单
+</div>
+<div id="menu" class="hidden"><h2>SETTINGS / 参数设置</h2><div id="menuBody"></div>
+  <p class="hint">所有修改即时生效 · ESC 关闭菜单</p></div>
+
+<script>
+'use strict';
+/* ================================================================
+ * FPV 穿越机花飞模拟器 (Single-File, Zero-Dependency)
+ *  - 姿态表达: SO(3) 单位四元数; 姿态演化经 so(3) 指数映射积分
+ *  - 平动: 电机推力 + 重力 + 速度平方气动阻尼
+ *  - Acro 模式: 摇杆 -> 目标角速度, 三轴 PID 输出控制力矩
+ *  - 输入: Gamepad API 硬件遥控器 (4 通道) + 键盘后备
+ *  - 渲染: 原生 WebGL 手写渲染器 + VTX 模拟图传后处理着色器
+ * ================================================================ */
+
+/* ---------------- 向量 / 四元数 / 矩阵 (SO(3) 工具库) ---------------- */
+const vAdd=(a,b)=>[a[0]+b[0],a[1]+b[1],a[2]+b[2]];
+const vSub=(a,b)=>[a[0]-b[0],a[1]-b[1],a[2]-b[2]];
+const vScl=(a,s)=>[a[0]*s,a[1]*s,a[2]*s];
+const vDot=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+const vLen=a=>Math.sqrt(vDot(a,a));
+const clamp=(x,a,b)=>x<a?a:(x>b?b:x);
+const smooth=(a,b,x)=>{ const t=clamp((x-a)/(b-a),0,1); return t*t*(3-2*t); };
+
+/* 四元数 [x,y,z,w] */
+function qMul(a,b){
+  return [ a[3]*b[0]+a[0]*b[3]+a[1]*b[2]-a[2]*b[1],
+           a[3]*b[1]-a[0]*b[2]+a[1]*b[3]+a[2]*b[0],
+           a[3]*b[2]+a[0]*b[1]-a[1]*b[0]+a[2]*b[3],
+           a[3]*b[3]-a[0]*b[0]-a[1]*b[1]-a[2]*b[2] ];
+}
+function qNorm(q){ const l=vLen(q)||1; return [q[0]/l,q[1]/l,q[2]/l,q[3]/l]; }
+/* so(3) 指数映射: 角速度向量 w*dt -> SO(3) 旋转四元数 (避免欧拉角万向节死锁) */
+function so3Exp(v){
+  const th=vLen(v);
+  if(th<1e-9) return [v[0]*0.5, v[1]*0.5, v[2]*0.5, 1];
+  const s=Math.sin(th/2)/th;
+  return [v[0]*s, v[1]*s, v[2]*s, Math.cos(th/2)];
+}
+function qRotate(q,v){ /* q * v * q^-1 */
+  const t=[ 2*(q[1]*v[2]-q[2]*v[1]), 2*(q[2]*v[0]-q[0]*v[2]), 2*(q[0]*v[1]-q[1]*v[0]) ];
+  return [ v[0]+q[3]*t[0]+(q[1]*t[2]-q[2]*t[1]),
+           v[1]+q[3]*t[1]+(q[2]*t[0]-q[0]*t[2]),
+           v[2]+q[3]*t[2]+(q[0]*t[1]-q[1]*t[0]) ];
+}
+function qToMat4(q){
+  const [x,y,z,w]=q;
+  return [1-2*(y*y+z*z),2*(x*y+z*w),2*(x*z-y*w),0,
+          2*(x*y-z*w),1-2*(x*x+z*z),2*(y*z+x*w),0,
+          2*(x*z+y*w),2*(y*z-x*w),1-2*(x*x+y*y),0,
+          0,0,0,1];
+}
+/* 4x4 矩阵 (列主序) */
+function m4Mul(a,b){
+  const o=new Array(16);
+  for(let c=0;c<4;c++)for(let r=0;r<4;r++){
+    o[c*4+r]=a[r]*b[c*4]+a[4+r]*b[c*4+1]+a[8+r]*b[c*4+2]+a[12+r]*b[c*4+3];
+  }
+  return o;
+}
+const m4T=(x,y,z)=>[1,0,0,0, 0,1,0,0, 0,0,1,0, x,y,z,1];
+function m4RotY(a){ const c=Math.cos(a),s=Math.sin(a); return [c,0,-s,0, 0,1,0,0, s,0,c,0, 0,0,0,1]; }
+function m4RotX(a){ const c=Math.cos(a),s=Math.sin(a); return [1,0,0,0, 0,c,s,0, 0,-s,c,0, 0,0,0,1]; }
+function m4Persp(fov,asp,n,f){ const t=1/Math.tan(fov/2);
+  return [t/asp,0,0,0, 0,t,0,0, 0,0,(f+n)/(n-f),-1, 0,0,2*f*n/(n-f),0]; }
+function m4LookAt(eye,c,up){
+  let z=vSub(eye,c); z=vScl(z,1/vLen(z));
+  let x=[up[1]*z[2]-up[2]*z[1], up[2]*z[0]-up[0]*z[2], up[0]*z[1]-up[1]*z[0]];
+  x=vScl(x,1/(vLen(x)||1));
+  const y=[z[1]*x[2]-z[2]*x[1], z[2]*x[0]-z[0]*x[2], z[0]*x[1]-z[1]*x[0]];
+  return [x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0,
+          -vDot(x,eye),-vDot(y,eye),-vDot(z,eye),1];
+}
+
+/* ---------------- 参数配置 (可经设置菜单实时修改) ---------------- */
+const cfg={
+  map:{ throttle:1, roll:2, pitch:3, yaw:0 },   /* Gamepad 轴绑定 */
+  inv:{ throttle:false, roll:false, pitch:false, yaw:false },
+  pid:{ p:0.9, i:6.0, d:0.045, rate:7.5, iLim:0.3 },
+  aero:{ mass:0.72, thrust:23.0, cd:0.13, g:9.81 }
+};
+const INERTIA=[0.0045,0.0045,0.0080];           /* 机体转动惯量 Ix,Iy,Iz */
+/* 机体系约定: X=前, Y=上, Z=右; 出生姿态偏航 90° 面向 -Z 方向的花飞场地 */
+const SPAWN={ p:[0,0.28,0], q:[0,0.70710678,0,0.70710678] };
+const VTX_RANGE=[130,270];                       /* 信号衰减距离区间 (m) */
+
+/* ---------------- 飞行状态 ---------------- */
+const drone={
+  p:[...SPAWN.p], v:[0,0,0], q:[...SPAWN.q], w:[0,0,0],
+  motor:0, armed:false, crashed:false, crashT:0, failsafe:false, fsT:0,
+  propAng:0
+};
+const pid={ int:[0,0,0], perr:[0,0,0] };
+const ch={ throttle:0, roll:0, pitch:0, yaw:0 };
+let signal=1, hudSig=1;
+
+function resetDrone(){
+  drone.p=[...SPAWN.p]; drone.v=[0,0,0]; drone.q=[...SPAWN.q]; drone.w=[0,0,0];
+  drone.motor=0; drone.armed=false; drone.crashed=false; drone.failsafe=false;
+  pid.int=[0,0,0]; pid.perr=[0,0,0];
+}
+
+/* ---------------- Acro 三轴 PID (角速度闭环) ---------------- */
+function pidStep(target,w,dt){
+  const tau=[0,0,0];
+  for(let a=0;a<3;a++){
+    const err=target[a]-w[a];
+    pid.int[a]=clamp(pid.int[a]+err*dt, -cfg.pid.iLim, cfg.pid.iLim);
+    const der=(err-pid.perr[a])/dt; pid.perr[a]=err;
+    tau[a]=cfg.pid.p*err + cfg.pid.i*pid.int[a] + cfg.pid.d*der;
+    tau[a]=clamp(tau[a],-6,6);
+  }
+  return tau;
+}
+
+/* ---------------- 刚体动力学 (SO(3) 姿态积分) ---------------- */
+function physics(dt){
+  if(drone.failsafe){ drone.motor=0; }
+  else if(drone.armed && !drone.crashed){ drone.motor=ch.throttle; }
+  else { drone.motor=0; }
+
+  /* 目标角速度: Acro 模式摇杆映射 (机体系 w=[绕X横滚, 绕Y偏航, 绕Z俯仰]) */
+  const R=cfg.pid.rate;
+  const target=[ ch.roll*R, ch.yaw*R*0.75, ch.pitch*R ];
+  const tau=drone.armed && !drone.crashed && !drone.failsafe
+    ? pidStep(target,drone.w,dt) : [0,0,0];
+
+  /* 角动力学: I·dw/dt = tau */
+  drone.w[0]+=tau[0]/INERTIA[0]*dt;
+  drone.w[1]+=tau[1]/INERTIA[1]*dt;
+  drone.w[2]+=tau[2]/INERTIA[2]*dt;
+  const wd=vLen(drone.w);
+  if(wd>60) drone.w=vScl(drone.w,60/wd);
+
+  /* SO(3) 姿态演化: q <- q ⊗ exp(w·dt) —— so(3) 指数映射, 无欧拉角 */
+  drone.q=qNorm(qMul(drone.q, so3Exp(vScl(drone.w,dt))));
+
+  /* 平动: 推力(机体系 +Y, 即机体竖直升力) + 重力 + 气动阻尼(∝ v²) */
+  let acc=[0,-cfg.aero.g,0];
+  if(drone.motor>0){
+    acc=vAdd(acc, vScl(qRotate(drone.q,[0, drone.motor*cfg.aero.thrust, 0]), 1/cfg.aero.mass));
+  }
+  const sp=vLen(drone.v);
+  acc=vSub(acc, vScl(drone.v, cfg.aero.cd*sp/cfg.aero.mass));
+  drone.v=vAdd(drone.v, vScl(acc,dt));
+  drone.p=vAdd(drone.p, vScl(drone.v,dt));
+
+  /* 地面碰撞: 坠机 -> 断电, 1.5s 后复位 */
+  if(drone.p[1]<0.06){
+    drone.p[1]=0.06;
+    if(drone.v[1]<0) drone.v[1]=0;
+    if(drone.armed && !drone.crashed){ drone.crashed=true; drone.crashT=1.5; drone.armed=false; }
+  }
+  if(drone.crashed){
+    drone.crashT-=dt;
+    drone.w=vScl(drone.w,0.9);
+    if(drone.crashT<=0) resetDrone();
+  }
+  /* 失控保护: 失联 3s 后自动复位 */
+  if(drone.failsafe){ drone.fsT-=dt; if(drone.fsT<=0) resetDrone(); }
+}
+
+/* ---------------- 输入: 硬件遥控器 (Gamepad API) + 键盘后备 ---------------- */
+const keys={};
+let prevArmBtn=false, prevEnter=false;
+addEventListener('keydown',e=>{
+  keys[e.code]=true;
+  if(e.code==='Escape'){ toggleMenu(); }
+  if(e.code==='KeyR'){ resetDrone(); }
+});
+addEventListener('keyup',e=>{ keys[e.code]=false; });
+
+function readInput(){
+  const pads=navigator.getGamepads ? navigator.getGamepads() : [];
+  let pad=null;
+  for(const gp of pads){ if(gp){ pad=gp; break; } }
+  let src='KEYBOARD';
+  const axis=(name)=>{
+    let v;
+    if(pad){
+      v=pad.axes[cfg.map[name]]||0;
+      if(cfg.inv[name]) v=-v;
+      if(name==='throttle') v=(1-v)/2;          /* 摇杆推上 = 油门增大 */
+      else v=(v+1)/2;                            /* [-1,1] -> [0,1] 居中 */
+      v=(v-0.5)*2;
+      src='GAMEPAD';
+    } else {
+      v=keyboardAxis(name);
+    }
+    return clamp(Math.abs(v)<0.06?0:v,-1,1);
+  };
+  if(pad){
+    ch.throttle=clamp(axis('throttle'),0,1);
+    ch.roll=axis('roll'); ch.pitch=axis('pitch'); ch.yaw=axis('yaw');
+  } else {
+    ch.throttle=clamp(axis('throttle'),0,1);
+    ch.roll=axis('roll'); ch.pitch=axis('pitch'); ch.yaw=axis('yaw');
+  }
+  /* 解锁指令: 手柄 A 键(0) 或 Enter, 电平触发, 要求低油门 */
+  const armBtn=pad?pad.buttons[0]&&pad.buttons[0].pressed:false;
+  const kbArm=!!keys['Enter'];
+  const wantArm=armBtn||kbArm;
+  prevArmBtn=armBtn; prevEnter=kbArm;
+  if(wantArm && ch.throttle<0.08 && !drone.failsafe && !drone.crashed){
+    drone.armed=true;
+  }
+  return pad?src:'KEYBOARD';
+}
+const kmap={
+  throttle:[ 'ArrowUp','ArrowDown' ],
+  roll:['KeyD','KeyA'], pitch:['KeyS','KeyW'], yaw:['ArrowRight','ArrowLeft']
+};
+function keyboardAxis(name){
+  const [up,dn]=kmap[name];
+  let v=0;
+  if(keys[up]) v+=1;
+  if(keys[dn]) v-=1;
+  return v;
+}
+
+/* ---------------- WebGL 渲染器 (零依赖手写) ---------------- */
+const cv=document.getElementById('gl');
+const gl=cv.getContext('webgl',{antialias:true});
+if(!gl){ document.body.innerHTML='<p style="color:#fff;padding:40px">浏览器不支持 WebGL</p>'; throw new Error('no webgl'); }
+
+const VS=`
+attribute vec3 aPos; attribute vec3 aNor;
+uniform mat4 uVP; uniform mat4 uM;
+varying vec3 vNor; varying vec3 vW;
+void main(){ vec4 w=uM*vec4(aPos,1.0); vW=w.xyz; vNor=mat3(uM)*aNor; gl_Position=uVP*w; }`;
+const FS_SCENE=`
+precision mediump float;
+varying vec3 vNor; varying vec3 vW;
+uniform vec3 uColor; uniform float uFlat;
+void main(){
+  vec3 c=uColor;
+  if(uFlat<0.5){
+    float d=max(dot(normalize(vNor), normalize(vec3(0.45,0.8,0.35))),0.0);
+    c=uColor*(0.38+0.72*d);
+  }
+  float h=clamp(vW.y/380.0,0.0,1.0);
+  c=mix(c, vec3(0.05,0.07,0.10), h*0.85);   /* 距离雾, 融入天空 */
+  gl_FragColor=vec4(c,1.0);
+}`;
+const FS_VTX=`
+precision mediump float;
+varying vec2 vUV;
+uniform sampler2D uTex; uniform vec2 uRes;
+uniform float uSignal; uniform float uTime; uniform float uJit; uniform float uFs;
+float rnd(vec2 p){ return fract(sin(dot(p,vec2(12.9898,78.233)))*43758.5453); }
+void main(){
+  float sn=clamp(uSignal,0.0,1.0);
+  float bad=1.0-sn;
+  vec2 uv=vUV;
+  /* 不同步滚动条纹 Rolling Bands */
+  float band=fract(uv.y*3.0 - uTime*(0.35+uJit*1.4));
+  float bandG=smoothstep(0.42,0.5,band)*(1.0-smoothstep(0.5,0.58,band));
+  uv.x+=bad*0.028*bandG*(uJit-0.5)*2.0;
+  uv.y+=bad*0.006*bandG;
+  /* 横向画面撕裂 Horizontal Tearing (随距离概率触发) */
+  float row=floor(uv.y*uRes.y/3.0);
+  float tr=rnd(vec2(row,floor(uTime*22.0)));
+  if(bad>0.16 && tr>1.0-bad*0.5){ uv.x+=bad*0.09*(uJit-0.5)*2.0; }
+  /* 模拟图传水平同步抖动 + 边缘卷绕 */
+  uv.x+=bad*0.004*sin(uv.y*50.0+uTime*40.0);
+  uv=fract(uv);
+  vec3 col=texture2D(uTex,uv).rgb;
+  /* 色彩失真 (模拟 CVBS 色度串扰) */
+  col.r=texture2D(uTex,uv+vec2(bad*0.0035,0.0)).r;
+  col.b=texture2D(uTex,uv-vec2(bad*0.0035,0.0)).b;
+  float lum=dot(col,vec3(0.3,0.6,0.1));
+  col=mix(vec3(lum),col,0.35+0.65*sn);
+  /* 扫描线 */
+  col*=0.93+0.07*sin(vUV.y*uRes.y*2.4);
+  /* 雪花噪点 Static Noise (随距离渐进) */
+  float n=rnd(vUV*uRes.xy*0.5+fract(uTime)*371.0);
+  col=mix(col,vec3(n), bad*bad*0.9);
+  col*=1.0-bad*0.25;
+  /* 暗角 */
+  vec2 q=vUV-0.5; col*=1.0-dot(q,q)*0.55;
+  /* 失控保护: 彻底黑屏失联 */
+  col=mix(col, vec3(0.02,0.02,0.02)+vec3(n*0.05), uFs);
+  gl_FragColor=vec4(col,1.0);
+}`;
+/* 全屏三角形顶点着色器 (后处理专用, 输出 vUV) */
+const VS_QUAD=`attribute vec2 aPos; varying vec2 vUV;
+void main(){ vUV=aPos*0.5+0.5; gl_Position=vec4(aPos,0.0,1.0); }`;
+function mkShader(type,src){
+  const s=gl.createShader(type); gl.shaderSource(s,src); gl.compileShader(s);
+  if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+function mkProg(vs,fs){
+  const p=gl.createProgram();
+  gl.attachShader(p,mkShader(gl.VERTEX_SHADER,vs));
+  gl.attachShader(p,mkShader(gl.FRAGMENT_SHADER,fs));
+  gl.bindAttribLocation(p,0,'aPos'); gl.bindAttribLocation(p,1,'aNor');
+  gl.linkProgram(p);
+  if(!gl.getProgramParameter(p,gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+const progScene=mkProg(VS,FS_SCENE);
+const progPost=mkProg(VS_QUAD,FS_VTX);
+const U=(p,n)=>gl.getUniformLocation(p,n);
+const uScene={ vp:U(progScene,'uVP'), m:U(progScene,'uM'), color:U(progScene,'uColor'), flat:U(progScene,'uFlat') };
+const uPost={ vp:U(progPost,'uVP'), m:U(progPost,'uM'), tex:U(progPost,'uTex'),
+              res:U(progPost,'uRes'), sig:U(progPost,'uSignal'), time:U(progPost,'uTime'),
+              jit:U(progPost,'uJit'), fs:U(progPost,'uFs'), color:U(progPost,'uColor'), flat:U(progPost,'uFlat') };
+
+/* 网格构建 */
+function makeMesh(pos,nor,idx,color,flat){
+  const m={ color, flat:flat||0 };
+  m.vbo=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,m.vbo);
+  const inter=new Float32Array(pos.length*2);
+  for(let i=0;i<pos.length;i+=3){
+    inter[i*2]=pos[i]; inter[i*2+1]=pos[i+1]; inter[i*2+2]=pos[i+2];
+    inter[i*2+3]=nor[i]; inter[i*2+4]=nor[i+1]; inter[i*2+5]=nor[i+2];
+  }
+  gl.bufferData(gl.ARRAY_BUFFER,inter,gl.STATIC_DRAW);
+  m.ibo=gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,m.ibo);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,new Uint16Array(idx),gl.STATIC_DRAW);
+  m.count=idx.length;
+  return m;
+}
+function boxGeo(w,h,d){
+  const x=w/2,y=h/2,z=d/2;
+  const faces=[
+    [[ 1,0,0], [[x,-y,-z],[x,y,-z],[x,y,z],[x,-y,z]] ],
+    [[-1,0,0], [[-x,-y,z],[-x,y,z],[-x,y,-z],[-x,-y,-z]] ],
+    [[ 0,1,0], [[-x,y,-z],[-x,y,z],[x,y,z],[x,y,-z]] ],
+    [[ 0,-1,0],[[-x,-y,z],[-x,-y,-z],[x,-y,-z],[x,-y,z]] ],
+    [[ 0,0,1], [[-x,-y,z],[x,-y,z],[x,y,z],[-x,y,z]] ],
+    [[ 0,0,-1],[[x,-y,-z],[-x,-y,-z],[-x,y,-z],[x,y,-z]] ]
+  ];
+  const pos=[],nor=[],idx=[];
+  for(const [n,q] of faces){
+    const b=pos.length/3;
+    for(const v of q){ pos.push(...v); nor.push(...n); }
+    idx.push(b,b+1,b+2,b,b+2,b+3);
+  }
+  return {pos,nor,idx};
+}
+function torusGeo(R,r,seg,tube){
+  const pos=[],nor=[],idx=[];
+  for(let i=0;i<=seg;i++){
+    const a=i/seg*Math.PI*2;
+    for(let j=0;j<=tube;j++){
+      const b=j/tube*Math.PI*2;
+      const cx=Math.cos(a)*R, cy=Math.sin(a)*R;
+      const nx=Math.cos(a)*Math.cos(b), ny=Math.sin(a)*Math.cos(b), nz=Math.sin(b);
+      pos.push(cx+nx*r, cy+ny*r, nz*r);
+      nor.push(nx,ny,nz);
+    }
+  }
+  for(let i=0;i<seg;i++)for(let j=0;j<tube;j++){
+    const a=i*(tube+1)+j, b=a+tube+1;
+    idx.push(a,b,a+1, b,b+1,a+1);
+  }
+  return {pos,nor,idx};
+}
+function sphereGeo(rad,lat,lon){
+  const pos=[],nor=[],idx=[];
+  for(let i=0;i<=lat;i++){
+    const th=i/lat*Math.PI;
+    for(let j=0;j<=lon;j++){
+      const ph=j/lon*Math.PI*2;
+      const x=Math.sin(th)*Math.cos(ph), y=Math.cos(th), z=Math.sin(th)*Math.sin(ph);
+      pos.push(x*rad,y*rad,z*rad); nor.push(x,y,z);
+    }
+  }
+  for(let i=0;i<lat;i++)for(let j=0;j<lon;j++){
+    const a=i*(lon+1)+j, b=a+lon+1;
+    idx.push(a,b,a+1, b,b+1,a+1);
+  }
+  return {pos,nor,idx};
+}
+
+/* 场景网格表: model 矩阵可静态或每帧更新 */
+const meshes=[];
+function addGeo(geo,model,color,flat){
+  const m=makeMesh(geo.pos,geo.nor,geo.idx,color,flat);
+  m.model=model; meshes.push(m); return m;
+}
+/* 地面 */
+addGeo({pos:[-400,0,-400, 400,0,-400, 400,0,400, -400,0,400],
+        nor:[0,1,0,0,1,0,0,1,0,0,1,0], idx:[0,1,2,0,2,3]}, m4T(0,0,0), [0.20,0.24,0.21]);
+/* 起飞坪 */
+addGeo(boxGeo(7,0.1,7), m4T(0,0.05,0), [0.32,0.36,0.40]);
+/* 天空穹顶 */
+addGeo(sphereGeo(650,12,20), m4T(0,0,0), [0.06,0.10,0.17], 1);
+/* 环形门 (花飞障碍) */
+function addGate(x,y,z,rotY,color){
+  const g=torusGeo(4.6,0.42,26,10);
+  const m=m4Mul(m4T(x,y,z), m4Mul(m4RotY(rotY), m4RotX(0)));
+  addGeo(g,m,color);
+}
+addGate(0,5.2,-30, 0, [1.0,0.23,0.23]);
+addGate(22,6,-62, Math.PI/2, [1.0,0.82,0.12]);
+addGate(-18,4.5,-95, 0.35, [0.17,1.0,0.53]);
+/* 立柱阵列 */
+[-12,-4,4,12].forEach((x,i)=>{
+  addGeo(boxGeo(1.3,9,1.3), m4T(x,4.5,-14), i%2?[1.0,0.25,0.25]:[0.85,0.86,0.9]);
+});
+/* 可穿越墙体废墟 (中间留洞) */
+addGeo(boxGeo(9,7,1.2), m4T(-7.6,3.5,-48), [0.54,0.58,0.65]);
+addGeo(boxGeo(9,7,1.2), m4T(7.6,3.5,-48), [0.54,0.58,0.65]);
+addGeo(boxGeo(25,2.4,1.2), m4T(0,8.2,-48), [0.54,0.58,0.65]);
+/* 散落方块 */
+[[10,1,-70],[-14,0.8,-80],[26,1.2,-40],[-24,1,-55],[15,0.7,-100]].forEach(b=>{
+  addGeo(boxGeo(b[1]*2,b[1]*2,b[1]*2), m4T(b[0],b[1],b[2]), [0.7,0.62,0.5]);
+});
+/* 无人机部件 (model 每帧重建) */
+const droneParts={ body:null, arms:[], motors:[], props:[] };
+droneParts.body=makeMesh(boxGeo(0.36,0.09,0.46).pos,boxGeo(0.36,0.09,0.46).nor,boxGeo(0.36,0.09,0.46).idx,[0.13,0.15,0.19]);
+for(let i=0;i<4;i++){
+  droneParts.arms.push(makeMesh(...Object.values(boxGeo(0.46,0.03,0.05)), [0.30,0.32,0.38]));
+  droneParts.motors.push(makeMesh(...Object.values(boxGeo(0.09,0.07,0.09)), [0.8,0.84,0.9]));
+  droneParts.props.push(makeMesh(...Object.values(boxGeo(0.34,0.012,0.035)), [1.0,0.55,0.0]));
+}
+
+/* 离屏帧缓冲 (供 VTX 后处理采样) */
+const fbo=gl.createFramebuffer();
+const fboTex=gl.createTexture();
+const fboDepth=gl.createRenderbuffer();
+function resize(){
+  const dpr=Math.min(devicePixelRatio||1,1.75);
+  cv.width=Math.floor(innerWidth*dpr); cv.height=Math.floor(innerHeight*dpr);
+  gl.bindTexture(gl.TEXTURE_2D,fboTex);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,cv.width,cv.height,0,gl.RGBA,gl.UNSIGNED_BYTE,null);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  gl.bindRenderbuffer(gl.RENDERBUFFER,fboDepth);
+  gl.renderbufferStorage(gl.RENDERBUFFER,gl.DEPTH_COMPONENT16,cv.width,cv.height);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,fboTex,0);
+  gl.framebufferRenderbuffer(gl.FRAMEBUFFER,gl.DEPTH_ATTACHMENT,gl.RENDERBUFFER,fboDepth);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+}
+addEventListener('resize',resize); resize();
+
+function drawMesh(mesh,vp,model){
+  gl.uniformMatrix4fv(uScene.vp,false,vp);
+  gl.uniformMatrix4fv(uScene.m,false,model||mesh.model);
+  gl.uniform3fv(uScene.color,mesh.color);
+  gl.uniform1f(uScene.flat,mesh.flat);
+  gl.bindBuffer(gl.ARRAY_BUFFER,mesh.vbo);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0,3,gl.FLOAT,false,24,0);
+  gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1,3,gl.FLOAT,false,24,12);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,mesh.ibo);
+  gl.drawElements(gl.TRIANGLES,mesh.count,gl.UNSIGNED_SHORT,0);
+}
+
+/* 全屏三角形 (后处理) */
+const quadBuf=gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER,quadBuf);
+gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1, 3,-1, -1,3]),gl.STATIC_DRAW);
+
+/* ---------------- 设置菜单 ---------------- */
+const menuEl=document.getElementById('menu');
+function toggleMenu(){ menuEl.classList.toggle('hidden'); }
+function buildMenu(){
+  const body=document.getElementById('menuBody');
+  const mkSlider=(sec,label,obj,key,min,max,step)=>{
+    const row=document.createElement('div'); row.className='mrow';
+    row.innerHTML=`<label>${label}</label><input type="range" min="${min}" max="${max}" step="${step}" value="${obj[key]}"><span class="val">${obj[key]}</span>`;
+    const inp=row.querySelector('input'), val=row.querySelector('.val');
+    inp.oninput=()=>{ obj[key]=parseFloat(inp.value); val.textContent=(Math.round(obj[key]*1000)/1000); };
+    sec.appendChild(row);
+  };
+  const sec=t=>{ const h=document.createElement('h3'); h.textContent=t; body.appendChild(h); return body; };
+  /* PID */
+  sec('ACRO PID');
+  mkSlider(body,'P 增益',cfg.pid,'p',0,3,0.05);
+  mkSlider(body,'I 增益',cfg.pid,'i',0,20,0.5);
+  mkSlider(body,'D 增益',cfg.pid,'d',0,0.3,0.005);
+  mkSlider(body,'最大角速率 rad/s',cfg.pid,'rate',1,16,0.5);
+  /* 气动 */
+  sec('气动物理 AERO');
+  mkSlider(body,'质量 kg',cfg.aero,'mass',0.2,2,0.02);
+  mkSlider(body,'最大推力 N',cfg.aero,'thrust',5,45,0.5);
+  mkSlider(body,'阻力系数 Cd',cfg.aero,'cd',0,0.6,0.01);
+  /* 通道 */
+  sec('遥控器通道绑定');
+  ['throttle','roll','pitch','yaw'].forEach(name=>{
+    const row=document.createElement('div'); row.className='chrow';
+    row.innerHTML=`<label>${name.toUpperCase()}</label>
+      <select>${[0,1,2,3].map(i=>`<option value="${i}"${cfg.map[name]===i?' selected':''}>AXIS ${i}</option>`).join('')}</select>
+      <label><input type="checkbox"${cfg.inv[name]?' checked':''}> 反向 REV</label>`;
+    row.querySelector('select').onchange=e=>{ cfg.map[name]=parseInt(e.target.value); };
+    row.querySelector('input').onchange=e=>{ cfg.inv[name]=e.target.checked; };
+    body.appendChild(row);
+  });
+  const btnRow=document.createElement('div'); btnRow.style.marginTop='14px';
+  const b1=document.createElement('button'); b1.className='mbtn'; b1.textContent='复位机体 (R)';
+  b1.onclick=resetDrone;
+  const b2=document.createElement('button'); b2.className='mbtn'; b2.textContent='关闭菜单 (ESC)';
+  b2.onclick=toggleMenu;
+  btnRow.appendChild(b1); btnRow.appendChild(b2); body.appendChild(btnRow);
+}
+buildMenu();
+
+/* ---------------- HUD ---------------- */
+const hudEl=document.getElementById('hud');
+const sigFill=document.getElementById('sigfill');
+const fsEl=document.getElementById('failsafe');
+function updateHUD(src){
+  const alt=drone.p[1].toFixed(1);
+  const spd=vLen(drone.v).toFixed(1);
+  hudEl.textContent=
+    `MODE : ACRO\n`+
+    `ARM  : ${drone.armed?'ARMED':'DISARMED'}${drone.crashed?'  [CRASH]':''}\n`+
+    `INPUT: ${src}\n`+
+    `ALT  : ${alt} m   SPD : ${spd} m/s\n`+
+    `THR  : ${(drone.motor*100).toFixed(0).padStart(3)} %`;
+  sigFill.style.width=(hudSig*100).toFixed(0)+'%';
+  sigFill.style.background=hudSig>0.35?'#8dff9e':'#ff5d5d';
+  fsEl.style.display=drone.failsafe?'flex':'none';
+}
+
+/* ---------------- 主循环 (rAF 优先, 定时器兜底) ---------------- */
+function startMainLoop(fn){
+  let rafFired=false, stopped=false, iid=0;
+  const tick=()=>{ if(!stopped) fn(performance.now()); };
+  const rafTick=()=>{ if(stopped) return; rafFired=true; tick(); requestAnimationFrame(rafTick); };
+  const intTick=()=>{ if(stopped) return;
+    if(rafFired){ clearInterval(iid); iid=0; return; }
+    tick();
+  };
+  requestAnimationFrame(rafTick);
+  iid=setInterval(intTick,33);
+}
+gl.enable(gl.DEPTH_TEST);
+gl.clearColor(0.04,0.06,0.10,1);
+let last=performance.now(), simTime=0;
+const PH_DT=1/240;
+let acc=0;
+
+function frame(now){
+  requestAnimationFrame(frame);
+  let dt=(now-last)/1000; last=now;
+  if(dt>0.05) dt=0.05;
+  simTime+=dt;
+
+  const src=readInput();
+
+  /* 信号强度: 基于与起飞点距离的衰减模型 */
+  const dist=vLen(vSub(drone.p,SPAWN.p));
+  let sig=1-smooth(VTX_RANGE[0],VTX_RANGE[1],dist);
+  sig=clamp(sig+(Math.random()-0.5)*0.05,0,1);
+  if(sig<0.02 && drone.armed){
+    drone.failsafe=true; drone.fsT=3.0; drone.armed=false;
+  }
+  signal=sig; hudSig+=(sig-hudSig)*0.2;
+
+  /* 定步长物理积分 */
+  acc+=dt; let n=0;
+  while(acc>=PH_DT && n<12){ physics(PH_DT); acc-=PH_DT; n++; }
+
+  /* 相机: 机身后方追机视角 */
+  const fwd=qRotate(drone.q,[1,0,0]);
+  const up=qRotate(drone.q,[0,1,0]);
+  const eye=vAdd(vSub(drone.p,vScl(fwd,5.2)), vScl(up,1.6));
+  const tgt=vAdd(drone.p,vScl(fwd,3));
+  const view=m4LookAt(eye,tgt,[0,1,0]);
+  const proj=m4Persp(95*Math.PI/180, cv.width/cv.height, 0.1, 1400);
+  const vp=m4Mul(proj,view);
+
+  /* ---- Pass 1: 场景 -> FBO ---- */
+  gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);
+  gl.viewport(0,0,cv.width,cv.height);
+  gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+  gl.useProgram(progScene);
+  for(const m of meshes) drawMesh(m,vp);
+  /* 无人机 (机体姿态直接来自 SO(3) 四元数) */
+  drone.propAng+=(0.4+drone.motor*1.4);
+  const base=m4Mul(m4T(...drone.p), qToMat4(drone.q));
+  drawMesh(droneParts.body,vp,base);
+  const signs=[[1,1],[1,-1],[-1,1],[-1,-1]];
+  for(let i=0;i<4;i++){
+    const s=signs[i];
+    const armM=m4Mul(base, m4Mul(m4T(s[0]*0.13,0,s[1]*0.13), m4RotY(s[0]*s[1]>0?0.785:-0.785)));
+    drawMesh(droneParts.arms[i],vp,armM);
+    const mpos=m4Mul(base, m4T(s[0]*0.26,0.045,s[1]*0.26));
+    drawMesh(droneParts.motors[i],vp,mpos);
+    const pM=m4Mul(base, m4Mul(m4T(s[0]*0.26,0.085,s[1]*0.26), m4RotY(drone.propAng*(i%2?1:-1)+i)));
+    drawMesh(droneParts.props[i],vp,pM);
+  }
+
+  /* ---- Pass 2: VTX 后处理 ---- */
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+  gl.viewport(0,0,cv.width,cv.height);
+  gl.disable(gl.DEPTH_TEST);
+  gl.useProgram(progPost);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D,fboTex);
+  gl.uniform1i(uPost.tex,0);
+  gl.uniform2f(uPost.res,cv.width,cv.height);
+  gl.uniform1f(uPost.sig,signal);
+  gl.uniform1f(uPost.time,simTime);
+  gl.uniform1f(uPost.jit,Math.random());
+  gl.uniform1f(uPost.fs,drone.failsafe?1:0);
+  gl.uniformMatrix4fv(uPost.vp,false,[1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]);
+  gl.uniformMatrix4fv(uPost.m,false,[1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]);
+  gl.uniform3fv(uPost.color,[1,1,1]); gl.uniform1f(uPost.flat,1);
+  gl.bindBuffer(gl.ARRAY_BUFFER,quadBuf);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);
+  gl.disableVertexAttribArray(1);
+  gl.drawArrays(gl.TRIANGLES,0,3);
+  gl.enable(gl.DEPTH_TEST);
+
+  updateHUD(src);
+}
+startMainLoop(frame);
+</script>
+</body>
+</html>

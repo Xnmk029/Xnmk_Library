@@ -1,3 +1,4 @@
+```markdown
 # 任务背景
 
 请基于 **Model Context Protocol (MCP)** 和 **Windows COM / ExtendScript** 接口，构建一个 Adobe Photoshop 自动化控制服务端（PSMCP）。通过该 MCP 服务端，AI 助手（如 Claude、Cursor、Antigravity 等）可以对 Adobe Photoshop 进行高度灵活的自动化操作，涵盖文档创建、图层管理、文本填充、色彩绘制、图像导出以及运行自定义 ExtendScript 脚本。
@@ -64,3 +65,5 @@ names.join(", ");
 - README 中给出 MCP 客户端配置示例（`claude_desktop_config.json` 等）。
 - 所有工具参数须有清晰 schema（名称、类型、描述、必填项）。
 - 不得包含 TODO 或未完成占位符。
+
+```

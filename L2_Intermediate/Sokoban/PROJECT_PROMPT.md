@@ -1,3 +1,4 @@
+```markdown
 # 任务背景
 
 本任务分两个阶段：先实现一套极具游戏质感的**像素风/写实风混合草地 Shader**（参考 Dylearn 在 Godot 4.3 中《How I made grass better than 99% of games | Stylized grass 3D pixel art》一文的方案效果），再**提炼该 Shader 风格**制作一个精良的 3D 推箱子游戏。
@@ -36,3 +37,5 @@
 - 推箱子逻辑完整可玩：可推动、可重置、有胜利判定。
 - 模型/贴图资源须声明来源；HDRI 与树木/鲸鱼模型允许网络获取但需在 README 记录出处。
 - 不得包含 TODO 或缺失核心算法的占位符。
+
+```

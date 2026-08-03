@@ -1,6 +1,7 @@
+```markdown
 # 任务背景
 
-请构建一个 SketchUp MCP 桥接器（SketchUp-MCP-Bridge）：让 MCP 兼容的 AI 助手（如 Claude 等）能够**实时读取、查询、修改正在运行的 SketchUp 模型**。目标是考核模型实现跨进程桥接架构（Ruby 插件 ↔ Python MCP Server）、TCP/HTTP 通信、3D 几何操作与事务安全的能力。
+请构建一个 SketchUp MCP 桥接器（SketchUp-MCP-Bridge）：让 MCP 兼容的 AI 助手（如 Claude 等）能够**实时读取、查询、修改正在运行的 SketchUp 模型**。本项目的核心目标是实现跨进程桥接架构（Ruby 插件 ↔ Python MCP Server）、TCP/HTTP 通信、3D 几何操作与事务安全的能力。
 
 # 需求范围
 
@@ -56,3 +57,5 @@ SketchUp-MCP-Bridge/
 - 提供连通性测试方式（无 SketchUp 环境时能给出明确错误信息）。
 - 所有工具参数有清晰 schema；错误响应可读、可诊断。
 - 不得包含 TODO 或未完成占位符。
+
+```
