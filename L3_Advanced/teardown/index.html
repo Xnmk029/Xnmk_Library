@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="color-scheme" content="dark" />
+<title>Teardown 风格 · 微体素沙盘 Demo</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #101216; }
+  #app { position: fixed; inset: 0; }
+  #app canvas { display: block; }
+  #vignette {
+    position: fixed; inset: 0; pointer-events: none; z-index: 5;
+    background: radial-gradient(ellipse at 50% 45%, rgba(0,0,0,0) 52%, rgba(0,0,0,0.5) 100%);
+  }
+  #info {
+    position: fixed; left: 16px; top: 16px; z-index: 10; color: #d6dae0;
+    font: 12px/1.8 "Segoe UI", system-ui, sans-serif; letter-spacing: .5px;
+    background: rgba(16,18,22,.55); border: 1px solid rgba(255,255,255,.08);
+    border-radius: 10px; padding: 10px 14px; backdrop-filter: blur(6px);
+    user-select: none; pointer-events: none;
+  }
+  #info b { font-size: 13px; color: #fff; letter-spacing: 2px; }
+  #info .dim { color: #8b929c; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="vignette"></div>
+<div id="info">
+  <b>TEARDOWN 风格 · 微体素沙盘</b><br />
+  左键旋转 · 滚轮缩放 · 右键平移 · <span class="dim">双击物体手动对焦</span><br />
+  <span class="dim" id="stat"></span>
+</div>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.170.0/examples/jsm/"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { SSAOPass } from 'three/addons/postprocessing/SSAOPass.js';
+import { BokehPass } from 'three/addons/postprocessing/BokehPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { FXAAShader } from 'three/addons/shaders/FXAAShader.js';
+import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
+
+let seed = 20260718;
+const rand = () => {
+  seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+  let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+  return ((t ^ t >>> 14) >>> 0) / 4294967296;
+};
+
+const app = document.getElementById('app');
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.shadowMap.autoUpdate = false;
+renderer.shadowMap.needsUpdate = true;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.2;
+app.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x15171b);
+scene.fog = new THREE.Fog(0x15171b, 55, 140);
+
+const camera = new THREE.PerspectiveCamera(34, window.innerWidth / window.innerHeight, 1, 200);
+camera.position.set(23, 30, 23);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 3, 0);
+controls.enableDamping = true;
+controls.dampingFactor = 0.06;
+controls.minDistance = 10;
+controls.maxDistance = 100;
+controls.maxPolarAngle = Math.PI * 0.49;
+controls.autoRotateSpeed = 1.2;
+
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+scene.environmentIntensity = 0.5;
+pmrem.dispose();
+
+const sun = new THREE.DirectionalLight(0xfff0dc, 3.6);
+sun.position.set(-17, 19, 10);
+sun.castShadow = true;
+sun.shadow.mapSize.set(4096, 4096);
+sun.shadow.camera.left = -26;
+sun.shadow.camera.right = 26;
+sun.shadow.camera.top = 26;
+sun.shadow.camera.bottom = -26;
+sun.shadow.camera.near = 2;
+sun.shadow.camera.far = 80;
+sun.shadow.camera.updateProjectionMatrix();
+sun.shadow.bias = -0.0004;
+sun.shadow.normalBias = 0.02;
+scene.add(sun);
+
+scene.add(new THREE.HemisphereLight(0xbdd2ff, 0x46403a, 0.45));
+
+const lampLight = new THREE.PointLight(0xffa14f, 30, 0, 2);
+lampLight.position.set(0, 3.2, -1);
+lampLight.castShadow = true;
+lampLight.shadow.mapSize.set(1024, 1024);
+lampLight.shadow.bias = -0.008;
+lampLight.shadow.camera.near = 0.5;
+lampLight.shadow.camera.far = 60;
+lampLight.shadow.camera.updateProjectionMatrix();
+scene.add(lampLight);
+
+const V = new Map();
+const key = (x, y, z) => x + ',' + y + ',' + z;
+const has = (x, y, z) => V.has(key(x, y, z));
+const put = (x, y, z, g, c) => { const k = key(x, y, z); if (!V.has(k)) V.set(k, { x, y, z, g, c }); };
+const col = (hex, jitter = 0) => {
+  const c = new THREE.Color(hex);
+  if (jitter) c.offsetHSL(0, 0, (rand() - 0.5) * jitter);
+  return c;
+};
+const hsl = (h, s, l) => new THREE.Color().setHSL(h, s, l, THREE.SRGBColorSpace);
+
+const B = 11;
+for (let x = -B; x < B; x++) for (let z = -B; z < B; z++) for (let y = 0; y < 2; y++) {
+  if (y === 1) {
+    const rim = x === -B || x === B - 1 || z === -B || z === B - 1;
+    if (rim && rand() < 0.16) continue;
+    if (x >= B - 3 && z >= B - 4 && rand() < 0.6) continue;
+  }
+  const c = col(0xb5b2aa, 0.07);
+  if (y === 0) c.multiplyScalar(0.78);
+  else if (rand() < 0.05) c.multiplyScalar(0.72);
+  put(x, y, z, 'diffuse', c);
+}
+
+const brickCache = new Map();
+const brickColor = (x, y) => {
+  const idx = Math.floor((x + (y % 2 ? 1 : 0) + 64) / 2);
+  const k = y + '_' + idx;
+  if (!brickCache.has(k)) {
+    const r = rand();
+    let c;
+    if (r < 0.08) c = hsl(0.02, 0.5, 0.16);
+    else if (r < 0.16) c = hsl(0.05, 0.38, 0.45);
+    else c = hsl(0.024 + rand() * 0.02, 0.5 + rand() * 0.12, 0.30 + rand() * 0.10);
+    brickCache.set(k, c);
+  }
+  return brickCache.get(k).clone().offsetHSL(0, 0, (rand() - 0.5) * 0.02);
+};
+
+const wallZ = -4;
+for (let x = -8; x <= 7; x++) {
+  const h = x <= 0 ? 8 : Math.max(1, Math.min(8, Math.round(8 - x * 0.9 + (rand() - 0.5) * 1.6)));
+  for (let y = 2; y < 2 + h; y++) {
+    const d = Math.hypot(x + 0.5 + 3.5, y + 0.5 - 6);
+    if (d < 2.1 + (rand() - 0.5) * 0.9) continue;
+    if (rand() < 0.03) continue;
+    if (x <= 0 && y === 1 + h && rand() < 0.2) continue;
+    put(x, y, wallZ, 'diffuse', brickColor(x, y));
+  }
+}
+
+for (let x = -4; x <= 3; x++) for (let y = 2; y <= 8; y++) {
+  const edge = x === -4 || x === 3 || y === 2 || y === 8;
+  if (edge) put(x, y, 2, 'diffuse', col(0x5c3f24, 0.06));
+  else put(x, y, 2, 'glass', col(0xdcf2f2, 0.03));
+}
+
+for (let x = -1; x <= 0; x++) for (let y = 2; y <= 3; y++) for (let z = -2; z <= -1; z++)
+  put(x, y, z, 'lamp', new THREE.Color(0xffffff));
+
+const pipe = [];
+for (let x = 5; x <= 10; x++) pipe.push([x, 2, 6]);
+pipe.push([10, 3, 6], [10, 4, 6], [10, 4, 5], [10, 4, 4], [10, 4, 3]);
+for (let x = 6; x <= 10; x++) pipe.push([x, 2, 8]);
+pipe.push([6, 3, 8]);
+for (let y = 2; y <= 6; y++) pipe.push([8, y, -2]);
+pipe.push([8, 6, -3]);
+let rusty = false;
+for (const [x, y, z] of pipe) {
+  if (rand() < 0.35) rusty = rand() < 0.45;
+  if (rusty) put(x, y, z, 'diffuse', col(0x7c452a, 0.1));
+  else put(x, y, z, 'metal', col(0xd9dee3, 0.05));
+}
+
+for (let x = -10; x <= -9; x++) for (let z = 7; z <= 8; z++) for (let y = 2; y <= 4; y++)
+  put(x, y, z, 'metal', y === 3 ? col(0x9aa3ac, 0.05) : col(0x6f767e, 0.05));
+
+for (let x = -6; x <= -3; x++) put(x, 2, 6, 'diffuse', col(0x6f4a2b, 0.06));
+for (let x = -6; x <= -3; x++) put(x, 2, 7, 'diffuse', col(0x7a522f, 0.06));
+for (let z = 5; z <= 8; z++) put(-4, 3, z, 'diffuse', col(0x60411f, 0.06));
+
+const debrisColor = () => {
+  const r = rand();
+  if (r < 0.6) return hsl(0.024 + rand() * 0.02, 0.5 + rand() * 0.12, 0.3 + rand() * 0.1);
+  if (r < 0.85) return col(0xa8a49b, 0.08);
+  return col(0x6f4a2b, 0.08);
+};
+let placed = 0, guard = 0;
+while (placed < 46 && guard < 500) {
+  guard++;
+  const x = Math.round(2 + (rand() + rand() - 1) * 5.5);
+  const z = Math.round((rand() + rand() - 1) * 4.5);
+  if (x < -B || x >= B || z < -B || z >= B) continue;
+  if (has(x, 2, z)) continue;
+  put(x, 2, z, 'diffuse', debrisColor());
+  placed++;
+  if (rand() < 0.22 && !has(x, 3, z)) { put(x, 3, z, 'diffuse', debrisColor()); placed++; }
+}
+
+const groups = { diffuse: [], metal: [], glass: [], lamp: [] };
+for (const v of V.values()) groups[v.g].push(v);
+
+const box = new THREE.BoxGeometry(1, 1, 1);
+const matDiffuse = new THREE.MeshPhysicalMaterial({ roughness: 0.93, metalness: 0, envMapIntensity: 0.4 });
+const matMetal = new THREE.MeshPhysicalMaterial({ roughness: 0.22, metalness: 1, envMapIntensity: 1.1 });
+const matGlass = new THREE.MeshPhysicalMaterial({
+  roughness: 0.07, metalness: 0, transmission: 1, ior: 1.52, thickness: 1.4,
+  attenuationColor: new THREE.Color(0xcdeef0), attenuationDistance: 7, envMapIntensity: 1
+});
+const matLamp = new THREE.MeshPhysicalMaterial({ color: 0x000000, emissive: 0xff9a3c, emissiveIntensity: 3.2, roughness: 1 });
+
+const build = (list, material, castShadow = true, receiveShadow = true) => {
+  const mesh = new THREE.InstancedMesh(box, material, list.length);
+  const m = new THREE.Matrix4();
+  list.forEach((v, i) => {
+    m.setPosition(v.x + 0.5, v.y + 0.5, v.z + 0.5);
+    mesh.setMatrixAt(i, m);
+    mesh.setColorAt(i, v.c);
+  });
+  if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+  mesh.castShadow = castShadow;
+  mesh.receiveShadow = receiveShadow;
+  scene.add(mesh);
+  return mesh;
+};
+const meshDiffuse = build(groups.diffuse, matDiffuse);
+const meshMetal = build(groups.metal, matMetal);
+const meshGlass = build(groups.glass, matGlass, false, false);
+const meshLamp = build(groups.lamp, matLamp, false, false);
+
+document.getElementById('stat').textContent = '体素实例: ' + V.size + ' · InstancedMesh x 4 · three r170';
+
+const floor = new THREE.Mesh(
+  new THREE.CircleGeometry(150, 64),
+  new THREE.MeshPhysicalMaterial({ color: 0x1e2126, roughness: 0.96, metalness: 0, envMapIntensity: 0.25 })
+);
+floor.rotation.x = -Math.PI / 2;
+floor.position.y = -0.02;
+floor.receiveShadow = true;
+scene.add(floor);
+
+const composer = new EffectComposer(renderer);
+composer.setPixelRatio(renderer.getPixelRatio());
+
+const renderPass = new RenderPass(scene, camera);
+composer.addPass(renderPass);
+
+const ssaoPass = new SSAOPass(scene, camera, window.innerWidth, window.innerHeight);
+ssaoPass.kernelRadius = 1.0;
+ssaoPass.minDistance = 0.0008;
+ssaoPass.maxDistance = 0.03;
+composer.addPass(ssaoPass);
+
+const bokehPass = new BokehPass(scene, camera, { focus: 41, aperture: 0.0007, maxblur: 0.012 });
+composer.addPass(bokehPass);
+
+composer.addPass(new OutputPass());
+
+const fxaaPass = new ShaderPass(FXAAShader);
+composer.addPass(fxaaPass);
+const updateFXAA = () => {
+  const pr = renderer.getPixelRatio();
+  fxaaPass.material.uniforms['resolution'].value.set(1 / (window.innerWidth * pr), 1 / (window.innerHeight * pr));
+};
+updateFXAA();
+
+const P = {
+  ssao: true, aoOnly: false, aoRadius: 1.0,
+  dof: true, autoFocus: true, focus: 41, aperture: 0.0007, maxblur: 0.012,
+  sun: 3.6, lamp: 30, exposure: 1.2, autoRotate: false
+};
+const gui = new GUI({ title: '渲染管线' });
+const f1 = gui.addFolder('SSAO 环境光遮蔽');
+f1.add(P, 'ssao').name('启用').onChange(v => ssaoPass.enabled = v);
+f1.add(P, 'aoOnly').name('仅显示 AO').onChange(v => {
+  ssaoPass.output = v ? SSAOPass.OUTPUT.SSAO : SSAOPass.OUTPUT.Default;
+});
+f1.add(P, 'aoRadius', 0.2, 3, 0.05).name('采样半径').onChange(v => ssaoPass.kernelRadius = v);
+const f2 = gui.addFolder('景深 DOF');
+f2.add(P, 'dof').name('启用').onChange(v => bokehPass.enabled = v);
+f2.add(P, 'autoFocus').name('自动对焦画面中心');
+const focusCtrl = f2.add(P, 'focus', 8, 120, 0.5).name('对焦距离')
+  .onChange(v => bokehPass.uniforms['focus'].value = v);
+f2.add(P, 'aperture', 0, 0.002, 0.00005).name('光圈')
+  .onChange(v => bokehPass.uniforms['aperture'].value = v);
+f2.add(P, 'maxblur', 0, 0.03, 0.001).name('最大模糊')
+  .onChange(v => bokehPass.uniforms['maxblur'].value = v);
+const f3 = gui.addFolder('光照与相机');
+f3.add(P, 'sun', 0, 8, 0.1).name('太阳强度').onChange(v => sun.intensity = v);
+f3.add(P, 'lamp', 0, 80, 1).name('灯箱强度').onChange(v => lampLight.intensity = v);
+f3.add(P, 'exposure', 0.3, 2.5, 0.05).name('曝光').onChange(v => renderer.toneMappingExposure = v);
+f3.add(P, 'autoRotate').name('自动旋转').onChange(v => controls.autoRotate = v);
+
+const raycaster = new THREE.Raycaster();
+renderer.domElement.addEventListener('dblclick', e => {
+  const ndc = new THREE.Vector2(
+    (e.clientX / window.innerWidth) * 2 - 1,
+    -(e.clientY / window.innerHeight) * 2 + 1
+  );
+  raycaster.setFromCamera(ndc, camera);
+  const hit = raycaster.intersectObjects([meshDiffuse, meshMetal, meshGlass, meshLamp, floor], false)[0];
+  if (hit) {
+    P.autoFocus = false;
+    P.focus = hit.distance;
+    bokehPass.uniforms['focus'].value = hit.distance;
+    gui.controllersRecursive().forEach(c => c.updateDisplay());
+  }
+});
+
+window.addEventListener('resize', () => {
+  const w = window.innerWidth, h = window.innerHeight;
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  renderer.setSize(w, h);
+  composer.setSize(w, h);
+  const pr = renderer.getPixelRatio();
+  if (bokehPass.renderTargetDepth) bokehPass.renderTargetDepth.setSize(Math.round(w * pr), Math.round(h * pr));
+  if (bokehPass.uniforms['aspect']) bokehPass.uniforms['aspect'].value = camera.aspect;
+  updateFXAA();
+});
+
+renderer.setAnimationLoop(() => {
+  controls.update();
+  if (P.dof && P.autoFocus) {
+    const d = camera.position.distanceTo(controls.target);
+    P.focus = d;
+    bokehPass.uniforms['focus'].value = d;
+    focusCtrl.updateDisplay();
+  }
+  composer.render();
+});
+</script>
+</body>
+</html>

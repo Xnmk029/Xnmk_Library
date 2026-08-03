@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>路径追踪 Cornell Box · GPU Benchmark</title>
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;overflow:hidden;background:#000;color:#ddd;font:13px/1.6 "Segoe UI",system-ui,sans-serif}
+#c{position:fixed;inset:0;width:100vw;height:100vh;display:block;cursor:grab}
+#c.drag{cursor:grabbing}
+#hud{position:fixed;top:12px;left:12px;background:rgba(0,0,0,.55);backdrop-filter:blur(4px);padding:10px 14px;border-radius:8px;font:12px/1.7 Consolas,Menlo,monospace;white-space:pre;pointer-events:none;border:1px solid rgba(255,255,255,.08)}
+#panel{position:fixed;top:12px;right:12px;width:250px;background:rgba(18,18,24,.88);backdrop-filter:blur(6px);padding:14px 16px;border-radius:10px;border:1px solid rgba(255,255,255,.08)}
+#panel h1{font-size:14px;margin:0 0 10px;color:#fff}
+#panel label{display:block;margin:8px 0 2px;color:#aaa}
+#panel .val{float:right;color:#6cf}
+#panel input[type=range]{width:100%;margin:2px 0 4px}
+#panel select{width:100%;background:#222;color:#ddd;border:1px solid #444;border-radius:4px;padding:3px}
+#panel .btns{display:flex;gap:8px;margin-top:12px}
+button{flex:1;background:#2a2a33;color:#ddd;border:1px solid #555;border-radius:6px;padding:6px 0;cursor:pointer;font-size:12px}
+button:hover{background:#3a3a45}
+#bench{width:100%;margin-top:10px;background:#1d4ed8;border-color:#3b82f6;color:#fff;font-weight:600;padding:8px 0}
+#bench:hover{background:#2563eb}
+#panel .tip{margin-top:10px;color:#777;font-size:11px}
+#panel.lock{pointer-events:none;opacity:.45}
+#benchbar{position:fixed;top:16px;left:50%;transform:translateX(-50%);width:340px;display:none;background:rgba(0,0,0,.7);border:1px solid rgba(255,255,255,.15);border-radius:8px;padding:10px 14px}
+#benchbar .track{height:6px;background:#333;border-radius:3px;overflow:hidden;margin-top:6px}
+#benchfill{height:100%;width:0;background:linear-gradient(90deg,#3b82f6,#22d3ee)}
+#modal{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,.6)}
+#modal .card{width:380px;background:#16161d;border:1px solid rgba(255,255,255,.12);border-radius:12px;padding:22px 26px}
+#modal h2{margin:0 0 6px;font-size:16px;color:#fff}
+#score{font-size:40px;font-weight:700;color:#22d3ee;margin:8px 0 2px}
+#score small{font-size:13px;color:#888;font-weight:400}
+#rtable{width:100%;margin:12px 0;border-collapse:collapse}
+#rtable td{padding:4px 0;border-bottom:1px solid rgba(255,255,255,.07)}
+#rtable td:last-child{text-align:right;color:#9cf;font-family:Consolas,monospace}
+#err{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:#000;color:#f66;font-size:15px;text-align:center;padding:30px}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"></div>
+<div id="panel">
+  <h1>路径追踪 GPU Benchmark</h1>
+  <label>渲染分辨率
+    <select id="iScale">
+      <option value="0.5">50%</option>
+      <option value="0.75">75%</option>
+      <option value="1" selected>100%</option>
+      <option value="1.5">150%</option>
+      <option value="2">200%</option>
+    </select>
+  </label>
+  <label>最大弹射深度 <span class="val" id="vB">6</span></label>
+  <input id="iB" type="range" min="2" max="16" step="1" value="6">
+  <label>每帧采样 (SPP) <span class="val" id="vS">1</span></label>
+  <input id="iS" type="range" min="1" max="8" step="1" value="1">
+  <label>曝光 <span class="val" id="vE">1.0</span></label>
+  <input id="iE" type="range" min="0.2" max="3" step="0.1" value="1">
+  <div class="btns">
+    <button id="btnPause">暂停</button>
+    <button id="btnReset">重置累积</button>
+  </div>
+  <button id="bench">开始跑分 (30s)</button>
+  <div class="tip">拖拽旋转视角 · 滚轮缩放<br>移动相机会重置累积采样</div>
+</div>
+<div id="benchbar">
+  <span id="benchtext">跑分中…</span>
+  <div class="track"><div id="benchfill"></div></div>
+</div>
+<div id="modal">
+  <div class="card">
+    <h2>跑分结果</h2>
+    <div id="score"></div>
+    <table id="rtable"></table>
+    <div class="btns">
+      <button id="btnCopy">复制结果</button>
+      <button id="btnClose">关闭</button>
+    </div>
+  </div>
+</div>
+<div id="err"></div>
+<script>
+"use strict";
+const $=id=>document.getElementById(id);
+const canvas=$("c");
+function fail(msg){const e=$("err");e.style.display="flex";e.textContent=msg;throw new Error(msg);}
+const gl=canvas.getContext("webgl2",{antialias:false,alpha:false,depth:false,stencil:false,powerPreference:"high-performance"});
+if(!gl)fail("此浏览器不支持 WebGL2，无法运行本 Benchmark");
+let TFMT;
+if(gl.getExtension("EXT_color_buffer_float"))TFMT={i:gl.RGBA32F,t:gl.FLOAT};
+else if(gl.getExtension("EXT_color_buffer_half_float"))TFMT={i:gl.RGBA16F,t:gl.HALF_FLOAT};
+else fail("缺少浮点渲染目标扩展 (EXT_color_buffer_float)");
+let gpuName="Unknown GPU";
+try{
+  const dbg=gl.getExtension("WEBGL_debug_renderer_info");
+  gpuName=dbg?gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL):gl.getParameter(gl.RENDERER);
+}catch(e){}
+
+const VS=`#version 300 es
+void main(){vec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));gl_Position=vec4(p*2.0-1.0,0.0,1.0);}`;
+
+const FS_PT=`#version 300 es
+precision highp float;
+precision highp int;
+uniform sampler2D uPrev;
+uniform vec2 uRes;
+uniform uint uFrame;
+uniform float uCount;
+uniform int uSPP;
+uniform int uMaxB;
+uniform vec3 uPos,uRight,uUp,uFwd;
+uniform float uTanF;
+out vec4 fragColor;
+
+const float PI=3.14159265359;
+const vec3 RMIN=vec3(-1.3,0.0,-1.3);
+const vec3 RMAX=vec3(1.3,2.2,2.2);
+const float LY=2.1995;
+const vec2 LMIN=vec2(-0.55,-0.75);
+const vec2 LMAX=vec2(0.55,0.35);
+const float LAREA=1.21;
+const vec3 LEMIT=vec3(15.0,11.2,6.8);
+
+uint gs;
+uint pcg(){gs=gs*747796405u+2891336453u;uint w=((gs>>((gs>>28u)+4u))^gs)*277803737u;return (w>>22u)^w;}
+float rnd(){return float(pcg())*(1.0/4294967296.0);}
+vec2 rnd2(){return vec2(rnd(),rnd());}
+
+struct Hit{float t;vec3 n;vec3 alb;int m;float rg;};
+
+void room(vec3 o,vec3 d,inout Hit h){
+  vec3 iv=1.0/d;
+  vec3 a=(RMIN-o)*iv,b=(RMAX-o)*iv;
+  vec3 tmx=max(a,b);
+  float tF=min(min(tmx.x,tmx.y),tmx.z);
+  if(tF<1e-4||tF>h.t)return;
+  vec3 n;vec3 alb=vec3(0.73);
+  if(tF==tmx.x){n=vec3(-sign(d.x),0.,0.);alb=d.x>0.?vec3(0.14,0.45,0.091):vec3(0.63,0.065,0.05);}
+  else if(tF==tmx.y){n=vec3(0.,-sign(d.y),0.);}
+  else{n=vec3(0.,0.,-sign(d.z));}
+  h.t=tF;h.n=n;h.alb=alb;h.m=0;h.rg=0.;
+}
+
+void lamp(vec3 o,vec3 d,inout Hit h){
+  float t=(LY-o.y)/d.y;
+  if(t<1e-4||t>h.t)return;
+  vec2 p=o.xz+d.xz*t;
+  if(p.x<LMIN.x||p.x>LMAX.x||p.y<LMIN.y||p.y>LMAX.y)return;
+  h.t=t;h.n=vec3(0.,-1.,0.);h.alb=vec3(0.);h.m=3;h.rg=0.;
+}
+
+void sph(vec3 c,float r,vec3 alb,int m,float rg,vec3 o,vec3 d,inout Hit h){
+  vec3 oc=o-c;float b=dot(oc,d);float cc=dot(oc,oc)-r*r;float ds=b*b-cc;
+  if(ds<0.)return;
+  float s=sqrt(ds);float t=-b-s;
+  if(t<1e-4)t=-b+s;
+  if(t<1e-4||t>h.t)return;
+  h.t=t;h.n=(o+d*t-c)/r;h.alb=alb;h.m=m;h.rg=rg;
+}
+
+vec3 rotY(vec3 p,float ca,float sa){return vec3(ca*p.x+sa*p.z,p.y,-sa*p.x+ca*p.z);}
+
+void box(vec3 c,vec3 hs,float ca,float sa,vec3 alb,int m,float rg,vec3 o,vec3 d,inout Hit h){
+  vec3 lo=rotY(o-c,ca,sa);vec3 ld=rotY(d,ca,sa);
+  vec3 iv=1.0/ld;
+  vec3 a=(-hs-lo)*iv,b=(hs-lo)*iv;
+  vec3 tmn=min(a,b),tmx=max(a,b);
+  float tN=max(max(tmn.x,tmn.y),tmn.z);
+  float tF=min(min(tmx.x,tmx.y),tmx.z);
+  if(tN>tF||tF<1e-4)return;
+  float t=tN>1e-4?tN:tF;
+  if(t>h.t)return;
+  vec3 lp=lo+ld*t;
+  vec3 an=abs(lp)/hs;
+  vec3 ln;
+  if(an.x>an.y&&an.x>an.z)ln=vec3(sign(lp.x),0.,0.);
+  else if(an.y>an.z)ln=vec3(0.,sign(lp.y),0.);
+  else ln=vec3(0.,0.,sign(lp.z));
+  h.t=t;h.n=rotY(ln,ca,-sa);h.alb=alb;h.m=m;h.rg=rg;
+}
+
+Hit scene(vec3 o,vec3 d){
+  Hit h;h.t=1e30;h.m=-1;h.n=vec3(0.);h.alb=vec3(0.);h.rg=0.;
+  room(o,d,h);
+  lamp(o,d,h);
+  box(vec3(-0.62,0.6,-0.55),vec3(0.3,0.6,0.3),0.9397,0.3420,vec3(0.73),0,0.,o,d,h);
+  box(vec3(0.6,0.3,-0.45),vec3(0.3,0.3,0.3),0.9511,-0.3090,vec3(0.73),0,0.,o,d,h);
+  sph(vec3(-0.62,1.48,-0.55),0.28,vec3(0.9,0.92,0.95),1,0.04,o,d,h);
+  sph(vec3(0.6,0.9,-0.45),0.3,vec3(1.0,0.71,0.29),1,0.3,o,d,h);
+  sph(vec3(-0.1,0.42,0.62),0.42,vec3(1.),2,0.,o,d,h);
+  return h;
+}
+
+bool occluded(vec3 o,vec3 d,float md){
+  Hit h=scene(o,d);
+  return h.m!=3&&h.t<md-1e-3;
+}
+
+vec3 cosH(vec3 n){
+  vec2 u=rnd2();
+  float r=sqrt(u.x),ph=6.2831853*u.y;
+  vec3 t=normalize(cross(abs(n.y)<0.99?vec3(0.,1.,0.):vec3(1.,0.,0.),n));
+  vec3 b=cross(n,t);
+  return normalize(t*(r*cos(ph))+b*(r*sin(ph))+n*sqrt(max(0.,1.-u.x)));
+}
+
+vec3 rsp(){
+  vec2 u=rnd2();
+  float z=1.-2.*u.x;
+  float r=sqrt(max(0.,1.-z*z));
+  float ph=6.2831853*u.y;
+  return vec3(r*cos(ph),r*sin(ph),z)*pow(max(rnd(),1e-4),0.33333);
+}
+
+vec3 nee(vec3 p,vec3 n,vec3 alb){
+  vec2 u=rnd2();
+  vec3 lp=vec3(mix(LMIN.x,LMAX.x,u.x),LY,mix(LMIN.y,LMAX.y,u.y));
+  vec3 tl=lp-p;
+  float d2=dot(tl,tl);
+  float dist=sqrt(d2);
+  vec3 ld=tl/dist;
+  float cs=dot(n,ld);
+  float cl=ld.y;
+  if(cs<=0.||cl<=1e-4)return vec3(0.);
+  if(occluded(p+n*1e-3,ld,dist))return vec3(0.);
+  float pdf=d2/(cl*LAREA);
+  return alb/PI*LEMIT*cs/pdf;
+}
+
+vec3 trace(vec3 o,vec3 d){
+  vec3 L=vec3(0.),tp=vec3(1.);
+  bool sp=true;
+  for(int b=0;b<uMaxB;b++){
+    Hit h=scene(o,d);
+    if(h.m<0)break;
+    if(h.m==3){if(sp)L+=tp*LEMIT;break;}
+    vec3 p=o+d*h.t;
+    vec3 n=h.n;
+    if(h.m==0){
+      if(dot(n,d)>0.)n=-n;
+      L+=tp*nee(p,n,h.alb);
+      d=cosH(n);o=p+n*1e-3;tp*=h.alb;sp=false;
+    }else if(h.m==1){
+      if(dot(n,d)>0.)n=-n;
+      float ci=clamp(dot(-d,n),0.,1.);
+      vec3 F=h.alb+(1.-h.alb)*pow(1.-ci,5.);
+      vec3 r=reflect(d,n);
+      r=normalize(r+h.rg*rsp());
+      if(dot(r,n)<=0.)break;
+      tp*=F;d=r;o=p+n*1e-3;sp=true;
+    }else{
+      bool ins=dot(n,d)>0.;
+      vec3 nl=ins?-n:n;
+      float eta=ins?1.5:(1.0/1.5);
+      float ci=clamp(dot(-d,nl),0.,1.);
+      float f0=0.04;
+      float Fr;
+      float sin2t=eta*eta*(1.0-ci*ci);
+      if(sin2t>=1.0)Fr=1.0;
+      else{
+        float cx=eta>1.0?sqrt(1.0-sin2t):ci;
+        Fr=f0+(1.0-f0)*pow(1.0-cx,5.0);
+      }
+      if(rnd()<Fr){d=reflect(d,nl);o=p+nl*1e-3;}
+      else{d=normalize(refract(d,nl,eta));o=p-nl*1e-3;}
+      sp=true;
+    }
+    if(b>2){
+      float q=clamp(max(tp.x,max(tp.y,tp.z)),0.05,0.95);
+      if(rnd()>q)break;
+      tp/=q;
+    }
+  }
+  return L;
+}
+
+void main(){
+  ivec2 fc=ivec2(gl_FragCoord.xy);
+  gs=(uint(fc.x)*1973u)^(uint(fc.y)*9277u)^(uFrame*26699u);
+  pcg();pcg();
+  vec3 sum=vec3(0.);
+  for(int s=0;s<uSPP;s++){
+    vec2 j=rnd2();
+    vec2 uv=(vec2(fc)+j)/uRes*2.0-1.0;
+    uv.x*=uRes.x/uRes.y;
+    vec3 rd=normalize(uFwd+uTanF*(uv.x*uRight+uv.y*uUp));
+    vec3 c=trace(uPos,rd);
+    if(any(isnan(c))||any(isinf(c)))c=vec3(0.);
+    sum+=min(c,vec3(60.));
+  }
+  vec3 prev=uCount>0.5?texelFetch(uPrev,fc,0).rgb:vec3(0.);
+  fragColor=vec4(prev+sum,1.0);
+}`;
+
+const FS_DISP=`#version 300 es
+precision highp float;
+uniform sampler2D uTex;
+uniform float uCount;
+uniform float uExp;
+out vec4 o;
+vec3 aces(vec3 x){return clamp(x*(2.51*x+0.03)/(x*(2.43*x+0.59)+0.14),0.,1.);}
+void main(){
+  vec3 c=texelFetch(uTex,ivec2(gl_FragCoord.xy),0).rgb/max(uCount,1.0);
+  c*=uExp;
+  c=aces(c);
+  c=pow(c,vec3(1.0/2.2));
+  o=vec4(c,1.0);
+}`;
+
+function sh(type,src){
+  const s=gl.createShader(type);
+  gl.shaderSource(s,src);
+  gl.compileShader(s);
+  if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))fail("Shader 编译失败:\n"+gl.getShaderInfoLog(s));
+  return s;
+}
+function prog(vs,fs){
+  const p=gl.createProgram();
+  gl.attachShader(p,sh(gl.VERTEX_SHADER,vs));
+  gl.attachShader(p,sh(gl.FRAGMENT_SHADER,fs));
+  gl.linkProgram(p);
+  if(!gl.getProgramParameter(p,gl.LINK_STATUS))fail("Program 链接失败:\n"+gl.getProgramInfoLog(p));
+  return p;
+}
+const ptProg=prog(VS,FS_PT);
+const dispProg=prog(VS,FS_DISP);
+function locs(p,names){const o={};for(const n of names)o[n]=gl.getUniformLocation(p,n);return o;}
+const ptU=locs(ptProg,["uPrev","uRes","uFrame","uCount","uSPP","uMaxB","uPos","uRight","uUp","uFwd","uTanF"]);
+const dU=locs(dispProg,["uTex","uCount","uExp"]);
+
+const state={scale:1,spp:1,bounces:6,exposure:1,paused:false};
+const CAM0={yaw:0,pitch:0.06,r:2.05,tg:[0,1.0,-0.1]};
+const cam={...CAM0,tg:[...CAM0.tg]};
+let W=0,H=0,tex=[null,null],fbo=[null,null],src=0,dst=1;
+let sampleCount=0,frameId=0,ema=0,lastT=0;
+const dpr=Math.min(window.devicePixelRatio||1,2);
+
+function allocTargets(){
+  for(let i=0;i<2;i++){
+    if(tex[i])gl.deleteTexture(tex[i]);
+    if(fbo[i])gl.deleteFramebuffer(fbo[i]);
+    tex[i]=gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D,tex[i]);
+    gl.texImage2D(gl.TEXTURE_2D,0,TFMT.i,W,H,0,gl.RGBA,TFMT.t,null);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+    fbo[i]=gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER,fbo[i]);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,tex[i],0);
+  }
+  if(gl.checkFramebufferStatus(gl.FRAMEBUFFER)!==gl.FRAMEBUFFER_COMPLETE)fail("浮点 FBO 创建失败");
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+  resetAccum();
+}
+function resetAccum(){
+  sampleCount=0;
+  gl.clearColor(0,0,0,0);
+  for(let i=0;i<2;i++){
+    gl.bindFramebuffer(gl.FRAMEBUFFER,fbo[i]);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+}
+function resize(){
+  W=Math.min(8192,Math.max(16,Math.floor(innerWidth*dpr*state.scale)));
+  H=Math.min(8192,Math.max(16,Math.floor(innerHeight*dpr*state.scale)));
+  canvas.width=W;canvas.height=H;
+  allocTargets();
+}
+
+const sub=(a,b)=>[a[0]-b[0],a[1]-b[1],a[2]-b[2]];
+const cross=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
+const norm=a=>{const l=Math.hypot(a[0],a[1],a[2])||1;return[a[0]/l,a[1]/l,a[2]/l];};
+function camVecs(){
+  const cy=Math.cos(cam.yaw),sy=Math.sin(cam.yaw),cp=Math.cos(cam.pitch),sp=Math.sin(cam.pitch);
+  let pos=[cam.tg[0]+cam.r*sy*cp,cam.tg[1]+cam.r*sp,cam.tg[2]+cam.r*cy*cp];
+  const m=0.08,mn=[-1.3+m,m,-1.3+m],mx=[1.3-m,2.2-m,2.2-m];
+  pos=pos.map((v,i)=>Math.min(mx[i],Math.max(mn[i],v)));
+  const f=norm(sub(cam.tg,pos));
+  const r=norm(cross(f,[0,1,0]));
+  const u=cross(r,f);
+  return{pos,f,r,u};
+}
+
+let bench=null;
+const TANF=Math.tan(55*0.5*Math.PI/180);
+
+function frame(t){
+  requestAnimationFrame(frame);
+  const dt=lastT?t-lastT:16.7;
+  lastT=t;
+  ema=ema?ema*0.9+dt*0.1:dt;
+  if(!state.paused){
+    gl.bindFramebuffer(gl.FRAMEBUFFER,fbo[dst]);
+    gl.viewport(0,0,W,H);
+    gl.useProgram(ptProg);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D,tex[src]);
+    gl.uniform1i(ptU.uPrev,0);
+    gl.uniform2f(ptU.uRes,W,H);
+    gl.uniform1ui(ptU.uFrame,frameId>>>0);
+    gl.uniform1f(ptU.uCount,sampleCount);
+    gl.uniform1i(ptU.uSPP,state.spp);
+    gl.uniform1i(ptU.uMaxB,state.bounces);
+    const c=camVecs();
+    gl.uniform3f(ptU.uPos,c.pos[0],c.pos[1],c.pos[2]);
+    gl.uniform3f(ptU.uRight,c.r[0],c.r[1],c.r[2]);
+    gl.uniform3f(ptU.uUp,c.u[0],c.u[1],c.u[2]);
+    gl.uniform3f(ptU.uFwd,c.f[0],c.f[1],c.f[2]);
+    gl.uniform1f(ptU.uTanF,TANF);
+    gl.drawArrays(gl.TRIANGLES,0,3);
+    sampleCount+=state.spp;
+    frameId++;
+    const tmp=src;src=dst;dst=tmp;
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+  gl.viewport(0,0,W,H);
+  gl.useProgram(dispProg);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D,tex[src]);
+  gl.uniform1i(dU.uTex,0);
+  gl.uniform1f(dU.uCount,Math.max(sampleCount,1));
+  gl.uniform1f(dU.uExp,state.exposure);
+  gl.drawArrays(gl.TRIANGLES,0,3);
+  if(bench)benchTick(dt);
+  hudTick(t);
+}
+
+let hudLast=0;
+function hudTick(t){
+  if(t-hudLast<250)return;
+  hudLast=t;
+  const fps=1000/ema;
+  const msps=W*H*state.spp*fps/1e6;
+  const mrays=msps*(1+state.bounces*0.7);
+  $("hud").textContent=
+    `FPS        ${fps.toFixed(1)}  (${ema.toFixed(2)} ms)\n`+
+    `分辨率     ${W} × ${H}\n`+
+    `累计 SPP   ${sampleCount}\n`+
+    `MSample/s  ${state.paused?"—":msps.toFixed(1)}\n`+
+    `MRay/s ≈   ${state.paused?"—":mrays.toFixed(0)}\n`+
+    `GPU        ${gpuName.length>34?gpuName.slice(0,34)+"…":gpuName}`;
+}
+
+function benchTick(dt){
+  if(bench.warm>0){bench.warm--;return;}
+  bench.t+=dt;
+  bench.dts.push(dt);
+  const pr=Math.min(bench.t/bench.dur,1);
+  $("benchfill").style.width=(pr*100).toFixed(1)+"%";
+  $("benchtext").textContent=`跑分中… 剩余 ${Math.max(0,(bench.dur-bench.t)/1000).toFixed(0)} s`;
+  if(bench.t>=bench.dur)endBench();
+}
+function startBench(){
+  if(bench)return;
+  bench={
+    dur:30000,t:0,warm:3,dts:[],
+    saved:{scale:state.scale,spp:state.spp,bounces:state.bounces,paused:state.paused,cam:{yaw:cam.yaw,pitch:cam.pitch,r:cam.r}}
+  };
+  state.scale=1;state.spp=2;state.bounces=8;state.paused=false;
+  cam.yaw=CAM0.yaw;cam.pitch=CAM0.pitch;cam.r=CAM0.r;
+  syncUI();
+  resize();
+  $("panel").classList.add("lock");
+  $("benchbar").style.display="block";
+  $("btnPause").textContent="暂停";
+}
+function endBench(){
+  const b=bench;bench=null;
+  const frames=b.dts.length;
+  const totalMs=b.dts.reduce((a,v)=>a+v,0);
+  const avgFps=1000*frames/totalMs;
+  const sorted=[...b.dts].sort((a,v)=>v-a);
+  const lowFps=1000/sorted[Math.min(frames-1,Math.floor(frames*0.01))];
+  const msamples=W*H*2*frames/1e6;
+  const score=Math.round(msamples);
+  const resStr=`${W} × ${H}`;
+  $("score").innerHTML=`${score.toLocaleString()} <small>分 (累计 MSamples / 30s)</small>`;
+  $("rtable").innerHTML=
+    `<tr><td>GPU</td><td>${gpuName}</td></tr>`+
+    `<tr><td>渲染分辨率</td><td>${resStr}</td></tr>`+
+    `<tr><td>平均 FPS</td><td>${avgFps.toFixed(1)}</td></tr>`+
+    `<tr><td>1% Low FPS</td><td>${lowFps.toFixed(1)}</td></tr>`+
+    `<tr><td>吞吐量</td><td>${(msamples/(totalMs/1000)).toFixed(1)} MSample/s</td></tr>`+
+    `<tr><td>压力参数</td><td>弹射 8 · SPP 2</td></tr>`;
+  window.__benchText=
+    `路径追踪 GPU Benchmark\nGPU: ${gpuName}\n分辨率: ${resStr} · 弹射 8 · SPP 2\n得分: ${score} (MSamples/30s)\n平均 FPS: ${avgFps.toFixed(1)} · 1% Low: ${lowFps.toFixed(1)}`;
+  state.scale=b.saved.scale;state.spp=b.saved.spp;state.bounces=b.saved.bounces;state.paused=b.saved.paused;
+  cam.yaw=b.saved.cam.yaw;cam.pitch=b.saved.cam.pitch;cam.r=b.saved.cam.r;
+  syncUI();
+  resize();
+  $("panel").classList.remove("lock");
+  $("benchbar").style.display="none";
+  $("modal").style.display="flex";
+}
+
+function syncUI(){
+  $("iScale").value=String(state.scale);
+  $("iB").value=state.bounces;$("vB").textContent=state.bounces;
+  $("iS").value=state.spp;$("vS").textContent=state.spp;
+  $("iE").value=state.exposure;$("vE").textContent=state.exposure.toFixed(1);
+  $("btnPause").textContent=state.paused?"继续":"暂停";
+}
+$("iScale").addEventListener("change",e=>{if(bench)return;state.scale=parseFloat(e.target.value);resize();});
+$("iB").addEventListener("input",e=>{if(bench)return;state.bounces=parseInt(e.target.value);$("vB").textContent=state.bounces;resetAccum();});
+$("iS").addEventListener("input",e=>{if(bench)return;state.spp=parseInt(e.target.value);$("vS").textContent=state.spp;});
+$("iE").addEventListener("input",e=>{state.exposure=parseFloat(e.target.value);$("vE").textContent=state.exposure.toFixed(1);});
+$("btnPause").addEventListener("click",()=>{if(bench)return;state.paused=!state.paused;$("btnPause").textContent=state.paused?"继续":"暂停";});
+$("btnReset").addEventListener("click",()=>{if(bench)return;resetAccum();});
+$("bench").addEventListener("click",startBench);
+$("btnClose").addEventListener("click",()=>{$("modal").style.display="none";});
+$("btnCopy").addEventListener("click",()=>{
+  if(navigator.clipboard&&window.__benchText)navigator.clipboard.writeText(window.__benchText);
+  $("btnCopy").textContent="已复制";
+  setTimeout(()=>{$("btnCopy").textContent="复制结果";},1200);
+});
+
+let dragging=false,lx=0,ly=0;
+canvas.addEventListener("pointerdown",e=>{
+  if(bench)return;
+  dragging=true;lx=e.clientX;ly=e.clientY;
+  canvas.classList.add("drag");
+  canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener("pointermove",e=>{
+  if(!dragging||bench)return;
+  const dx=e.clientX-lx,dy=e.clientY-ly;
+  lx=e.clientX;ly=e.clientY;
+  cam.yaw-=dx*0.005;
+  cam.pitch=Math.min(1.2,Math.max(-1.2,cam.pitch-dy*0.005));
+  resetAccum();
+});
+const endDrag=e=>{dragging=false;canvas.classList.remove("drag");};
+canvas.addEventListener("pointerup",endDrag);
+canvas.addEventListener("pointercancel",endDrag);
+window.addEventListener("wheel",e=>{
+  if(bench||e.target!==canvas)return;
+  e.preventDefault();
+  cam.r=Math.min(2.45,Math.max(0.5,cam.r*Math.exp(e.deltaY*0.0012)));
+  resetAccum();
+},{passive:false});
+
+let rsTimer=0;
+window.addEventListener("resize",()=>{
+  clearTimeout(rsTimer);
+  rsTimer=setTimeout(resize,150);
+});
+
+syncUI();
+resize();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
