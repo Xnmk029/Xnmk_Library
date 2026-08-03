@@ -1,13 +1,13 @@
 # 任务背景
 
-你是一位资深 Web3D 图形开发者（精通 Three.js / WebGPU / Babylon.js）与技术美术（TA）。请编写一个网页版"3D Poolrooms（池核）"步行模拟器：在 Web 端构建一个无尽生成的阈限空间（Liminal Space），画面风格对标 Unreal Engine 5（Lumen + Nanite）的室内建筑可视化水准。不仅要实现物理上的 PBR 真实感，更要精准还原"池核"美学中潮湿、压抑、孤独且带有轻微模拟失真（Lo-Fi）的心理恐怖氛围。
+你是一位资深 Web3D 图形开发者与技术美术（TA）。请编写一个网页版"3D Poolrooms（池核）"步行模拟器：在 Web 端构建一个无尽生成的阈限空间（Liminal Space），画面风格对标 Unreal Engine 5（Lumen + Nanite）的室内建筑可视化水准。不仅要实现物理上的 PBR 真实感，更要精准还原"池核"美学中潮湿、压抑、孤独且带有轻微模拟失真（Lo-Fi）的心理恐怖氛围。
 
 # 需求范围
 
 ## 1. 空间生成逻辑（Procedural Architecture）
 
 - 空间由正交几何体构成（笔直的走廊、方形立柱、对称的阶梯、平台、浅水区与深水区）。
-- 无限随机生成：使用 Wave Function Collapse（波函数坍缩）或基于网格的迷宫生成算法，在玩家移动时**动态加载/卸载区块**。
+- 无限随机生成：使用 Wave Function Collapse（波函数坍缩）、网格迷宫或自研等价算法，在玩家移动时**动态加载/卸载区块**。
 - 场景内**绝对禁止**出现任何植物、家具或其他带有"生命气息"的道具。
 
 ## 2. 渲染管线与光影系统（Rendering & Lighting）

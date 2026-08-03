@@ -1,13 +1,13 @@
 # 任务背景
 
-You are an expert in WebGL and physics engine development. Please create a single-file HTML project that implements a 3D soft-body cloth physics simulation based on a "Mass-Spring System" or "Position-Based Dynamics (Verlet Integration)."
+You are an expert in WebGL and physics engine development. Please create a single-file HTML project that implements a 3D soft-body cloth physics simulation using a mass-spring system, Position-Based Dynamics, or an equivalent soft-body approach.
 
 # 需求范围
 
 ## 项目格式要求
 
-- 交付为单个 `index.html`，包含全部 HTML、CSS 与 JavaScript。
-- 3D 渲染、交互与 UI 库可通过可靠公共 CDN 引入（如 Three.js + OrbitControls）。
+- 交付为单个 `index.html`（或可运行工程），包含全部 HTML、CSS 与 JavaScript。
+- 3D 渲染、交互与 UI 库可通过可靠公共 CDN 引入。
 - 核心布料物理必须完整实现。
 
 ## A. 动态网格分辨率
