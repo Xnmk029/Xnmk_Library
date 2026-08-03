@@ -1,0 +1,43 @@
+# 任务背景
+
+你是一个顶尖的前端开发专家和 UI/UX 设计师。请使用 React + Vite + CSS 编写一个极其炫酷、具有赛博朋克科幻 HUD（Heads-Up Display）风格的"复合型创客与系统管理员"多职业交互式个人简历网页。
+
+# 需求范围
+
+## 设计美学要求
+
+- **视觉格调**：深邃的科技暗色背景（`#050507`），搭配全局环境暗角（Vignette）和半透明细网格背景线。
+- **色彩体系**：使用高饱和度、发光的霓虹渐变作为不同职业的主题色：
+  - AI 提示词专家（AI PROMPT ENGINEER）：绿光 `#23ff00`
+  - 单车工程技师（BICYCLE TECHNICIAN）：橙/黄光 `#ffaa00`
+  - IT 系统管理员（IT SYSTEMS ADMIN）：青/蓝光 `#00f0ff`
+  - 3D 关卡设计师（3D LEVEL DESIGNER）：粉红/玫红光 `#ff0055`
+
+## 微动效与氛围感
+
+- 鼠标悬停在各职业入口时，对应的导引线条延伸并亮起专属霓虹色。
+- 核心状态信息和标题带有赛博朋克式字符乱码滚动加载动效（Scramble Text）。
+- 页面背景为 Canvas：绘制 250 条发光的贝塞尔曲线，根据鼠标位置产生排斥扰动，随滚轮滚动产生波浪振幅，在悬停/选中不同职业时过渡变换对应发光颜色与透明度。
+
+## 技术栈
+
+- **核心框架**：React
+- **动画库**：Framer Motion（无缝过渡与弹簧 LayoutId 动画）
+- **3D 渲染**：Three.js + `@react-three/fiber` + `@react-three/drei`（3D 视窗展示）
+- **样式**：原生 CSS（不使用 Tailwind，保持结构清晰与高自定义度）
+
+## 项目文件结构
+
+请生成以下 4 个核心文件：
+
+1. `src/index.css`：全局基础样式与暗色网格背景
+2. `src/App.css`：页面布局、赛博朋克转场框架、Bento Grid 技能库
+3. `src/components/CanvasBackground.jsx`：高性能交互式 Canvas 贝塞尔扰动背景线组件
+4. `src/App.jsx`：主应用入口，包含乱码滚动、不同职业的转场子页面、3D Live 视窗、滚动触发的 Bento 技能展示
+
+# 交付与限制要求
+
+- 交付完整可运行的 Vite + React 工程（含 `package.json`），`npm install && npm run dev` 即可启动。
+- 页面在常见桌面分辨率下布局完整、无横向滚动条、无控制台报错。
+- 所有动效须真实可交互，不得以静态截图代替。
+- 不得包含 TODO 或未完成占位符。

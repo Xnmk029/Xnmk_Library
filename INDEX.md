@@ -52,7 +52,7 @@ F:\benchmark
 | 15 | [`PenroseStairs`](./L2_Intermediate/PenroseStairs) | **彭罗斯阶梯：HTML 视错觉 Benchmark**<br>*Penrose Optical Illusion 3D Geometry* | 3D 图形、物理仿真与 Shaders<br>(3D Graphics, Physics & Shaders) | `L2` | [提示词 (Prompt)](./L2_Intermediate/PenroseStairs/PROJECT_PROMPT.md) \| [说明 (README)](./L2_Intermediate/PenroseStairs/README.md) |
 | 16 | [`Sokoban`](./L2_Intermediate/Sokoban) | **推箱子：Three.js 草地 Shader 与推箱子 Benchmark**<br>*Three.js Shader Grass & Sokoban Game* | Web 游戏与交互逻辑<br>(Web Games & Interactive Logic) | `L2` | [提示词 (Prompt)](./L2_Intermediate/Sokoban/PROJECT_PROMPT.md) \| [说明 (README)](./L2_Intermediate/Sokoban/README.md) |
 | 17 | [`Bicycle3D`](./L3_Advanced/Bicycle3D) | **自行车：参数化 3D 工作室与传动系统 Benchmark**<br>*Parametric 3D Bicycle Studio & Drivetrain* | 3D 图形、物理仿真与 Shaders<br>(3D Graphics, Physics & Shaders) | `L3` | [提示词 (Prompt)](./L3_Advanced/Bicycle3D/PROJECT_PROMPT.md) \| [说明 (README)](./L3_Advanced/Bicycle3D/README.md) |
-| 18 | [`EscapeFromDuckov`](./L3_Advanced/EscapeFromDuckov) | **逃离鸭科夫：游戏系统与着色器特效 Benchmark**<br>*Escape from Duckov Game Design & Shaders* | 3D 图形、物理仿真与 Shaders<br>(3D Graphics, Physics & Shaders) | `L3` | [提示词 (Prompt)](./L3_Advanced/EscapeFromDuckov/PROJECT_PROMPT.md) \| [说明 (README)](./L3_Advanced/EscapeFromDuckov/README.md) |
+| 18 | [`EscapeFromDuckov`](./L3_Advanced/EscapeFromDuckov) | **逃离鸭科夫：游戏系统与着色器特效 Benchmark**<br>*Escape from Duckov Game Design & Shaders* | 3D 图形、物理仿真与 Shaders<br>(3D Graphics, Physics & Shaders) | `L3` | ⚠️ 拟建测试项（提示词与说明待发布） |
 | 19 | [`FPV`](./L3_Advanced/FPV) | **FPV：穿越机花飞 3D 模拟器 Benchmark**<br>*FPV Drone Freestyle 3D Simulator* | 3D 图形、物理仿真与 Shaders<br>(3D Graphics, Physics & Shaders) | `L3` | [提示词 (Prompt)](./L3_Advanced/FPV/PROJECT_PROMPT.md) \| [说明 (README)](./L3_Advanced/FPV/README.md) |
 | 20 | [`IndustrialDigitalTwin`](./L3_Advanced/IndustrialDigitalTwin) | **工业数字孪生设备监控 Benchmark**<br>*Industrial Digital Twin Equipment Monitoring* | 3D 图形、物理仿真与 Shaders<br>(3D Graphics, Physics & Shaders) | `L3` | [提示词 (Prompt)](./L3_Advanced/IndustrialDigitalTwin/PROJECT_PROMPT.md) \| [说明 (README)](./L3_Advanced/IndustrialDigitalTwin/README.md) |
 | 21 | [`LitRPGNovel`](./L3_Advanced/LitRPGNovel) | **文字：Minecraft 硬核生存小说 Benchmark**<br>*Minecraft Hardcore LitRPG Long Novel* | Web 游戏与交互逻辑<br>(Web Games & Interactive Logic) | `L3` | [提示词 (Prompt)](./L3_Advanced/LitRPGNovel/PROJECT_PROMPT.md) \| [说明 (README)](./L3_Advanced/LitRPGNovel/README.md) |
@@ -112,7 +112,7 @@ Targeting WebGL/Three.js engines, custom GLSL shaders, rigid body dynamics, and 
 
 - [`Bicycle3D`](./L3_Advanced/Bicycle3D): 自行车：参数化 3D 工作室与传动系统 Benchmark (Parametric 3D bicycle studio & mechanical drivetrain)
 - [`cloth`](./L3_Advanced/cloth): cloth：3D 质点-弹簧布料物理仿真 Benchmark (3D mass-spring cloth physics simulation with wind & stair collision)
-- [`EscapeFromDuckov`](./L3_Advanced/EscapeFromDuckov): 逃离鸭科夫：游戏系统与着色器特效 Benchmark (Escape from Duckov game mechanics & fog shaders)
+- [`EscapeFromDuckov`](./L3_Advanced/EscapeFromDuckov): 逃离鸭科夫：游戏系统与着色器特效 Benchmark (Escape from Duckov game mechanics & fog shaders) ⚠️ 拟建测试项，提示词待发布
 - [`FPV`](./L3_Advanced/FPV): FPV：穿越机花飞 3D 模拟器 Benchmark (FPV drone freestyle 3D simulator with SO(3) attitude integration & VTX noise shader)
 - [`IndustrialDigitalTwin`](./L3_Advanced/IndustrialDigitalTwin): 工业数字孪生设备监控 Benchmark (Industrial digital twin equipment monitoring & raycasting)
 - [`LitRPGNovel`](./L3_Advanced/LitRPGNovel): 文字：Minecraft 硬核生存小说 Benchmark (Minecraft LitRPG long novel controlled narrative)
