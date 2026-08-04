@@ -2,7 +2,7 @@
 
 This repository is a standardized evaluation suite containing **37 independent benchmark projects** organized into **4 difficulty tier directories (L1 to L4)** for auditing AI code generation, physics simulations, 3D graphics, and hardware protocols.
 
-> 🌐 **中文版本文档**: [README.md](./README.zh.md)
+> 🌐 **中文版本文档**: [README.md](./README.md)
 
 ---
 
@@ -32,7 +32,7 @@ Xnmk_Prompt_Library_1.0
 - **Python Tools & Native Engines**: Evaluates PyOpenGL, FFMPEG video pipelines, non-blocking UDP networking, and spatial distance resampling.
 - **System Integration & MCP Protocol**: Evaluates Model Context Protocol (MCP) servers, OS API hooks, and code refactoring.
 
-> 💡 **Tip**: To quickly find projects by evaluation domain, see [DOMAIN_INDEX.en.md](./DOMAIN_INDEX.md) — browse by domain and jump directly to prompts.
+> 💡 **Tip**: To quickly find projects by evaluation domain, see [DOMAIN_INDEX.en.md](./DOMAIN_INDEX.en.md) — browse by domain and jump directly to prompts.
 
 ---
 
