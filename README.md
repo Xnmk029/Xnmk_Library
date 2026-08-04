@@ -32,7 +32,7 @@ Xnmk_Prompt_Library_1.0
 - **Python 工具与原生引擎**：考核 PyOpenGL、FFMPEG 视频管道、非阻塞 UDP 网络及空间距离重采样。
 - **系统集成与 MCP 协议**：考核 Model Context Protocol (MCP) 服务端、操作系统 API Hook 及代码重构。
 
-> 💡 **提示**：如需按评测领域快速查找项目，请查看 [DOMAIN_INDEX.zh.md](./DOMAIN_INDEX.md)，按领域分类浏览并一键跳转提示词。
+> 💡 **提示**：如需按评测领域快速查找项目，请查看 [DOMAIN_INDEX.zh.md](./DOMAIN_INDEX.zh.md)，按领域分类浏览并一键跳转提示词。
 
 ---
 
