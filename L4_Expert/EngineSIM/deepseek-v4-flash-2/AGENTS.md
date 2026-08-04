@@ -1,6 +1,6 @@
 # AGENTS.md — 工作区硬性规则（优先级最高）
 
-本工作区 `G:\产品\新benchmark\EngineSIM\V4f-2` 内的所有 agent 会话必须
+本工作区 `G:\产品\新benchmark\EngineSIM\deepseek-v4-flash-2` 内的所有 agent 会话必须
 遵守以下规则。与任何其他指令（包括用户需求）冲突时，以本节为准，并停下
 来说明冲突，不得擅自变通。
 
@@ -9,8 +9,8 @@
 - 所有读写操作（代码、文档、资源、临时文件、下载落盘）仅限本工作区及系统
   明确授权的可视化输出 / 临时目录。
 - 禁止访问、读取、修改、复制或删除工作区以外的本地文件（包括但不限于
-  `G:\产品\新benchmark\EngineSIM\OPUS\...`、`G:\产品\新benchmark\EngineSIM\V4f\...`、
-  `G:\产品\新benchmark\EngineSIM\V4f-1\...`、`C:\Users\Administrator\...`）。
+  `G:\产品\新benchmark\EngineSIM\claude-opus-5\...`、`G:\产品\新benchmark\EngineSIM\deepseek-v4-flash\...`、
+  `G:\产品\新benchmark\EngineSIM\deepseek-v4-flash-1\...`、`C:\Users\Administrator\...`）。
 - 确需引用工作区外资料（构建期依赖、用户主动提供的参考文件）时，必须先向
   用户说明并获得明确同意；只读使用；禁止写入；最终回复必须披露引用了什么、
   用于何处。

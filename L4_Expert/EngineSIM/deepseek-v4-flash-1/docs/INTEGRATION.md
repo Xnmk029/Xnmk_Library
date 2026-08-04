@@ -1,4 +1,4 @@
-# V4f 集成说明
+# deepseek-v4-flash 集成说明
 
 ## 页面加载链（经典脚本，零 ES module 机制）
 

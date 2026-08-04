@@ -1,5 +1,5 @@
 ```markdown
-# V4f 深度项目提示词（汇总两个 Codex 线程的全部需求）
+# deepseek-v4-flash 深度项目提示词（汇总两个 Codex 线程的全部需求）
 
 > 用途：把本项目（程序化 V8 引擎声音 + Three.js 四轮双轨驾驶模拟）的完整需求、
 > 架构约束、验收标准与踩坑记录打包成一份可直接交给 AI 的提示词，用于继续开发、
@@ -13,9 +13,9 @@
 本节的限制为准，并停下来说明冲突。
 
 1. **绝对工作区限制**：所有读写操作（代码、文档、资源、临时文件、下载落盘）
-   必须严格限制在 `G:\产品\新benchmark\EngineSIM\V4f` 及系统明确授权的
+   必须严格限制在 `G:\产品\新benchmark\EngineSIM\deepseek-v4-flash` 及系统明确授权的
    可视化输出/临时目录内。禁止访问、读取、修改、复制或删除工作区以外的
-   本地文件（包括但不限于 `G:\产品\新benchmark\EngineSIM\OPUS\...`、
+   本地文件（包括但不限于 `G:\产品\新benchmark\EngineSIM\claude-opus-5\...`、
    `C:\Users\Administrator\...`）。确需引用工作区外资料（构建期 three.cjs、
    用户主动提供的参考目录/文档）时，必须：先向用户说明并获得明确同意 →
    只读使用 → 禁止写入 → 在最终回复中披露引用内容与用途。
@@ -64,9 +64,9 @@
 5. **服务器** `tools/serve.mjs` 需支持 `.obj/.mtl/.glb` 的 MIME。
 6. **测试纪律**：物理/DSP 必须是纯函数、可离线测试；`npm test` 当前 22 项全绿，
    任何改动不得破坏。
-7. **外部依赖边界**：`G:\产品\新benchmark\EngineSIM\OPUS\v8drivingsim\node_modules\three`
+7. **外部依赖边界**：`G:\产品\新benchmark\EngineSIM\claude-opus-5\v8drivingsim\node_modules\three`
    是构建期依赖（`three.cjs` 用于生成 classic 版；OBJLoader/MTLLoader 已 vendor 进
-   `vendor/three/addons/loaders/`）；`V4f\node_modules` 是本地验证用的 junction，
+   `vendor/three/addons/loaders/`）；`deepseek-v4-flash\node_modules` 是本地验证用的 junction，
    项目构建/测试不依赖它。运行时 bundle 不得引用任何工作区外路径。
    ——以上引用一律受第 0 节约束：只读、先说明、后执行、最终披露。
 

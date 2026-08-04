@@ -1,7 +1,7 @@
-# 集成指南：把 V4f 接到驾驶模拟器
+# 集成指南：把 deepseek-v4-flash 接到驾驶模拟器
 
-V4f 是一个**声音驱动模块**：模拟器负责物理和渲染，每帧把发动机状态喂给
-V4f，V4f 输出一对立体声。DSP 全部跑在 AudioWorklet 里，主线程每帧只需
+deepseek-v4-flash 是一个**声音驱动模块**：模拟器负责物理和渲染，每帧把发动机状态喂给
+deepseek-v4-flash，deepseek-v4-flash 输出一对立体声。DSP 全部跑在 AudioWorklet 里，主线程每帧只需
 一次 `update()` 调用。
 
 ## 1. 快速开始
@@ -142,7 +142,7 @@ node tools/spectrogram.mjs out/sweep.wav out/spectrogram-sweep.png
 
 ## 6. 下一步
 
-- 轮胎滚噪/风噪/路缘石撞击（独立 ambience 节点，参考 OPUS 的 VehicleAmbience）；
+- 轮胎滚噪/风噪/路缘石撞击（独立 ambience 节点，参考 claude-opus-5 的 VehicleAmbience）；
 - 换挡机构声、传动啸叫；
 - 更多引擎定义（I6、水平对置、涡轮泄压阀）；
 - 多监听点（车外追焦、直升机视角）与多普勒。

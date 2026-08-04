@@ -1,4 +1,4 @@
-# EngineSIM — V8 引擎声音与驾驶模拟（V4f-2）
+# EngineSIM — V8 引擎声音与驾驶模拟（deepseek-v4-flash-2）
 
 参考 [ange-yaghi/engine-sim](https://github.com/ange-yaghi/engine-sim) 的公开建模思路，
 实现**精简、低 CPU、带混响优化**的浏览器引擎声音驱动 + Three.js 驾驶模拟。

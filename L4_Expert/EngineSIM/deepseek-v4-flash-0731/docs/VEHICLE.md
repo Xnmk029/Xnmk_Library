@@ -1,4 +1,4 @@
-# V4f 四轮双轨车辆模型
+# deepseek-v4-flash 四轮双轨车辆模型
 
 车辆物理是**四轮双轨（dual-track）模型**：四个轮子各自独立计算，而不是把
 一根轴的两只轮子合并成一条"轨道"。左/右载荷转移、Ackermann 转向、开式
@@ -74,7 +74,7 @@ Fz_RL = FzR0/2 + ΔFz_long/2 - (1-φ)·ΔFz_lat   （+ 后轴下压力/2）
 
 ## 动力总成
 
-- 发动机：曲轴单自由度（转动惯量 0.21 kg·m²），来自 V4f 引擎配置的
+- 发动机：曲轴单自由度（转动惯量 0.21 kg·m²），来自 deepseek-v4-flash 引擎配置的
   扭矩曲线 + 摩擦/泵气损失 + 怠速 PI 调速器 + 旋转断油限速器；
 - 离合器：半隐式粘性耦合（对滑差做 backward Euler），任意刚度无条件
   稳定；自动离合在怠速上方渐进结合，车速 >4 m/s 后全锁，踩刹车停稳时
@@ -112,7 +112,7 @@ r_dot  = Mz/Izz
 
 ## 与音频的关系
 
-车辆每帧把 `engine.audioState(cabin)` 喂给 V4f 的 `EngineSoundDriver`：
+车辆每帧把 `engine.audioState(cabin)` 喂给 deepseek-v4-flash 的 `EngineSoundDriver`：
 
 - 断油（限速器/换挡瞬间）→ DSP 旋转断油 + 回火；
 - 松油滑行 → overrun 噼啪声强度由引擎负载与转速计算；

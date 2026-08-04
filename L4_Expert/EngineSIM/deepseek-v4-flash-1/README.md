@@ -1,7 +1,7 @@
-# V4f — 程序化 V8 引擎声音 + 驾驶模拟（自包含重建）
+# deepseek-v4-flash — 程序化 V8 引擎声音 + 驾驶模拟（自包含重建）
 
-本仓库按 `PROJECT_PROMPT.md` 在 `G:\产品\新benchmark\EngineSIM\V4f-1` 内从零重建。
-实现路线：**不访问 OPUS 外部项目、不联网、不引入工作区外依赖**；浏览器端零运行时
+本仓库按 `PROJECT_PROMPT.md` 在 `G:\产品\新benchmark\EngineSIM\deepseek-v4-flash-1` 内从零重建。
+实现路线：**不访问 claude-opus-5 外部项目、不联网、不引入工作区外依赖**；浏览器端零运行时
 依赖，Three.js 场景将由 `vendor/three/three.classic.js`（自研 THREE 兼容精简层）
 提供。
 
@@ -66,7 +66,7 @@ docs/                    设计文档
 
 ## 边界与审计
 
-全部读写均在本工作区 `V4f-1` 内；未访问
-`G:\产品\新benchmark\EngineSIM\OPUS\...`、`C:\Users\Administrator\...`（可视化
+全部读写均在本工作区 `deepseek-v4-flash-1` 内；未访问
+`G:\产品\新benchmark\EngineSIM\claude-opus-5\...`、`C:\Users\Administrator\...`（可视化
 输出目录除外）；无网络调用；无工作区外引用。每轮改动后按 AGENTS.md 执行
 边界自检。

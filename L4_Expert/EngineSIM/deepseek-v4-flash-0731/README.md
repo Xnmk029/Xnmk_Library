@@ -1,4 +1,4 @@
-# V4f 引擎声音驱动
+# deepseek-v4-flash 引擎声音驱动
 
 一个**精简、低 CPU 占用**的程序化引擎声音驱动模块，参考
 [ange-yaghi/engine-sim](https://github.com/ange-yaghi/engine-sim) 的身份感来源，
