@@ -1,19 +1,22 @@
 # 脚本：B 站 IP 归属地油猴脚本
 
+## 分类元数据
 
-
-## Classification Metadata (分类元数据)
-
-- **Test Domain (测试方向)**: System Integration & MCP Protocol
-- **Difficulty Level (难度等级)**: `L1 (Basic)`
-- **Primary Tech Stack (核心技术栈)**: JavaScript Userscript / DOM Parsing
-- **Core Evaluation Focus (核心考核点)**: DOM tree traversal, dynamic page observation, Userscript header metadata
+- **测试领域**: 系统集成与 MCP 协议
+- **难度等级**: `L1`（基础）
+- **核心技术栈**: JavaScript Userscript / DOM Parsing
+- **核心考核点**: DOM 树遍历、动态页面观察、Userscript 元数据头
 
 ## 任务定位
 
 测试模型快速理解网页结构、编写用户脚本和处理动态页面的能力。
 
-## 标准化提示词
+## 提示词
+
+> 📋 **完整提示词以 [`PROJECT_PROMPT.md`](./PROJECT_PROMPT.md) 为唯一标准**，本页不再内嵌副本（避免版本漂移）。一键复制请见仓库根目录 [`DOMAIN_INDEX.zh.md`](../../DOMAIN_INDEX.zh.md)。
+> 评测时请直接使用提示词原文，**不要修改任何技术约束**。
+>
+> 下方小节为任务要点速览，仅供理解项目背景；**评测输入请以 PROJECT_PROMPT.md 原文为准**。
 
 编写一个浏览器油猴脚本，在 B 站电脑端页面显示可从公开页面数据获得的 IP 归属地信息。
 

@@ -1,19 +1,22 @@
 # 2048：Roguelike 融合游戏 Benchmark
 
+## 分类元数据
 
-
-## Classification Metadata (分类元数据)
-
-- **Test Domain (测试方向)**: Web Games & Interactive Logic
-- **Difficulty Level (难度等级)**: `L2 (Intermediate)`
-- **Primary Tech Stack (核心技术栈)**: HTML5 / CSS3 / JavaScript / Canvas
-- **Core Evaluation Focus (核心考核点)**: Game state machine, animation touch & physical feel, Roguelike mechanics
+- **测试领域**: Web 游戏与交互逻辑
+- **难度等级**: `L2`（中级）
+- **核心技术栈**: HTML5 / CSS3 / JavaScript / Canvas
+- **核心考核点**: 游戏状态机、动画手感与物理感、Roguelike 机制
 
 ## 任务定位
 
 测试模型的前端动效能力与对 Roguelike 单局闭环的理解，各占 50%。
 
-## 标准化提示词
+## 提示词
+
+> 📋 **完整提示词以 [`PROJECT_PROMPT.md`](./PROJECT_PROMPT.md) 为唯一标准**，本页不再内嵌副本（避免版本漂移）。一键复制请见仓库根目录 [`DOMAIN_INDEX.zh.md`](../../DOMAIN_INDEX.zh.md)。
+> 评测时请直接使用提示词原文，**不要修改任何技术约束**。
+>
+> 下方小节为任务要点速览，仅供理解项目背景；**评测输入请以 PROJECT_PROMPT.md 原文为准**。
 
 发挥创意上限，使用合适的 Web 技术栈设计一个“2048 融合机制 + Roguelike 元素”的网页游戏。主题、世界观和视觉风格可自由决定。
 

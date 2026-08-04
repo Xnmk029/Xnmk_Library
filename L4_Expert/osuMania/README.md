@@ -1,13 +1,11 @@
 # osu!mania：Python OpenGL 高效视频渲染工具 Benchmark
 
+## 分类元数据
 
-
-## Classification Metadata (分类元数据)
-
-- **Test Domain (测试方向)**: Python Tools & Native Engines
-- **Difficulty Level (难度等级)**: `L4 (Expert)`
-- **Primary Tech Stack (核心技术栈)**: Python / PyOpenGL / GLFW / FFMPEG Pipe / skin.ini parser
-- **Core Evaluation Focus (核心考核点)**: 480p skin.ini coordinate mapping, .osu parser, LN note stretching, FFMPEG video pipe
+- **测试领域**: Python 工具与原生引擎
+- **难度等级**: `L4`（专家级）
+- **核心技术栈**: Python / PyOpenGL / GLFW / FFMPEG Pipe / skin.ini parser
+- **核心考核点**: 480p skin.ini 坐标映射、.osu 解析器、长条音符拉伸、FFMPEG 视频管道
 
 ## 任务定位
 
@@ -18,46 +16,12 @@
 
 ---
 
-## 标准化提示词
+## 提示词
 
-```markdown
-你是一名精通 Python 2D/3D 图形学、OpenGL 与游戏音视频引擎的高级系统架构师。请编写一个基于 Python 和 OpenGL 的高效 osu!mania 视频渲染工具。
-
-### 核心功能与技术要求
-
-#### 1. 渲染架构与导出引擎
-- **技术栈**：使用 Python（如 PyOpenGL / ModernGL + GLFW / Pygame）搭建 OpenGL 渲染管线。
-- **渲染效率**：支持高帧率实时预览与硬加速离线视频导出（集成 `ffmpeg-python` 或通过管道输出 FFMPEG 导出 MP4 视频）。
-- **参数可调**：支持命令行或配置文件自定义输出分辨率（如 1920x1080、2560x1440 等）及渲染帧率（如 60fps、120fps、240fps）。
-
-#### 2. osu! stable Mania 界面像素级还原
-- **480p 虚拟坐标映射**：osu! stable 内部采用 480p (640x480) 虚拟坐标系。系统必须自动将 `skin.ini` 中的各项数值映射至当前渲染目标分辨率。
-- **轨道与舞台 (Stage Layout)**：
-  - 支持 `ColumnStart`、`ColumnWidth`、`ColumnSpacing`、`ColumnRight` 参数计算。
-  - 正确渲染 `StageLeft`、`StageRight`、`StageHint`（判定线提示）、`StageLight`（按键光束）与 `StageBottom`。
-- **按键与 Note 下落 (Receptors & Notes)**：
-  - 完美渲染标准 Note（单点）与 Long Note (LN/长条 Note，包含 Head 头部、Body 身体纹理拉伸、Tail 尾部）。
-  - 支持 `HitPosition` 参数（决定判定线的垂直 Y 轴像素位置）。
-  - 正确响应 `KeyImage[N]` (未按下) 与 `KeyImage[N]D` (按下状态/按键反馈)。
-- **判定与 Combo UI (Judgement & Combo UI)**：
-  - 精确显示 300g (MAX)、300、200、100、50、0 (Miss) 判定文字动画（缩放与渐淡效果）。
-  - 结合 `ComboPosition` 与自定义数字图片（`Combo-0.png` ~ `Combo-9.png`）动态渲染当前连击数。
-- **血条与计分板 (Health & Score)**：
-  - 支持 HP 状态栏（`scorebar-bg` / `scorebar-colour`）与 Score 计分板渲染。
-
-#### 3. 自定义皮肤与谱面文件解析 (`skin.ini` & `.osu`)
-- **`skin.ini` 解析器**：
-  - 完整读取 `[Mania]` 配置段落，包括 `Keys: 4` / `Keys: 7` 等键数配置。
-  - 支持精灵图片缺省回退（如果皮肤中未提供特定图片，自动回退到内置默认样式或回退规则）。
-- **`.osu` 谱面解析器**：
-  - 解析 `[TimingPoints]` 获取 BPM 与 Timing 偏移。
-  - 解析 `[HitObjects]` 中的轨道映射（根据 X 轴坐标计算所在音符轨道 Column = floor(x * KeyCount / 512)）。
-  - 正确区分普通 Note 与 LN Note（根据类型掩码及冒号分隔的结束时间戳 `endTime`）。
-
-#### 4. 代码质量与交付
-- 代码结构清晰、解耦（分为 `parser` 谱面皮肤解析、`engine` 渲染引擎、`exporter` 视频导出器）。
-- 提供命令行启动入口（支持传入 `.osu` 文件路径、皮肤目录路径、导出视频路径、分辨率与 FPS 参数）。
-```
+> 📋 **完整提示词以 [`PROJECT_PROMPT.md`](./PROJECT_PROMPT.md) 为唯一标准**，本页不再内嵌副本（避免版本漂移）。一键复制请见仓库根目录 [`DOMAIN_INDEX.zh.md`](../../DOMAIN_INDEX.zh.md)。
+> 评测时请直接使用提示词原文，**不要修改任何技术约束**。
+>
+> 下方小节为任务要点速览，仅供理解项目背景；**评测输入请以 PROJECT_PROMPT.md 原文为准**。
 
 ---
 

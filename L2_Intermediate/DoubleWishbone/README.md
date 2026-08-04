@@ -1,19 +1,22 @@
 # 双叉臂：汽车前悬挂运动学 Benchmark
 
+## 分类元数据
 
-
-## Classification Metadata (分类元数据)
-
-- **Test Domain (测试方向)**: 3D Graphics, Physics & Shaders
-- **Difficulty Level (难度等级)**: `L2 (Intermediate)`
-- **Primary Tech Stack (核心技术栈)**: Canvas 2D / Three.js / Vector Physics
-- **Core Evaluation Focus (核心考核点)**: Rigid linkages, deformable rod constraints, kinematic verification
+- **测试领域**: 3D 图形、物理仿真与 Shaders
+- **难度等级**: `L2`（中级）
+- **核心技术栈**: Canvas 2D / Three.js / Vector Physics
+- **核心考核点**: 刚性连杆机构、可变形杆件约束、运动学验证
 
 ## 任务定位
 
 测试模型用节点、刚性线和可形变线实现可验证的汽车双叉臂前悬挂运动学。
 
-## 标准化提示词
+## 提示词
+
+> 📋 **完整提示词以 [`PROJECT_PROMPT.md`](./PROJECT_PROMPT.md) 为唯一标准**，本页不再内嵌副本（避免版本漂移）。一键复制请见仓库根目录 [`DOMAIN_INDEX.zh.md`](../../DOMAIN_INDEX.zh.md)。
+> 评测时请直接使用提示词原文，**不要修改任何技术约束**。
+>
+> 下方小节为任务要点速览，仅供理解项目背景；**评测输入请以 PROJECT_PROMPT.md 原文为准**。
 
 在单一 `index.html` 中实现汽车双叉臂前悬挂运动学演示。忽略工作区其他文件；除 Tailwind CDN 外不依赖外部库。
 

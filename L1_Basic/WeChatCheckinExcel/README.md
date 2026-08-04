@@ -71,11 +71,9 @@ python main.py
 - [test_parser.py](file:///g:/%E4%BA%A7%E5%93%81/%E6%96%B0benchmark/%E7%AD%BE%E5%88%B0/test_parser.py): 消息解析单元测试
 - [test_excel.py](file:///g:/%E4%BA%A7%E5%93%81/%E6%96%B0benchmark/%E7%AD%BE%E5%88%B0/test_excel.py): Excel 追加写入单元测试
 
+## 分类元数据
 
-## Classification Metadata (分类元数据)
-
-- **Test Domain (测试方向)**: System Integration & MCP Protocol
-- **Difficulty Level (难度等级)**: `L1 (Basic)`
-- **Primary Tech Stack (核心技术栈)**: Python / openpyxl / Regex / Win32 API
-- **Core Evaluation Focus (核心考核点)**: WeChat PC message hook/listener, regex field extraction, Excel sheet update
-
+- **测试领域**: 系统集成与 MCP 协议
+- **难度等级**: `L1`（基础）
+- **核心技术栈**: Python / openpyxl / Regex / Win32 API
+- **核心考核点**: 微信 PC 端消息 Hook/监听、正则字段提取、Excel 工作表更新

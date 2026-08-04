@@ -1,19 +1,22 @@
 # RTX：Web 路径追踪房间 GPU Benchmark
 
+## 分类元数据
 
-
-## Classification Metadata (分类元数据)
-
-- **Test Domain (测试方向)**: 3D Graphics, Physics & Shaders
-- **Difficulty Level (难度等级)**: `L3 (Advanced)`
-- **Primary Tech Stack (核心技术栈)**: WebGL2 / WebGPU / Path Tracing Shaders
-- **Core Evaluation Focus (核心考核点)**: Monte Carlo ray tracing, BVH traversal, GPU workload benchmark reporter
+- **测试领域**: 3D 图形、物理仿真与 Shaders
+- **难度等级**: `L3`（高级）
+- **核心技术栈**: WebGL2 / WebGPU / Path Tracing Shaders
+- **核心考核点**: 蒙特卡洛光线追踪、BVH 遍历、GPU 负载基准报告
 
 ## 任务定位
 
 测试模型在浏览器中实现路径追踪展示、可控 GPU workload 和结构化性能报告的能力。
 
-## 标准化提示词
+## 提示词
+
+> 📋 **完整提示词以 [`PROJECT_PROMPT.md`](./PROJECT_PROMPT.md) 为唯一标准**，本页不再内嵌副本（避免版本漂移）。一键复制请见仓库根目录 [`DOMAIN_INDEX.zh.md`](../../DOMAIN_INDEX.zh.md)。
+> 评测时请直接使用提示词原文，**不要修改任何技术约束**。
+>
+> 下方小节为任务要点速览，仅供理解项目背景；**评测输入请以 PROJECT_PROMPT.md 原文为准**。
 
 使用 HTML 下合适的 Web 图形技术栈，生成一个展示路径追踪计算结果的小房间，并将其设计为可重复执行的显卡 benchmark。
 

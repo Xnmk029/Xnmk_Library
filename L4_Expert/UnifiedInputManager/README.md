@@ -1,11 +1,11 @@
 # Unified Controller Input Manager Benchmark
 
-## Classification Metadata (分类元数据)
+## 分类元数据
 
-- **Test Domain (测试方向)**: Python Tools & Native Engines
-- **Difficulty Level (难度等级)**: `L4 (Expert)`
-- **Primary Tech Stack (核心技术栈)**: Python / ctypes / C++ Bindings / Win32 RawInput / XInput / SteamInput SDK / HID Protocol
-- **Core Evaluation Focus (核心考核点)**: Standard interface documentation research, multi-hardware protocol data structure parsing, unified abstraction layer, and async concurrency architecture.
+- **测试领域**: Python 工具与原生引擎
+- **难度等级**: `L4`（专家级）
+- **核心技术栈**: Python / ctypes / C++ Bindings / Win32 RawInput / XInput / SteamInput SDK / HID Protocol
+- **核心考核点**: 标准接口文档调研、多硬件协议数据结构解析、统一抽象层与异步并发架构
 
 ---
 
@@ -18,36 +18,12 @@
 
 ---
 
-## 标准化提示词
+## 提示词
 
-```markdown
-# 任务背景
-本项目为一款跨平台 Python 应用程序，现需开发一个「统一控制器输入管理模块 (Unified Input Manager)」。系统需要直接与多种底层硬件接口及平台协议进行交互。
-
-# 需求范围
-请为该项目规划并设计对以下五种输入协议的支持。设计必须严格贴合它们各自官方文档的底层逻辑与数据规范：
-1. XInput
-2. Steam Input
-3. Raw HID Input
-4. PlayStation Input
-5. Switch Input
-
-# 交付要求
-请输出具体的技术设计方案，包含以下三个部分：
-
-## 一、 架构设计 (Architecture)
-* 设计一个统一的输入管理器抽象层。
-* 详细说明这五种底层结构完全不同的协议，如何被标准化并统一暴露给上层业务逻辑。
-
-## 二、 核心实现 (Core Implementation)
-* 分别提供这五种协议最核心的底层数据接入与解析代码（核心逻辑或伪代码）。
-* 代码需直观展现你对该协议专属初始化流程或原始数据结构的理解。
-* 明确标注其中需要依赖系统级调用或外部 C/C++ 封装的部分。
-
-## 三、 架构冲突与解决方案 (Challenges & Solutions)
-* 结合这五类协议官方文档中关于数据获取方式（如生命周期、并发机制、I/O 模式）的定义，分析将它们统合在一个 Python 进程中运行时，最核心的架构冲突是什么？
-* 给出你的代码级解决方案。
-```
+> 📋 **完整提示词以 [`PROJECT_PROMPT.md`](./PROJECT_PROMPT.md) 为唯一标准**，本页不再内嵌副本（避免版本漂移）。一键复制请见仓库根目录 [`DOMAIN_INDEX.zh.md`](../../DOMAIN_INDEX.zh.md)。
+> 评测时请直接使用提示词原文，**不要修改任何技术约束**。
+>
+> 下方小节为任务要点速览，仅供理解项目背景；**评测输入请以 PROJECT_PROMPT.md 原文为准**。
 
 ---
 

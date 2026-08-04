@@ -81,11 +81,9 @@ python server.py
 - SketchUp API 调用强制在主线程执行 (通过 UI.start_timer 调度), 确保线程安全。
 - 请求超时: Ruby 端 30s, Python 端 35s。
 
+## 分类元数据
 
-## Classification Metadata (分类元数据)
-
-- **Test Domain (测试方向)**: System Integration & MCP Protocol
-- **Difficulty Level (难度等级)**: `L4 (Expert)`
-- **Primary Tech Stack (核心技术栈)**: Ruby / Python / MCP Protocol / SSE Transport
-- **Core Evaluation Focus (核心考核点)**: Real-time CAD model query, SSE/stdio transport, 3D geometry manipulation
-
+- **测试领域**: 系统集成与 MCP 协议
+- **难度等级**: `L4`（专家级）
+- **核心技术栈**: Ruby / Python / MCP Protocol / SSE Transport
+- **核心考核点**: 实时 CAD 模型查询、SSE/stdio 传输、3D 几何操作

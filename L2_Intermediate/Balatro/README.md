@@ -1,19 +1,22 @@
 # 小丑牌：网页卡牌游戏与动效复刻 Benchmark
 
+## 分类元数据
 
-
-## Classification Metadata (分类元数据)
-
-- **Test Domain (测试方向)**: Web Games & Interactive Logic
-- **Difficulty Level (难度等级)**: `L2 (Intermediate)`
-- **Primary Tech Stack (核心技术栈)**: HTML5 / WebGL / CSS Animations
-- **Core Evaluation Focus (核心考核点)**: Godot-to-CSS translation, card game state machine, juice & feedback
+- **测试领域**: Web 游戏与交互逻辑
+- **难度等级**: `L2`（中级）
+- **核心技术栈**: HTML5 / WebGL / CSS Animations
+- **核心考核点**: Godot 到 CSS 的转译、卡牌游戏状态机、动效反馈（Juice）
 
 ## 任务定位
 
 测试模型对于Godot与css之间代码转译能力，以及理解成熟卡牌游戏流程、实现可玩状态机，并复现高质量卡牌反馈与界面动效的能力。
 
-## 标准化提示词
+## 提示词
+
+> 📋 **完整提示词以 [`PROJECT_PROMPT.md`](./PROJECT_PROMPT.md) 为唯一标准**，本页不再内嵌副本（避免版本漂移）。一键复制请见仓库根目录 [`DOMAIN_INDEX.zh.md`](../../DOMAIN_INDEX.zh.md)。
+> 评测时请直接使用提示词原文，**不要修改任何技术约束**。
+>
+> 下方小节为任务要点速览，仅供理解项目背景；**评测输入请以 PROJECT_PROMPT.md 原文为准**。
 
 制作一个完整复刻《小丑牌》玩法与动效语言的HTML游戏，主要注意还原其动效表现。可以研究公开源码的实现思路，但必须明确第三方代码与素材来源，并优先使用自主实现和可再分发资产。
 

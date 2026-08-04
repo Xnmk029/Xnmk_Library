@@ -1,19 +1,22 @@
 # SVG：纯矢量《蒙娜丽莎》笔触复刻 Benchmark
 
+## 分类元数据
 
-
-## Classification Metadata (分类元数据)
-
-- **Test Domain (测试方向)**: Visual Arts & Modern UI
-- **Difficulty Level (难度等级)**: `L1 (Basic)`
-- **Primary Tech Stack (核心技术栈)**: Pure SVG / Vector Paths & Gradients
-- **Core Evaluation Focus (核心考核点)**: Vector stroke composition, color layering, depth & perspective grouping
+- **测试领域**: 视觉艺术与现代 UI 组件
+- **难度等级**: `L1`（基础）
+- **核心技术栈**: Pure SVG / Vector Paths & Gradients
+- **核心考核点**: 矢量笔触组织、色彩分层、景深与透视分组
 
 ## 任务定位
 
 测试模型使用纯 SVG 组织大量矢量笔触、构图、色彩分层和远近层次的能力。
 
-## 标准化提示词
+## 提示词
+
+> 📋 **完整提示词以 [`PROJECT_PROMPT.md`](./PROJECT_PROMPT.md) 为唯一标准**，本页不再内嵌副本（避免版本漂移）。一键复制请见仓库根目录 [`DOMAIN_INDEX.zh.md`](../../DOMAIN_INDEX.zh.md)。
+> 评测时请直接使用提示词原文，**不要修改任何技术约束**。
+>
+> 下方小节为任务要点速览，仅供理解项目背景；**评测输入请以 PROJECT_PROMPT.md 原文为准**。
 
 使用纯 SVG 创作一幅对达·芬奇《蒙娜丽莎》的研究性复刻，目标尺寸约 1200×1600，竖幅。
 

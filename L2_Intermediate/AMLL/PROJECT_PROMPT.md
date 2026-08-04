@@ -1,4 +1,3 @@
-```markdown
 # 任务背景
 请编写一个单文件（Single-File）纯 Web 页面，高保真还原 iPad 版 Apple Music 的“沉浸式动态歌词播放器”界面，视觉与交互体验需对齐开源项目 `amll-player`。
 
@@ -25,4 +24,3 @@
 * **单文件交付**：所有 HTML 结构、CSS 样式和 JS 逻辑必须整合在单个 `.html` 文件中，开箱即用。
 * **零依赖**：严禁使用任何第三方库或框架（如 React/Vue、jQuery、GSAP、Tailwind 等），全原生实现。
 * **高性能**：注重渲染性能，动画需保持流畅（60fps），尽量避免引发页面重排（Reflow）。
-```
