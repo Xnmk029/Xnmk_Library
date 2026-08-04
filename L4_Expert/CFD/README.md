@@ -1,19 +1,22 @@
 # CFD：3D SPH 流体仿真与性能基准
 
+## 分类元数据
 
-
-## Classification Metadata (分类元数据)
-
-- **Test Domain (测试方向)**: 3D Graphics, Physics & Shaders
-- **Difficulty Level (难度等级)**: `L4 (Expert)`
-- **Primary Tech Stack (核心技术栈)**: WebGL / SPH / WebGPU / Custom Shaders
-- **Core Evaluation Focus (核心考核点)**: SPH fluid dynamics, refraction/reflection shader, real-time particle solver
+- **测试领域**: 3D 图形、物理仿真与 Shaders
+- **难度等级**: `L4`（专家级）
+- **核心技术栈**: WebGL / SPH / WebGPU / Custom Shaders
+- **核心考核点**: SPH 流体动力学、折射/反射着色器、实时粒子求解器
 
 ## 任务定位
 
 测试模型实现实时粒子物理、三维可视化、性能监控和可复现基准测试的能力。
 
-## 标准化提示词
+## 提示词
+
+> 📋 **完整提示词以 [`PROJECT_PROMPT.md`](./PROJECT_PROMPT.md) 为唯一标准**，本页不再内嵌副本（避免版本漂移）。一键复制请见仓库根目录 [`DOMAIN_INDEX.zh.md`](../../DOMAIN_INDEX.zh.md)。
+> 评测时请直接使用提示词原文，**不要修改任何技术约束**。
+>
+> 下方小节为任务要点速览，仅供理解项目背景；**评测输入请以 PROJECT_PROMPT.md 原文为准**。
 
 你是一名精通 WebGL、Three.js 和实时流体动力学的高级前端物理工程师。请编写一个单文件网页版 3D 流体仿真与基准测试工具。
 

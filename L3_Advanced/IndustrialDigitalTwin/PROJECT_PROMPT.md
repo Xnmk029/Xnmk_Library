@@ -1,4 +1,3 @@
-```markdown
 # 任务背景
 
 使用现代前端框架 + Web 3D 技术栈（如 Vue 3 + Three.js + Vite，或 React/原生方案均可）创建一个工业数字孪生设备监控页面，深色工业风。
@@ -65,5 +64,3 @@
 - 交付完整 Vite + Vue 3 工程（含 `package.json`），核心实现集中在 `App.vue`。
 - 安装依赖后 `npm run dev` 可直接运行，控制台无报错。
 - 不得包含 TODO 或未完成占位符。
-
-```

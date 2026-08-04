@@ -100,11 +100,9 @@ names.join(", ");
 
 MIT License
 
+## 分类元数据
 
-## Classification Metadata (分类元数据)
-
-- **Test Domain (测试方向)**: System Integration & MCP Protocol
-- **Difficulty Level (难度等级)**: `L4 (Expert)`
-- **Primary Tech Stack (核心技术栈)**: Python / Photoshop COM API / MCP Protocol
-- **Core Evaluation Focus (核心考核点)**: MCP JSON-RPC server, Photoshop COM automation, layer & document querying
-
+- **测试领域**: 系统集成与 MCP 协议
+- **难度等级**: `L4`（专家级）
+- **核心技术栈**: Python / Photoshop COM API / MCP Protocol
+- **核心考核点**: MCP JSON-RPC 服务端、Photoshop COM 自动化、图层与文档查询

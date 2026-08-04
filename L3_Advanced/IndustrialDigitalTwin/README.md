@@ -1,19 +1,22 @@
 # 工业数字孪生设备监控 Benchmark
 
+## 分类元数据
 
-
-## Classification Metadata (分类元数据)
-
-- **Test Domain (测试方向)**: 3D Graphics, Physics & Shaders
-- **Difficulty Level (难度等级)**: `L3 (Advanced)`
-- **Primary Tech Stack (核心技术栈)**: Vue 3 / Three.js / Vite / Interactive Raycasting
-- **Core Evaluation Focus (核心考核点)**: Industrial CAD model rendering, interactive raycasting, real-time telemetry UI
+- **测试领域**: 3D 图形、物理仿真与 Shaders
+- **难度等级**: `L3`（高级）
+- **核心技术栈**: Vue 3 / Three.js / Vite / Interactive Raycasting
+- **核心考核点**: 工业 CAD 模型渲染、交互式射线拾取、实时遥测 UI
 
 ## 任务定位
 
 测试模型整合 Vue 3、Three.js、交互拾取、实时模拟数据和工业监控 UI 的能力。
 
-## 标准化提示词
+## 提示词
+
+> 📋 **完整提示词以 [`PROJECT_PROMPT.md`](./PROJECT_PROMPT.md) 为唯一标准**，本页不再内嵌副本（避免版本漂移）。一键复制请见仓库根目录 [`DOMAIN_INDEX.zh.md`](../../DOMAIN_INDEX.zh.md)。
+> 评测时请直接使用提示词原文，**不要修改任何技术约束**。
+>
+> 下方小节为任务要点速览，仅供理解项目背景；**评测输入请以 PROJECT_PROMPT.md 原文为准**。
 
 使用 Vue 3 Composition API、`<script setup>`、Three.js 和 Vite 创建一个工业数字孪生设备监控页面，主要实现集中在 `App.vue`。
 

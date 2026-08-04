@@ -1,19 +1,22 @@
 # Teardown / 硬表面机械与微体素场景 Benchmark
 
+## 分类元数据
 
-
-## Classification Metadata (分类元数据)
-
-- **Test Domain (测试方向)**: 3D Graphics, Physics & Shaders
-- **Difficulty Level (难度等级)**: `L3 (Advanced)`
-- **Primary Tech Stack (核心技术栈)**: Three.js InstancedMesh / SSAO / Low-poly PBR
-- **Core Evaluation Focus (核心考核点)**: Instanced Voxel grid, SSAO post-processing, gun disassembly animation
+- **测试领域**: 3D 图形、物理仿真与 Shaders
+- **难度等级**: `L3`（高级）
+- **核心技术栈**: Three.js InstancedMesh / SSAO / Low-poly PBR
+- **核心考核点**: 实例化体素网格、SSAO 后期处理、枪械拆解动画
 
 ## 任务定位
 
 测试模型在单文件 Web 项目中完成程序化硬表面建模、机械结构动画、微体素场景生成和 PBR 渲染的综合能力。
 
-## 标准化提示词
+## 提示词
+
+> 📋 **完整提示词以 [`PROJECT_PROMPT.md`](./PROJECT_PROMPT.md) 为唯一标准**，本页不再内嵌副本（避免版本漂移）。一键复制请见仓库根目录 [`DOMAIN_INDEX.zh.md`](../../DOMAIN_INDEX.zh.md)。
+> 评测时请直接使用提示词原文，**不要修改任何技术约束**。
+>
+> 下方小节为任务要点速览，仅供理解项目背景；**评测输入请以 PROJECT_PROMPT.md 原文为准**。
 
 你是一名精通 WebGL、Three.js 与技术美术的高级图形开发者。请使用 HTML、CSS 和 JavaScript，交付一个可直接运行的单文件交互式 3D Demo。
 

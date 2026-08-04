@@ -1,19 +1,22 @@
 # EngineSIM：V8 发动机声音与车辆动力学模拟
 
+## 分类元数据
 
-
-## Classification Metadata (分类元数据)
-
-- **Test Domain (测试方向)**: Python Tools & Native Engines
-- **Difficulty Level (难度等级)**: `L4 (Expert)`
-- **Primary Tech Stack (核心技术栈)**: Web Audio API / DSP / Audio Spectrogram
-- **Core Evaluation Focus (核心考核点)**: Procedural audio synthesis, combustion pulse modeling, FFT spectrogram
+- **测试领域**: Python 工具与原生引擎
+- **难度等级**: `L4`（专家级）
+- **核心技术栈**: Web Audio API / DSP / Audio Spectrogram
+- **核心考核点**: 程序化音频合成、燃烧脉冲建模、FFT 频谱图
 
 ## 任务定位
 
 测试模型理解开源技术项目、重建程序化发动机声音，以及原项目的C++移植能力，并把音频、车辆动力学和 Three.js 场景整合为可运行产品的能力。
 
-## 标准化提示词
+## 提示词
+
+> 📋 **完整提示词以 [`PROJECT_PROMPT.md`](./PROJECT_PROMPT.md) 为唯一标准**，本页不再内嵌副本（避免版本漂移）。一键复制请见仓库根目录 [`DOMAIN_INDEX.zh.md`](../../DOMAIN_INDEX.zh.md)。
+> 评测时请直接使用提示词原文，**不要修改任何技术约束**。
+>
+> 下方小节为任务要点速览，仅供理解项目背景；**评测输入请以 PROJECT_PROMPT.md 原文为准**。
 
 参考开源项目 `ange-yaghi/engine-sim` 的公开原理，制作一个计算开销较低、强化混响与驾驶听感的浏览器发动机声音模拟项目。
 

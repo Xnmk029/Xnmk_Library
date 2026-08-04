@@ -1,19 +1,22 @@
 # 彭罗斯阶梯：HTML 视错觉 Benchmark
 
+## 分类元数据
 
-
-## Classification Metadata (分类元数据)
-
-- **Test Domain (测试方向)**: 3D Graphics, Physics & Shaders
-- **Difficulty Level (难度等级)**: `L2 (Intermediate)`
-- **Primary Tech Stack (核心技术栈)**: HTML5 Canvas / Three.js Orthographic Camera
-- **Core Evaluation Focus (核心考核点)**: Orthographic projection, impossible geometry illusion, infinite stair walk
+- **测试领域**: 3D 图形、物理仿真与 Shaders
+- **难度等级**: `L2`（中级）
+- **核心技术栈**: HTML5 Canvas / Three.js Orthographic Camera
+- **核心考核点**: 正交投影、不可能几何错觉、无限楼梯行走
 
 ## 任务定位
 
 测试模型在网页中构建立体几何、相机投影和不可能结构视错觉的能力。
 
-## 标准化提示词
+## 提示词
+
+> 📋 **完整提示词以 [`PROJECT_PROMPT.md`](./PROJECT_PROMPT.md) 为唯一标准**，本页不再内嵌副本（避免版本漂移）。一键复制请见仓库根目录 [`DOMAIN_INDEX.zh.md`](../../DOMAIN_INDEX.zh.md)。
+> 评测时请直接使用提示词原文，**不要修改任何技术约束**。
+>
+> 下方小节为任务要点速览，仅供理解项目背景；**评测输入请以 PROJECT_PROMPT.md 原文为准**。
 
 使用 HTML 下合适的技术栈绘制一座彭罗斯阶梯，要求同时具有清晰立体感和稳定的视错觉闭环。
 

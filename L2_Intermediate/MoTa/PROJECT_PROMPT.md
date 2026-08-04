@@ -1,3 +1,1 @@
-```markdown
 帮我生成一个在Html下的Flash魔塔游戏
-```

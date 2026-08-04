@@ -1,19 +1,22 @@
 # 文字：Minecraft 硬核生存长篇小说 Benchmark
 
+## 分类元数据
 
-
-## Classification Metadata (分类元数据)
-
-- **Test Domain (测试方向)**: Web Games & Interactive Logic
-- **Difficulty Level (难度等级)**: `L3 (Advanced)`
-- **Primary Tech Stack (核心技术栈)**: Markdown / Long-form Controlled Narrative
-- **Core Evaluation Focus (核心考核点)**: Worldbuilding, chapter architecture, spatial awareness & inventory tracking
+- **测试领域**: Web 游戏与交互逻辑
+- **难度等级**: `L3`（高级）
+- **核心技术栈**: Markdown / Long-form Controlled Narrative
+- **核心考核点**: 世界观构建、章节架构、空间感知与物品栏追踪
 
 ## 任务定位
 
 测试模型进行长篇世界观规划、章节结构设计和风格受控叙事创作的能力。
 
-## 标准化提示词
+## 提示词
+
+> 📋 **完整提示词以 [`PROJECT_PROMPT.md`](./PROJECT_PROMPT.md) 为唯一标准**，本页不再内嵌副本（避免版本漂移）。一键复制请见仓库根目录 [`DOMAIN_INDEX.zh.md`](../../DOMAIN_INDEX.zh.md)。
+> 评测时请直接使用提示词原文，**不要修改任何技术约束**。
+>
+> 下方小节为任务要点速览，仅供理解项目背景；**评测输入请以 PROJECT_PROMPT.md 原文为准**。
 
 你是一位擅长 LitRPG 与硬核生存题材的资深小说家，重视细腻心理描写、环境感官和清晰的空间画面。
 

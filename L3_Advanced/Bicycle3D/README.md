@@ -1,19 +1,22 @@
 # 自行车：参数化 3D 工作室与传动系统 Benchmark
 
+## 分类元数据
 
-
-## Classification Metadata (分类元数据)
-
-- **Test Domain (测试方向)**: 3D Graphics, Physics & Shaders
-- **Difficulty Level (难度等级)**: `L3 (Advanced)`
-- **Primary Tech Stack (核心技术栈)**: Three.js / WebGL / OrbitControls
-- **Core Evaluation Focus (核心考核点)**: Parametric modeling, mechanical kinematic linkage, PBR product UI
+- **测试领域**: 3D 图形、物理仿真与 Shaders
+- **难度等级**: `L3`（高级）
+- **核心技术栈**: Three.js / WebGL / OrbitControls
+- **核心考核点**: 参数化建模、机械运动学联动、PBR 产品级 UI
 
 ## 任务定位
 
 测试模型在单文件 Three.js 项目中进行程序化建模、机械依赖管理、参数化重建、动画和产品级 UI 设计的能力。
 
-## 标准化提示词
+## 提示词
+
+> 📋 **完整提示词以 [`PROJECT_PROMPT.md`](./PROJECT_PROMPT.md) 为唯一标准**，本页不再内嵌副本（避免版本漂移）。一键复制请见仓库根目录 [`DOMAIN_INDEX.zh.md`](../../DOMAIN_INDEX.zh.md)。
+> 评测时请直接使用提示词原文，**不要修改任何技术约束**。
+>
+> 下方小节为任务要点速览，仅供理解项目背景；**评测输入请以 PROJECT_PROMPT.md 原文为准**。
 
 你是一名高级 WebGL/Three.js 开发者、创意技术专家和自行车车架工程师。请创建一个完整可运行的单文件 HTML 应用：交互式 3D 自行车工作室与装配模拟器。
 
