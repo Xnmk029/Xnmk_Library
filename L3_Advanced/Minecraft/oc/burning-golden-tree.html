@@ -1,0 +1,1981 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>燃烧黄金树 · 艾尔登法环夜景</title>
+<style>
+  html,body{margin:0;padding:0;overflow:hidden;background:#0a0503;font-family:system-ui,"Microsoft YaHei",sans-serif;}
+  #scene{position:fixed;inset:0;display:block;}
+  #loading{position:fixed;inset:0;background:#0a0503;color:#e8b26a;display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:10;gap:14px;font-size:15px;letter-spacing:2px;}
+  #loading .sp{width:38px;height:38px;border:3px solid rgba(232,178,106,.25);border-top-color:#e8b26a;border-radius:50%;animation:rot 0.9s linear infinite;}
+  @keyframes rot{to{transform:rotate(360deg);}}
+  #error{position:fixed;inset:0;background:#0a0503;color:#e8b26a;display:none;flex-direction:column;align-items:center;justify-content:center;z-index:20;gap:12px;text-align:center;padding:24px;}
+  #error h3{margin:0;font-size:18px;}
+  #error p{max-width:560px;font-size:13px;color:#c99;}
+  #error button{background:#e8b26a;color:#1a0d08;border:none;padding:8px 22px;border-radius:4px;cursor:pointer;font-size:14px;}
+  #hud{position:fixed;top:12px;right:12px;z-index:5;display:flex;flex-direction:column;gap:8px;align-items:flex-end;}
+  #hud button{background:rgba(20,10,5,.72);color:#e8b26a;border:1px solid rgba(232,178,106,.4);border-radius:5px;padding:6px 14px;cursor:pointer;font-size:13px;backdrop-filter:blur(3px);}
+  #hud button:hover{background:rgba(60,30,10,.8);}
+  #hint{position:fixed;bottom:10px;left:12px;z-index:5;color:rgba(232,178,106,.5);font-size:11px;letter-spacing:1px;}
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<div id="loading"><div class="sp"></div>燃烧黄金树 · 加载中…</div>
+<div id="error"><h3>加载失败</h3><p id="errMsg"></p><button onclick="location.reload()">重新加载</button></div>
+<div id="hud">
+  <button id="btnReset">重置视角</button>
+  <button id="btnPause">暂停</button>
+</div>
+<div id="hint">拖拽旋转 · 滚轮缩放 · 双击重置视角</div>
+<script type="importmap">
+{"imports":{"three":"https://unpkg.com/three@0.160.0/build/three.module.js","three/addons/":"https://unpkg.com/three@0.160.0/examples/jsm/"}}
+</script>
+<script type="module">
+/* ============================================================
+   CONFIG 集中参数（燃烧黄金树 · 艾尔登法环夜景 · 单文件）
+   世界尺度: 树高1400 | 树干0~770 | 树冠y∈[620,1460]
+   华盖椭球壳: 心(0,980,0) RX=950 RY=470 | shellRadiusAt(y,az)=950*sqrt(1-h^2)*(0.4+0.9*fbm3(...4阶))
+   相机: CAM_POS=(150,105,-3900) CAM_TARGET=(0,560,0) FOV=37 near=1 far=30000
+   画质: ?q=high|medium|low（默认 high）
+     叶簇 5200/3400/2000 | 碎叶 1100/700/420 | 火星 900/650/450
+     灰烬 800/640/500 | 火焰 36/30/24 | 垂藤 26/22/18 | 光束 14/12/10
+     烟团 8 | 城簇 12/10/8 | 植被 90/70/50 | 树干 44x48/36x40/28x32
+   渲染: ACESFilmic exposure0.9 SRGB pixelRatio<=1.5 FogExp2(0x1a0d08,0.00028)
+   后期: RenderPass->UnrealBloomPass(半分辨率 0.50/0.45/0.40 r0.70 t0.85)->VignettePass->OutputPass
+   随机: mulberry32(20260802) 唯一随机源 | JS/GLSL 同构 vnoise3/fbm3/sstep
+   降档: fps<24 持续 2.5s => bloom x0.8 | 20s 无操作绕Y缓转 0.008 rad/s
+   ============================================================ */
+
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { Pass, FullScreenQuad } from 'three/addons/postprocessing/Pass.js';
+import * as BufferGeometryUtils from 'three/addons/utils/BufferGeometryUtils.js';
+function mergeGeos(gs){
+  return BufferGeometryUtils.mergeGeometries(gs);
+}
+
+const ENABLE_CROWN_SMOKE = true;
+const CAM_POS = [150, 105, -3900];
+const CAM_TARGET = [0, 560, 0];
+const CAM_FOV = 37;
+const CAM_NEAR = 1, CAM_FAR = 30000;
+const TREE_H = 1400;
+const SHELL_C = new THREE.Vector3(0, 980, 0);
+const SHELL_RX = 950, SHELL_RY = 470;
+const UP = new THREE.Vector3(0, 1, 0);
+
+const q = new URLSearchParams(location.search).get('q') || 'high';
+const QUALITY = {
+  high:  { leaves: 5200, frags: 1100, sparks: 900,  ashes: 800,  flames: 36, vines: 26, beams: 14, smoke: 8, city: 12, veg: 90,  trunkR: 44, trunkS: 48, bloom: 0.50 },
+  medium:{ leaves: 3400, frags: 700,  sparks: 650,  ashes: 640,  flames: 30, vines: 22, beams: 12, smoke: 8, city: 10, veg: 70,  trunkR: 36, trunkS: 40, bloom: 0.45 },
+  low:   { leaves: 2000, frags: 420,  sparks: 450,  ashes: 500,  flames: 24, vines: 18, beams: 10, smoke: 8, city: 8,  veg: 50,  trunkR: 28, trunkS: 32, bloom: 0.40 }
+};
+const Q = QUALITY[q] || QUALITY.high;
+
+/* ---------- 唯一随机源 + JS 噪声（与 GLSL 同构） ---------- */
+function mulberry32(seed){
+  return function(){
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+const rng = mulberry32(20260802);
+
+function hash13(x, y, z){
+  x += 1.0; y += 1.0; z += 1.0;
+  let h = Math.sin(x * 127.1 + y * 311.7 + z * 74.7) * 43758.5453;
+  h -= Math.floor(h);
+  return h;
+}
+function vnoise3(x, y, z){
+  const ix = Math.floor(x), iy = Math.floor(y), iz = Math.floor(z);
+  let fx = x - ix, fy = y - iy, fz = z - iz;
+  const u = fx * fx * (3 - 2 * fx), v = fy * fy * (3 - 2 * fy), w = fz * fz * (3 - 2 * fz);
+  const a = hash13(ix, iy, iz),     b = hash13(ix + 1, iy, iz),
+        c = hash13(ix, iy + 1, iz), d = hash13(ix + 1, iy + 1, iz),
+        e = hash13(ix, iy, iz + 1), f = hash13(ix + 1, iy, iz + 1),
+        g = hash13(ix, iy + 1, iz + 1), h = hash13(ix + 1, iy + 1, iz + 1);
+  const x1 = a + (b - a) * u, x2 = c + (d - c) * u, x3 = e + (f - e) * u, x4 = g + (h - g) * u;
+  const y1 = x1 + (x2 - x1) * v, y2 = x3 + (x4 - x3) * v;
+  return y1 + (y2 - y1) * w;
+}
+function fbm3(x, y, z, oct){
+  let f = 0, amp = 0.5;
+  for (let i = 0; i < oct; i++){
+    f += amp * vnoise3(x, y, z);
+    x = x * 2 + 11.3; y = y * 2 + 7.7; z = z * 2 + 5.1;
+    amp *= 0.5;
+  }
+  return f;
+}
+function sstep(a, b, x){
+  if (a === b) return x < a ? 0 : 1;
+  if (a > b) return 1 - sstep(b, a, x);
+  if (x <= a) return 0;
+  if (x >= b) return 1;
+  const t = (x - a) / (b - a);
+  return t * t * (3 - 2 * t);
+}
+
+/* ---------- GLSL 公共前缀（NOISE） ---------- */
+const GLSL_NOISE = `
+float hash13(vec3 p){
+  p = fract(p * 0.1031);
+  p += dot(p, p.zyx + 31.32);
+  return fract((p.x + p.y) * p.z);
+}
+float vnoise3(vec3 p){
+  vec3 i = floor(p);
+  vec3 f = fract(p);
+  vec3 u = f * f * (3.0 - 2.0 * f);
+  float n000 = hash13(i);
+  float n100 = hash13(i + vec3(1.0, 0.0, 0.0));
+  float n010 = hash13(i + vec3(0.0, 1.0, 0.0));
+  float n110 = hash13(i + vec3(1.0, 1.0, 0.0));
+  float n001 = hash13(i + vec3(0.0, 0.0, 1.0));
+  float n101 = hash13(i + vec3(1.0, 0.0, 1.0));
+  float n011 = hash13(i + vec3(0.0, 1.0, 1.0));
+  float n111 = hash13(i + vec3(1.0, 1.0, 1.0));
+  return mix(mix(mix(n000, n100, u.x), mix(n010, n110, u.x), u.y),
+             mix(mix(n001, n101, u.x), mix(n011, n111, u.x), u.y), u.z);
+}
+float fbm(vec3 p){
+  float f = 0.0;
+  float a = 0.5;
+  for (int i = 0; i < 4; i++){
+    f += a * vnoise3(p);
+    p = p * 2.0 + vec3(11.3, 7.7, 5.1);
+    a *= 0.5;
+  }
+  return f;
+}
+float fbm5(vec3 p){
+  float f = 0.0;
+  float a = 0.5;
+  for (int i = 0; i < 5; i++){
+    f += a * vnoise3(p);
+    p = p * 2.02 + vec3(13.7, 9.1, 3.9);
+    a *= 0.5;
+  }
+  return f;
+}
+float sstep(float a, float b, float x){
+  return smoothstep(a, b, x);
+}
+`;
+
+/* ---------- G-1 叶簇/碎叶 ---------- */
+const LEAF_VS = `
+attribute float aPhase;
+uniform float uTime;
+varying vec2 vUv;
+varying vec3 vCol;
+void main() {
+#ifdef USE_INSTANCING_COLOR
+  float flick = 1.0 + 0.15 * sin(uTime * (1.0 + 2.0 * aPhase) + aPhase * 6.2831);
+  vCol = instanceColor * flick;
+#else
+  vCol = vec3(0.85, 0.38, 0.08);
+#endif
+  vUv = uv;
+  vec4 wp = instanceMatrix * vec4(position, 1.0);
+  float ph = aPhase * 6.2831;
+  float w1 = sin(uTime * (0.50 + aPhase * 0.40) + ph);
+  float w2 = cos(uTime * (0.35 + aPhase * 0.50) + ph * 1.7);
+  float amp = min(2.5, (0.6 + 1.6 * aPhase) * (wp.y / 1460.0 + 0.10));
+  wp.x += w1 * amp;
+  wp.z += w2 * amp;
+  wp.y += sin(uTime * 0.9 + ph * 2.3) * amp * 0.20;
+  gl_Position = projectionMatrix * viewMatrix * wp;
+}`;
+const LEAF_FS = `
+uniform sampler2D uTex;
+varying vec2 vUv;
+varying vec3 vCol;
+void main() {
+  vec4 t = texture2D(uTex, vUv);
+  if (t.a < 0.45) discard;
+  gl_FragColor = vec4(vCol * t.rgb, 1.0);
+}`;
+
+/* ---------- G-2 树皮（主干与枝干全部用此） ---------- */
+const BARK_VS = `
+varying vec3 vWorldPos;
+varying vec3 vNormalW;
+varying vec3 vCol;
+void main(){
+  vec4 wp = modelMatrix * vec4(position, 1.0);
+  vWorldPos = wp.xyz;
+  vNormalW = normalMatrix * normal;
+  vCol = color;
+  gl_Position = projectionMatrix * viewMatrix * wp;
+}`;
+const BARK_FS = GLSL_NOISE + `
+uniform float uTime;
+uniform vec3 uSunDir;
+uniform vec3 uFogNear;
+uniform vec3 uFogFar;
+varying vec3 vWorldPos;
+varying vec3 vNormalW;
+varying vec3 vCol;
+void main() {
+  vec3 N = normalize(vNormalW);
+  vec3 V = normalize(cameraPosition - vWorldPos);
+  float lambert = max(dot(N, uSunDir), 0.0);
+  float hF = clamp(vWorldPos.y / 1400.0, 0.0, 1.0);
+  vec3 col = vec3(0.05, 0.045, 0.038) * (0.55 + 0.45 * lambert);
+  float ang = atan(vWorldPos.z, vWorldPos.x);
+  float fiber = fbm(vec3(ang * 13.0, vWorldPos.y * 0.004, 3.7));
+  col *= 1.0 + 0.09 * (fiber - 0.5) * 2.0;
+  col *= 0.85 + 0.15 * smoothstep(0.0, 1.0, abs(N.y));
+  float heat = clamp(vCol.r, 0.0, 1.0);
+  vec3 heatCol = mix(vec3(0.35, 0.10, 0.03), vec3(0.70, 0.26, 0.05), smoothstep(0.45, 0.9, heat));
+  col += heatCol * smoothstep(0.40, 0.90, heat) * (0.25 + 0.75 * heat) * 0.55;
+  col += vec3(0.70, 0.26, 0.05) * smoothstep(0.80, 1.0, heat) * 0.22;
+  float dens = 0.32 + 0.68 * hF;
+  float c1 = fbm(vec3(vWorldPos.x * 0.10, vWorldPos.y * 0.006 - uTime * 0.015, vWorldPos.z * 0.10));
+  float c2 = fbm(vec3(vWorldPos.x * 0.26, vWorldPos.y * 0.017 - uTime * 0.045, vWorldPos.z * 0.26 + 7.31));
+  float w = 0.055 + 0.08 * dens;
+  float b = smoothstep(0.48 - w, 0.48, c1) * smoothstep(0.48 + w, 0.48, c1) * 0.8
+          + smoothstep(0.52 - w, 0.52, c2) * smoothstep(0.52 + w, 0.52, c2) * 0.5;
+  float crackMask = pow(clamp(b, 0.0, 1.0), 1.6);
+  float pulse = fbm(vec3(vWorldPos.x * 0.35, vWorldPos.y * 0.02 - uTime * 0.30, vWorldPos.z * 0.35 + 1.7));
+  vec3 crackCol = mix(vec3(0.30, 0.04, 0.005), vec3(1.0, 0.32, 0.04), smoothstep(0.25, 0.65, pulse));
+  crackCol = mix(crackCol, vec3(1.0, 0.82, 0.45), smoothstep(0.80, 0.95, pulse));
+  crackCol *= 1.0 + 0.6 * smoothstep(0.50, 0.90, pulse);
+  float rootBoost = mix(1.7, 1.0, hF) * (0.5 + 0.5 * clamp(vCol.r, 0.0, 1.0));
+  col += crackCol * crackMask * rootBoost;
+  col += vec3(1.0, 0.45, 0.12) * pow(1.0 - max(dot(N, V), 0.0), 3.0) * 0.18;
+  float dist = length(vWorldPos - cameraPosition);
+  float fog = 1.0 - exp(-pow(dist * 0.00022, 1.7));
+  vec3 fogCol = mix(uFogNear, uFogFar, clamp(dist / 6000.0, 0.0, 1.0));
+  col = mix(col, fogCol, clamp(fog, 0.0, 0.9));
+  gl_FragColor = vec4(col, 1.0);
+}`;
+
+/* ---------- G-3 天空（fbm 5 阶变体） ---------- */
+const SKY_VS = `
+varying vec3 vDir;
+void main(){
+  vDir = position;
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+}`;
+const SKY_FS = GLSL_NOISE + `
+uniform float uTime;
+varying vec3 vDir;
+void main() {
+  vec3 dir = normalize(vDir);
+  float h = dir.y;
+  vec3 col = mix(vec3(0.16, 0.07, 0.035), vec3(0.028, 0.024, 0.022), smoothstep(-0.05, 0.35, h));
+  float band = exp(-pow((h - 0.005) / 0.075, 2.0));
+  col = mix(col, vec3(0.24, 0.10, 0.04), band * 0.90);
+  float big = smoothstep(0.30, 0.50, fbm5(dir * 0.9 + 4.2));
+  float cn1 = fbm5(vec3(dir.x * 2.2, dir.y * 4.0, dir.z * 2.2 + uTime * 0.002));
+  float cn2 = fbm5(vec3(dir.x * 3.6, dir.y * 4.68, dir.z * 3.6 + uTime * 0.003));
+  float cn3 = fbm5(vec3(dir.x * 6.3, dir.y * 5.7, dir.z * 6.3 + uTime * 0.005));
+  float low = smoothstep(0.0, 0.22, h) * smoothstep(0.52, 0.08, h);
+  float mid = smoothstep(0.10, 0.30, h) * smoothstep(0.65, 0.16, h);
+  float high = smoothstep(0.28, 0.68, h);
+  float m1 = smoothstep(0.47, 0.57, cn1) * (low * 0.7 + band * 0.9) * big;
+  float m2 = smoothstep(0.47, 0.57, cn2) * (mid * 0.7) * big;
+  float m3 = smoothstep(0.47, 0.57, cn3) * (high * 0.5) * big;
+  float det = fbm5(dir * 7.0 + uTime * 0.004);
+  col = mix(col, vec3(0.048, 0.033, 0.024) * (0.55 + 0.9 * det), m1);
+  col = mix(col, vec3(0.036, 0.026, 0.020) * (0.55 + 0.9 * det), m2);
+  col = mix(col, vec3(0.024, 0.018, 0.014) * (0.55 + 0.9 * det), m3);
+  col = mix(col, vec3(0.022, 0.020, 0.018), smoothstep(0.0, -0.10, h));
+  float fire = smoothstep(0.0, 0.30, h) * (1.0 - smoothstep(0.10, 0.30, h)) * pow(max(dot(dir, normalize(vec3(0.0, 0.3, 1.0))), 0.0), 1.5);
+  col += vec3(0.55, 0.18, 0.04) * fire * 0.75;
+  float azw = pow(max(dot(dir, normalize(vec3(0.0, 0.3, 1.0))), 0.0), 2.0);
+  float ring = smoothstep(0.28, 0.38, h) * smoothstep(0.60, 0.48, h);
+  float rn = fbm5(vec3(dir.x * 4.0, dir.y * 6.0 + uTime * 0.002, dir.z * 4.0 + 9.3));
+  float ringMask = ring * azw * smoothstep(0.45, 0.58, rn);
+  col = mix(col, vec3(0.06, 0.040, 0.028), ringMask);
+  col += vec3(0.50, 0.16, 0.035) * ringMask * (1.0 - h) * 0.55;
+  float ember = smoothstep(0.55, 0.75, h) * smoothstep(0.32, 0.14, fbm5(dir * 3.0 + 5.1));
+  col = mix(col, vec3(0.06, 0.030, 0.018), ember * 0.45);
+  col += vec3(0.014, 0.007, 0.004) * smoothstep(0.35, 0.80, h);
+  float lum = dot(col, vec3(0.299, 0.587, 0.114));
+  if (lum > 0.22) col *= 0.22 / lum;
+  gl_FragColor = vec4(col, 1.0);
+}`;
+
+/* ---------- G-4 火焰舌（billboard，结构同 G-5） ---------- */
+const FLAME_VS = `
+attribute float aSize;
+attribute float aPhase;
+uniform float uTime;
+varying vec2 vUv;
+varying float vPhase;
+varying float vFlick;
+void main(){
+  vUv = uv;
+  vPhase = aPhase;
+  vFlick = 1.0 + 0.15 * sin(uTime * (2.0 + aPhase * 2.5) + aPhase * 6.2831);
+  vec3 right = vec3(viewMatrix[0][0], viewMatrix[1][0], viewMatrix[2][0]);
+  vec3 up = vec3(viewMatrix[0][1], viewMatrix[1][1], viewMatrix[2][1]);
+  vec3 c = instanceMatrix[3].xyz;
+  vec3 world = c + right * (position.x * aSize) + up * (position.y * aSize);
+  gl_Position = projectionMatrix * viewMatrix * vec4(world, 1.0);
+}`;
+const FLAME_FS = GLSL_NOISE + `
+uniform float uTime;
+varying vec2 vUv;
+varying float vPhase;
+varying float vFlick;
+void main() {
+  float dx = (vUv.x - 0.5) / 0.26;
+  float horiz = exp(-dx * dx);
+  float vert = smoothstep(0.0, 0.18, vUv.y) * pow(max(0.0, 1.0 - vUv.y), 1.5);
+  float n = fbm(vec3(vUv.x * 2.6, vUv.y * 1.8 - uTime * 1.5 + vPhase * 3.0, 4.7));
+  float alpha = smoothstep(0.38, 0.62, n) * horiz * vert * 0.85;
+  if (alpha < 0.02) discard;
+  vec3 col = mix(vec3(1.0, 0.72, 0.30), vec3(0.85, 0.22, 0.03), vUv.y);
+  gl_FragColor = vec4(col * alpha * vFlick, alpha * vFlick);
+}`;
+
+/* ---------- G-5 核心光晕 billboard ---------- */
+const GLOW_VS = `
+attribute float aSize;
+attribute float aAlpha;
+attribute float aPhase;
+uniform float uTime;
+varying vec2 vUv;
+varying float vA;
+void main(){
+  vUv = uv;
+  vec3 right = vec3(viewMatrix[0][0], viewMatrix[1][0], viewMatrix[2][0]);
+  vec3 up = vec3(viewMatrix[0][1], viewMatrix[1][1], viewMatrix[2][1]);
+  vec3 c = instanceMatrix[3].xyz;
+  vec3 world = c + right * (position.x * aSize) + up * (position.y * aSize);
+  vA = aAlpha * (0.75 + 0.25 * sin(uTime * 0.30 + aPhase * 6.2831));
+  gl_Position = projectionMatrix * viewMatrix * vec4(world, 1.0);
+}`;
+const GLOW_FS = `
+uniform sampler2D uTex;
+varying vec2 vUv;
+varying float vA;
+void main(){
+  vec4 t = texture2D(uTex, vUv);
+  gl_FragColor = vec4(t.rgb * vec3(1.0, 0.58, 0.16) * vA, t.a * vA);
+}`;
+
+/* ---------- G-6 剪影通用 ---------- */
+const SIL_VS = `
+varying vec3 vWorldPos;
+void main(){
+  vec4 wp = modelMatrix * vec4(position, 1.0);
+  vWorldPos = wp.xyz;
+  gl_Position = projectionMatrix * viewMatrix * wp;
+}`;
+const SIL_FS = `
+uniform vec3 uColor;
+uniform vec3 uFogNear;
+uniform vec3 uFogFar;
+varying vec3 vWorldPos;
+void main(){
+  float dist = length(vWorldPos - cameraPosition);
+  float fog = 1.0 - exp(-pow(dist * 0.00030, 1.7));
+  vec3 fogCol = mix(uFogNear, uFogFar, clamp(dist / 6000.0, 0.0, 1.0));
+  gl_FragColor = vec4(mix(uColor, fogCol, clamp(fog, 0.0, 0.9)), 1.0);
+}`;
+
+/* ---------- G-7 体积光束 ---------- */
+const BEAM_VS = GLSL_NOISE + `
+attribute float aPhase;
+uniform float uTime;
+varying vec2 vUv;
+varying float vPh;
+void main(){
+  vUv = uv;
+  vPh = aPhase;
+  vec3 p = position;
+  p.x += sstep(0.2, 1.0, uv.y) * (position.x > 0.0 ? 1.0 : -1.0) * (4.0 + 3.0 * sin(uTime * (0.4 + 0.3 * aPhase) + aPhase * 6.2831));
+  gl_Position = projectionMatrix * viewMatrix * vec4(p, 1.0);
+}`;
+const BEAM_FS = `
+uniform sampler2D uTex;
+uniform float uTime;
+uniform float uAlpha;
+varying vec2 vUv;
+varying float vPh;
+void main(){
+  vec4 t = texture2D(uTex, vUv);
+  float breath = 0.6 + 0.4 * (0.5 + 0.5 * sin(uTime * 0.4 + vPh * 6.2831));
+  gl_FragColor = vec4(t.rgb, t.a * uAlpha * breath);
+}`;
+
+/* ---------- G-8 垂藤 ---------- */
+const VINE_VS = GLSL_NOISE + `
+attribute float aV;
+attribute float aSeed;
+uniform float uTime;
+varying vec3 vCol;
+varying vec3 vWorldPos;
+void main(){
+  vec3 p = position;
+  float sway = aV * aV * (9.0 + 6.0 * aSeed);
+  float tt = uTime * (0.7 + 0.5 * aSeed);
+  p.x += sin(tt * 1.0 + aSeed * 6.2831) * sway;
+  p.z += cos(tt * 1.3 + aSeed * 2.7) * sway;
+  p.y += sin(tt * 0.9 + aSeed * 4.1) * 0.15;
+  vec4 wp = modelMatrix * vec4(p, 1.0);
+  vWorldPos = wp.xyz;
+  float f = aV;
+  vec3 colA = mix(vec3(0.55, 0.22, 0.06), vec3(0.85, 0.35, 0.08), sstep(0.0, 0.66, f));
+  vCol = mix(colA, vec3(0.95, 0.45, 0.10), sstep(0.66, 1.0, f));
+  gl_Position = projectionMatrix * viewMatrix * wp;
+}`;
+const VINE_FS = `
+uniform vec3 uFogNear;
+uniform vec3 uFogFar;
+varying vec3 vCol;
+varying vec3 vWorldPos;
+void main(){
+  float dist = length(vWorldPos - cameraPosition);
+  float fog = 1.0 - exp(-pow(dist * 0.00022, 1.7));
+  vec3 fogCol = mix(uFogNear, uFogFar, clamp(dist / 6000.0, 0.0, 1.0));
+  vec3 col = mix(vCol, fogCol, clamp(fog, 0.0, 0.9));
+  gl_FragColor = vec4(col, 1.0);
+}`;
+
+/* ---------- 粒子（火星/灰烬/光尘/城火） ---------- */
+const SPARK_VS = `
+attribute float aPhase;
+attribute float aSpeed;
+attribute float aRise;
+attribute float aAmp;
+attribute float aHz;
+attribute float aSize;
+attribute vec3 aCol;
+uniform float uTime;
+varying float vLife;
+varying vec3 vCol;
+void main(){
+  float p = mod(uTime * aSpeed + aPhase, 1.0);
+  vLife = p;
+  vCol = aCol;
+  vec3 pos = position;
+  pos.y += aRise * p;
+  pos.x += sin(uTime * aHz + aPhase * 6.2831) * aAmp * p;
+  pos.z += cos(uTime * aHz * 1.37 + aPhase * 9.13) * aAmp * p;
+  vec4 mv = modelViewMatrix * vec4(pos, 1.0);
+  gl_PointSize = min(16.0, aSize * (320.0 / -mv.z));
+  gl_Position = projectionMatrix * mv;
+}`;
+const SPARK_FS = GLSL_NOISE + `
+varying float vLife;
+varying vec3 vCol;
+void main(){
+  float a = sstep(0.0, 0.08, vLife) * sstep(1.0, 0.88, vLife) * (1.0 - 0.45 * vLife);
+  a *= smoothstep(1.0, 0.0, length(gl_PointCoord - 0.5) * 2.0);
+  gl_FragColor = vec4(vCol, a);
+}`;
+const ASH_VS = `
+attribute float aBase;
+attribute float aSpeed;
+attribute float aSeed;
+attribute float aSize;
+attribute float aAlpha;
+attribute vec3 aCol;
+uniform float uTime;
+varying float vLife;
+varying vec3 vCol;
+varying float vA;
+void main(){
+  vCol = aCol;
+  vA = aAlpha;
+  float y = mod(1600.0 - uTime * aSpeed - aBase, 1600.0);
+  vLife = y / 1600.0;
+  vec3 pos = position;
+  pos.y = y;
+  pos.x += sin(uTime * 0.07 + aSeed * 6.2831) * 35.0;
+  pos.z += cos(uTime * 0.09 + aSeed * 4.1) * 35.0;
+  vec4 mv = modelViewMatrix * vec4(pos, 1.0);
+  gl_PointSize = min(12.0, aSize * (300.0 / -mv.z));
+  gl_Position = projectionMatrix * mv;
+}`;
+const ASH_FS = GLSL_NOISE + `
+varying float vLife;
+varying vec3 vCol;
+varying float vA;
+void main(){
+  float a = sstep(0.0, 0.12, vLife) * sstep(1.0, 0.85, vLife) * vA;
+  a *= smoothstep(1.0, 0.0, length(gl_PointCoord - 0.5) * 2.0);
+  gl_FragColor = vec4(vCol, a);
+}`;
+const DUST_VS = GLSL_NOISE + `
+attribute float aPhase;
+attribute float aSize;
+uniform float uTime;
+varying float vA;
+void main(){
+  float dAxis = length(position.xz);
+  vA = (1.0 - sstep(300.0, 1500.0, dAxis)) * 0.55;
+  vec3 pos = position;
+  pos.y += sin(uTime * 0.10 + aPhase * 6.2831) * 40.0;
+  pos.x += sin(uTime * 0.05 + aPhase * 3.7) * 12.0;
+  vec4 mv = modelViewMatrix * vec4(pos, 1.0);
+  gl_PointSize = min(16.0, aSize * (300.0 / -mv.z));
+  gl_Position = projectionMatrix * mv;
+}`;
+const DUST_FS = `
+varying float vA;
+void main(){
+  float a = vA * smoothstep(1.0, 0.0, length(gl_PointCoord - 0.5) * 2.0);
+  gl_FragColor = vec4(vec3(1.0, 0.5, 0.15), a);
+}`;
+const CITYFIRE_VS = `
+attribute float aPhase;
+attribute float aSize;
+uniform float uTime;
+varying float vF;
+void main(){
+  vF = 0.5 + 0.5 * sin(uTime * 1.5 + aPhase * 6.2831);
+  vec4 mv = modelViewMatrix * vec4(position, 1.0);
+  gl_PointSize = min(16.0, aSize * (300.0 / -mv.z));
+  gl_Position = projectionMatrix * mv;
+}`;
+const CITYFIRE_FS = `
+varying float vF;
+void main(){
+  float a = vF * 0.45 * smoothstep(1.0, 0.0, length(gl_PointCoord - 0.5) * 2.0);
+  gl_FragColor = vec4(vec3(1.0, 0.5, 0.15) * (0.7 + 0.3 * vF), a);
+}`;
+const SMOKE_VS = `
+varying vec2 vUv;
+varying float vAlpha;
+void main(){
+  vUv = uv;
+  vAlpha = 1.0;
+  gl_Position = projectionMatrix * viewMatrix * vec4(position, 1.0);
+}`;
+const SMOKE_FS = GLSL_NOISE + `
+uniform sampler2D uTex;
+uniform float uAlpha;
+varying vec2 vUv;
+varying float vAlpha;
+void main(){
+  vec4 t = texture2D(uTex, vUv);
+  vec3 col = mix(vec3(0.055, 0.038, 0.028), vec3(0.45, 0.15, 0.03), sstep(0.35, 0.0, vUv.y));
+  gl_FragColor = vec4(col, t.a * uAlpha * vAlpha);
+}`;
+
+/* ---------- Vignette Pass ---------- */
+const PASS_VS = `
+varying vec2 vUv;
+void main(){
+  vUv = uv;
+  gl_Position = vec4(position.xy, 0.0, 1.0);
+}`;
+const VIGNETTE_FS = GLSL_NOISE + `
+uniform sampler2D tDiffuse;
+varying vec2 vUv;
+void main(){
+  vec4 c = texture2D(tDiffuse, vUv);
+  vec2 d = vUv * 2.0 - 1.0;
+  float dd = length(d);
+  float vig = 0.75 + 0.25 * (1.0 - pow(dd, 2.2));
+  float lum = dot(c.rgb, vec3(0.299, 0.587, 0.114));
+  vec3 dark = c.rgb * vec3(0.97, 0.98, 1.02);
+  vec3 bright = c.rgb * vec3(1.06, 0.98, 0.88);
+  vec3 col = mix(dark, bright, sstep(0.25, 0.6, lum));
+  gl_FragColor = vec4(col * vig, 1.0);
+}`;
+class VignettePass extends Pass {
+  constructor(){
+    super();
+    this.uniforms = { tDiffuse: { value: null } };
+    this.fsQuad = new FullScreenQuad(new THREE.ShaderMaterial({
+      uniforms: this.uniforms,
+      vertexShader: PASS_VS,
+      fragmentShader: VIGNETTE_FS
+    }));
+  }
+  render(renderer, writeBuffer, readBuffer){
+    this.uniforms.tDiffuse.value = readBuffer.texture;
+    if (writeBuffer !== null) renderer.setRenderTarget(writeBuffer);
+    this.fsQuad.render(renderer);
+  }
+  dispose(){ this.fsQuad.dispose(); }
+}
+
+/* ---------- 渲染器 / 场景 / 相机 ---------- */
+const canvas = document.getElementById('scene');
+let renderer;
+try {
+  renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
+} catch (e) {
+  showError('WebGL 初始化失败: ' + e.message);
+}
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 0.9;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.setClearColor(0x1a0d08, 1);
+
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(0x1a0d08, 0.00028);
+
+const camera = new THREE.PerspectiveCamera(CAM_FOV, window.innerWidth / window.innerHeight, CAM_NEAR, CAM_FAR);
+camera.position.set(CAM_POS[0], CAM_POS[1], CAM_POS[2]);
+
+const controls = new OrbitControls(camera, canvas);
+controls.target.set(CAM_TARGET[0], CAM_TARGET[1], CAM_TARGET[2]);
+controls.enableDamping = true;
+controls.dampingFactor = 0.06;
+controls.minDistance = 600;
+controls.maxDistance = 12000;
+controls.minPolarAngle = 0.05;
+controls.maxPolarAngle = 1.95;
+
+/* ---------- 工具函数 ---------- */
+function shellRadiusAt(y, az){
+  const h = Math.max(-0.98, Math.min(0.98, (y - 980) / 470));
+  const c = Math.cos(az) * 0.9, s = Math.sin(az) * 0.9;
+  return 950 * Math.sqrt(Math.max(0, 1 - h * h)) * (0.4 + 0.9 * fbm3(c, y * 0.004, s, 4));
+}
+function canopyFireColor(y, kr){
+  const t = sstep(620, 1460, y);
+  const c = new THREE.Color(0.85, 0.38, 0.08);
+  const wB = Math.max(t, sstep(0.40, 0.85, kr)) * 0.9;
+  c.lerp(new THREE.Color(1.0, 0.62, 0.18), wB);
+  const wD = Math.min(1, Math.max(1 - t, (1 - kr) * 0.5, sstep(0.88, 1.0, kr)) * 0.85);
+  c.lerp(new THREE.Color(0.42, 0.10, 0.02), wD);
+  return c.multiplyScalar(0.88 + 0.24 * rng());
+}
+function krAt(x, y, z){
+  return Math.hypot(x, z) / Math.max(1, shellRadiusAt(y, Math.atan2(z, x)));
+}
+function terrainH(x, z){
+  const d = Math.sqrt(x * x + z * z);
+  return 30 * Math.exp(-(d * d) / (560 * 560)) + 10 * Math.exp(-(d * d) / (150 * 150))
+       + (fbm3(x * 0.0012 + 7.3, 3.0, z * 0.0012 + 1.4, 4) - 0.5) * 12;
+}
+function silMaterial(r, g, b){
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      uColor: { value: new THREE.Color(r, g, b) },
+      uFogNear: { value: new THREE.Color(0.03, 0.028, 0.02) },
+      uFogFar: { value: new THREE.Color(0.07, 0.035, 0.018) }
+    },
+    vertexShader: SIL_VS,
+    fragmentShader: SIL_FS
+  });
+}
+function makeCanvas(w, h){
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  return c;
+}
+function radialGlowTexture(inner, outer){
+  const c = makeCanvas(128, 128);
+  const g = c.getContext('2d');
+  const gr = g.createRadialGradient(64, 64, 0, 64, 64, 64);
+  gr.addColorStop(0, 'rgba(255,255,255,' + inner + ')');
+  gr.addColorStop(0.4, 'rgba(255,255,255,' + outer + ')');
+  gr.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = gr;
+  g.fillRect(0, 0, 128, 128);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+function tubeGeometry(pts, rings, segs, radFn, colFn){
+  const n = Math.max(4, rings);
+  const P = [];
+  for (let i = 0; i < n; i++){
+    const t = i / (n - 1);
+    const idx = Math.min(pts.length - 1, Math.round(t * (pts.length - 1)));
+    P.push(pts[idx]);
+  }
+  const frames = [];
+  {
+    let T = P[1].clone().sub(P[0]);
+    if (T.lengthSq() < 1e-9) T.set(0, 1, 0);
+    T.normalize();
+    const ref = Math.abs(T.y) < 0.95 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(1, 0, 0);
+    let N = new THREE.Vector3().crossVectors(T, ref).normalize();
+    let B = new THREE.Vector3().crossVectors(T, N).normalize();
+    frames.push({ T: T.clone(), N: N, B: B });
+  }
+  for (let i = 1; i < n; i++){
+    const T = P[Math.min(i + 1, n - 1)].clone().sub(P[Math.max(i - 1, 0)]);
+    if (T.lengthSq() < 1e-12) T.copy(frames[i - 1].T);
+    T.normalize();
+    const qm = new THREE.Quaternion().setFromUnitVectors(frames[i - 1].T, T);
+    const N = frames[i - 1].N.clone().applyQuaternion(qm);
+    const B = frames[i - 1].B.clone().applyQuaternion(qm);
+    frames.push({ T: T.clone(), N: N, B: B });
+  }
+  const pos = [], nor = [], uv = [], col = [], idx = [];
+  for (let i = 0; i < n; i++){
+    const t = i / (n - 1);
+    const f = frames[i];
+    for (let j = 0; j <= segs; j++){
+      const a = (j / segs) * Math.PI * 2;
+      const ca = Math.cos(a), sa = Math.sin(a);
+      const r = radFn(t, a);
+      const px = P[i].x + f.N.x * ca * r + f.B.x * sa * r;
+      const py = P[i].y + f.N.y * ca * r + f.B.y * sa * r;
+      const pz = P[i].z + f.N.z * ca * r + f.B.z * sa * r;
+      const nx = f.N.x * ca + f.B.x * sa;
+      const ny = f.N.y * ca + f.B.y * sa;
+      const nz = f.N.z * ca + f.B.z * sa;
+      pos.push(px, py, pz);
+      nor.push(nx, ny, nz);
+      uv.push(j / segs, t);
+      const c = colFn(t, a);
+      col.push(c.r, c.g, c.b);
+    }
+  }
+  for (let i = 0; i < n - 1; i++){
+    for (let j = 0; j < segs; j++){
+      const a0 = i * (segs + 1) + j;
+      idx.push(a0, a0 + 1, a0 + segs + 1, a0 + 1, a0 + segs + 2, a0 + segs + 1);
+    }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('normal', new THREE.Float32BufferAttribute(nor, 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  g.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+  g.setIndex(idx);
+  return g;
+}
+function instancedCards(quadGeo, material, items){
+  const mesh = new THREE.InstancedMesh(quadGeo, material, items.length);
+  const m4 = new THREE.Matrix4(), quat = new THREE.Quaternion(), eul = new THREE.Euler(), pos = new THREE.Vector3(), scl = new THREE.Vector3();
+  for (let i = 0; i < items.length; i++){
+    const it = items[i];
+    pos.set(it.x, it.y, it.z);
+    quat.setFromEuler(eul.set(0, rng() * Math.PI * 2, 0));
+    scl.set(it.size, it.size * (0.85 + rng() * 0.25), 1);
+    m4.compose(pos, quat, scl);
+    mesh.setMatrixAt(i, m4);
+    mesh.setColorAt(i, it.color);
+  }
+  mesh.instanceMatrix.needsUpdate = true;
+  if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+  mesh.frustumCulled = false;
+  scene.add(mesh);
+  return mesh;
+}
+
+/* ---------- 纹理：叶簇（核心修复：高镂空） ---------- */
+let leafTex, leafCoverage;
+function makeLeafTexture(){
+  const W = 256;
+  let n = 40 + Math.floor(rng() * 21);
+  let scale = 1.0;
+  let coverage = 0;
+  let c = makeCanvas(W, W);
+  for (let attempt = 0; attempt < 26; attempt++){
+    c = makeCanvas(W, W);
+    const g = c.getContext('2d');
+    for (let i = 0; i < n; i++){
+      const ang = rng() * Math.PI * 2;
+      const rad = Math.pow(rng(), 0.55) * 0.40 * (W / 2);
+      const cx = W / 2 + Math.cos(ang) * rad;
+      const cy = W / 2 + Math.sin(ang) * rad;
+      const len = (10 + rng() * 12) * scale;
+      const wid = len * 0.4;
+      const gray = 0.72 + rng() * 0.28;
+      g.save();
+      g.translate(cx, cy);
+      g.rotate(rng() * Math.PI * 2);
+      g.fillStyle = 'rgb(' + (gray * 255 | 0) + ',' + (gray * 255 | 0) + ',' + (gray * 255 | 0) + ')';
+      g.beginPath();
+      g.moveTo(-len / 2, 0);
+      g.quadraticCurveTo(0, -wid, len / 2, 0);
+      g.quadraticCurveTo(0, wid, -len / 2, 0);
+      g.fill();
+      g.restore();
+    }
+    const img = g.getImageData(0, 0, W, W);
+    let cnt = 0;
+    for (let i = 3; i < img.data.length; i += 4){ if (img.data[i] >= 115) cnt++; }
+    coverage = cnt / (W * W);
+    if (coverage >= 0.18 && coverage <= 0.38) break;
+    if (coverage > 0.38){ n = Math.max(18, Math.floor(n * 0.82)); scale *= 0.90; }
+    else { n = Math.min(96, n + 8); scale *= 1.08; }
+  }
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.anisotropy = 4;
+  console.log('叶簇纹理覆盖率: ' + (coverage * 100).toFixed(1) + '%');
+  return { tex: t, coverage: coverage };
+}
+{ const r = makeLeafTexture(); leafTex = r.tex; leafCoverage = r.coverage; }
+
+function makeFragTexture(){
+  const c = makeCanvas(64, 64);
+  const g = c.getContext('2d');
+  g.translate(32, 32);
+  g.rotate(rng() * Math.PI * 2);
+  const len = 34, wid = 13;
+  g.fillStyle = '#999';
+  g.beginPath();
+  g.moveTo(-len / 2, 0);
+  g.quadraticCurveTo(0, -wid, len / 2, 0);
+  g.quadraticCurveTo(0, wid, -len / 2, 0);
+  g.fill();
+  g.strokeStyle = '#555';
+  g.lineWidth = 1.5;
+  g.beginPath();
+  g.moveTo(-len / 2, 0);
+  g.lineTo(len / 2, 0);
+  g.stroke();
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+const fragTex = makeFragTexture();
+
+/* ---------- 材质 ---------- */
+const leafMat = new THREE.ShaderMaterial({
+  uniforms: { uTime: { value: 0 }, uTex: { value: leafTex } },
+  vertexShader: LEAF_VS,
+  fragmentShader: LEAF_FS,
+  side: THREE.DoubleSide,
+  transparent: false
+});
+const fragMat = new THREE.ShaderMaterial({
+  uniforms: { uTime: { value: 0 }, uTex: { value: fragTex } },
+  vertexShader: LEAF_VS,
+  fragmentShader: LEAF_FS,
+  side: THREE.DoubleSide,
+  transparent: false
+});
+const barkMat = new THREE.ShaderMaterial({
+  uniforms: {
+    uTime: { value: 0 },
+    uSunDir: { value: new THREE.Vector3(0.28, 0.74, 0.60).normalize() },
+    uFogNear: { value: new THREE.Color(0.06, 0.035, 0.02) },
+    uFogFar: { value: new THREE.Color(0.07, 0.035, 0.018) }
+  },
+  vertexShader: BARK_VS,
+  fragmentShader: BARK_FS,
+  vertexColors: true
+});
+const skyMat = new THREE.ShaderMaterial({
+  uniforms: { uTime: { value: 0 } },
+  vertexShader: SKY_VS,
+  fragmentShader: SKY_FS,
+  side: THREE.BackSide,
+  depthWrite: false
+});
+const glowTex = radialGlowTexture(1, 0.35);
+const glowMat = new THREE.ShaderMaterial({
+  uniforms: { uTime: { value: 0 }, uTex: { value: glowTex } },
+  vertexShader: GLOW_VS,
+  fragmentShader: GLOW_FS,
+  transparent: true,
+  blending: THREE.AdditiveBlending,
+  depthWrite: false,
+  depthTest: true
+});
+const flameMat = new THREE.ShaderMaterial({
+  uniforms: { uTime: { value: 0 } },
+  vertexShader: FLAME_VS,
+  fragmentShader: FLAME_FS,
+  transparent: true,
+  blending: THREE.AdditiveBlending,
+  depthWrite: false,
+  depthTest: true
+});
+const beamTex = (function(){
+  const c = makeCanvas(64, 256);
+  const g = c.getContext('2d');
+  const img = g.createImageData(64, 256);
+  const d = img.data;
+  for (let v = 0; v < 256; v++){
+    const vy = v / 255;
+    for (let u = 0; u < 64; u++){
+      const ux = u / 63;
+      const alpha = Math.exp(-Math.pow((ux - 0.5) / 0.26, 2)) * sstep(0, 0.10, vy) * sstep(1, 0.80, vy);
+      const o = (v * 64 + u) * 4;
+      d[o] = 255; d[o + 1] = 140; d[o + 2] = 60; d[o + 3] = Math.round(alpha * 255);
+    }
+  }
+  g.putImageData(img, 0, 0);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+})();
+const beamMat = new THREE.ShaderMaterial({
+  uniforms: { uTime: { value: 0 }, uTex: { value: beamTex }, uAlpha: { value: 0.06 } },
+  vertexShader: BEAM_VS,
+  fragmentShader: BEAM_FS,
+  transparent: true,
+  blending: THREE.AdditiveBlending,
+  depthWrite: false,
+  depthTest: true
+});
+const vineMat = new THREE.ShaderMaterial({
+  uniforms: {
+    uTime: { value: 0 },
+    uFogNear: { value: new THREE.Color(0.06, 0.035, 0.02) },
+    uFogFar: { value: new THREE.Color(0.07, 0.035, 0.018) }
+  },
+  vertexShader: VINE_VS,
+  fragmentShader: VINE_FS
+});
+
+/* ---------- 天空 ---------- */
+{
+  const sky = new THREE.Mesh(new THREE.SphereGeometry(20000, 48, 32), skyMat);
+  sky.frustumCulled = false;
+  sky.renderOrder = -1;
+  scene.add(sky);
+}
+
+/* ---------- 地面 ---------- */
+{
+  const gs = 180;
+  const geo = new THREE.PlaneGeometry(18000, 18000, gs, gs);
+  geo.rotateX(-Math.PI / 2);
+  const posA = geo.attributes.position;
+  const colors = new Float32Array(posA.count * 3);
+  for (let i = 0; i < posA.count; i++){
+    const x = posA.getX(i), z = posA.getZ(i);
+    const y = terrainH(x, z);
+    posA.setY(i, y);
+    const d = Math.sqrt(x * x + z * z);
+    const v = fbm3(x * 0.0009 + 2.1, z * 0.0009 + 5.3, 1.7, 3);
+    let r = 0.03 + 0.012 * (v - 0.5), g2 = 0.026 + 0.010 * (v - 0.5), b = 0.022 + 0.008 * (v - 0.5);
+    const warm = Math.exp(-d * d / (1800 * 1800)) * (0.5 + 0.5 * v);
+    r += 0.195 * warm; g2 += 0.078 * warm; b += 0.020 * warm;
+    colors[i * 3] = r; colors[i * 3 + 1] = g2; colors[i * 3 + 2] = b;
+  }
+  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  geo.computeVertexNormals();
+  const mat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 1, metalness: 0, side: THREE.DoubleSide });
+  const m = new THREE.Mesh(geo, mat);
+  m.frustumCulled = false;
+  scene.add(m);
+}
+
+/* ---------- 树：主干 + 板根 + 分枝（G-2） ---------- */
+function trunkR(t){
+  return (45 + 52 * Math.pow(1 - t, 0.55))
+       * (1 + 0.10 * Math.sin(6.1 * t + 1.3) + 0.07 * Math.sin(2.9 * t + 0.4))
+       * (1 + 0.28 * Math.exp(-7 * t));
+}
+const trunkPts = new THREE.CatmullRomCurve3([
+  new THREE.Vector3(0, 0, 0), new THREE.Vector3(5, 150, 3), new THREE.Vector3(12, 310, -8),
+  new THREE.Vector3(10, 470, -14), new THREE.Vector3(-8, 620, 6), new THREE.Vector3(-14, 770, 10)
+]).getPoints(60);
+const trunkGeo = tubeGeometry(trunkPts, Q.trunkR, Q.trunkS,
+  (t, a) => trunkR(t) * (1 - 0.08 * Math.pow(Math.abs(Math.sin(a * 13 + 0.9 * t)), 0.6)),
+  () => new THREE.Color(0.22, 0.10, 0.04));
+
+function rootGeometry(az, L, H0){
+  const segs = 6;
+  const pos = [], nor = [], uv = [], col = [], idx = [];
+  const ox = -Math.sin(az), oz = Math.cos(az);
+  const cx0 = Math.cos(az), cz0 = Math.sin(az);
+  const r0 = trunkR(0) - 10;
+  const baseY = terrainH(0, 0) - 3;
+  for (let s = 0; s <= segs; s++){
+    const f = s / segs;
+    const dist = r0 + L * Math.pow(f, 1.15);
+    const y = baseY + H0 * Math.pow(1 - f, 1.1) + H0 * 0.12 * f;
+    const w = (22 + (6 - 22) * f) / 2;
+    const px = cx0 * dist, pz = cz0 * dist;
+    const hf = 1 - f;
+    pos.push(px + ox * w, y, pz + oz * w);
+    pos.push(px - ox * w, y, pz - oz * w);
+    nor.push(ox, 0.25, oz); nor.push(ox, 0.25, oz);
+    uv.push(0, 0); uv.push(1, 0);
+    const cr = 0.20 + 0.10 * hf, cg = 0.10 + 0.05 * hf, cb = 0.04 + 0.03 * hf;
+    col.push(cr, cg, cb, cr, cg, cb);
+  }
+  for (let s = 0; s < segs; s++){
+    const a0 = s * 2;
+    idx.push(a0, a0 + 1, a0 + 2, a0 + 1, a0 + 3, a0 + 2);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('normal', new THREE.Float32BufferAttribute(nor, 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  g.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+  g.setIndex(idx);
+  return g;
+}
+function branchCurvePoints(p0, dir, len, elevEnd, curl, N){
+  const R = new THREE.Vector3();
+  R.crossVectors(dir, UP);
+  if (R.lengthSq() < 1e-8) R.set(1, 0, 0); else R.normalize();
+  const dirE = dir.clone();
+  dirE.y = dir.y * elevEnd;
+  dirE.normalize();
+  const pts = [];
+  const pos = p0.clone();
+  for (let i = 0; i <= N; i++){
+    const t = i / N;
+    const d = new THREE.Vector3().lerpVectors(dir, dirE, sstep(0.55, 1.0, t)).normalize();
+    pts.push(pos.clone());
+    pos.addScaledVector(d, len / N);
+  }
+  for (let i = 0; i <= N; i++){
+    const t = i / N;
+    const u = Math.max(0, t - 0.55) / 0.45;
+    pts[i].addScaledVector(R, curl * len * u * u * 0.30);
+  }
+  return pts;
+}
+function childDir(parentDir, spread, tropism, gold){
+  const axis = new THREE.Vector3().crossVectors(UP, parentDir);
+  if (axis.lengthSq() < 1e-8) axis.set(1, 0, 0);
+  axis.normalize();
+  axis.applyAxisAngle(parentDir, gold);
+  const d = parentDir.clone().applyAxisAngle(axis, spread);
+  d.y += tropism;
+  d.normalize();
+  return d;
+}
+const BRANCH_LEVELS = [
+  { spread: 0.35, tropism: 0.18, radMul: 0.60, lenMul: 0.60, forks: [0.30, 0.55, 0.85], cross: 9 },
+  { spread: 0.42, tropism: 0.16, radMul: 0.58, lenMul: 0.60, forks: [0.35, 0.62, 0.90], cross: 8 },
+  { spread: 0.50, tropism: 0.15, radMul: 0.55, lenMul: 0.58, forks: [0.40, 0.68, 0.94], cross: 7 },
+  { spread: 0.58, tropism: 0.14, radMul: 0.50, lenMul: 0.56, forks: [0.45, 0.75], cross: 5 },
+  { spread: 0.65, tropism: 0.13, radMul: 0.45, lenMul: 0.55, forks: [0.55, 0.90], cross: 4 },
+  { spread: 0.70, tropism: 0.12, radMul: 0.40, lenMul: 0.55, forks: [], cross: 3 }
+];
+const HEAT_LEVELS = [0.22, 0.30, 0.52, 0.62, 0.85, 1.0, 1.0];
+const branchGeoList = [trunkGeo];
+const skeletonPts = [];
+const exposedTips = [];
+function addBranch(level, p0, dir, len, rad, elevEnd, curl, goldBase){
+  const lv = level >= 1 ? BRANCH_LEVELS[level - 1] : null;
+  const segs = level === 0 ? 9 : lv.cross;
+  const rings = level === 0 ? 16 : [14, 12, 10, 8, 6, 5][level - 1];
+  const N = rings * 4;
+  const curve = branchCurvePoints(p0, dir, len, elevEnd, curl, N);
+  const heat = HEAT_LEVELS[level];
+  const radFn = (t) => rad * Math.max(0.12, 1 - 0.55 * Math.pow(t, 1.25));
+  branchGeoList.push(tubeGeometry(curve, rings, segs, radFn, () => new THREE.Color(heat, heat * 0.45, heat * 0.18)));
+  if (level >= 3){
+    const steps = level === 3 ? 5 : (level === 4 ? 4 : 3);
+    for (let i = 0; i < steps; i++){
+      const t = 0.25 + 0.7 * (steps === 1 ? 0 : (i / (steps - 1)));
+      const idx = Math.min(curve.length - 1, Math.round(t * (curve.length - 1)));
+      skeletonPts.push({ x: curve[idx].x, y: curve[idx].y, z: curve[idx].z });
+    }
+  }
+  const forks = level === 0 ? [0.45, 0.72] : lv.forks;
+  for (const f of forks){
+    const idx = Math.min(curve.length - 1, Math.round(f * (curve.length - 1)));
+    const pf = curve[idx];
+    const dirAt = new THREE.Vector3().subVectors(curve[Math.min(idx + 1, curve.length - 1)], curve[Math.max(idx - 1, 0)]).normalize();
+    const spread = (lv ? lv.spread : 0.35) * (0.85 + 0.3 * rng());
+    const gold = 137.5 * Math.PI / 180 + rng() * 0.4;
+    const cd = childDir(dirAt, spread, lv ? lv.tropism : 0.18, gold);
+    const clen = len * (lv ? lv.lenMul : 0.60);
+    const crad = rad * (lv ? lv.radMul : 0.60);
+    if (level < 6) addBranch(level + 1, pf, cd, clen, crad, 0.85 + rng() * 0.3, (rng() * 2 - 1) * 0.35, gold);
+  }
+  if (level === 6){
+    const tip = curve[curve.length - 1];
+    if (rng() < 0.12){
+      const tipDir = new THREE.Vector3().subVectors(tip, curve[curve.length - 2]).normalize();
+      const ext = 40 + rng() * 100;
+      const p2 = tip.clone().addScaledVector(tipDir, ext);
+      branchGeoList.push(tubeGeometry([tip, p2], 3, 3, () => 0.35, () => new THREE.Color(1, 0.45, 0.18)));
+      exposedTips.push({ x: p2.x, y: p2.y, z: p2.z });
+    } else {
+      exposedTips.push({ x: tip.x, y: tip.y, z: tip.z });
+    }
+  }
+}
+{
+  const mains = 7 + Math.floor(rng() * 5);
+  const trunkCurve = new THREE.CatmullRomCurve3([
+    new THREE.Vector3(0, 0, 0), new THREE.Vector3(5, 150, 3), new THREE.Vector3(12, 310, -8),
+    new THREE.Vector3(10, 470, -14), new THREE.Vector3(-8, 620, 6), new THREE.Vector3(-14, 770, 10)
+  ]);
+  for (let i = 0; i < mains; i++){
+    const t = 0.55 + rng() * 0.15;
+    const p0 = trunkCurve.getPoint(t);
+    const el = (20 + rng() * 25) * Math.PI / 180;
+    const az = (i + rng() * 0.4) * (Math.PI * 2 / mains);
+    const dir = new THREE.Vector3(Math.cos(az) * Math.cos(el), Math.sin(el), Math.sin(az) * Math.cos(el));
+    const len = 950 + rng() * 300;
+    const rad = 26 + rng() * 8;
+    addBranch(0, p0, dir, len, rad, 0.85 + rng() * 0.3, (rng() * 2 - 1) * 0.35, rng());
+  }
+  const roots = 8 + Math.floor(rng() * 3);
+  for (let i = 0; i < roots; i++){
+    const az = (i + rng() * 0.3) * (Math.PI * 2 / roots);
+    branchGeoList.push(rootGeometry(az, 260 + rng() * 220, 100 + rng() * 70));
+  }
+  const merged = mergeGeos(branchGeoList);
+  const trunk = new THREE.Mesh(merged, barkMat);
+  trunk.frustumCulled = false;
+  scene.add(trunk);
+}
+
+/* ---------- 垂藤（G-8，先生成以取尖端） ---------- */
+const vineTips = [];
+const vineGeos = [];
+for (let i = 0; i < Q.vines; i++){
+  const y0 = 640 + rng() * 180;
+  const az = rng() * Math.PI * 2;
+  const R0 = shellRadiusAt(y0, az) * (0.75 + rng() * 0.2);
+  const len = 200 + rng() * 100;
+  const lat = (rng() * 2 - 1) * 135;
+  const latAz = rng() * Math.PI * 2;
+  const seed = rng();
+  const pts = [];
+  const nPts = 11;
+  for (let s = 0; s < nPts; s++){
+    const f = s / (nPts - 1);
+    const x = Math.cos(az) * R0 + Math.cos(latAz) * lat * f;
+    const z = Math.sin(az) * R0 + Math.sin(latAz) * lat * f;
+    const y = y0 - len * 0.55 * f * f;
+    pts.push(new THREE.Vector3(x, y, z));
+  }
+  const g = tubeGeometry(pts, 10, 5,
+    (f) => (1.4 - 0.9 * f) * (0.8 + 0.4 * seed),
+    () => new THREE.Color(0.85, 0.35, 0.08));
+  const av = new Float32Array(g.attributes.position.count);
+  const asd = new Float32Array(g.attributes.position.count);
+  for (let v = 0; v < g.attributes.position.count; v++){
+    av[v] = g.attributes.uv.getY(v);
+    asd[v] = seed;
+  }
+  g.setAttribute('aV', new THREE.BufferAttribute(av, 1));
+  g.setAttribute('aSeed', new THREE.BufferAttribute(asd, 1));
+  vineGeos.push(g);
+  vineTips.push({ x: pts[nPts - 1].x, y: pts[nPts - 1].y, z: pts[nPts - 1].z });
+}
+{
+  const merged = mergeGeos(vineGeos);
+  const vines = new THREE.Mesh(merged, vineMat);
+  vines.frustumCulled = false;
+  scene.add(vines);
+}
+
+/* ---------- 树冠（InstancedMesh 交叉90°双Plane，G-1） ---------- */
+const q1 = new THREE.PlaneGeometry(1, 1);
+const q2 = new THREE.PlaneGeometry(1, 1);
+q2.rotateY(Math.PI / 2);
+const LEAF_QUAD = mergeGeos([q1, q2]);
+
+const leafItems = [];
+let maxR = 0;
+function pushLeaf(x, y, z, size, color){
+  const r = Math.hypot(x, z);
+  if (r > 1210){ x *= 1210 / r; z *= 1210 / r; }
+  leafItems.push({ x: x, y: y, z: z, size: size, color: color });
+  const r2 = Math.hypot(x, z);
+  if (r2 > maxR) maxR = r2;
+}
+function shellSample(krLo, krHi){
+  let h = (rng() * 2 - 1) * 0.98;
+  const az = rng() * Math.PI * 2;
+  let kr = krLo + rng() * (krHi - krLo);
+  for (let k = 0; k < 30; k++){
+    const y = 980 + h * 470;
+    const R = shellRadiusAt(y, az);
+    if (rng() < Math.min(1, R / 950)) break;
+    kr = krLo + rng() * (krHi - krLo);
+  }
+  const y = 980 + h * 470;
+  const R = shellRadiusAt(y, az);
+  const rr = R * kr;
+  return { x: Math.cos(az) * rr, y: y, z: Math.sin(az) * rr, kr: kr };
+}
+{
+  const nSkel = Math.floor(Q.leaves * 0.30);
+  for (let i = 0; i < nSkel; i++){
+    const sp = skeletonPts[Math.floor(rng() * skeletonPts.length)];
+    const dir = new THREE.Vector3(rng() * 2 - 1, rng() * 2 - 1, rng() * 2 - 1).normalize();
+    const rd = 70 + rng() * 100;
+    let x = sp.x + dir.x * rd, y = sp.y + dir.y * rd, z = sp.z + dir.z * rd;
+    const rr = Math.hypot(x, z);
+    if (rr > 1210){ x *= 1210 / rr; z *= 1210 / rr; }
+    const kr = krAt(x, y, z);
+    pushLeaf(x, y, z, 90 + rng() * 110, canopyFireColor(y, kr));
+  }
+  const nShell = Math.floor(Q.leaves * 0.55);
+  for (let i = 0; i < nShell; i++){
+    const s = shellSample(0.50, 0.95);
+    pushLeaf(s.x, s.y, s.z, 110 + rng() * 130, canopyFireColor(s.y, s.kr));
+  }
+  const nCore = Q.leaves - nSkel - nShell;
+  for (let i = 0; i < nCore; i++){
+    const d = new THREE.Vector3(rng() * 2 - 1, rng() * 2 - 1, rng() * 2 - 1).normalize();
+    const rr = 380 * Math.cbrt(rng());
+    const x = d.x * rr, y = 1050 + d.y * rr, z = d.z * rr;
+    const col = new THREE.Color(0.30, 0.10, 0.03).multiplyScalar(0.88 + 0.24 * rng());
+    pushLeaf(x, y, z, 220 + rng() * 120, col);
+  }
+  for (const tip of vineTips){
+    if (tip.y < 560) continue;
+    const k = 1 + Math.floor(rng() * 2);
+    for (let j = 0; j < k; j++){
+      const x = tip.x + (rng() * 2 - 1) * 40;
+      const y = tip.y + (rng() * 2 - 1) * 40;
+      const z = tip.z + (rng() * 2 - 1) * 40;
+      pushLeaf(x, y, z, 70 + rng() * 50, new THREE.Color(0.9, 0.4, 0.08).multiplyScalar(0.88 + 0.24 * rng()));
+    }
+  }
+}
+
+/* ---------- 直方图补撒（36方位 x 12高格，仅 y>=700 且 kr>=0.55） ---------- */
+let histEmptyRate = 0;
+{
+  const N_AZ = 36, N_Y = 12;
+  const cells = new Int8Array(N_AZ * N_Y);
+  const mark = (x, y, z) => {
+    if (y < 700) return;
+    const az = Math.atan2(z, x);
+    let ai = Math.floor((az + Math.PI) / (Math.PI * 2) * N_AZ);
+    ai = (ai % N_AZ + N_AZ) % N_AZ;
+    const yi = Math.max(0, Math.min(N_Y - 1, Math.floor((y - 700) / (1460 - 700) * N_Y)));
+    cells[ai * N_Y + yi] = 1;
+  };
+  for (const it of leafItems) mark(it.x, it.y, it.z);
+  let rate = () => {
+    let empty = 0, total = 0;
+    for (let i = 0; i < N_AZ * N_Y; i++){
+      const yi = i % N_Y;
+      const y = 700 + (yi + 0.5) / N_Y * 760;
+      const az = (Math.floor(i / N_Y) + 0.5) / N_AZ * Math.PI * 2 - Math.PI;
+      const R = shellRadiusAt(y, az);
+      if (y < 700 || R * 0.55 < 40) continue;
+      total++;
+      if (cells[i] === 0) empty++;
+    }
+    return total === 0 ? 0 : empty / total;
+  };
+  for (let iter = 0; iter < 8; iter++){
+    histEmptyRate = rate();
+    if (histEmptyRate <= 0.18) break;
+    for (let i = 0; i < N_AZ * N_Y; i++){
+      if (cells[i] === 1) continue;
+      const yi = i % N_Y;
+      const y = 700 + (yi + 0.5) / N_Y * 760;
+      const az = (Math.floor(i / N_Y) + 0.5) / N_AZ * Math.PI * 2 - Math.PI;
+      const R = shellRadiusAt(y, az);
+      if (y < 700 || R * 0.55 < 40) continue;
+      const kr = 0.55 + rng() * 0.30;
+      const rr = R * kr;
+      const x = Math.cos(az) * rr, z = Math.sin(az) * rr;
+      pushLeaf(x, y, z, 160 + rng() * 120, canopyFireColor(y, kr));
+      cells[i] = 1;
+    }
+  }
+  histEmptyRate = rate();
+  console.log('树冠直方图空格率(补撒后): ' + (histEmptyRate * 100).toFixed(1) + '%');
+  instancedCards(LEAF_QUAD, leafMat, leafItems);
+}
+/* ---------- 碎叶层（独立 InstancedMesh，共享 G-1） ---------- */
+{
+  const nShell = Math.floor(Q.frags * 0.85);
+  const items = [];
+  for (let i = 0; i < nShell; i++){
+    const s = shellSample(0.72, 1.05);
+    const t = sstep(620, 1460, s.y);
+    items.push({
+      x: s.x, y: s.y, z: s.z,
+      size: 10 + rng() * 14,
+      color: new THREE.Color(0.50 + 0.50 * t, 0.10 + 0.42 * t, 0.02 + 0.08 * t)
+    });
+  }
+  let budget = Q.frags - items.length;
+  for (let i = 0; i < exposedTips.length && budget > 0; i += 2){
+    const tip = exposedTips[i];
+    if (tip.y > 1300) continue;
+    const k = Math.min(budget, 4 + Math.floor(rng() * 5));
+    for (let j = 0; j < k; j++){
+      items.push({
+        x: tip.x + (rng() * 2 - 1) * 30,
+        y: tip.y + (rng() * 2 - 1) * 30,
+        z: tip.z + (rng() * 2 - 1) * 30,
+        size: 10 + rng() * 14,
+        color: new THREE.Color(0.55, 0.22, 0.05)
+      });
+    }
+    budget -= k;
+  }
+  instancedCards(LEAF_QUAD, fragMat, items);
+}
+
+/* ---------- 光晕（G-5）与火焰（G-4） ---------- */
+{
+  const n = 3 + Math.floor(rng() * 3);
+  const items = [];
+  for (let i = 0; i < n; i++){
+    items.push({
+      x: (rng() * 2 - 1) * 200, y: 1150 + (rng() * 2 - 1) * 140, z: (rng() * 2 - 1) * 200,
+      size: 600 + rng() * 400,
+      alpha: 0.05 + rng() * 0.04,
+      phase: rng()
+    });
+  }
+  const geo = new THREE.PlaneGeometry(1, 1);
+  const mesh = new THREE.InstancedMesh(geo, glowMat, items.length);
+  const m4 = new THREE.Matrix4(), quat = new THREE.Quaternion(), pos = new THREE.Vector3(), scl = new THREE.Vector3(1, 1, 1);
+  const aSize = new THREE.InstancedBufferAttribute(new Float32Array(items.length), 1);
+  const aAlpha = new THREE.InstancedBufferAttribute(new Float32Array(items.length), 1);
+  const aPhase = new THREE.InstancedBufferAttribute(new Float32Array(items.length), 1);
+  for (let i = 0; i < items.length; i++){
+    const it = items[i];
+    pos.set(it.x, it.y, it.z);
+    quat.identity();
+    m4.compose(pos, quat, scl);
+    mesh.setMatrixAt(i, m4);
+    aSize.setX(i, it.size);
+    aAlpha.setX(i, it.alpha);
+    aPhase.setX(i, it.phase);
+  }
+  mesh.instanceMatrix.needsUpdate = true;
+  const bg = new THREE.InstancedBufferGeometry();
+  bg.copy(geo);
+  bg.setAttribute('aSize', aSize);
+  bg.setAttribute('aAlpha', aAlpha);
+  bg.setAttribute('aPhase', aPhase);
+  mesh.geometry = bg;
+  mesh.frustumCulled = false;
+  mesh.renderOrder = 10;
+  scene.add(mesh);
+}
+{
+  const items = [];
+  for (let i = 0; i < Q.flames; i++){
+    const y = 1500 - Math.pow(rng(), 1.4) * 600;
+    const az = rng() * Math.PI * 2;
+    const R = shellRadiusAt(y, az) * (0.75 + rng() * 0.35);
+    items.push({ x: Math.cos(az) * R, y: y, z: Math.sin(az) * R, size: 80 + rng() * 180, phase: rng() });
+  }
+  const geo = new THREE.PlaneGeometry(1, 1);
+  const mesh = new THREE.InstancedMesh(geo, flameMat, items.length);
+  const m4 = new THREE.Matrix4(), quat = new THREE.Quaternion(), pos = new THREE.Vector3(), scl = new THREE.Vector3(1, 1, 1);
+  const aSize = new THREE.InstancedBufferAttribute(new Float32Array(items.length), 1);
+  const aPhase = new THREE.InstancedBufferAttribute(new Float32Array(items.length), 1);
+  for (let i = 0; i < items.length; i++){
+    const it = items[i];
+    pos.set(it.x, it.y, it.z);
+    quat.identity();
+    m4.compose(pos, quat, scl);
+    mesh.setMatrixAt(i, m4);
+    aSize.setX(i, it.size);
+    aPhase.setX(i, it.phase);
+  }
+  mesh.instanceMatrix.needsUpdate = true;
+  const bg = new THREE.InstancedBufferGeometry();
+  bg.copy(geo);
+  bg.setAttribute('aSize', aSize);
+  bg.setAttribute('aPhase', aPhase);
+  mesh.geometry = bg;
+  mesh.frustumCulled = false;
+  mesh.renderOrder = 12;
+  scene.add(mesh);
+}
+
+/* ---------- 体积光束（G-7，梯形交叉双quad） ---------- */
+{
+  const pos = [], uv = [], idx = [], ph = [];
+  for (let i = 0; i < Q.beams; i++){
+    const y = 640 + rng() * 240;
+    const az = rng() * Math.PI * 2;
+    const R = shellRadiusAt(y, az) * (0.7 + rng() * 0.25);
+    const p0 = new THREE.Vector3(Math.cos(az) * R, y, Math.sin(az) * R);
+    const len = 620 + rng() * 380;
+    const tilt = (rng() * 2 - 1) * 0.35;
+    const az2 = az + (rng() * 2 - 1) * 0.6;
+    const dir = new THREE.Vector3(Math.sin(tilt) * Math.cos(az2), -Math.cos(tilt), Math.sin(tilt) * Math.sin(az2)).normalize();
+    const quat = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, -1, 0), dir);
+    const center = p0.clone().addScaledVector(dir, -len / 2);
+    const wT = 17, wB = 43;
+    const verts = [
+      { lx: -wT, ly: 0.5, u: 0, v: 1 }, { lx: wT, ly: 0.5, u: 1, v: 1 },
+      { lx: wB, ly: -0.5, u: 1, v: 0 }, { lx: -wB, ly: -0.5, u: 0, v: 0 },
+      { lz: -wT, ly: 0.5, u: 0, v: 1 }, { lz: wT, ly: 0.5, u: 1, v: 1 },
+      { lz: wB, ly: -0.5, u: 1, v: 0 }, { lz: -wB, ly: -0.5, u: 0, v: 0 }
+    ];
+    for (let j = 0; j < verts.length; j++){
+      const vt = verts[j];
+      const lv = new THREE.Vector3(vt.lx || 0, vt.ly * len, vt.lz || 0);
+      const w = center.clone().add(lv.applyQuaternion(quat));
+      pos.push(w.x, w.y, w.z);
+      uv.push(vt.u, vt.v);
+      ph.push(rng());
+    }
+    const base = i * 8;
+    idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
+    idx.push(base + 4, base + 5, base + 6, base + 4, base + 6, base + 7);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  g.setAttribute('aPhase', new THREE.Float32BufferAttribute(ph, 1));
+  g.setIndex(idx);
+  const mesh = new THREE.Mesh(g, beamMat);
+  mesh.frustumCulled = false;
+  mesh.renderOrder = 15;
+  scene.add(mesh);
+}
+
+/* ---------- 粒子：火星 / 灰烬 / 光尘 ---------- */
+let cityFireMat = null;
+function makePoints(attrs, material, count, fill){
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(count * 3), 3));
+  for (const k in attrs){
+    g.setAttribute(k, new THREE.Float32BufferAttribute(new Float32Array(count * attrs[k]), attrs[k]));
+  }
+  const pa = g.attributes.position.array;
+  for (let i = 0; i < count; i++) fill(i, g);
+  const pts = new THREE.Points(g, material);
+  pts.frustumCulled = false;
+  scene.add(pts);
+  return pts;
+}
+const sparkMat = new THREE.ShaderMaterial({
+  uniforms: { uTime: { value: 0 } },
+  vertexShader: SPARK_VS, fragmentShader: SPARK_FS,
+  transparent: true, blending: THREE.AdditiveBlending, depthWrite: false
+});
+const ashMat = new THREE.ShaderMaterial({
+  uniforms: { uTime: { value: 0 } },
+  vertexShader: ASH_VS, fragmentShader: ASH_FS,
+  transparent: true, blending: THREE.NormalBlending, depthWrite: false
+});
+const dustMat = new THREE.ShaderMaterial({
+  uniforms: { uTime: { value: 0 } },
+  vertexShader: DUST_VS, fragmentShader: DUST_FS,
+  transparent: true, blending: THREE.AdditiveBlending, depthWrite: false
+});
+{
+  const count = Q.sparks;
+  const sp = new THREE.BufferGeometry();
+  sp.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(count * 3), 3));
+  sp.setAttribute('aPhase', new THREE.Float32BufferAttribute(new Float32Array(count), 1));
+  sp.setAttribute('aSpeed', new THREE.Float32BufferAttribute(new Float32Array(count), 1));
+  sp.setAttribute('aRise', new THREE.Float32BufferAttribute(new Float32Array(count), 1));
+  sp.setAttribute('aAmp', new THREE.Float32BufferAttribute(new Float32Array(count), 1));
+  sp.setAttribute('aHz', new THREE.Float32BufferAttribute(new Float32Array(count), 1));
+  sp.setAttribute('aSize', new THREE.Float32BufferAttribute(new Float32Array(count), 1));
+  sp.setAttribute('aCol', new THREE.Float32BufferAttribute(new Float32Array(count * 3), 3));
+  const pA = sp.attributes.position.array, cA = sp.attributes.aCol.array;
+  for (let i = 0; i < count; i++){
+    let s = shellSample(0.6, 0.95);
+    pA[i * 3] = s.x; pA[i * 3 + 1] = s.y; pA[i * 3 + 2] = s.z;
+    sp.attributes.aPhase.setX(i, rng());
+    sp.attributes.aSpeed.setX(i, 0.2 + rng() * 0.3);
+    sp.attributes.aRise.setX(i, 120 + rng() * 630);
+    sp.attributes.aAmp.setX(i, 8 + rng() * 17);
+    sp.attributes.aHz.setX(i, 2 + rng() * 2);
+    sp.attributes.aSize.setX(i, 5 + rng() * 6);
+    cA[i * 3] = 1.0; cA[i * 3 + 1] = 0.55 + rng() * 0.2; cA[i * 3 + 2] = 0.12 + rng() * 0.18;
+  }
+  const pts = new THREE.Points(sp, sparkMat);
+  pts.frustumCulled = false;
+  pts.renderOrder = 13;
+  scene.add(pts);
+}
+{
+  const count = Q.ashes;
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(count * 3), 3));
+  g.setAttribute('aBase', new THREE.Float32BufferAttribute(new Float32Array(count), 1));
+  g.setAttribute('aSpeed', new THREE.Float32BufferAttribute(new Float32Array(count), 1));
+  g.setAttribute('aSeed', new THREE.Float32BufferAttribute(new Float32Array(count), 1));
+  g.setAttribute('aSize', new THREE.Float32BufferAttribute(new Float32Array(count), 1));
+  g.setAttribute('aAlpha', new THREE.Float32BufferAttribute(new Float32Array(count), 1));
+  g.setAttribute('aCol', new THREE.Float32BufferAttribute(new Float32Array(count * 3), 3));
+  const pA = g.attributes.position.array, cA = g.attributes.aCol.array;
+  for (let i = 0; i < count; i++){
+    let x = 0, z = 0;
+    for (let k = 0; k < 24; k++){
+      x = (rng() * 2 - 1) * 2600;
+      z = (rng() * 2 - 1) * 2600 - 600;
+      if (x * x + (z + 600) * (z + 600) <= 2600 * 2600) break;
+    }
+    pA[i * 3] = x; pA[i * 3 + 1] = 0; pA[i * 3 + 2] = z;
+    g.attributes.aBase.setX(i, rng() * 1600);
+    g.attributes.aSpeed.setX(i, 15 + rng() * 20);
+    g.attributes.aSeed.setX(i, rng());
+    g.attributes.aSize.setX(i, 5 + rng() * 4);
+    g.attributes.aAlpha.setX(i, 0.35 + rng() * 0.25);
+    const m = 0.85 + rng() * 0.30;
+    cA[i * 3] = 0.68 * m; cA[i * 3 + 1] = 0.64 * m; cA[i * 3 + 2] = 0.58 * m;
+  }
+  const pts = new THREE.Points(g, ashMat);
+  pts.frustumCulled = false;
+  scene.add(pts);
+}
+{
+  const count = { high: 300, medium: 240, low: 180 }[q] || 240;
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(count * 3), 3));
+  g.setAttribute('aPhase', new THREE.Float32BufferAttribute(new Float32Array(count), 1));
+  g.setAttribute('aSize', new THREE.Float32BufferAttribute(new Float32Array(count), 1));
+  const pA = g.attributes.position.array;
+  for (let i = 0; i < count; i++){
+    const az = rng() * Math.PI * 2;
+    const r = 300 + rng() * 600;
+    pA[i * 3] = Math.cos(az) * r;
+    pA[i * 3 + 1] = 480 + rng() * 520;
+    pA[i * 3 + 2] = Math.sin(az) * r;
+    g.attributes.aPhase.setX(i, rng());
+    g.attributes.aSize.setX(i, 4 + rng() * 4);
+  }
+  const pts = new THREE.Points(g, dustMat);
+  pts.frustumCulled = false;
+  scene.add(pts);
+}
+
+/* ---------- 烟团（8 个 billboard，CPU 更新） ---------- */
+const smokeData = [];
+const smokeGeo = (function(){
+  const pos = [], uv = [], idx = [];
+  for (let i = 0; i < 8; i++){
+    smokeData.push({
+      phase: rng(), kr: 0.9 + rng() * 0.4,
+      y: 1300 + rng() * 400, size: 350 + rng() * 300, alpha: 0.12 + rng() * 0.08
+    });
+    const base = i * 4;
+    pos.push(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    uv.push(1, 1, 0, 1, 0, 0, 1, 0);
+    idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  g.setIndex(idx);
+  return g;
+})();
+const smokeTex = radialGlowTexture(0.55, 0.35);
+const smokeMat = new THREE.ShaderMaterial({
+  uniforms: { uTex: { value: smokeTex }, uTime: { value: 0 }, uAlpha: { value: 0.16 } },
+  vertexShader: SMOKE_VS, fragmentShader: SMOKE_FS,
+  transparent: true, blending: THREE.NormalBlending, depthWrite: false
+});
+const smokeMesh = new THREE.Mesh(smokeGeo, smokeMat);
+smokeMesh.frustumCulled = false;
+smokeMesh.renderOrder = 14;
+if (ENABLE_CROWN_SMOKE) scene.add(smokeMesh);
+function updateSmoke(t){
+  const right = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 0);
+  const up = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 1);
+  const pos = smokeGeo.attributes.position.array;
+  for (let i = 0; i < 8; i++){
+    const sd = smokeData[i];
+    const ang = sd.phase * Math.PI * 2 + t * (0.008 + 0.014 * sd.phase);
+    const R = shellRadiusAt(sd.y, ang) * sd.kr * (1.0 + 0.15 * Math.sin(t * 0.1 + sd.phase * 6.2831));
+    const cx = Math.cos(ang) * R, cy = sd.y + Math.sin(t * 0.05 + sd.phase * 9.0) * 20.0, cz = Math.sin(ang) * R;
+    const s = sd.size;
+    for (let v = 0; v < 4; v++){
+      const lx = (v & 1) ? 0.5 : -0.5, ly = (v & 2) ? 0.5 : -0.5;
+      const o = (i * 4 + v) * 3;
+      pos[o] = cx + right.x * lx * s + up.x * ly * s;
+      pos[o + 1] = cy + right.y * lx * s + up.y * ly * s;
+      pos[o + 2] = cz + right.z * lx * s + up.z * ly * s;
+    }
+  }
+  smokeGeo.attributes.position.needsUpdate = true;
+}
+
+/* ---------- 王城圈（G-6 剪影） ---------- */
+const cityMat = silMaterial(0.026, 0.022, 0.018);
+{
+  const gapAz = -Math.PI / 2;
+  const clusters = [];
+  for (let i = 0; i < Q.city; i++){
+    let az = 0, r = 0;
+    for (let k = 0; k < 40; k++){
+      az = rng() * Math.PI * 2;
+      if (Math.abs(((az - gapAz + Math.PI) % (Math.PI * 2) + Math.PI) % (Math.PI * 2) - Math.PI) < 1.2) continue;
+      r = 600 + rng() * 1000;
+      break;
+    }
+    clusters.push({ x: Math.cos(az) * r, z: Math.sin(az) * r });
+  }
+  for (const cl of clusters){
+    const pieces = [];
+    const n = 12 + Math.floor(rng() * 9);
+    const cols = Math.ceil(Math.sqrt(n));
+    const spacing = 50 + rng() * 20;
+    const landmarks = 1 + (rng() < 0.5 ? 1 : 0);
+    for (let i = 0; i < n; i++){
+      const gx = (i % cols) - (cols - 1) / 2;
+      const gz = Math.floor(i / cols) - (cols - 1) / 2;
+      const px = (gx + (rng() * 2 - 1) * 0.55) * spacing;
+      const pz = (gz + (rng() * 2 - 1) * 0.55) * spacing;
+      const isLandmark = i < landmarks;
+      const h = isLandmark ? 180 + rng() * 120 : Math.pow(rng(), 1.6) * 110 + 40;
+      const s = (40 + rng() * 30) * (0.45 + rng() * 1.1);
+      const type = isLandmark ? (rng() < 0.5 ? 0 : 1) : Math.floor(rng() * 4);
+      if (type === 0){
+        const tiers = 2 + Math.floor(rng() * 3);
+        let y = 0;
+        for (let k = 0; k < tiers; k++){
+          const w = s * (1 - 0.16 * k);
+          const hh = h / tiers * (1.2 - k * 0.1);
+          const box = new THREE.BoxGeometry(w, hh, w);
+          box.translate(px, y + hh / 2, pz);
+          pieces.push(box);
+          y += hh;
+        }
+      } else if (type === 1){
+        const box = new THREE.BoxGeometry(s, h * 0.7, s);
+        box.translate(px, h * 0.35, pz);
+        pieces.push(box);
+        const cone = new THREE.ConeGeometry(s * 0.5, h * 0.42, 6);
+        cone.translate(px, h * 0.7 + h * 0.21, pz);
+        pieces.push(cone);
+      } else if (type === 2){
+        const wall = new THREE.BoxGeometry(s * 3.2, h * 0.45, s * 0.55);
+        wall.translate(px, h * 0.225, pz);
+        pieces.push(wall);
+        const nb = 3 + Math.floor(rng() * 3);
+        for (let k = 0; k < nb; k++){
+          const cw = s * 0.22, chh = h * 0.18;
+          const bx = new THREE.BoxGeometry(cw, chh, s * 0.5);
+          bx.translate(px - s * 1.4 + k * (s * 2.8 / (nb - 1)), h * 0.45 + chh / 2, pz);
+          pieces.push(bx);
+        }
+      } else {
+        const half = s * 0.55, archH = h * 0.55;
+        const curve = new THREE.QuadraticBezierCurve3(
+          new THREE.Vector3(px - half, 0, pz),
+          new THREE.Vector3(px, archH, pz),
+          new THREE.Vector3(px + half, 0, pz));
+        pieces.push(new THREE.TubeGeometry(curve, 12, s * 0.13, 6, false));
+        const p1 = new THREE.BoxGeometry(s * 0.16, h * 0.45, s * 0.5);
+        p1.translate(px - half, h * 0.225, pz);
+        pieces.push(p1);
+        const p2 = p1.clone();
+        p2.translate(half * 2, 0, 0);
+        pieces.push(p2);
+      }
+    }
+    const g = mergeGeos(pieces);
+    const m = new THREE.Mesh(g, cityMat);
+    m.position.set(cl.x, terrainH(cl.x, cl.z) - 2, cl.z);
+    m.frustumCulled = false;
+    scene.add(m);
+  }
+}
+{
+  const count = 12 + Math.floor(rng() * 7);
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(count * 3), 3));
+  g.setAttribute('aPhase', new THREE.Float32BufferAttribute(new Float32Array(count), 1));
+  g.setAttribute('aSize', new THREE.Float32BufferAttribute(new Float32Array(count), 1));
+  const pA = g.attributes.position.array;
+  for (let i = 0; i < count; i++){
+    const az = rng() * Math.PI * 2;
+    const r = 600 + rng() * 1000;
+    const x = Math.cos(az) * r, z = Math.sin(az) * r;
+    pA[i * 3] = x; pA[i * 3 + 1] = terrainH(x, z) + 2 + rng() * 4; pA[i * 3 + 2] = z;
+    g.attributes.aPhase.setX(i, rng());
+    g.attributes.aSize.setX(i, 6 + rng() * 8);
+  }
+  const mat = cityFireMat = new THREE.ShaderMaterial({
+    uniforms: { uTime: { value: 0 } },
+    vertexShader: CITYFIRE_VS, fragmentShader: CITYFIRE_FS,
+    transparent: true, blending: THREE.AdditiveBlending, depthWrite: false
+  });
+  const pts = new THREE.Points(g, mat);
+  pts.frustumCulled = false;
+  scene.add(pts);
+}
+
+/* ---------- 远山（双层360° 连续山脊三角带） ---------- */
+function ridgeRing(r, H, color){
+  const N = 360;
+  const pos = [];
+  const seed = rng() * 10;
+  for (let i = 0; i <= N; i++){
+    const az = (i % N) / N * Math.PI * 2;
+    const f1 = fbm3(az * 9 + seed, 0.5, 7.7, 4);
+    const f2 = fbm3(az * 23 + seed * 2.7, 0.5, 3.3, 4);
+    const h = Math.pow(f1, 1.6) * H + 0.45 * Math.pow(f2, 1.4) * H;
+    pos.push(Math.cos(az) * r, h, Math.sin(az) * r);
+    pos.push(Math.cos(az) * r, -80, Math.sin(az) * r);
+  }
+  const idx = [];
+  for (let i = 0; i < N; i++){
+    const a = i * 2, b = i * 2 + 1, c = (i + 1) * 2, d = (i + 1) * 2 + 1;
+    idx.push(a, b, c, c, b, d);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  const m = new THREE.Mesh(g, silMaterial(color[0], color[1], color[2]));
+  m.frustumCulled = false;
+  scene.add(m);
+}
+ridgeRing(5500, 260 + rng() * 360, [0.020, 0.014, 0.011]);
+ridgeRing(8500, 450 + rng() * 450, [0.032, 0.020, 0.014]);
+
+/* ---------- 枯树植被（禁圆锥） ---------- */
+{
+  const geos = [];
+  for (let i = 0; i < Q.veg; i++){
+    let x = 0, z = 0;
+    for (let k = 0; k < 40; k++){
+      const az = rng() * Math.PI * 2;
+      if (Math.abs(((az - gapAz() + Math.PI) % (Math.PI * 2) + Math.PI) % (Math.PI * 2) - Math.PI) < 1.2) continue;
+      const r = 700 + rng() * 1900;
+      x = Math.cos(az) * r; z = Math.sin(az) * r;
+      break;
+    }
+    const h = 25 + rng() * 65;
+    const y0 = terrainH(x, z);
+    const trunk = new THREE.CylinderGeometry(0.7 + rng() * 1.2, 1.2 + rng() * 1.8, h, 5);
+    trunk.translate(x, y0 + h / 2, z);
+    geos.push(trunk);
+    const nb = 3 + Math.floor(rng() * 4);
+    for (let j = 0; j < nb; j++){
+      const len = h * (0.3 + rng() * 0.35);
+      const a1 = rng() * Math.PI * 2, a2 = Math.PI * 0.3 + rng() * 0.5;
+      const dir = new THREE.Vector3(Math.cos(a1) * Math.cos(a2), Math.sin(a2), Math.sin(a1) * Math.cos(a2));
+      const sy = y0 + h * (0.55 + rng() * 0.4);
+      const pole = new THREE.CylinderGeometry(0.09 + rng() * 0.22, 0.14 + rng() * 0.28, len, 4);
+      pole.applyQuaternion(new THREE.Quaternion().setFromUnitVectors(UP, dir));
+      pole.translate(dir.x * len * 0.5, sy + dir.y * len * 0.5, dir.z * len * 0.5);
+      geos.push(pole);
+    }
+  }
+  const g = mergeGeos(geos);
+  const m = new THREE.Mesh(g, silMaterial(0.06, 0.045, 0.032));
+  m.frustumCulled = false;
+  scene.add(m);
+}
+function gapAz(){ return -Math.PI / 2; }
+
+/* ---------- 前景断塔尖（相机左前） ---------- */
+{
+  const fwd = new THREE.Vector3().subVectors(controls.target, camera.position).normalize();
+  const right = new THREE.Vector3().crossVectors(fwd, UP).normalize();
+  const left = right.clone().negate();
+  const base = camera.position.clone().addScaledVector(fwd, 140).addScaledVector(left, 55);
+  const pieces = [];
+  let y = terrainH(base.x, base.z) + 2;
+  const widths = [14, 10, 7];
+  for (let k = 0; k < 3; k++){
+    const h = 26 - k * 3;
+    const box = new THREE.BoxGeometry(widths[k], h, widths[k] * 0.8);
+    box.translate(base.x + (rng() - 0.5) * 2, y + h / 2, base.z + (rng() - 0.5) * 2);
+    box.rotateZ((rng() - 0.5) * 0.12);
+    pieces.push(box);
+    y += h;
+  }
+  const shard = new THREE.ConeGeometry(4, 16, 4);
+  shard.translate(base.x + (rng() - 0.5) * 3, y + 4, base.z);
+  shard.rotateZ((rng() - 0.5) * 0.5);
+  pieces.push(shard);
+  const g = mergeGeos(pieces);
+  const m = new THREE.Mesh(g, silMaterial(0.012, 0.010, 0.009));
+  m.frustumCulled = false;
+  scene.add(m);
+}
+
+/* ---------- 地面雾（14+5 片） ---------- */
+{
+  const fogTex = (function(){
+    const c = makeCanvas(256, 256);
+    const g = c.getContext('2d');
+    const gr = g.createRadialGradient(128, 128, 0, 128, 128, 128);
+    gr.addColorStop(0, 'rgba(255,255,255,0.10)');
+    gr.addColorStop(0.45, 'rgba(255,255,255,1)');
+    gr.addColorStop(1, 'rgba(255,255,255,0)');
+    g.fillStyle = gr;
+    g.fillRect(0, 0, 256, 256);
+    const t = new THREE.CanvasTexture(c);
+    t.colorSpace = THREE.SRGBColorSpace;
+    return t;
+  })();
+  for (let i = 0; i < 19; i++){
+    let x, z, y;
+    if (i < 5){
+      x = (rng() * 2 - 1) * 900;
+      z = -3400 + rng() * 1800;
+      y = 15 + rng() * 45;
+    } else {
+      const az = rng() * Math.PI * 2;
+      const r = 800 + rng() * 3700;
+      x = Math.cos(az) * r;
+      z = Math.sin(az) * r;
+      y = terrainH(x, z) + 15 + rng() * 25;
+    }
+    const size = 3900 + rng() * 5100;
+    const geo = new THREE.PlaneGeometry(size, size);
+    geo.rotateX(-Math.PI / 2);
+    const mat = new THREE.MeshBasicMaterial({
+      color: new THREE.Color(0.12, 0.055, 0.028),
+      map: fogTex,
+      transparent: true,
+      opacity: 0.12 + rng() * 0.08,
+      depthWrite: false
+    });
+    const m = new THREE.Mesh(geo, mat);
+    m.position.set(x, y, z);
+    m.rotation.y = rng() * Math.PI * 2;
+    m.frustumCulled = false;
+    scene.add(m);
+  }
+}
+
+/* ---------- 灯光 ---------- */
+const hemi = new THREE.HemisphereLight(0x1a0f0a, 0x080604, 0.3);
+scene.add(hemi);
+const dirLight = new THREE.DirectionalLight(0x5a1a08, 0.5);
+dirLight.position.set(-300, 1600, 1200);
+scene.add(dirLight);
+const pointLight = new THREE.PointLight(0xff6b1a, 60000, 5000, 2);
+pointLight.position.set(0, 1000, 0);
+scene.add(pointLight);
+
+/* ---------- 后期链 ---------- */
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+const bloomPass = new UnrealBloomPass(
+  new THREE.Vector2(window.innerWidth, window.innerHeight),
+  Q.bloom, 0.70, 0.85);
+composer.addPass(bloomPass);
+composer.addPass(new VignettePass());
+composer.addPass(new OutputPass());
+
+/* ---------- 交互 ---------- */
+let paused = false;
+let lastInteract = 0;
+controls.addEventListener('start', () => { lastInteract = tNow; });
+function resetView(){
+  camera.position.set(CAM_POS[0], CAM_POS[1], CAM_POS[2]);
+  controls.target.set(CAM_TARGET[0], CAM_TARGET[1], CAM_TARGET[2]);
+  lastInteract = tNow;
+}
+document.getElementById('btnReset').addEventListener('click', resetView);
+document.getElementById('btnPause').addEventListener('click', () => {
+  paused = !paused;
+  document.getElementById('btnPause').textContent = paused ? '继续' : '暂停';
+});
+canvas.addEventListener('dblclick', resetView);
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  composer.setSize(window.innerWidth, window.innerHeight);
+});
+
+/* ---------- 加载/错误遮罩 + 看门狗 ---------- */
+function showError(msg){
+  const el = document.getElementById('error');
+  el.style.display = 'flex';
+  document.getElementById('errMsg').textContent = msg;
+  document.getElementById('loading').style.display = 'none';
+}
+window.addEventListener('error', (e) => { showError('脚本错误: ' + (e.message || e.type)); });
+window.addEventListener('unhandledrejection', (e) => { showError('异步错误: ' + (e.reason && e.reason.message ? e.reason.message : e.reason)); });
+setTimeout(() => { if (!booted) showError('CDN 资源加载超时（15s）。请检查网络后重新加载。'); }, 15000);
+
+/* ---------- 主循环 ---------- */
+let tNow = 0;
+let booted = false;
+let lastT = performance.now();
+let fpsEma = 60;
+let lowFpsSince = 0;
+let bloomDown = false;
+let frameCount = 0;
+const Y_AXIS = new THREE.Vector3(0, 1, 0);
+const tmpQ = new THREE.Quaternion();
+
+function animate(){
+  requestAnimationFrame(animate);
+  const now = performance.now();
+  const dt = Math.min(0.05, (now - lastT) / 1000);
+  lastT = now;
+  if (dt > 0){
+    const fps = 1 / dt;
+    fpsEma = fpsEma * 0.9 + fps * 0.1;
+    if (fpsEma < 24){
+      if (lowFpsSince === 0) lowFpsSince = tNow;
+      else if (tNow - lowFpsSince > 2.5 && !bloomDown){
+        bloomDown = true;
+        bloomPass.strength *= 0.8;
+      }
+    } else lowFpsSince = 0;
+  }
+  if (!paused){
+    tNow += dt;
+    const t = tNow;
+    leafMat.uniforms.uTime.value = t;
+    fragMat.uniforms.uTime.value = t;
+    barkMat.uniforms.uTime.value = t;
+    skyMat.uniforms.uTime.value = t;
+    glowMat.uniforms.uTime.value = t;
+    flameMat.uniforms.uTime.value = t;
+    beamMat.uniforms.uTime.value = t;
+    vineMat.uniforms.uTime.value = t;
+    sparkMat.uniforms.uTime.value = t;
+    ashMat.uniforms.uTime.value = t;
+    dustMat.uniforms.uTime.value = t;
+    cityFireMat && (cityFireMat.uniforms.uTime.value = t);
+    pointLight.intensity = 60000 * (1 + 0.2 * (fbm3(t * 0.8, 3.5, 7.7, 3) - 0.5) * 2);
+    if (ENABLE_CROWN_SMOKE) updateSmoke(t);
+    if (t - lastInteract > 20){
+      tmpQ.setFromAxisAngle(Y_AXIS, 0.008 * dt);
+      camera.position.sub(controls.target).applyQuaternion(tmpQ).add(controls.target);
+    }
+  }
+  controls.update();
+  composer.render();
+  frameCount++;
+  if (!booted && frameCount >= 3){
+    booted = true;
+    document.getElementById('loading').style.display = 'none';
+    setTimeout(runAcceptance, 200);
+  }
+}
+
+/* ---------- 运行时自动验收 ---------- */
+function countDrawCalls(){
+  let c = 0;
+  scene.traverse(o => { if (o.isMesh || o.isPoints || o.isLine) c++; });
+  return c;
+}
+function runAcceptance(){
+  const widthRatio = (2 * Math.atan(maxR / 3900)) / (CAM_FOV * Math.PI / 180);
+  const v = new THREE.Vector3(0, 1460, 0).project(camera);
+  const topRatio = (1 - v.y) / 2;
+  const calls = countDrawCalls();
+  const glslOk = LEAF_VS.includes('instanceMatrix * vec4(position')
+    && !/gl_Position\s*=\s*projectionMatrix\s*\*\s*viewMatrix\s*\*\s*position/.test(LEAF_VS);
+  const rows = [
+    { 指标: '叶簇纹理覆盖率', 实测: (leafCoverage * 100).toFixed(1) + '%', 目标: '18%~38%', 结果: (leafCoverage >= 0.18 && leafCoverage <= 0.38) ? 'PASS' : 'FAIL' },
+    { 指标: '树冠直方图空格率', 实测: (histEmptyRate * 100).toFixed(1) + '%', 目标: '≤18%', 结果: histEmptyRate <= 0.18 ? 'PASS' : 'FAIL' },
+    { 指标: '树冠最大角宽/视口', 实测: widthRatio.toFixed(3), 目标: '0.60~0.98', 结果: (widthRatio >= 0.60 && widthRatio <= 0.98) ? 'PASS' : 'FAIL' },
+    { 指标: '冠顶距上缘比例', 实测: (topRatio * 100).toFixed(1) + '%', 目标: '8%~14%', 结果: (topRatio >= 0.08 && topRatio <= 0.14) ? 'PASS' : 'FAIL' },
+    { 指标: 'draw call 总数', 实测: calls, 目标: '≤70', 结果: calls <= 70 ? 'PASS' : 'FAIL' },
+    { 指标: 'GLSL 完整性(instanceMatrix)', 实测: glslOk ? '是' : '否', 目标: '是', 结果: glslOk ? 'PASS' : 'FAIL' }
+  ];
+  console.table(rows);
+  const fails = rows.filter(r => r.结果 === 'FAIL');
+  if (fails.length){
+    console.warn('未达标项：' + fails.map(r => r.指标 + ' 实测=' + r.实测 + '（目标 ' + r.目标 + '）').join('；'));
+  } else {
+    console.log('全部验收指标达标');
+  }
+}
+animate();
+</script>
+</body>
+</html>

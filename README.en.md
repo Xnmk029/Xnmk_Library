@@ -1,6 +1,6 @@
 # AI Prompt Test Benchmark Suite
 
-This repository is a standardized evaluation suite containing **37 benchmark projects** for auditing AI code generation, physics simulations, 3D graphics, and hardware protocols. Projects are stored in 4 difficulty tier directories (L1–L4) and catalogued by technical domain in **[DOMAIN_INDEX.en.md](./DOMAIN_INDEX.en.md)**.
+This repository is a standardized evaluation suite containing **38 benchmark projects** for auditing AI code generation, physics simulations, 3D graphics, and hardware protocols. Projects are stored in 4 difficulty tier directories (L1–L4) and catalogued by technical domain in **[DOMAIN_INDEX.en.md](./DOMAIN_INDEX.en.md)**.
 
 **[中文文档 →](./README.md)** ｜ **[Domain Catalog with Copy-Ready Prompts →](./DOMAIN_INDEX.en.md)**
 
@@ -12,7 +12,7 @@ This repository is a standardized evaluation suite containing **37 benchmark pro
 benchmark/
 ├── L1_Basic/                     # Level 1: Basic tools & scripts (5 projects)
 ├── L2_Intermediate/              # Level 2: Web apps & interactive games (11 projects)
-├── L3_Advanced/                  # Level 3: 3D engines & physics simulation (12 projects)
+├── L3_Advanced/                  # Level 3: 3D engines & physics simulation (13 projects)
 ├── L4_Expert/                    # Level 4: Native engines & hardware protocols (9 projects)
 ├── DOMAIN_INDEX.en.md            # Domain catalog with embedded copy-ready prompts (English)
 ├── DOMAIN_INDEX.zh.md            # Domain catalog with embedded copy-ready prompts (Chinese)
@@ -64,19 +64,19 @@ benchmark/
 | 25 | [`RainWorld`](./L3_Advanced/RainWorld) | Mass-Spring / PBD Cloth Dynamics | 3D Graphics, Physics & Shaders | `L3` | [Prompt](./L3_Advanced/RainWorld/PROJECT_PROMPT.md) \| [Rubric](./L3_Advanced/RainWorld/README.md) |
 | 26 | [`USP`](./L3_Advanced/USP) | USP Match Gun Disassembly & Low-Poly Scene | 3D Graphics, Physics & Shaders | `L3` | [Prompt](./L3_Advanced/USP/PROJECT_PROMPT.md) \| [Rubric](./L3_Advanced/USP/README.md) |
 | 27 | [`cloth`](./L3_Advanced/cloth) | 3D Mass-Spring Cloth Physics Simulation | 3D Graphics, Physics & Shaders | `L3` | [Prompt](./L3_Advanced/cloth/PROJECT_PROMPT.md) \| [Rubric](./L3_Advanced/cloth/README.md) |
-| 28 | [`teardown`](./L3_Advanced/teardown) | Teardown Voxel Diorama & Mechanical Disassembly | 3D Graphics, Physics & Shaders | `L3` | [Prompt](./L3_Advanced/teardown/PROJECT_PROMPT.md) \| [Rubric](./L3_Advanced/teardown/README.md) |
-| 29 | [`BEAMhard`](./L4_Expert/BEAMhard) | BEAMhard: BeamNG Vehicle Physics & Damage | System Integration & MCP Protocol | `L4` | [Prompt](./L4_Expert/BEAMhard/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/BEAMhard/README.md) |
-| 30 | [`CFD`](./L4_Expert/CFD) | Ultra-Realistic CFD Fluid Simulation & Rendering | 3D Graphics, Physics & Shaders | `L4` | [Prompt](./L4_Expert/CFD/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/CFD/README.md) |
-| 31 | [`DeepSWE`](./L4_Expert/DeepSWE) | DeepSWE Benchmark Evaluation Tasks | System Integration & MCP Protocol | `L4` | [Prompt](./L4_Expert/DeepSWE/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/DeepSWE/README.md) |
-| 32 | [`EngineSIM`](./L4_Expert/EngineSIM) | Engine Sound & DSP Audio Synthesis | Python Tools & Native Engines | `L4` | [Prompt](./L4_Expert/EngineSIM/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/EngineSIM/README.md) |
-| 33 | [`PSMCP`](./L4_Expert/PSMCP) | Adobe Photoshop MCP Server Integration | System Integration & MCP Protocol | `L4` | [Prompt](./L4_Expert/PSMCP/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/PSMCP/README.md) |
-| 34 | [`SketchUpMCP`](./L4_Expert/SketchUpMCP) | SketchUp MCP Bridge Integration | System Integration & MCP Protocol | `L4` | [Prompt](./L4_Expert/SketchUpMCP/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/SketchUpMCP/README.md) |
-| 35 | [`Telemetry`](./L4_Expert/Telemetry) | RAC Telemetry & Distance-based Resampling Analysis | Python Tools & Native Engines | `L4` | [Prompt](./L4_Expert/Telemetry/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/Telemetry/README.md) |
-| 36 | [`UnifiedInputManager`](./L4_Expert/UnifiedInputManager) | Unified Controller Input Manager | Python Tools & Native Engines | `L4` | [Prompt](./L4_Expert/UnifiedInputManager/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/UnifiedInputManager/README.md) |
-| 37 | [`osuMania`](./L4_Expert/osuMania) | osu!mania Python OpenGL High-Perf Video Renderer | Python Tools & Native Engines | `L4` | [Prompt](./L4_Expert/osuMania/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/osuMania/README.md) |
+| 28 | [`Minecraft`](./L3_Advanced/Minecraft) | *Minecraft-style Voxel Sandbox* | 3D Graphics, Physics & Shaders | `L3` | [Prompt](./L3_Advanced/Minecraft/PROJECT_PROMPT.md) |
+| 29 | [`teardown`](./L3_Advanced/teardown) | Teardown Voxel Diorama & Mechanical Disassembly | 3D Graphics, Physics & Shaders | `L3` | [Prompt](./L3_Advanced/teardown/PROJECT_PROMPT.md) \| [Rubric](./L3_Advanced/teardown/README.md) |
+| 30 | [`BEAMhard`](./L4_Expert/BEAMhard) | BEAMhard: BeamNG Vehicle Physics & Damage | System Integration & MCP Protocol | `L4` | [Prompt](./L4_Expert/BEAMhard/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/BEAMhard/README.md) |
+| 31 | [`CFD`](./L4_Expert/CFD) | Ultra-Realistic CFD Fluid Simulation & Rendering | 3D Graphics, Physics & Shaders | `L4` | [Prompt](./L4_Expert/CFD/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/CFD/README.md) |
+| 32 | [`DeepSWE`](./L4_Expert/DeepSWE) | DeepSWE Benchmark Evaluation Tasks | System Integration & MCP Protocol | `L4` | [Prompt](./L4_Expert/DeepSWE/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/DeepSWE/README.md) |
+| 33 | [`EngineSIM`](./L4_Expert/EngineSIM) | Engine Sound & DSP Audio Synthesis | Python Tools & Native Engines | `L4` | [Prompt](./L4_Expert/EngineSIM/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/EngineSIM/README.md) |
+| 34 | [`PSMCP`](./L4_Expert/PSMCP) | Adobe Photoshop MCP Server Integration | System Integration & MCP Protocol | `L4` | [Prompt](./L4_Expert/PSMCP/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/PSMCP/README.md) |
+| 35 | [`SketchUpMCP`](./L4_Expert/SketchUpMCP) | SketchUp MCP Bridge Integration | System Integration & MCP Protocol | `L4` | [Prompt](./L4_Expert/SketchUpMCP/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/SketchUpMCP/README.md) |
+| 36 | [`Telemetry`](./L4_Expert/Telemetry) | RAC Telemetry & Distance-based Resampling Analysis | Python Tools & Native Engines | `L4` | [Prompt](./L4_Expert/Telemetry/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/Telemetry/README.md) |
+| 37 | [`UnifiedInputManager`](./L4_Expert/UnifiedInputManager) | Unified Controller Input Manager | Python Tools & Native Engines | `L4` | [Prompt](./L4_Expert/UnifiedInputManager/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/UnifiedInputManager/README.md) |
+| 38 | [`osuMania`](./L4_Expert/osuMania) | osu!mania Python OpenGL High-Perf Video Renderer | Python Tools & Native Engines | `L4` | [Prompt](./L4_Expert/osuMania/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/osuMania/README.md) |
 
 ---
-
 ## 4. Tier Breakdown & Registry
 
 ### Level 1: Basic Tools & Scripts
@@ -120,6 +120,7 @@ Targeting WebGL/Three.js engines, custom GLSL shaders, rigid body dynamics, and 
 - [`RainWorld`](./L3_Advanced/RainWorld): Mass-spring / PBD cloth dynamics & obstacle collision
 - [`USP`](./L3_Advanced/USP): USP Match gun disassembly & low-poly mechanical animation
 - [`cloth`](./L3_Advanced/cloth): 3D mass-spring cloth physics simulation with wind & stair collision
+- [`Minecraft`](./L3_Advanced/Minecraft): Minecraft-style Voxel Sandbox
 - [`teardown`](./L3_Advanced/teardown): Teardown voxel diorama & mechanical disassembly
 
 ### Level 4: Native Engines & Hardware Protocols

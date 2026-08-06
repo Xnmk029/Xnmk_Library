@@ -2,7 +2,7 @@
 
 **[中文索引 →](./DOMAIN_INDEX.zh.md)** ｜ **[Back to README →](./README.en.md)**
 
-All 37 benchmark projects organized by **5 technical domains** — no difficulty tiers here. Every prompt is embedded in full below: expand and copy, no page jumps needed.
+All 38 benchmark projects organized by **5 technical domains** — no difficulty tiers here. Every prompt is embedded in full below: expand and copy, no page jumps needed.
 
 ---
 
@@ -23,7 +23,7 @@ All 37 benchmark projects organized by **5 technical domains** — no difficulty
 | Domain | Projects | Included |
 |---|:-:|---|
 | [🎮 Web Games & Interactive Logic](#web) | 8 | 2048 · Balatro · FPSlab · GoBoard · MoTa · Musicgames · Sokoban · LitRPGNovel |
-| [🧊 3D Graphics, Physics & Shaders](#graphics) | 14 | DoubleWishbone · PenroseStairs · Bicycle3D · EscapeFromDuckov · FPV · IndustrialDigitalTwin · MinecraftVOxy · Poolrooms3D · RTX · RainWorld · USP · cloth · teardown · CFD |
+| [🧊 3D Graphics, Physics & Shaders](#graphics) | 15 | DoubleWishbone · PenroseStairs · Bicycle3D · EscapeFromDuckov · FPV · IndustrialDigitalTwin · MinecraftVOxy · Poolrooms3D · RTX · RainWorld · USP · cloth · teardown · CFD · Minecraft|
 | [🎨 Visual Arts & Modern UI](#ui) | 3 | SVG · AMLL · FrontendShowcase |
 | [🐍 Python Tools & Native Engines](#python) | 5 | PyFlowingLight · EngineSIM · Telemetry · UnifiedInputManager · osuMania |
 | [🔌 System Integration & MCP Protocol](#system) | 7 | Archive · BilibiliUserscript · WeChatCheckinExcel · BEAMhard · DeepSWE · PSMCP · SketchUpMCP |
@@ -38,7 +38,7 @@ All 37 benchmark projects organized by **5 technical domains** — no difficulty
 > Evaluates game state machines, input responsiveness, rule closure, and Web Audio sound synchronization.
 
 
-### 06 · 2048: Roguelike Fusion Web Game
+### 6 · 2048: Roguelike Fusion Web Game
 *2048：Roguelike 融合网页游戏*
 
 📁 `L2_Intermediate/2048/PROJECT_PROMPT.md` ｜ [Source file](./L2_Intermediate/2048/PROJECT_PROMPT.md) ｜ [Rubric](./L2_Intermediate/2048/README.md)
@@ -82,7 +82,7 @@ All 37 benchmark projects organized by **5 technical domains** — no difficulty
 </details>
 
 
-### 08 · Balatro Poker Card Game Replica
+### 8 · Balatro Poker Card Game Replica
 *小丑牌：网页卡牌游戏与动效复刻*
 
 📁 `L2_Intermediate/Balatro/PROJECT_PROMPT.md` ｜ [Source file](./L2_Intermediate/Balatro/PROJECT_PROMPT.md) ｜ [Rubric](./L2_Intermediate/Balatro/README.md)
@@ -391,7 +391,7 @@ All 37 benchmark projects organized by **5 technical domains** — no difficulty
 > Evaluates WebGL/WebGPU shaders, rigid-body dynamics, SO(3) matrix integration, SPH fluids, and ray tracing.
 
 
-### 09 · Car Front Double Wishbone Kinematics
+### 9 · Car Front Double Wishbone Kinematics
 *双叉臂：汽车前悬挂运动学*
 
 📁 `L2_Intermediate/DoubleWishbone/PROJECT_PROMPT.md` ｜ [Source file](./L2_Intermediate/DoubleWishbone/PROJECT_PROMPT.md) ｜ [Rubric](./L2_Intermediate/DoubleWishbone/README.md)
@@ -904,7 +904,35 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 </details>
 
 
-### 28 · Teardown Voxel Diorama & Mechanical Disassembly
+### 28 · Minecraft-style Voxel Sandbox
+*我的世界：3D 体素沙盒世界 · L3*
+
+📁 `L3_Advanced/Minecraft/PROJECT_PROMPT.md` ｜ [Source file](./L3_Advanced/Minecraft/PROJECT_PROMPT.md)
+
+<details>
+<summary>📋 Full prompt — click to expand</summary>
+
+```markdown
+# 任务背景
+
+以 Minecraft（我的世界）为参考，生成一个可在浏览器中运行的 3D 体素沙盒世界。
+
+# 需求范围
+
+- 3D 体素地形：程序化生成（噪声地形）、无限/大世界或区块加载
+- 方块系统：放置 / 破坏 / 材质渲染（草地、泥土、石头、水、树木等）
+- 玩家控制：WASD 移动、跳跃、视角环顾、第三人称/第一人称
+- 基础交互：快捷栏、背包、合成（可选）、世界存档（localStorage）
+
+# 交付与限制要求
+
+- 单文件 index.html 或零构建静态工程，直接可运行
+- 纯本地运行，不依赖外部服务
+```
+
+</details>
+
+### 29 · Teardown Voxel Diorama & Mechanical Disassembly
 *teardown：硬表面机械与微体素场景*
 
 📁 `L3_Advanced/teardown/PROJECT_PROMPT.md` ｜ [Source file](./L3_Advanced/teardown/PROJECT_PROMPT.md) ｜ [Rubric](./L3_Advanced/teardown/README.md)
@@ -968,7 +996,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 </details>
 
 
-### 30 · Ultra-Realistic CFD Fluid Simulation & Rendering
+### 31 · Ultra-Realistic CFD Fluid Simulation & Rendering
 *CFD：超拟真流体计算与物理渲染*
 
 📁 `L4_Expert/CFD/PROJECT_PROMPT.md` ｜ [Source file](./L4_Expert/CFD/PROJECT_PROMPT.md) ｜ [Rubric](./L4_Expert/CFD/README.md)
@@ -1021,7 +1049,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 > Evaluates high-density responsive layouts, diffused fluid backgrounds, SVG vector drawing, and advanced motion pipelines.
 
 
-### 04 · Pure SVG Vector Mona Lisa Painting Study
+### 4 · Pure SVG Vector Mona Lisa Painting Study
 *SVG：纯矢量《蒙娜丽莎》笔触复刻*
 
 📁 `L1_Basic/SVG/PROJECT_PROMPT.md` ｜ [Source file](./L1_Basic/SVG/PROJECT_PROMPT.md) ｜ [Rubric](./L1_Basic/SVG/README.md)
@@ -1063,7 +1091,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 </details>
 
 
-### 07 · Apple Music Lyrics Player UI
+### 7 · Apple Music Lyrics Player UI
 *AMLL：Apple Music 动态歌词播放器*
 
 📁 `L2_Intermediate/AMLL/PROJECT_PROMPT.md` ｜ [Source file](./L2_Intermediate/AMLL/PROJECT_PROMPT.md) ｜ [Rubric](./L2_Intermediate/AMLL/README.md)
@@ -1170,7 +1198,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 > Evaluates PyOpenGL, FFMPEG video pipelines, non-blocking UDP networking, and spatial distance resampling.
 
 
-### 03 · Python Desktop Floating Light Widget
+### 3 · Python Desktop Floating Light Widget
 *PY流光：Python 桌面悬浮球*
 
 📁 `L1_Basic/PyFlowingLight/PROJECT_PROMPT.md` ｜ [Source file](./L1_Basic/PyFlowingLight/PROJECT_PROMPT.md) ｜ [Rubric](./L1_Basic/PyFlowingLight/README.md)
@@ -1214,7 +1242,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 </details>
 
 
-### 32 · Engine Sound & DSP Audio Synthesis
+### 33 · Engine Sound & DSP Audio Synthesis
 *EngineSIM：引擎声浪与 DSP 音频合成*
 
 📁 `L4_Expert/EngineSIM/PROJECT_PROMPT.md` ｜ [Source file](./L4_Expert/EngineSIM/PROJECT_PROMPT.md) ｜ [Rubric](./L4_Expert/EngineSIM/README.md)
@@ -1261,7 +1289,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 </details>
 
 
-### 35 · RAC Telemetry & Distance-based Resampling Analysis
+### 36 · RAC Telemetry & Distance-based Resampling Analysis
 *遥测：RAC 赛车实时遥测与距离空间重采样分析*
 
 📁 `L4_Expert/Telemetry/PROJECT_PROMPT.md` ｜ [Source file](./L4_Expert/Telemetry/PROJECT_PROMPT.md) ｜ [Rubric](./L4_Expert/Telemetry/README.md)
@@ -1313,7 +1341,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 </details>
 
 
-### 36 · Unified Controller Input Manager
+### 37 · Unified Controller Input Manager
 *UnifiedInputManager：跨平台 Controller 统一输入管理器*
 
 📁 `L4_Expert/UnifiedInputManager/PROJECT_PROMPT.md` ｜ [Source file](./L4_Expert/UnifiedInputManager/PROJECT_PROMPT.md) ｜ [Rubric](./L4_Expert/UnifiedInputManager/README.md)
@@ -1353,7 +1381,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 </details>
 
 
-### 37 · osu!mania Python OpenGL High-Perf Video Renderer
+### 38 · osu!mania Python OpenGL High-Perf Video Renderer
 *osu!mania：Python OpenGL 高效视频渲染工具*
 
 📁 `L4_Expert/osuMania/PROJECT_PROMPT.md` ｜ [Source file](./L4_Expert/osuMania/PROJECT_PROMPT.md) ｜ [Rubric](./L4_Expert/osuMania/README.md)
@@ -1412,7 +1440,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 > Evaluates Model Context Protocol (MCP) servers, OS API hooks, and code refactoring.
 
 
-### 01 · Automation Scripts Archive
+### 1 · Automation Scripts Archive
 *归档：快捷自动化与主题脚本*
 
 📁 `L1_Basic/Archive/PROJECT_PROMPT.md` ｜ [Source file](./L1_Basic/Archive/PROJECT_PROMPT.md) ｜ [Rubric](./L1_Basic/Archive/README.md)
@@ -1461,7 +1489,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 </details>
 
 
-### 02 · Bilibili IP Location Userscript
+### 2 · Bilibili IP Location Userscript
 *脚本：B站 IP 归属地油猴脚本*
 
 📁 `L1_Basic/BilibiliUserscript/PROJECT_PROMPT.md` ｜ [Source file](./L1_Basic/BilibiliUserscript/PROJECT_PROMPT.md) ｜ [Rubric](./L1_Basic/BilibiliUserscript/README.md)
@@ -1504,7 +1532,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 </details>
 
 
-### 05 · WeChat Message Parser & Excel Importer
+### 5 · WeChat Message Parser & Excel Importer
 *签到：微信打卡预约消息自动导入 Excel 系统*
 
 📁 `L1_Basic/WeChatCheckinExcel/PROJECT_PROMPT.md` ｜ [Source file](./L1_Basic/WeChatCheckinExcel/PROJECT_PROMPT.md) ｜ [Rubric](./L1_Basic/WeChatCheckinExcel/README.md)
@@ -1570,7 +1598,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 </details>
 
 
-### 29 · BEAMhard: BeamNG Vehicle Physics & Damage
+### 30 · BEAMhard: BeamNG Vehicle Physics & Damage
 *BEAMhard：BeamNG 软体车辆物理与损毁模拟*
 
 📁 `L4_Expert/BEAMhard/PROJECT_PROMPT.md` ｜ [Source file](./L4_Expert/BEAMhard/PROJECT_PROMPT.md) ｜ [Rubric](./L4_Expert/BEAMhard/README.md)
@@ -1652,7 +1680,7 @@ Phase 1 执行时须将全部分卷解包合并到统一 `vehicles/` 目录。
 </details>
 
 
-### 31 · DeepSWE Benchmark Evaluation Tasks
+### 32 · DeepSWE Benchmark Evaluation Tasks
 *DeepSWE：软件工程与代码演进*
 
 📁 `L4_Expert/DeepSWE/PROJECT_PROMPT.md` ｜ [Source file](./L4_Expert/DeepSWE/PROJECT_PROMPT.md) ｜ [Rubric](./L4_Expert/DeepSWE/README.md)
@@ -1704,7 +1732,7 @@ solution/         参考解法（对智能体保密）
 </details>
 
 
-### 33 · Adobe Photoshop MCP Server Integration
+### 34 · Adobe Photoshop MCP Server Integration
 *PSMCP：Adobe Photoshop MCP 服务端*
 
 📁 `L4_Expert/PSMCP/PROJECT_PROMPT.md` ｜ [Source file](./L4_Expert/PSMCP/PROJECT_PROMPT.md) ｜ [Rubric](./L4_Expert/PSMCP/README.md)
@@ -1784,7 +1812,7 @@ names.join(", ");
 </details>
 
 
-### 34 · SketchUp MCP Bridge Integration
+### 35 · SketchUp MCP Bridge Integration
 *草图大师MCP：SketchUp MCP 桥接器*
 
 📁 `L4_Expert/SketchUpMCP/PROJECT_PROMPT.md` ｜ [Source file](./L4_Expert/SketchUpMCP/PROJECT_PROMPT.md) ｜ [Rubric](./L4_Expert/SketchUpMCP/README.md)

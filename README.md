@@ -1,6 +1,6 @@
 # AI 大语言模型 Benchmark 测试套件
 
-本仓库为一个标准化的 AI 代码生成与系统架构评测套件，共包含 **37 个独立测试项目**。所有测试项按照 4 个难度阶梯目录（L1 至 L4）进行归类存储，并按技术领域整理在 **[DOMAIN_INDEX.zh.md](./DOMAIN_INDEX.zh.md)** 全景索引中。
+本仓库为一个标准化的 AI 代码生成与系统架构评测套件，共包含 **38 个独立测试项目**。所有测试项按照 4 个难度阶梯目录（L1 至 L4）进行归类存储，并按技术领域整理在 **[DOMAIN_INDEX.zh.md](./DOMAIN_INDEX.zh.md)** 全景索引中。
 
 **[English Documentation →](./README.en.md)** ｜ **[按领域分类的提示词索引（一键复制）→](./DOMAIN_INDEX.zh.md)**
 
@@ -12,7 +12,7 @@
 benchmark/
 ├── L1_Basic/                     # Level 1: 基础工具与脚本类（5 个项目）
 ├── L2_Intermediate/              # Level 2: 中级 Web 应用与交互游戏类（11 个项目）
-├── L3_Advanced/                  # Level 3: 高级 3D 引擎与物理仿真类（12 个项目）
+├── L3_Advanced/                  # Level 3: 高级 3D 引擎与物理仿真类（13 个项目）
 ├── L4_Expert/                    # Level 4: 专家级原生引擎与硬件协议类（9 个项目）
 ├── DOMAIN_INDEX.en.md            # 按领域分类的提示词全景索引·英文版（内嵌全文，一键复制）
 ├── DOMAIN_INDEX.zh.md            # 按领域分类的提示词全景索引·中文版（内嵌全文，一键复制）
@@ -64,19 +64,19 @@ benchmark/
 | 25 | [`RainWorld`](./L3_Advanced/RainWorld) | **雨世界：质点-弹簧布料模拟** | 3D 图形、物理仿真与 Shaders | `L3` | [提示词](./L3_Advanced/RainWorld/PROJECT_PROMPT.md) \| [评分标准](./L3_Advanced/RainWorld/README.md) |
 | 26 | [`USP`](./L3_Advanced/USP) | **USP：Match 配重手枪机械分解** | 3D 图形、物理仿真与 Shaders | `L3` | [提示词](./L3_Advanced/USP/PROJECT_PROMPT.md) \| [评分标准](./L3_Advanced/USP/README.md) |
 | 27 | [`cloth`](./L3_Advanced/cloth) | **cloth：3D 质点-弹簧布料物理仿真** | 3D 图形、物理仿真与 Shaders | `L3` | [提示词](./L3_Advanced/cloth/PROJECT_PROMPT.md) \| [评分标准](./L3_Advanced/cloth/README.md) |
-| 28 | [`teardown`](./L3_Advanced/teardown) | **teardown：硬表面机械与微体素场景** | 3D 图形、物理仿真与 Shaders | `L3` | [提示词](./L3_Advanced/teardown/PROJECT_PROMPT.md) \| [评分标准](./L3_Advanced/teardown/README.md) |
-| 29 | [`BEAMhard`](./L4_Expert/BEAMhard) | **BEAMhard：BeamNG 软体车辆物理与损毁模拟** | 系统集成与 MCP 协议 | `L4` | [提示词](./L4_Expert/BEAMhard/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/BEAMhard/README.md) |
-| 30 | [`CFD`](./L4_Expert/CFD) | **CFD：超拟真流体计算与物理渲染** | 3D 图形、物理仿真与 Shaders | `L4` | [提示词](./L4_Expert/CFD/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/CFD/README.md) |
-| 31 | [`DeepSWE`](./L4_Expert/DeepSWE) | **DeepSWE：软件工程与代码演进** | 系统集成与 MCP 协议 | `L4` | [提示词](./L4_Expert/DeepSWE/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/DeepSWE/README.md) |
-| 32 | [`EngineSIM`](./L4_Expert/EngineSIM) | **EngineSIM：引擎声浪与 DSP 音频合成** | Python 工具与原生引擎 | `L4` | [提示词](./L4_Expert/EngineSIM/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/EngineSIM/README.md) |
-| 33 | [`PSMCP`](./L4_Expert/PSMCP) | **PSMCP：Adobe Photoshop MCP 服务端** | 系统集成与 MCP 协议 | `L4` | [提示词](./L4_Expert/PSMCP/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/PSMCP/README.md) |
-| 34 | [`SketchUpMCP`](./L4_Expert/SketchUpMCP) | **草图大师MCP：SketchUp MCP 桥接器** | 系统集成与 MCP 协议 | `L4` | [提示词](./L4_Expert/SketchUpMCP/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/SketchUpMCP/README.md) |
-| 35 | [`Telemetry`](./L4_Expert/Telemetry) | **遥测：RAC 赛车实时遥测与距离空间重采样分析** | Python 工具与原生引擎 | `L4` | [提示词](./L4_Expert/Telemetry/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/Telemetry/README.md) |
-| 36 | [`UnifiedInputManager`](./L4_Expert/UnifiedInputManager) | **UnifiedInputManager：跨平台 Controller 统一输入管理器** | Python 工具与原生引擎 | `L4` | [提示词](./L4_Expert/UnifiedInputManager/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/UnifiedInputManager/README.md) |
-| 37 | [`osuMania`](./L4_Expert/osuMania) | **osu!mania：Python OpenGL 高效视频渲染工具** | Python 工具与原生引擎 | `L4` | [提示词](./L4_Expert/osuMania/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/osuMania/README.md) |
+| 28 | [`Minecraft`](./L3_Advanced/Minecraft) | **我的世界：3D 体素沙盒世界** | 3D 图形、物理仿真与 Shaders | `L3` | [提示词](./L3_Advanced/Minecraft/PROJECT_PROMPT.md) |
+| 29 | [`teardown`](./L3_Advanced/teardown) | **teardown：硬表面机械与微体素场景** | 3D 图形、物理仿真与 Shaders | `L3` | [提示词](./L3_Advanced/teardown/PROJECT_PROMPT.md) \| [评分标准](./L3_Advanced/teardown/README.md) |
+| 30 | [`BEAMhard`](./L4_Expert/BEAMhard) | **BEAMhard：BeamNG 软体车辆物理与损毁模拟** | 系统集成与 MCP 协议 | `L4` | [提示词](./L4_Expert/BEAMhard/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/BEAMhard/README.md) |
+| 31 | [`CFD`](./L4_Expert/CFD) | **CFD：超拟真流体计算与物理渲染** | 3D 图形、物理仿真与 Shaders | `L4` | [提示词](./L4_Expert/CFD/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/CFD/README.md) |
+| 32 | [`DeepSWE`](./L4_Expert/DeepSWE) | **DeepSWE：软件工程与代码演进** | 系统集成与 MCP 协议 | `L4` | [提示词](./L4_Expert/DeepSWE/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/DeepSWE/README.md) |
+| 33 | [`EngineSIM`](./L4_Expert/EngineSIM) | **EngineSIM：引擎声浪与 DSP 音频合成** | Python 工具与原生引擎 | `L4` | [提示词](./L4_Expert/EngineSIM/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/EngineSIM/README.md) |
+| 34 | [`PSMCP`](./L4_Expert/PSMCP) | **PSMCP：Adobe Photoshop MCP 服务端** | 系统集成与 MCP 协议 | `L4` | [提示词](./L4_Expert/PSMCP/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/PSMCP/README.md) |
+| 35 | [`SketchUpMCP`](./L4_Expert/SketchUpMCP) | **草图大师MCP：SketchUp MCP 桥接器** | 系统集成与 MCP 协议 | `L4` | [提示词](./L4_Expert/SketchUpMCP/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/SketchUpMCP/README.md) |
+| 36 | [`Telemetry`](./L4_Expert/Telemetry) | **遥测：RAC 赛车实时遥测与距离空间重采样分析** | Python 工具与原生引擎 | `L4` | [提示词](./L4_Expert/Telemetry/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/Telemetry/README.md) |
+| 37 | [`UnifiedInputManager`](./L4_Expert/UnifiedInputManager) | **UnifiedInputManager：跨平台 Controller 统一输入管理器** | Python 工具与原生引擎 | `L4` | [提示词](./L4_Expert/UnifiedInputManager/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/UnifiedInputManager/README.md) |
+| 38 | [`osuMania`](./L4_Expert/osuMania) | **osu!mania：Python OpenGL 高效视频渲染工具** | Python 工具与原生引擎 | `L4` | [提示词](./L4_Expert/osuMania/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/osuMania/README.md) |
 
 ---
-
 ## 4. 难度阶梯与项目清单
 
 ### Level 1: 基础工具与脚本类 (L1_Basic)
@@ -120,6 +120,7 @@ benchmark/
 - [`RainWorld`](./L3_Advanced/RainWorld): 雨世界：质点-弹簧布料模拟
 - [`USP`](./L3_Advanced/USP): USP：Match 配重手枪机械分解
 - [`cloth`](./L3_Advanced/cloth): cloth：3D 质点-弹簧布料物理仿真
+- [`Minecraft`](./L3_Advanced/Minecraft): 我的世界：3D 体素沙盒世界
 - [`teardown`](./L3_Advanced/teardown): teardown：硬表面机械与微体素场景
 
 ### Level 4: 专家级原生引擎与硬件协议类 (L4_Expert)

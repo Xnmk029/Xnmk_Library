@@ -2,7 +2,7 @@
 
 **[English Index →](./DOMAIN_INDEX.en.md)** ｜ **[返回主 README →](./README.md)**
 
-全部 37 个测试项目按 **5 大技术领域** 归类，不再按 L1–L4 难度划分。每个项目的提示词全文已内嵌在下方 —— 展开即复制，无需跳转页面。
+全部 38 个测试项目按 **5 大技术领域** 归类，不再按 L1–L4 难度划分。每个项目的提示词全文已内嵌在下方 —— 展开即复制，无需跳转页面。
 
 ---
 
@@ -23,7 +23,7 @@
 | 领域 | 项目数 | 项目 |
 |---|:-:|---|
 | [🎮 Web 游戏与交互逻辑](#web) | 8 | 2048 · Balatro · FPSlab · GoBoard · MoTa · Musicgames · Sokoban · LitRPGNovel |
-| [🧊 3D 图形、物理仿真与 Shaders](#graphics) | 14 | DoubleWishbone · PenroseStairs · Bicycle3D · EscapeFromDuckov · FPV · IndustrialDigitalTwin · MinecraftVOxy · Poolrooms3D · RTX · RainWorld · USP · cloth · teardown · CFD |
+| [🧊 3D 图形、物理仿真与 Shaders](#graphics) | 15 | DoubleWishbone · PenroseStairs · Bicycle3D · EscapeFromDuckov · FPV · IndustrialDigitalTwin · MinecraftVOxy · Poolrooms3D · RTX · RainWorld · USP · cloth · teardown · CFD · Minecraft|
 | [🎨 视觉艺术与现代 UI 组件](#ui) | 3 | SVG · AMLL · FrontendShowcase |
 | [🐍 Python 工具与原生引擎](#python) | 5 | PyFlowingLight · EngineSIM · Telemetry · UnifiedInputManager · osuMania |
 | [🔌 系统集成与 MCP 协议](#system) | 7 | Archive · BilibiliUserscript · WeChatCheckinExcel · BEAMhard · DeepSWE · PSMCP · SketchUpMCP |
@@ -38,7 +38,7 @@
 > 考核游戏状态机、输入响应、规则闭环与 Web Audio 音效同步。
 
 
-### 06 · 2048：Roguelike 融合网页游戏
+### 6 · 2048：Roguelike 融合网页游戏
 *2048: Roguelike Fusion Web Game*
 
 📁 `L2_Intermediate/2048/PROJECT_PROMPT.md` ｜ [源文件](./L2_Intermediate/2048/PROJECT_PROMPT.md) ｜ [评分标准](./L2_Intermediate/2048/README.md)
@@ -82,7 +82,7 @@
 </details>
 
 
-### 08 · 小丑牌：网页卡牌游戏与动效复刻
+### 8 · 小丑牌：网页卡牌游戏与动效复刻
 *Balatro Poker Card Game Replica*
 
 📁 `L2_Intermediate/Balatro/PROJECT_PROMPT.md` ｜ [源文件](./L2_Intermediate/Balatro/PROJECT_PROMPT.md) ｜ [评分标准](./L2_Intermediate/Balatro/README.md)
@@ -391,7 +391,7 @@
 > 考核 WebGL/WebGPU 着色器、刚体动力学、SO(3) 矩阵积分、SPH 流体及光线追踪。
 
 
-### 09 · 双叉臂：汽车前悬挂运动学
+### 9 · 双叉臂：汽车前悬挂运动学
 *Car Front Double Wishbone Kinematics*
 
 📁 `L2_Intermediate/DoubleWishbone/PROJECT_PROMPT.md` ｜ [源文件](./L2_Intermediate/DoubleWishbone/PROJECT_PROMPT.md) ｜ [评分标准](./L2_Intermediate/DoubleWishbone/README.md)
@@ -904,7 +904,36 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 </details>
 
 
-### 28 · teardown：硬表面机械与微体素场景
+
+### 28 · 我的世界：3D 体素沙盒世界
+*Minecraft-style Voxel Sandbox · L3*
+
+📁 `L3_Advanced/Minecraft/PROJECT_PROMPT.md` ｜ [源文件](./L3_Advanced/Minecraft/PROJECT_PROMPT.md)
+
+<details>
+<summary>📋 提示词全文 — 点击展开，用代码块右上角按钮一键复制</summary>
+
+```markdown
+# 任务背景
+
+以 Minecraft（我的世界）为参考，生成一个可在浏览器中运行的 3D 体素沙盒世界。
+
+# 需求范围
+
+- 3D 体素地形：程序化生成（噪声地形）、无限/大世界或区块加载
+- 方块系统：放置 / 破坏 / 材质渲染（草地、泥土、石头、水、树木等）
+- 玩家控制：WASD 移动、跳跃、视角环顾、第三人称/第一人称
+- 基础交互：快捷栏、背包、合成（可选）、世界存档（localStorage）
+
+# 交付与限制要求
+
+- 单文件 index.html 或零构建静态工程，直接可运行
+- 纯本地运行，不依赖外部服务
+```
+
+</details>
+
+### 29 · teardown：硬表面机械与微体素场景
 *Teardown Voxel Diorama & Mechanical Disassembly*
 
 📁 `L3_Advanced/teardown/PROJECT_PROMPT.md` ｜ [源文件](./L3_Advanced/teardown/PROJECT_PROMPT.md) ｜ [评分标准](./L3_Advanced/teardown/README.md)
@@ -968,7 +997,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 </details>
 
 
-### 30 · CFD：超拟真流体计算与物理渲染
+### 31 · CFD：超拟真流体计算与物理渲染
 *Ultra-Realistic CFD Fluid Simulation & Rendering*
 
 📁 `L4_Expert/CFD/PROJECT_PROMPT.md` ｜ [源文件](./L4_Expert/CFD/PROJECT_PROMPT.md) ｜ [评分标准](./L4_Expert/CFD/README.md)
@@ -1021,7 +1050,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 > 考核高密度响应式布局、弥散流体背景、SVG 矢量绘制及高级动效管线。
 
 
-### 04 · SVG：纯矢量《蒙娜丽莎》笔触复刻
+### 4 · SVG：纯矢量《蒙娜丽莎》笔触复刻
 *Pure SVG Vector Mona Lisa Painting Study*
 
 📁 `L1_Basic/SVG/PROJECT_PROMPT.md` ｜ [源文件](./L1_Basic/SVG/PROJECT_PROMPT.md) ｜ [评分标准](./L1_Basic/SVG/README.md)
@@ -1063,7 +1092,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 </details>
 
 
-### 07 · AMLL：Apple Music 动态歌词播放器
+### 7 · AMLL：Apple Music 动态歌词播放器
 *Apple Music Lyrics Player UI*
 
 📁 `L2_Intermediate/AMLL/PROJECT_PROMPT.md` ｜ [源文件](./L2_Intermediate/AMLL/PROJECT_PROMPT.md) ｜ [评分标准](./L2_Intermediate/AMLL/README.md)
@@ -1170,7 +1199,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 > 考核 PyOpenGL、FFMPEG 视频管道、非阻塞 UDP 网络及空间距离重采样。
 
 
-### 03 · PY流光：Python 桌面悬浮球
+### 3 · PY流光：Python 桌面悬浮球
 *Python Desktop Floating Light Widget*
 
 📁 `L1_Basic/PyFlowingLight/PROJECT_PROMPT.md` ｜ [源文件](./L1_Basic/PyFlowingLight/PROJECT_PROMPT.md) ｜ [评分标准](./L1_Basic/PyFlowingLight/README.md)
@@ -1214,7 +1243,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 </details>
 
 
-### 32 · EngineSIM：引擎声浪与 DSP 音频合成
+### 33 · EngineSIM：引擎声浪与 DSP 音频合成
 *Engine Sound & DSP Audio Synthesis*
 
 📁 `L4_Expert/EngineSIM/PROJECT_PROMPT.md` ｜ [源文件](./L4_Expert/EngineSIM/PROJECT_PROMPT.md) ｜ [评分标准](./L4_Expert/EngineSIM/README.md)
@@ -1261,7 +1290,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 </details>
 
 
-### 35 · 遥测：RAC 赛车实时遥测与距离空间重采样分析
+### 36 · 遥测：RAC 赛车实时遥测与距离空间重采样分析
 *RAC Telemetry & Distance-based Resampling Analysis*
 
 📁 `L4_Expert/Telemetry/PROJECT_PROMPT.md` ｜ [源文件](./L4_Expert/Telemetry/PROJECT_PROMPT.md) ｜ [评分标准](./L4_Expert/Telemetry/README.md)
@@ -1313,7 +1342,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 </details>
 
 
-### 36 · UnifiedInputManager：跨平台 Controller 统一输入管理器
+### 37 · UnifiedInputManager：跨平台 Controller 统一输入管理器
 *Unified Controller Input Manager*
 
 📁 `L4_Expert/UnifiedInputManager/PROJECT_PROMPT.md` ｜ [源文件](./L4_Expert/UnifiedInputManager/PROJECT_PROMPT.md) ｜ [评分标准](./L4_Expert/UnifiedInputManager/README.md)
@@ -1353,7 +1382,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 </details>
 
 
-### 37 · osu!mania：Python OpenGL 高效视频渲染工具
+### 38 · osu!mania：Python OpenGL 高效视频渲染工具
 *osu!mania Python OpenGL High-Perf Video Renderer*
 
 📁 `L4_Expert/osuMania/PROJECT_PROMPT.md` ｜ [源文件](./L4_Expert/osuMania/PROJECT_PROMPT.md) ｜ [评分标准](./L4_Expert/osuMania/README.md)
@@ -1412,7 +1441,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 > 考核 Model Context Protocol (MCP) 服务端、操作系统 API Hook 及代码重构。
 
 
-### 01 · 归档：快捷自动化与主题脚本
+### 1 · 归档：快捷自动化与主题脚本
 *Automation Scripts Archive*
 
 📁 `L1_Basic/Archive/PROJECT_PROMPT.md` ｜ [源文件](./L1_Basic/Archive/PROJECT_PROMPT.md) ｜ [评分标准](./L1_Basic/Archive/README.md)
@@ -1461,7 +1490,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 </details>
 
 
-### 02 · 脚本：B站 IP 归属地油猴脚本
+### 2 · 脚本：B站 IP 归属地油猴脚本
 *Bilibili IP Location Userscript*
 
 📁 `L1_Basic/BilibiliUserscript/PROJECT_PROMPT.md` ｜ [源文件](./L1_Basic/BilibiliUserscript/PROJECT_PROMPT.md) ｜ [评分标准](./L1_Basic/BilibiliUserscript/README.md)
@@ -1504,7 +1533,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 </details>
 
 
-### 05 · 签到：微信打卡预约消息自动导入 Excel 系统
+### 5 · 签到：微信打卡预约消息自动导入 Excel 系统
 *WeChat Message Parser & Excel Importer*
 
 📁 `L1_Basic/WeChatCheckinExcel/PROJECT_PROMPT.md` ｜ [源文件](./L1_Basic/WeChatCheckinExcel/PROJECT_PROMPT.md) ｜ [评分标准](./L1_Basic/WeChatCheckinExcel/README.md)
@@ -1570,7 +1599,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 </details>
 
 
-### 29 · BEAMhard：BeamNG 软体车辆物理与损毁模拟
+### 30 · BEAMhard：BeamNG 软体车辆物理与损毁模拟
 *BEAMhard: BeamNG Vehicle Physics & Damage*
 
 📁 `L4_Expert/BEAMhard/PROJECT_PROMPT.md` ｜ [源文件](./L4_Expert/BEAMhard/PROJECT_PROMPT.md) ｜ [评分标准](./L4_Expert/BEAMhard/README.md)
@@ -1652,7 +1681,7 @@ Phase 1 执行时须将全部分卷解包合并到统一 `vehicles/` 目录。
 </details>
 
 
-### 31 · DeepSWE：软件工程与代码演进
+### 32 · DeepSWE：软件工程与代码演进
 *DeepSWE Benchmark Evaluation Tasks*
 
 📁 `L4_Expert/DeepSWE/PROJECT_PROMPT.md` ｜ [源文件](./L4_Expert/DeepSWE/PROJECT_PROMPT.md) ｜ [评分标准](./L4_Expert/DeepSWE/README.md)
@@ -1704,7 +1733,7 @@ solution/         参考解法（对智能体保密）
 </details>
 
 
-### 33 · PSMCP：Adobe Photoshop MCP 服务端
+### 34 · PSMCP：Adobe Photoshop MCP 服务端
 *Adobe Photoshop MCP Server Integration*
 
 📁 `L4_Expert/PSMCP/PROJECT_PROMPT.md` ｜ [源文件](./L4_Expert/PSMCP/PROJECT_PROMPT.md) ｜ [评分标准](./L4_Expert/PSMCP/README.md)
@@ -1784,7 +1813,7 @@ names.join(", ");
 </details>
 
 
-### 34 · 草图大师MCP：SketchUp MCP 桥接器
+### 35 · 草图大师MCP：SketchUp MCP 桥接器
 *SketchUp MCP Bridge Integration*
 
 📁 `L4_Expert/SketchUpMCP/PROJECT_PROMPT.md` ｜ [源文件](./L4_Expert/SketchUpMCP/PROJECT_PROMPT.md) ｜ [评分标准](./L4_Expert/SketchUpMCP/README.md)
