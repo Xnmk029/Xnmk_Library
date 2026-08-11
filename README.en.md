@@ -1,8 +1,8 @@
 # AI Prompt Test Benchmark Suite
 
-This repository is a standardized evaluation suite containing **38 benchmark projects** for auditing AI code generation, physics simulations, 3D graphics, and hardware protocols. Projects are stored in 4 difficulty tier directories (L1–L4) and catalogued by technical domain in **[DOMAIN_INDEX.en.md](./DOMAIN_INDEX.en.md)**.
+This repository is a standardized evaluation suite containing **38 benchmark projects** (L1–L4) for auditing AI code generation, physics simulations, 3D graphics, and hardware protocols, plus a root-level **[Image/](./Image/)** partition with **6** independent image-generation items. L1–L4 projects are stored in 4 difficulty tiers and catalogued by domain in **[DOMAIN_INDEX.en.md](./DOMAIN_INDEX.en.md)**; image items are listed in **[Image/README.md](./Image/README.md)**.
 
-**[中文文档 →](./README.md)** ｜ **[Domain Catalog with Copy-Ready Prompts →](./DOMAIN_INDEX.en.md)**
+**[中文文档 →](./README.md)** ｜ **[Domain Catalog with Copy-Ready Prompts →](./DOMAIN_INDEX.en.md)** ｜ **[Image Partition →](./Image/README.md)**
 
 ---
 
@@ -14,6 +14,7 @@ benchmark/
 ├── L2_Intermediate/              # Level 2: Web apps & interactive games (11 projects)
 ├── L3_Advanced/                  # Level 3: 3D engines & physics simulation (13 projects)
 ├── L4_Expert/                    # Level 4: Native engines & hardware protocols (9 projects)
+├── Image/                        # Image generation & editing (6 independent items)
 ├── DOMAIN_INDEX.en.md            # Domain catalog with embedded copy-ready prompts (English)
 ├── DOMAIN_INDEX.zh.md            # Domain catalog with embedded copy-ready prompts (Chinese)
 ├── LICENSE                       # MIT License
@@ -30,6 +31,7 @@ benchmark/
 - **Visual Arts & Modern UI**: Evaluates high-density responsive layouts, diffused fluid backgrounds, SVG vector drawing, and advanced motion pipelines.
 - **Python Tools & Native Engines**: Evaluates PyOpenGL, FFMPEG video pipelines, non-blocking UDP networking, and spatial distance resampling.
 - **System Integration & MCP Protocol**: Evaluates Model Context Protocol (MCP) servers, OS API hooks, and code refactoring.
+- **Image Generation & Editing** ([`Image/`](./Image/)): Evaluates text-to-image / image-to-image, structure preservation, style constraints, and layout/text fidelity.
 
 ---
 
@@ -75,6 +77,14 @@ benchmark/
 | 36 | [`Telemetry`](./L4_Expert/Telemetry) | RAC Telemetry & Distance-based Resampling Analysis | Python Tools & Native Engines | `L4` | [Prompt](./L4_Expert/Telemetry/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/Telemetry/README.md) |
 | 37 | [`UnifiedInputManager`](./L4_Expert/UnifiedInputManager) | Unified Controller Input Manager | Python Tools & Native Engines | `L4` | [Prompt](./L4_Expert/UnifiedInputManager/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/UnifiedInputManager/README.md) |
 | 38 | [`osuMania`](./L4_Expert/osuMania) | osu!mania Python OpenGL High-Perf Video Renderer | Python Tools & Native Engines | `L4` | [Prompt](./L4_Expert/osuMania/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/osuMania/README.md) |
+| 39 | [`ArchPhotoreal`](./Image/ArchPhotoreal) | Architecture Photorealization | Image Generation & Editing | `Image` | [Prompt](./Image/ArchPhotoreal/PROJECT_PROMPT.md) \| [Rubric](./Image/ArchPhotoreal/README.md) |
+| 40 | [`StandardBooks3D`](./Image/StandardBooks3D) | National-Standard Books 3D Product Render | Image Generation & Editing | `Image` | [Prompt](./Image/StandardBooks3D/PROJECT_PROMPT.md) \| [Rubric](./Image/StandardBooks3D/README.md) |
+| 41 | [`ConstructivistPoster`](./Image/ConstructivistPoster) | Constructivist Promo Poster | Image Generation & Editing | `Image` | [Prompt](./Image/ConstructivistPoster/PROJECT_PROMPT.md) \| [Rubric](./Image/ConstructivistPoster/README.md) |
+| 42 | [`WindowGlitchPoster`](./Image/WindowGlitchPoster) | Window-Overlay Glitch Poster | Image Generation & Editing | `Image` | [Prompt](./Image/WindowGlitchPoster/PROJECT_PROMPT.md) \| [Rubric](./Image/WindowGlitchPoster/README.md) |
+| 43 | [`GovTechPPT`](./Image/GovTechPPT) | Government/Tech PPT Poster | Image Generation & Editing | `Image` | [Prompt](./Image/GovTechPPT/PROJECT_PROMPT.md) \| [Rubric](./Image/GovTechPPT/README.md) |
+| 44 | [`TextbookPeachBlossom`](./Image/TextbookPeachBlossom) | Peach Blossom Spring Textbook Spread | Image Generation & Editing | `Image` | [Prompt](./Image/TextbookPeachBlossom/PROJECT_PROMPT.md) \| [Rubric](./Image/TextbookPeachBlossom/README.md) |
+
+> See **[Image/README.md](./Image/README.md)** for the image partition overview.
 
 ---
 ## 4. Tier Breakdown & Registry
