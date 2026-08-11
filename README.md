@@ -1,8 +1,8 @@
 # AI 大语言模型 Benchmark 测试套件
 
-本仓库为一个标准化的 AI 代码生成与系统架构评测套件，共包含 **38 个独立测试项目**。所有测试项按照 4 个难度阶梯目录（L1 至 L4）进行归类存储，并按技术领域整理在 **[DOMAIN_INDEX.zh.md](./DOMAIN_INDEX.zh.md)** 全景索引中。
+本仓库为一个标准化的 AI 代码生成与系统架构评测套件，共包含 **38 个独立测试项目**（L1–L4），另含根目录 **[Image/](./Image/)** 图像生成分区（**6** 个独立测试项）。L1–L4 按难度阶梯归类，并按技术领域整理在 **[DOMAIN_INDEX.zh.md](./DOMAIN_INDEX.zh.md)** 全景索引中；图像项见 **[Image/README.md](./Image/README.md)**。
 
-**[English Documentation →](./README.en.md)** ｜ **[按领域分类的提示词索引（一键复制）→](./DOMAIN_INDEX.zh.md)**
+**[English Documentation →](./README.en.md)** ｜ **[按领域分类的提示词索引（一键复制）→](./DOMAIN_INDEX.zh.md)** ｜ **[图像生成分区 →](./Image/README.md)**
 
 ---
 
@@ -14,6 +14,7 @@ benchmark/
 ├── L2_Intermediate/              # Level 2: 中级 Web 应用与交互游戏类（11 个项目）
 ├── L3_Advanced/                  # Level 3: 高级 3D 引擎与物理仿真类（13 个项目）
 ├── L4_Expert/                    # Level 4: 专家级原生引擎与硬件协议类（9 个项目）
+├── Image/                        # 图像生成与编辑（6 个独立测试项，与 L1–L4 并列）
 ├── DOMAIN_INDEX.en.md            # 按领域分类的提示词全景索引·英文版（内嵌全文，一键复制）
 ├── DOMAIN_INDEX.zh.md            # 按领域分类的提示词全景索引·中文版（内嵌全文，一键复制）
 ├── LICENSE                       # MIT 开源许可证
@@ -30,6 +31,7 @@ benchmark/
 - **视觉艺术与现代 UI 组件**：考核高密度响应式布局、弥散流体背景、SVG 矢量绘制及高级动效管线。
 - **Python 工具与原生引擎**：考核 PyOpenGL、FFMPEG 视频管道、非阻塞 UDP 网络及空间距离重采样。
 - **系统集成与 MCP 协议**：考核 Model Context Protocol (MCP) 服务端、操作系统 API Hook 及代码重构。
+- **图像生成与编辑**（[`Image/`](./Image/)）：考核文生图 / 图生图、结构保持、风格约束、版式文字与信息图传达。
 
 ---
 
@@ -75,6 +77,14 @@ benchmark/
 | 36 | [`Telemetry`](./L4_Expert/Telemetry) | **遥测：RAC 赛车实时遥测与距离空间重采样分析** | Python 工具与原生引擎 | `L4` | [提示词](./L4_Expert/Telemetry/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/Telemetry/README.md) |
 | 37 | [`UnifiedInputManager`](./L4_Expert/UnifiedInputManager) | **UnifiedInputManager：跨平台 Controller 统一输入管理器** | Python 工具与原生引擎 | `L4` | [提示词](./L4_Expert/UnifiedInputManager/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/UnifiedInputManager/README.md) |
 | 38 | [`osuMania`](./L4_Expert/osuMania) | **osu!mania：Python OpenGL 高效视频渲染工具** | Python 工具与原生引擎 | `L4` | [提示词](./L4_Expert/osuMania/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/osuMania/README.md) |
+| 39 | [`ArchPhotoreal`](./Image/ArchPhotoreal) | **建筑建模真实化** | 图像生成与编辑 | `Image` | [提示词](./Image/ArchPhotoreal/PROJECT_PROMPT.md) \| [评分标准](./Image/ArchPhotoreal/README.md) |
+| 40 | [`StandardBooks3D`](./Image/StandardBooks3D) | **国标系列图书 3D 渲染** | 图像生成与编辑 | `Image` | [提示词](./Image/StandardBooks3D/PROJECT_PROMPT.md) \| [评分标准](./Image/StandardBooks3D/README.md) |
+| 41 | [`ConstructivistPoster`](./Image/ConstructivistPoster) | **构成主义宣传海报** | 图像生成与编辑 | `Image` | [提示词](./Image/ConstructivistPoster/PROJECT_PROMPT.md) \| [评分标准](./Image/ConstructivistPoster/README.md) |
+| 42 | [`WindowGlitchPoster`](./Image/WindowGlitchPoster) | **窗口叠层与故障拼贴** | 图像生成与编辑 | `Image` | [提示词](./Image/WindowGlitchPoster/PROJECT_PROMPT.md) \| [评分标准](./Image/WindowGlitchPoster/README.md) |
+| 43 | [`GovTechPPT`](./Image/GovTechPPT) | **政务科技 PPT 海报** | 图像生成与编辑 | `Image` | [提示词](./Image/GovTechPPT/PROJECT_PROMPT.md) \| [评分标准](./Image/GovTechPPT/README.md) |
+| 44 | [`TextbookPeachBlossom`](./Image/TextbookPeachBlossom) | **桃花源记课本展开页** | 图像生成与编辑 | `Image` | [提示词](./Image/TextbookPeachBlossom/PROJECT_PROMPT.md) \| [评分标准](./Image/TextbookPeachBlossom/README.md) |
+
+> 图像分区总览与评测流程见 **[Image/README.md](./Image/README.md)**。
 
 ---
 ## 4. 难度阶梯与项目清单
