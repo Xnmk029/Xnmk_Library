@@ -2,7 +2,7 @@
 
 **[English Index →](./DOMAIN_INDEX.en.md)** ｜ **[返回主 README →](./README.md)**
 
-全部 38 个测试项目按 **5 大技术领域** 归类，不再按 L1–L4 难度划分。每个项目的提示词全文已内嵌在下方 —— 展开即复制，无需跳转页面。
+全部 39 个测试项目按 **5 大技术领域** 归类，不再按 L1–L4 难度划分。每个项目的提示词全文已内嵌在下方 —— 展开即复制，无需跳转页面。
 
 ---
 
@@ -23,7 +23,7 @@
 | 领域 | 项目数 | 项目 |
 |---|:-:|---|
 | [🎮 Web 游戏与交互逻辑](#web) | 8 | 2048 · Balatro · FPSlab · GoBoard · MoTa · Musicgames · Sokoban · LitRPGNovel |
-| [🧊 3D 图形、物理仿真与 Shaders](#graphics) | 15 | DoubleWishbone · PenroseStairs · Bicycle3D · EscapeFromDuckov · FPV · IndustrialDigitalTwin · MinecraftVOxy · Poolrooms3D · RTX · RainWorld · USP · cloth · teardown · CFD · Minecraft|
+| [🧊 3D 图形、物理仿真与 Shaders](#graphics) | 16 | DoubleWishbone · PenroseStairs · Bicycle3D · BicycleDrivetrain · EscapeFromDuckov · FPV · IndustrialDigitalTwin · MinecraftVOxy · Poolrooms3D · RTX · RainWorld · USP · cloth · teardown · CFD · Minecraft|
 | [🎨 视觉艺术与现代 UI 组件](#ui) | 3 | SVG · AMLL · FrontendShowcase |
 | [🐍 Python 工具与原生引擎](#python) | 5 | PyFlowingLight · EngineSIM · Telemetry · UnifiedInputManager · osuMania |
 | [🔌 系统集成与 MCP 协议](#system) | 7 | Archive · BilibiliUserscript · WeChatCheckinExcel · BEAMhard · DeepSWE · PSMCP · SketchUpMCP |
@@ -314,7 +314,7 @@
 </details>
 
 
-### 21 · 文字：Minecraft 硬核生存小说
+### 22 · 文字：Minecraft 硬核生存小说
 *Minecraft Hardcore LitRPG Long Novel*
 
 📁 `L3_Advanced/LitRPGNovel/PROJECT_PROMPT.md` ｜ [源文件](./L3_Advanced/LitRPGNovel/PROJECT_PROMPT.md) ｜ [评分标准](./L3_Advanced/LitRPGNovel/README.md)
@@ -442,8 +442,8 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 </details>
 
 
-### 17 · 自行车：参数化 3D 工作室与传动系统
-*Parametric 3D Bicycle Studio & Drivetrain*
+### 17 · 自行车：参数化 3D 工作室与装配模拟器
+*Parametric 3D Bicycle Studio & Assembly Simulator*
 
 📁 `L3_Advanced/Bicycle3D/PROJECT_PROMPT.md` ｜ [源文件](./L3_Advanced/Bicycle3D/PROJECT_PROMPT.md) ｜ [评分标准](./L3_Advanced/Bicycle3D/README.md)
 
@@ -495,12 +495,6 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 - 实时显示几何参数、传动规格与估算重量（重量须随配置变化响应，不能是静态值）。
 - 提供重置、相机预设、组件标签、UI 折叠等基础功能；OrbitControls 可用，几何更新不得意外重置相机。
 
-## 轻量传动展示台（附加子任务）
-
-- 另提供低多边形动态自行车传动展示台：曲柄、牙盘、链条（连续环）、5–7 片飞轮、后拨、透明亚克力支架。
-- 支持电机启停、升挡/降挡、当前挡位显示（如 "Gear: 3/7"）。
-- 换挡时后拨导轮水平移动、链条路径平滑插值（lerp）并保持传动同步。
-
 # 交付与限制要求
 
 - 交付可复制运行的单个 HTML 代码块；Three.js 与 OrbitControls 通过可靠 CDN 引入。
@@ -512,13 +506,63 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 </details>
 
 
-### 18 · 逃离鸭科夫：游戏系统与着色器特效
+### 18 · 自行车：低多边形动态传动展示台
+*Low-poly Dynamic Bicycle Drivetrain Display Stand*
+
+📁 `L3_Advanced/BicycleDrivetrain/PROJECT_PROMPT.md` ｜ [源文件](./L3_Advanced/BicycleDrivetrain/PROJECT_PROMPT.md) ｜ [评分标准](./L3_Advanced/BicycleDrivetrain/README.md)
+
+<details>
+<summary>📋 提示词全文 — 点击展开，用代码块右上角按钮一键复制</summary>
+
+```
+# 任务背景
+
+你是一名高级 WebGL/Three.js 开发者、创意技术专家和机械传动工程师。请创建一个完整可运行的单文件 HTML 应用：**低多边形动态自行车传动展示台**（Low-poly Dynamic Bicycle Drivetrain Display Stand）。结果应像一个完整的交互式产品，而非静态 3D 场景或一堆互不关联的控件。
+
+# 需求范围
+
+## 程序化建模（禁止外部模型）
+
+- 低多边形程序化生成：曲柄、牙盘、链条（连续闭合环）、5–7 片飞轮、后拨、透明亚克力支架。
+- 链条必须为连续环，随牙盘与飞轮同步运动；飞轮各齿片尺寸/间距可见。
+- 后拨含导轮，位于链条路径上；整体安装于透明亚克力展示支架上。
+
+## 功能与交互
+
+- 支持电机启停、升挡/降挡、当前挡位显示（如 "Gear: 3/7"）。
+- 换挡时后拨导轮水平移动、链条路径平滑插值（lerp）并保持传动同步。
+- 挡位变化后，飞轮挡位、后拨位置、链条路径与 HUD 显示必须一致，不得错位或跳变。
+
+## 视觉与环境
+
+- **NPR 赛璐璐风格**：动漫式 cel shading、高对比明暗分区、清晰轮廓/墨线、图形化色块、色调分离；可加克制的像素化/海报化处理。
+- 保持明亮可读基线：避免整体过暗、阴影吞噬结构、bloom 遮挡轮廓、像素化过度。
+- 展示支架为透明亚克力风格（半透明材质、清晰边缘高光），有尺度感但不过度杂乱的工作台/展示环境。
+
+## UI 与规格
+
+- 提供电机启停按钮、升挡/降挡按钮、当前挡位 HUD（如 "Gear: 3/7"）。
+- 实时显示传动规格（牙盘齿数、飞轮齿数与当前齿比等）。
+- 提供重置、相机预设等基础功能；OrbitControls 可用。
+
+# 交付与限制要求
+
+- 交付可复制运行的单个 HTML 代码块；Three.js 与 OrbitControls 通过可靠 CDN 引入。
+- 不输出伪代码、局部片段、TODO 或要求用户补齐核心功能。
+- 避免控制台报错；优先稳定流畅的交互与合理性能（复用几何/材质、链条等用实例化）。
+- 完成后用中文简要解释场景图、传动同步更新架构与渲染管线。
+```
+
+</details>
+
+
+### 19 · 逃离鸭科夫：游戏系统与着色器特效
 *Escape from Duckov Game Design & Shaders*
 
 📁 `L3_Advanced/EscapeFromDuckov` · ⚠️ **拟建测试项：提示词与评分标准待发布**
 
 
-### 19 · FPV：穿越机花飞 3D 模拟器
+### 20 · FPV：穿越机花飞 3D 模拟器
 *FPV Drone Freestyle 3D Simulator*
 
 📁 `L3_Advanced/FPV/PROJECT_PROMPT.md` ｜ [源文件](./L3_Advanced/FPV/PROJECT_PROMPT.md) ｜ [评分标准](./L3_Advanced/FPV/README.md)
@@ -569,7 +613,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 </details>
 
 
-### 20 · 工业数字孪生设备监控
+### 21 · 工业数字孪生设备监控
 *Industrial Digital Twin Equipment Monitoring*
 
 📁 `L3_Advanced/IndustrialDigitalTwin/PROJECT_PROMPT.md` ｜ [源文件](./L3_Advanced/IndustrialDigitalTwin/PROJECT_PROMPT.md) ｜ [评分标准](./L3_Advanced/IndustrialDigitalTwin/README.md)
@@ -649,7 +693,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 </details>
 
 
-### 22 · 我的世界VOxy：区块着色器与渲染引擎
+### 23 · 我的世界VOxy：区块着色器与渲染引擎
 *Minecraft VOxy Chunk Shader & Rendering Engine*
 
 📁 `L3_Advanced/MinecraftVOxy/PROJECT_PROMPT.md` ｜ [源文件](./L3_Advanced/MinecraftVOxy/PROJECT_PROMPT.md) ｜ [评分标准](./L3_Advanced/MinecraftVOxy/README.md)
@@ -697,7 +741,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 </details>
 
 
-### 23 · 池核：3D Poolrooms 步行模拟器
+### 24 · 池核：3D Poolrooms 步行模拟器
 *3D Poolrooms Backrooms Simulator*
 
 📁 `L3_Advanced/Poolrooms3D/PROJECT_PROMPT.md` ｜ [源文件](./L3_Advanced/Poolrooms3D/PROJECT_PROMPT.md) ｜ [评分标准](./L3_Advanced/Poolrooms3D/README.md)
@@ -714,7 +758,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 </details>
 
 
-### 24 · RTX：Web 路径追踪房间 GPU
+### 25 · RTX：Web 路径追踪房间 GPU
 *Web Path Tracing GPU Workload Benchmark*
 
 📁 `L3_Advanced/RTX/PROJECT_PROMPT.md` ｜ [源文件](./L3_Advanced/RTX/PROJECT_PROMPT.md) ｜ [评分标准](./L3_Advanced/RTX/README.md)
@@ -757,7 +801,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 </details>
 
 
-### 25 · 雨世界：质点-弹簧布料模拟
+### 26 · 雨世界：质点-弹簧布料模拟
 *Mass-Spring / PBD Cloth Dynamics*
 
 📁 `L3_Advanced/RainWorld/PROJECT_PROMPT.md` ｜ [源文件](./L3_Advanced/RainWorld/PROJECT_PROMPT.md) ｜ [评分标准](./L3_Advanced/RainWorld/README.md)
@@ -801,7 +845,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 </details>
 
 
-### 26 · USP：Match 配重手枪机械分解
+### 27 · USP：Match 配重手枪机械分解
 *USP Match Gun Disassembly & Low-Poly Scene*
 
 📁 `L3_Advanced/USP/PROJECT_PROMPT.md` ｜ [源文件](./L3_Advanced/USP/PROJECT_PROMPT.md) ｜ [评分标准](./L3_Advanced/USP/README.md)
@@ -847,7 +891,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 </details>
 
 
-### 27 · cloth：3D 质点-弹簧布料物理仿真
+### 28 · cloth：3D 质点-弹簧布料物理仿真
 *3D Mass-Spring Cloth Physics Simulation*
 
 📁 `L3_Advanced/cloth/PROJECT_PROMPT.md` ｜ [源文件](./L3_Advanced/cloth/PROJECT_PROMPT.md) ｜ [评分标准](./L3_Advanced/cloth/README.md)
@@ -905,7 +949,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 
 
 
-### 28 · 我的世界：3D 体素沙盒世界
+### 29 · 我的世界：3D 体素沙盒世界
 *Minecraft-style Voxel Sandbox · L3*
 
 📁 `L3_Advanced/Minecraft/PROJECT_PROMPT.md` ｜ [源文件](./L3_Advanced/Minecraft/PROJECT_PROMPT.md)
@@ -933,7 +977,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 
 </details>
 
-### 29 · teardown：硬表面机械与微体素场景
+### 30 · teardown：硬表面机械与微体素场景
 *Teardown Voxel Diorama & Mechanical Disassembly*
 
 📁 `L3_Advanced/teardown/PROJECT_PROMPT.md` ｜ [源文件](./L3_Advanced/teardown/PROJECT_PROMPT.md) ｜ [评分标准](./L3_Advanced/teardown/README.md)
@@ -997,7 +1041,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 </details>
 
 
-### 31 · CFD：超拟真流体计算与物理渲染
+### 32 · CFD：超拟真流体计算与物理渲染
 *Ultra-Realistic CFD Fluid Simulation & Rendering*
 
 📁 `L4_Expert/CFD/PROJECT_PROMPT.md` ｜ [源文件](./L4_Expert/CFD/PROJECT_PROMPT.md) ｜ [评分标准](./L4_Expert/CFD/README.md)
@@ -1243,7 +1287,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 </details>
 
 
-### 33 · EngineSIM：引擎声浪与 DSP 音频合成
+### 34 · EngineSIM：引擎声浪与 DSP 音频合成
 *Engine Sound & DSP Audio Synthesis*
 
 📁 `L4_Expert/EngineSIM/PROJECT_PROMPT.md` ｜ [源文件](./L4_Expert/EngineSIM/PROJECT_PROMPT.md) ｜ [评分标准](./L4_Expert/EngineSIM/README.md)
@@ -1290,7 +1334,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 </details>
 
 
-### 36 · 遥测：RAC 赛车实时遥测与距离空间重采样分析
+### 37 · 遥测：RAC 赛车实时遥测与距离空间重采样分析
 *RAC Telemetry & Distance-based Resampling Analysis*
 
 📁 `L4_Expert/Telemetry/PROJECT_PROMPT.md` ｜ [源文件](./L4_Expert/Telemetry/PROJECT_PROMPT.md) ｜ [评分标准](./L4_Expert/Telemetry/README.md)
@@ -1342,7 +1386,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 </details>
 
 
-### 37 · UnifiedInputManager：跨平台 Controller 统一输入管理器
+### 38 · UnifiedInputManager：跨平台 Controller 统一输入管理器
 *Unified Controller Input Manager*
 
 📁 `L4_Expert/UnifiedInputManager/PROJECT_PROMPT.md` ｜ [源文件](./L4_Expert/UnifiedInputManager/PROJECT_PROMPT.md) ｜ [评分标准](./L4_Expert/UnifiedInputManager/README.md)
@@ -1382,7 +1426,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 </details>
 
 
-### 38 · osu!mania：Python OpenGL 高效视频渲染工具
+### 39 · osu!mania：Python OpenGL 高效视频渲染工具
 *osu!mania Python OpenGL High-Perf Video Renderer*
 
 📁 `L4_Expert/osuMania/PROJECT_PROMPT.md` ｜ [源文件](./L4_Expert/osuMania/PROJECT_PROMPT.md) ｜ [评分标准](./L4_Expert/osuMania/README.md)
@@ -1599,7 +1643,7 @@ UI整体使用工业软件风格，表现出准确、专业的视觉风格，不
 </details>
 
 
-### 30 · BEAMhard：BeamNG 软体车辆物理与损毁模拟
+### 31 · BEAMhard：BeamNG 软体车辆物理与损毁模拟
 *BEAMhard: BeamNG Vehicle Physics & Damage*
 
 📁 `L4_Expert/BEAMhard/PROJECT_PROMPT.md` ｜ [源文件](./L4_Expert/BEAMhard/PROJECT_PROMPT.md) ｜ [评分标准](./L4_Expert/BEAMhard/README.md)
@@ -1681,7 +1725,7 @@ Phase 1 执行时须将全部分卷解包合并到统一 `vehicles/` 目录。
 </details>
 
 
-### 32 · DeepSWE：软件工程与代码演进
+### 33 · DeepSWE：软件工程与代码演进
 *DeepSWE Benchmark Evaluation Tasks*
 
 📁 `L4_Expert/DeepSWE/PROJECT_PROMPT.md` ｜ [源文件](./L4_Expert/DeepSWE/PROJECT_PROMPT.md) ｜ [评分标准](./L4_Expert/DeepSWE/README.md)
@@ -1733,7 +1777,7 @@ solution/         参考解法（对智能体保密）
 </details>
 
 
-### 34 · PSMCP：Adobe Photoshop MCP 服务端
+### 35 · PSMCP：Adobe Photoshop MCP 服务端
 *Adobe Photoshop MCP Server Integration*
 
 📁 `L4_Expert/PSMCP/PROJECT_PROMPT.md` ｜ [源文件](./L4_Expert/PSMCP/PROJECT_PROMPT.md) ｜ [评分标准](./L4_Expert/PSMCP/README.md)
@@ -1813,7 +1857,7 @@ names.join(", ");
 </details>
 
 
-### 35 · 草图大师MCP：SketchUp MCP 桥接器
+### 36 · 草图大师MCP：SketchUp MCP 桥接器
 *SketchUp MCP Bridge Integration*
 
 📁 `L4_Expert/SketchUpMCP/PROJECT_PROMPT.md` ｜ [源文件](./L4_Expert/SketchUpMCP/PROJECT_PROMPT.md) ｜ [评分标准](./L4_Expert/SketchUpMCP/README.md)

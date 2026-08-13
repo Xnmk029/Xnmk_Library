@@ -1,6 +1,6 @@
 # AI 大语言模型 Benchmark 测试套件
 
-本仓库为一个标准化的 AI 代码生成与系统架构评测套件，共包含 **38 个独立测试项目**（L1–L4），另含根目录 **[Image/](./Image/)** 图像生成分区（**6** 个独立测试项）。L1–L4 按难度阶梯归类，并按技术领域整理在 **[DOMAIN_INDEX.zh.md](./DOMAIN_INDEX.zh.md)** 全景索引中；图像项见 **[Image/README.md](./Image/README.md)**。
+本仓库为一个标准化的 AI 代码生成与系统架构评测套件，共包含 **39 个独立测试项目**（L1–L4），另含根目录 **[Image/](./Image/)** 图像生成分区（**6** 个独立测试项）。L1–L4 按难度阶梯归类，并按技术领域整理在 **[DOMAIN_INDEX.zh.md](./DOMAIN_INDEX.zh.md)** 全景索引中；图像项见 **[Image/README.md](./Image/README.md)**。
 
 **[English Documentation →](./README.en.md)** ｜ **[按领域分类的提示词索引（一键复制）→](./DOMAIN_INDEX.zh.md)** ｜ **[图像生成分区 →](./Image/README.md)**
 
@@ -12,7 +12,7 @@
 benchmark/
 ├── L1_Basic/                     # Level 1: 基础工具与脚本类（5 个项目）
 ├── L2_Intermediate/              # Level 2: 中级 Web 应用与交互游戏类（11 个项目）
-├── L3_Advanced/                  # Level 3: 高级 3D 引擎与物理仿真类（13 个项目）
+├── L3_Advanced/                  # Level 3: 高级 3D 引擎与物理仿真类（14 个项目）
 ├── L4_Expert/                    # Level 4: 专家级原生引擎与硬件协议类（9 个项目）
 ├── Image/                        # 图像生成与编辑（6 个独立测试项，与 L1–L4 并列）
 ├── DOMAIN_INDEX.en.md            # 按领域分类的提示词全景索引·英文版（内嵌全文，一键复制）
@@ -55,34 +55,35 @@ benchmark/
 | 14 | [`Musicgames`](./L2_Intermediate/Musicgames) | **Musicgames：冰与火之舞 × 节奏医生 融合音游** | Web 游戏与交互逻辑 | `L2` | [提示词](./L2_Intermediate/Musicgames/PROJECT_PROMPT.md) \| [评分标准](./L2_Intermediate/Musicgames/README.md) |
 | 15 | [`PenroseStairs`](./L2_Intermediate/PenroseStairs) | **彭罗斯阶梯：HTML 视错觉** | 3D 图形、物理仿真与 Shaders | `L2` | [提示词](./L2_Intermediate/PenroseStairs/PROJECT_PROMPT.md) \| [评分标准](./L2_Intermediate/PenroseStairs/README.md) |
 | 16 | [`Sokoban`](./L2_Intermediate/Sokoban) | **推箱子：Three.js 草地 Shader 与推箱子** | Web 游戏与交互逻辑 | `L2` | [提示词](./L2_Intermediate/Sokoban/PROJECT_PROMPT.md) \| [评分标准](./L2_Intermediate/Sokoban/README.md) |
-| 17 | [`Bicycle3D`](./L3_Advanced/Bicycle3D) | **自行车：参数化 3D 工作室与传动系统** | 3D 图形、物理仿真与 Shaders | `L3` | [提示词](./L3_Advanced/Bicycle3D/PROJECT_PROMPT.md) \| [评分标准](./L3_Advanced/Bicycle3D/README.md) |
-| 18 | [`EscapeFromDuckov`](./L3_Advanced/EscapeFromDuckov) | **逃离鸭科夫：游戏系统与着色器特效** | 3D 图形、物理仿真与 Shaders | `L3` | ⚠️ 拟建测试项（提示词与说明待发布） |
-| 19 | [`FPV`](./L3_Advanced/FPV) | **FPV：穿越机花飞 3D 模拟器** | 3D 图形、物理仿真与 Shaders | `L3` | [提示词](./L3_Advanced/FPV/PROJECT_PROMPT.md) \| [评分标准](./L3_Advanced/FPV/README.md) |
-| 20 | [`IndustrialDigitalTwin`](./L3_Advanced/IndustrialDigitalTwin) | **工业数字孪生设备监控** | 3D 图形、物理仿真与 Shaders | `L3` | [提示词](./L3_Advanced/IndustrialDigitalTwin/PROJECT_PROMPT.md) \| [评分标准](./L3_Advanced/IndustrialDigitalTwin/README.md) |
-| 21 | [`LitRPGNovel`](./L3_Advanced/LitRPGNovel) | **文字：Minecraft 硬核生存小说** | Web 游戏与交互逻辑 | `L3` | [提示词](./L3_Advanced/LitRPGNovel/PROJECT_PROMPT.md) \| [评分标准](./L3_Advanced/LitRPGNovel/README.md) |
-| 22 | [`MinecraftVOxy`](./L3_Advanced/MinecraftVOxy) | **我的世界VOxy：区块着色器与渲染引擎** | 3D 图形、物理仿真与 Shaders | `L3` | [提示词](./L3_Advanced/MinecraftVOxy/PROJECT_PROMPT.md) \| [评分标准](./L3_Advanced/MinecraftVOxy/README.md) |
-| 23 | [`Poolrooms3D`](./L3_Advanced/Poolrooms3D) | **池核：3D Poolrooms 步行模拟器** | 3D 图形、物理仿真与 Shaders | `L3` | [提示词](./L3_Advanced/Poolrooms3D/PROJECT_PROMPT.md) \| [评分标准](./L3_Advanced/Poolrooms3D/README.md) |
-| 24 | [`RTX`](./L3_Advanced/RTX) | **RTX：Web 路径追踪房间 GPU** | 3D 图形、物理仿真与 Shaders | `L3` | [提示词](./L3_Advanced/RTX/PROJECT_PROMPT.md) \| [评分标准](./L3_Advanced/RTX/README.md) |
-| 25 | [`RainWorld`](./L3_Advanced/RainWorld) | **雨世界：质点-弹簧布料模拟** | 3D 图形、物理仿真与 Shaders | `L3` | [提示词](./L3_Advanced/RainWorld/PROJECT_PROMPT.md) \| [评分标准](./L3_Advanced/RainWorld/README.md) |
-| 26 | [`USP`](./L3_Advanced/USP) | **USP：Match 配重手枪机械分解** | 3D 图形、物理仿真与 Shaders | `L3` | [提示词](./L3_Advanced/USP/PROJECT_PROMPT.md) \| [评分标准](./L3_Advanced/USP/README.md) |
-| 27 | [`cloth`](./L3_Advanced/cloth) | **cloth：3D 质点-弹簧布料物理仿真** | 3D 图形、物理仿真与 Shaders | `L3` | [提示词](./L3_Advanced/cloth/PROJECT_PROMPT.md) \| [评分标准](./L3_Advanced/cloth/README.md) |
-| 28 | [`Minecraft`](./L3_Advanced/Minecraft) | **我的世界：3D 体素沙盒世界** | 3D 图形、物理仿真与 Shaders | `L3` | [提示词](./L3_Advanced/Minecraft/PROJECT_PROMPT.md) |
-| 29 | [`teardown`](./L3_Advanced/teardown) | **teardown：硬表面机械与微体素场景** | 3D 图形、物理仿真与 Shaders | `L3` | [提示词](./L3_Advanced/teardown/PROJECT_PROMPT.md) \| [评分标准](./L3_Advanced/teardown/README.md) |
-| 30 | [`BEAMhard`](./L4_Expert/BEAMhard) | **BEAMhard：BeamNG 软体车辆物理与损毁模拟** | 系统集成与 MCP 协议 | `L4` | [提示词](./L4_Expert/BEAMhard/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/BEAMhard/README.md) |
-| 31 | [`CFD`](./L4_Expert/CFD) | **CFD：超拟真流体计算与物理渲染** | 3D 图形、物理仿真与 Shaders | `L4` | [提示词](./L4_Expert/CFD/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/CFD/README.md) |
-| 32 | [`DeepSWE`](./L4_Expert/DeepSWE) | **DeepSWE：软件工程与代码演进** | 系统集成与 MCP 协议 | `L4` | [提示词](./L4_Expert/DeepSWE/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/DeepSWE/README.md) |
-| 33 | [`EngineSIM`](./L4_Expert/EngineSIM) | **EngineSIM：引擎声浪与 DSP 音频合成** | Python 工具与原生引擎 | `L4` | [提示词](./L4_Expert/EngineSIM/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/EngineSIM/README.md) |
-| 34 | [`PSMCP`](./L4_Expert/PSMCP) | **PSMCP：Adobe Photoshop MCP 服务端** | 系统集成与 MCP 协议 | `L4` | [提示词](./L4_Expert/PSMCP/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/PSMCP/README.md) |
-| 35 | [`SketchUpMCP`](./L4_Expert/SketchUpMCP) | **草图大师MCP：SketchUp MCP 桥接器** | 系统集成与 MCP 协议 | `L4` | [提示词](./L4_Expert/SketchUpMCP/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/SketchUpMCP/README.md) |
-| 36 | [`Telemetry`](./L4_Expert/Telemetry) | **遥测：RAC 赛车实时遥测与距离空间重采样分析** | Python 工具与原生引擎 | `L4` | [提示词](./L4_Expert/Telemetry/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/Telemetry/README.md) |
-| 37 | [`UnifiedInputManager`](./L4_Expert/UnifiedInputManager) | **UnifiedInputManager：跨平台 Controller 统一输入管理器** | Python 工具与原生引擎 | `L4` | [提示词](./L4_Expert/UnifiedInputManager/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/UnifiedInputManager/README.md) |
-| 38 | [`osuMania`](./L4_Expert/osuMania) | **osu!mania：Python OpenGL 高效视频渲染工具** | Python 工具与原生引擎 | `L4` | [提示词](./L4_Expert/osuMania/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/osuMania/README.md) |
-| 39 | [`ArchPhotoreal`](./Image/ArchPhotoreal) | **建筑建模真实化** | 图像生成与编辑 | `Image` | [提示词](./Image/ArchPhotoreal/PROJECT_PROMPT.md) \| [评分标准](./Image/ArchPhotoreal/README.md) |
-| 40 | [`StandardBooks3D`](./Image/StandardBooks3D) | **国标系列图书 3D 渲染** | 图像生成与编辑 | `Image` | [提示词](./Image/StandardBooks3D/PROJECT_PROMPT.md) \| [评分标准](./Image/StandardBooks3D/README.md) |
-| 41 | [`ConstructivistPoster`](./Image/ConstructivistPoster) | **构成主义宣传海报** | 图像生成与编辑 | `Image` | [提示词](./Image/ConstructivistPoster/PROJECT_PROMPT.md) \| [评分标准](./Image/ConstructivistPoster/README.md) |
-| 42 | [`WindowGlitchPoster`](./Image/WindowGlitchPoster) | **窗口叠层与故障拼贴** | 图像生成与编辑 | `Image` | [提示词](./Image/WindowGlitchPoster/PROJECT_PROMPT.md) \| [评分标准](./Image/WindowGlitchPoster/README.md) |
-| 43 | [`GovTechPPT`](./Image/GovTechPPT) | **政务科技 PPT 海报** | 图像生成与编辑 | `Image` | [提示词](./Image/GovTechPPT/PROJECT_PROMPT.md) \| [评分标准](./Image/GovTechPPT/README.md) |
-| 44 | [`TextbookPeachBlossom`](./Image/TextbookPeachBlossom) | **桃花源记课本展开页** | 图像生成与编辑 | `Image` | [提示词](./Image/TextbookPeachBlossom/PROJECT_PROMPT.md) \| [评分标准](./Image/TextbookPeachBlossom/README.md) |
+| 17 | [`Bicycle3D`](./L3_Advanced/Bicycle3D) | **自行车：参数化 3D 工作室与装配模拟器** | 3D 图形、物理仿真与 Shaders | `L3` | [提示词](./L3_Advanced/Bicycle3D/PROJECT_PROMPT.md) \| [评分标准](./L3_Advanced/Bicycle3D/README.md) |
+| 18 | [`BicycleDrivetrain`](./L3_Advanced/BicycleDrivetrain) | **自行车：低多边形动态传动展示台** | 3D 图形、物理仿真与 Shaders | `L3` | [提示词](./L3_Advanced/BicycleDrivetrain/PROJECT_PROMPT.md) \| [评分标准](./L3_Advanced/BicycleDrivetrain/README.md) |
+| 19 | [`EscapeFromDuckov`](./L3_Advanced/EscapeFromDuckov) | **逃离鸭科夫：游戏系统与着色器特效** | 3D 图形、物理仿真与 Shaders | `L3` | ⚠️ 拟建测试项（提示词与说明待发布） |
+| 20 | [`FPV`](./L3_Advanced/FPV) | **FPV：穿越机花飞 3D 模拟器** | 3D 图形、物理仿真与 Shaders | `L3` | [提示词](./L3_Advanced/FPV/PROJECT_PROMPT.md) \| [评分标准](./L3_Advanced/FPV/README.md) |
+| 21 | [`IndustrialDigitalTwin`](./L3_Advanced/IndustrialDigitalTwin) | **工业数字孪生设备监控** | 3D 图形、物理仿真与 Shaders | `L3` | [提示词](./L3_Advanced/IndustrialDigitalTwin/PROJECT_PROMPT.md) \| [评分标准](./L3_Advanced/IndustrialDigitalTwin/README.md) |
+| 22 | [`LitRPGNovel`](./L3_Advanced/LitRPGNovel) | **文字：Minecraft 硬核生存小说** | Web 游戏与交互逻辑 | `L3` | [提示词](./L3_Advanced/LitRPGNovel/PROJECT_PROMPT.md) \| [评分标准](./L3_Advanced/LitRPGNovel/README.md) |
+| 23 | [`MinecraftVOxy`](./L3_Advanced/MinecraftVOxy) | **我的世界VOxy：区块着色器与渲染引擎** | 3D 图形、物理仿真与 Shaders | `L3` | [提示词](./L3_Advanced/MinecraftVOxy/PROJECT_PROMPT.md) \| [评分标准](./L3_Advanced/MinecraftVOxy/README.md) |
+| 24 | [`Poolrooms3D`](./L3_Advanced/Poolrooms3D) | **池核：3D Poolrooms 步行模拟器** | 3D 图形、物理仿真与 Shaders | `L3` | [提示词](./L3_Advanced/Poolrooms3D/PROJECT_PROMPT.md) \| [评分标准](./L3_Advanced/Poolrooms3D/README.md) |
+| 25 | [`RTX`](./L3_Advanced/RTX) | **RTX：Web 路径追踪房间 GPU** | 3D 图形、物理仿真与 Shaders | `L3` | [提示词](./L3_Advanced/RTX/PROJECT_PROMPT.md) \| [评分标准](./L3_Advanced/RTX/README.md) |
+| 26 | [`RainWorld`](./L3_Advanced/RainWorld) | **雨世界：质点-弹簧布料模拟** | 3D 图形、物理仿真与 Shaders | `L3` | [提示词](./L3_Advanced/RainWorld/PROJECT_PROMPT.md) \| [评分标准](./L3_Advanced/RainWorld/README.md) |
+| 27 | [`USP`](./L3_Advanced/USP) | **USP：Match 配重手枪机械分解** | 3D 图形、物理仿真与 Shaders | `L3` | [提示词](./L3_Advanced/USP/PROJECT_PROMPT.md) \| [评分标准](./L3_Advanced/USP/README.md) |
+| 28 | [`cloth`](./L3_Advanced/cloth) | **cloth：3D 质点-弹簧布料物理仿真** | 3D 图形、物理仿真与 Shaders | `L3` | [提示词](./L3_Advanced/cloth/PROJECT_PROMPT.md) \| [评分标准](./L3_Advanced/cloth/README.md) |
+| 29 | [`Minecraft`](./L3_Advanced/Minecraft) | **我的世界：3D 体素沙盒世界** | 3D 图形、物理仿真与 Shaders | `L3` | [提示词](./L3_Advanced/Minecraft/PROJECT_PROMPT.md) |
+| 30 | [`teardown`](./L3_Advanced/teardown) | **teardown：硬表面机械与微体素场景** | 3D 图形、物理仿真与 Shaders | `L3` | [提示词](./L3_Advanced/teardown/PROJECT_PROMPT.md) \| [评分标准](./L3_Advanced/teardown/README.md) |
+| 31 | [`BEAMhard`](./L4_Expert/BEAMhard) | **BEAMhard：BeamNG 软体车辆物理与损毁模拟** | 系统集成与 MCP 协议 | `L4` | [提示词](./L4_Expert/BEAMhard/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/BEAMhard/README.md) |
+| 32 | [`CFD`](./L4_Expert/CFD) | **CFD：超拟真流体计算与物理渲染** | 3D 图形、物理仿真与 Shaders | `L4` | [提示词](./L4_Expert/CFD/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/CFD/README.md) |
+| 33 | [`DeepSWE`](./L4_Expert/DeepSWE) | **DeepSWE：软件工程与代码演进** | 系统集成与 MCP 协议 | `L4` | [提示词](./L4_Expert/DeepSWE/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/DeepSWE/README.md) |
+| 34 | [`EngineSIM`](./L4_Expert/EngineSIM) | **EngineSIM：引擎声浪与 DSP 音频合成** | Python 工具与原生引擎 | `L4` | [提示词](./L4_Expert/EngineSIM/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/EngineSIM/README.md) |
+| 35 | [`PSMCP`](./L4_Expert/PSMCP) | **PSMCP：Adobe Photoshop MCP 服务端** | 系统集成与 MCP 协议 | `L4` | [提示词](./L4_Expert/PSMCP/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/PSMCP/README.md) |
+| 36 | [`SketchUpMCP`](./L4_Expert/SketchUpMCP) | **草图大师MCP：SketchUp MCP 桥接器** | 系统集成与 MCP 协议 | `L4` | [提示词](./L4_Expert/SketchUpMCP/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/SketchUpMCP/README.md) |
+| 37 | [`Telemetry`](./L4_Expert/Telemetry) | **遥测：RAC 赛车实时遥测与距离空间重采样分析** | Python 工具与原生引擎 | `L4` | [提示词](./L4_Expert/Telemetry/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/Telemetry/README.md) |
+| 38 | [`UnifiedInputManager`](./L4_Expert/UnifiedInputManager) | **UnifiedInputManager：跨平台 Controller 统一输入管理器** | Python 工具与原生引擎 | `L4` | [提示词](./L4_Expert/UnifiedInputManager/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/UnifiedInputManager/README.md) |
+| 39 | [`osuMania`](./L4_Expert/osuMania) | **osu!mania：Python OpenGL 高效视频渲染工具** | Python 工具与原生引擎 | `L4` | [提示词](./L4_Expert/osuMania/PROJECT_PROMPT.md) \| [评分标准](./L4_Expert/osuMania/README.md) |
+| 40 | [`ArchPhotoreal`](./Image/ArchPhotoreal) | **建筑建模真实化** | 图像生成与编辑 | `Image` | [提示词](./Image/ArchPhotoreal/PROJECT_PROMPT.md) \| [评分标准](./Image/ArchPhotoreal/README.md) |
+| 41 | [`StandardBooks3D`](./Image/StandardBooks3D) | **国标系列图书 3D 渲染** | 图像生成与编辑 | `Image` | [提示词](./Image/StandardBooks3D/PROJECT_PROMPT.md) \| [评分标准](./Image/StandardBooks3D/README.md) |
+| 42 | [`ConstructivistPoster`](./Image/ConstructivistPoster) | **构成主义宣传海报** | 图像生成与编辑 | `Image` | [提示词](./Image/ConstructivistPoster/PROJECT_PROMPT.md) \| [评分标准](./Image/ConstructivistPoster/README.md) |
+| 43 | [`WindowGlitchPoster`](./Image/WindowGlitchPoster) | **窗口叠层与故障拼贴** | 图像生成与编辑 | `Image` | [提示词](./Image/WindowGlitchPoster/PROJECT_PROMPT.md) \| [评分标准](./Image/WindowGlitchPoster/README.md) |
+| 44 | [`GovTechPPT`](./Image/GovTechPPT) | **政务科技 PPT 海报** | 图像生成与编辑 | `Image` | [提示词](./Image/GovTechPPT/PROJECT_PROMPT.md) \| [评分标准](./Image/GovTechPPT/README.md) |
+| 45 | [`TextbookPeachBlossom`](./Image/TextbookPeachBlossom) | **桃花源记课本展开页** | 图像生成与编辑 | `Image` | [提示词](./Image/TextbookPeachBlossom/PROJECT_PROMPT.md) \| [评分标准](./Image/TextbookPeachBlossom/README.md) |
 
 > 图像分区总览与评测流程见 **[Image/README.md](./Image/README.md)**。
 
@@ -119,7 +120,8 @@ benchmark/
 
 针对 WebGL/Three.js 3D 渲染引擎、自定义 GLSL 着色器、质点弹簧物理及 PBR 场景能力。
 
-- [`Bicycle3D`](./L3_Advanced/Bicycle3D): 自行车：参数化 3D 工作室与传动系统
+- [`Bicycle3D`](./L3_Advanced/Bicycle3D): 自行车：参数化 3D 工作室与装配模拟器
+- [`BicycleDrivetrain`](./L3_Advanced/BicycleDrivetrain): 自行车：低多边形动态传动展示台
 - [`EscapeFromDuckov`](./L3_Advanced/EscapeFromDuckov): 逃离鸭科夫：游戏系统与着色器特效 ⚠️ 拟建测试项，提示词待发布
 - [`FPV`](./L3_Advanced/FPV): FPV：穿越机花飞 3D 模拟器
 - [`IndustrialDigitalTwin`](./L3_Advanced/IndustrialDigitalTwin): 工业数字孪生设备监控

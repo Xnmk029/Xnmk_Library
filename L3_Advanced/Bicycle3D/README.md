@@ -1,4 +1,4 @@
-# 自行车：参数化 3D 工作室与传动系统 Benchmark
+# 自行车：参数化 3D 工作室与装配模拟器 Benchmark
 
 ## 分类元数据
 
@@ -10,6 +10,8 @@
 ## 任务定位
 
 测试模型在单文件 Three.js 项目中进行程序化建模、机械依赖管理、参数化重建、动画和产品级 UI 设计的能力。
+
+> ℹ️ 原「轻量传动展示台」附加子任务已拆分为独立试题，见 [BicycleDrivetrain](../BicycleDrivetrain/README.md)。
 
 ## 提示词
 
@@ -59,13 +61,6 @@
 - 控件按 Frame Geometry、Drivetrain、Fit & Cockpit、Assembly、Colors & Finishes、Render Style、Specifications 分组。
 - 实时显示几何参数、传动规格和估算重量。
 - 提供重置、相机预设、标签、UI 折叠等基础功能。
-
-### 轻量传动台子任务
-
-- 另提供低多边形动态自行车传动展示台。
-- 包含曲柄、牙盘、链条、5–7 片飞轮、后拨和透明亚克力支架。
-- 支持电机启停、升挡、降挡和当前挡位显示。
-- 换挡时后拨与链线平滑插值，并保持传动同步。
 
 ## 输出要求
 

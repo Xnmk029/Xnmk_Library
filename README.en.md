@@ -1,6 +1,6 @@
 # AI Prompt Test Benchmark Suite
 
-This repository is a standardized evaluation suite containing **38 benchmark projects** (L1–L4) for auditing AI code generation, physics simulations, 3D graphics, and hardware protocols, plus a root-level **[Image/](./Image/)** partition with **6** independent image-generation items. L1–L4 projects are stored in 4 difficulty tiers and catalogued by domain in **[DOMAIN_INDEX.en.md](./DOMAIN_INDEX.en.md)**; image items are listed in **[Image/README.md](./Image/README.md)**.
+This repository is a standardized evaluation suite containing **39 benchmark projects** (L1–L4) for auditing AI code generation, physics simulations, 3D graphics, and hardware protocols, plus a root-level **[Image/](./Image/)** partition with **6** independent image-generation items. L1–L4 projects are stored in 4 difficulty tiers and catalogued by domain in **[DOMAIN_INDEX.en.md](./DOMAIN_INDEX.en.md)**; image items are listed in **[Image/README.md](./Image/README.md)**.
 
 **[中文文档 →](./README.md)** ｜ **[Domain Catalog with Copy-Ready Prompts →](./DOMAIN_INDEX.en.md)** ｜ **[Image Partition →](./Image/README.md)**
 
@@ -12,7 +12,7 @@ This repository is a standardized evaluation suite containing **38 benchmark pro
 benchmark/
 ├── L1_Basic/                     # Level 1: Basic tools & scripts (5 projects)
 ├── L2_Intermediate/              # Level 2: Web apps & interactive games (11 projects)
-├── L3_Advanced/                  # Level 3: 3D engines & physics simulation (13 projects)
+├── L3_Advanced/                  # Level 3: 3D engines & physics simulation (14 projects)
 ├── L4_Expert/                    # Level 4: Native engines & hardware protocols (9 projects)
 ├── Image/                        # Image generation & editing (6 independent items)
 ├── DOMAIN_INDEX.en.md            # Domain catalog with embedded copy-ready prompts (English)
@@ -55,34 +55,35 @@ benchmark/
 | 14 | [`Musicgames`](./L2_Intermediate/Musicgames) | ADOFAI x Rhythm Doctor Hybrid Music Game | Web Games & Interactive Logic | `L2` | [Prompt](./L2_Intermediate/Musicgames/PROJECT_PROMPT.md) \| [Rubric](./L2_Intermediate/Musicgames/README.md) |
 | 15 | [`PenroseStairs`](./L2_Intermediate/PenroseStairs) | Penrose Optical Illusion 3D Geometry | 3D Graphics, Physics & Shaders | `L2` | [Prompt](./L2_Intermediate/PenroseStairs/PROJECT_PROMPT.md) \| [Rubric](./L2_Intermediate/PenroseStairs/README.md) |
 | 16 | [`Sokoban`](./L2_Intermediate/Sokoban) | Three.js Shader Grass & Sokoban Game | Web Games & Interactive Logic | `L2` | [Prompt](./L2_Intermediate/Sokoban/PROJECT_PROMPT.md) \| [Rubric](./L2_Intermediate/Sokoban/README.md) |
-| 17 | [`Bicycle3D`](./L3_Advanced/Bicycle3D) | Parametric 3D Bicycle Studio & Drivetrain | 3D Graphics, Physics & Shaders | `L3` | [Prompt](./L3_Advanced/Bicycle3D/PROJECT_PROMPT.md) \| [Rubric](./L3_Advanced/Bicycle3D/README.md) |
-| 18 | [`EscapeFromDuckov`](./L3_Advanced/EscapeFromDuckov) | Escape from Duckov Game Design & Shaders | 3D Graphics, Physics & Shaders | `L3` | ⚠️ Planned — prompt & rubric to be published |
-| 19 | [`FPV`](./L3_Advanced/FPV) | FPV Drone Freestyle 3D Simulator | 3D Graphics, Physics & Shaders | `L3` | [Prompt](./L3_Advanced/FPV/PROJECT_PROMPT.md) \| [Rubric](./L3_Advanced/FPV/README.md) |
-| 20 | [`IndustrialDigitalTwin`](./L3_Advanced/IndustrialDigitalTwin) | Industrial Digital Twin Equipment Monitoring | 3D Graphics, Physics & Shaders | `L3` | [Prompt](./L3_Advanced/IndustrialDigitalTwin/PROJECT_PROMPT.md) \| [Rubric](./L3_Advanced/IndustrialDigitalTwin/README.md) |
-| 21 | [`LitRPGNovel`](./L3_Advanced/LitRPGNovel) | Minecraft Hardcore LitRPG Long Novel | Web Games & Interactive Logic | `L3` | [Prompt](./L3_Advanced/LitRPGNovel/PROJECT_PROMPT.md) \| [Rubric](./L3_Advanced/LitRPGNovel/README.md) |
-| 22 | [`MinecraftVOxy`](./L3_Advanced/MinecraftVOxy) | Minecraft VOxy Chunk Shader & Rendering Engine | 3D Graphics, Physics & Shaders | `L3` | [Prompt](./L3_Advanced/MinecraftVOxy/PROJECT_PROMPT.md) \| [Rubric](./L3_Advanced/MinecraftVOxy/README.md) |
-| 23 | [`Poolrooms3D`](./L3_Advanced/Poolrooms3D) | 3D Poolrooms Backrooms Simulator | 3D Graphics, Physics & Shaders | `L3` | [Prompt](./L3_Advanced/Poolrooms3D/PROJECT_PROMPT.md) \| [Rubric](./L3_Advanced/Poolrooms3D/README.md) |
-| 24 | [`RTX`](./L3_Advanced/RTX) | Web Path Tracing GPU Workload Benchmark | 3D Graphics, Physics & Shaders | `L3` | [Prompt](./L3_Advanced/RTX/PROJECT_PROMPT.md) \| [Rubric](./L3_Advanced/RTX/README.md) |
-| 25 | [`RainWorld`](./L3_Advanced/RainWorld) | Mass-Spring / PBD Cloth Dynamics | 3D Graphics, Physics & Shaders | `L3` | [Prompt](./L3_Advanced/RainWorld/PROJECT_PROMPT.md) \| [Rubric](./L3_Advanced/RainWorld/README.md) |
-| 26 | [`USP`](./L3_Advanced/USP) | USP Match Gun Disassembly & Low-Poly Scene | 3D Graphics, Physics & Shaders | `L3` | [Prompt](./L3_Advanced/USP/PROJECT_PROMPT.md) \| [Rubric](./L3_Advanced/USP/README.md) |
-| 27 | [`cloth`](./L3_Advanced/cloth) | 3D Mass-Spring Cloth Physics Simulation | 3D Graphics, Physics & Shaders | `L3` | [Prompt](./L3_Advanced/cloth/PROJECT_PROMPT.md) \| [Rubric](./L3_Advanced/cloth/README.md) |
-| 28 | [`Minecraft`](./L3_Advanced/Minecraft) | *Minecraft-style Voxel Sandbox* | 3D Graphics, Physics & Shaders | `L3` | [Prompt](./L3_Advanced/Minecraft/PROJECT_PROMPT.md) |
-| 29 | [`teardown`](./L3_Advanced/teardown) | Teardown Voxel Diorama & Mechanical Disassembly | 3D Graphics, Physics & Shaders | `L3` | [Prompt](./L3_Advanced/teardown/PROJECT_PROMPT.md) \| [Rubric](./L3_Advanced/teardown/README.md) |
-| 30 | [`BEAMhard`](./L4_Expert/BEAMhard) | BEAMhard: BeamNG Vehicle Physics & Damage | System Integration & MCP Protocol | `L4` | [Prompt](./L4_Expert/BEAMhard/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/BEAMhard/README.md) |
-| 31 | [`CFD`](./L4_Expert/CFD) | Ultra-Realistic CFD Fluid Simulation & Rendering | 3D Graphics, Physics & Shaders | `L4` | [Prompt](./L4_Expert/CFD/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/CFD/README.md) |
-| 32 | [`DeepSWE`](./L4_Expert/DeepSWE) | DeepSWE Benchmark Evaluation Tasks | System Integration & MCP Protocol | `L4` | [Prompt](./L4_Expert/DeepSWE/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/DeepSWE/README.md) |
-| 33 | [`EngineSIM`](./L4_Expert/EngineSIM) | Engine Sound & DSP Audio Synthesis | Python Tools & Native Engines | `L4` | [Prompt](./L4_Expert/EngineSIM/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/EngineSIM/README.md) |
-| 34 | [`PSMCP`](./L4_Expert/PSMCP) | Adobe Photoshop MCP Server Integration | System Integration & MCP Protocol | `L4` | [Prompt](./L4_Expert/PSMCP/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/PSMCP/README.md) |
-| 35 | [`SketchUpMCP`](./L4_Expert/SketchUpMCP) | SketchUp MCP Bridge Integration | System Integration & MCP Protocol | `L4` | [Prompt](./L4_Expert/SketchUpMCP/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/SketchUpMCP/README.md) |
-| 36 | [`Telemetry`](./L4_Expert/Telemetry) | RAC Telemetry & Distance-based Resampling Analysis | Python Tools & Native Engines | `L4` | [Prompt](./L4_Expert/Telemetry/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/Telemetry/README.md) |
-| 37 | [`UnifiedInputManager`](./L4_Expert/UnifiedInputManager) | Unified Controller Input Manager | Python Tools & Native Engines | `L4` | [Prompt](./L4_Expert/UnifiedInputManager/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/UnifiedInputManager/README.md) |
-| 38 | [`osuMania`](./L4_Expert/osuMania) | osu!mania Python OpenGL High-Perf Video Renderer | Python Tools & Native Engines | `L4` | [Prompt](./L4_Expert/osuMania/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/osuMania/README.md) |
-| 39 | [`ArchPhotoreal`](./Image/ArchPhotoreal) | Architecture Photorealization | Image Generation & Editing | `Image` | [Prompt](./Image/ArchPhotoreal/PROJECT_PROMPT.md) \| [Rubric](./Image/ArchPhotoreal/README.md) |
-| 40 | [`StandardBooks3D`](./Image/StandardBooks3D) | National-Standard Books 3D Product Render | Image Generation & Editing | `Image` | [Prompt](./Image/StandardBooks3D/PROJECT_PROMPT.md) \| [Rubric](./Image/StandardBooks3D/README.md) |
-| 41 | [`ConstructivistPoster`](./Image/ConstructivistPoster) | Constructivist Promo Poster | Image Generation & Editing | `Image` | [Prompt](./Image/ConstructivistPoster/PROJECT_PROMPT.md) \| [Rubric](./Image/ConstructivistPoster/README.md) |
-| 42 | [`WindowGlitchPoster`](./Image/WindowGlitchPoster) | Window-Overlay Glitch Poster | Image Generation & Editing | `Image` | [Prompt](./Image/WindowGlitchPoster/PROJECT_PROMPT.md) \| [Rubric](./Image/WindowGlitchPoster/README.md) |
-| 43 | [`GovTechPPT`](./Image/GovTechPPT) | Government/Tech PPT Poster | Image Generation & Editing | `Image` | [Prompt](./Image/GovTechPPT/PROJECT_PROMPT.md) \| [Rubric](./Image/GovTechPPT/README.md) |
-| 44 | [`TextbookPeachBlossom`](./Image/TextbookPeachBlossom) | Peach Blossom Spring Textbook Spread | Image Generation & Editing | `Image` | [Prompt](./Image/TextbookPeachBlossom/PROJECT_PROMPT.md) \| [Rubric](./Image/TextbookPeachBlossom/README.md) |
+| 17 | [`Bicycle3D`](./L3_Advanced/Bicycle3D) | Parametric 3D Bicycle Studio & Assembly Simulator | 3D Graphics, Physics & Shaders | `L3` | [Prompt](./L3_Advanced/Bicycle3D/PROJECT_PROMPT.md) \| [Rubric](./L3_Advanced/Bicycle3D/README.md) |
+| 18 | [`BicycleDrivetrain`](./L3_Advanced/BicycleDrivetrain) | **Low-poly Dynamic Bicycle Drivetrain Display Stand** | 3D Graphics, Physics & Shaders | `L3` | [Prompt](./L3_Advanced/BicycleDrivetrain/PROJECT_PROMPT.md) \| [Rubric](./L3_Advanced/BicycleDrivetrain/README.md) |
+| 19 | [`EscapeFromDuckov`](./L3_Advanced/EscapeFromDuckov) | Escape from Duckov Game Design & Shaders | 3D Graphics, Physics & Shaders | `L3` | ⚠️ Planned — prompt & rubric to be published |
+| 20 | [`FPV`](./L3_Advanced/FPV) | FPV Drone Freestyle 3D Simulator | 3D Graphics, Physics & Shaders | `L3` | [Prompt](./L3_Advanced/FPV/PROJECT_PROMPT.md) \| [Rubric](./L3_Advanced/FPV/README.md) |
+| 21 | [`IndustrialDigitalTwin`](./L3_Advanced/IndustrialDigitalTwin) | Industrial Digital Twin Equipment Monitoring | 3D Graphics, Physics & Shaders | `L3` | [Prompt](./L3_Advanced/IndustrialDigitalTwin/PROJECT_PROMPT.md) \| [Rubric](./L3_Advanced/IndustrialDigitalTwin/README.md) |
+| 22 | [`LitRPGNovel`](./L3_Advanced/LitRPGNovel) | Minecraft Hardcore LitRPG Long Novel | Web Games & Interactive Logic | `L3` | [Prompt](./L3_Advanced/LitRPGNovel/PROJECT_PROMPT.md) \| [Rubric](./L3_Advanced/LitRPGNovel/README.md) |
+| 23 | [`MinecraftVOxy`](./L3_Advanced/MinecraftVOxy) | Minecraft VOxy Chunk Shader & Rendering Engine | 3D Graphics, Physics & Shaders | `L3` | [Prompt](./L3_Advanced/MinecraftVOxy/PROJECT_PROMPT.md) \| [Rubric](./L3_Advanced/MinecraftVOxy/README.md) |
+| 24 | [`Poolrooms3D`](./L3_Advanced/Poolrooms3D) | 3D Poolrooms Backrooms Simulator | 3D Graphics, Physics & Shaders | `L3` | [Prompt](./L3_Advanced/Poolrooms3D/PROJECT_PROMPT.md) \| [Rubric](./L3_Advanced/Poolrooms3D/README.md) |
+| 25 | [`RTX`](./L3_Advanced/RTX) | Web Path Tracing GPU Workload Benchmark | 3D Graphics, Physics & Shaders | `L3` | [Prompt](./L3_Advanced/RTX/PROJECT_PROMPT.md) \| [Rubric](./L3_Advanced/RTX/README.md) |
+| 26 | [`RainWorld`](./L3_Advanced/RainWorld) | Mass-Spring / PBD Cloth Dynamics | 3D Graphics, Physics & Shaders | `L3` | [Prompt](./L3_Advanced/RainWorld/PROJECT_PROMPT.md) \| [Rubric](./L3_Advanced/RainWorld/README.md) |
+| 27 | [`USP`](./L3_Advanced/USP) | USP Match Gun Disassembly & Low-Poly Scene | 3D Graphics, Physics & Shaders | `L3` | [Prompt](./L3_Advanced/USP/PROJECT_PROMPT.md) \| [Rubric](./L3_Advanced/USP/README.md) |
+| 28 | [`cloth`](./L3_Advanced/cloth) | 3D Mass-Spring Cloth Physics Simulation | 3D Graphics, Physics & Shaders | `L3` | [Prompt](./L3_Advanced/cloth/PROJECT_PROMPT.md) \| [Rubric](./L3_Advanced/cloth/README.md) |
+| 29 | [`Minecraft`](./L3_Advanced/Minecraft) | *Minecraft-style Voxel Sandbox* | 3D Graphics, Physics & Shaders | `L3` | [Prompt](./L3_Advanced/Minecraft/PROJECT_PROMPT.md) |
+| 30 | [`teardown`](./L3_Advanced/teardown) | Teardown Voxel Diorama & Mechanical Disassembly | 3D Graphics, Physics & Shaders | `L3` | [Prompt](./L3_Advanced/teardown/PROJECT_PROMPT.md) \| [Rubric](./L3_Advanced/teardown/README.md) |
+| 31 | [`BEAMhard`](./L4_Expert/BEAMhard) | BEAMhard: BeamNG Vehicle Physics & Damage | System Integration & MCP Protocol | `L4` | [Prompt](./L4_Expert/BEAMhard/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/BEAMhard/README.md) |
+| 32 | [`CFD`](./L4_Expert/CFD) | Ultra-Realistic CFD Fluid Simulation & Rendering | 3D Graphics, Physics & Shaders | `L4` | [Prompt](./L4_Expert/CFD/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/CFD/README.md) |
+| 33 | [`DeepSWE`](./L4_Expert/DeepSWE) | DeepSWE Benchmark Evaluation Tasks | System Integration & MCP Protocol | `L4` | [Prompt](./L4_Expert/DeepSWE/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/DeepSWE/README.md) |
+| 34 | [`EngineSIM`](./L4_Expert/EngineSIM) | Engine Sound & DSP Audio Synthesis | Python Tools & Native Engines | `L4` | [Prompt](./L4_Expert/EngineSIM/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/EngineSIM/README.md) |
+| 35 | [`PSMCP`](./L4_Expert/PSMCP) | Adobe Photoshop MCP Server Integration | System Integration & MCP Protocol | `L4` | [Prompt](./L4_Expert/PSMCP/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/PSMCP/README.md) |
+| 36 | [`SketchUpMCP`](./L4_Expert/SketchUpMCP) | SketchUp MCP Bridge Integration | System Integration & MCP Protocol | `L4` | [Prompt](./L4_Expert/SketchUpMCP/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/SketchUpMCP/README.md) |
+| 37 | [`Telemetry`](./L4_Expert/Telemetry) | RAC Telemetry & Distance-based Resampling Analysis | Python Tools & Native Engines | `L4` | [Prompt](./L4_Expert/Telemetry/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/Telemetry/README.md) |
+| 38 | [`UnifiedInputManager`](./L4_Expert/UnifiedInputManager) | Unified Controller Input Manager | Python Tools & Native Engines | `L4` | [Prompt](./L4_Expert/UnifiedInputManager/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/UnifiedInputManager/README.md) |
+| 39 | [`osuMania`](./L4_Expert/osuMania) | osu!mania Python OpenGL High-Perf Video Renderer | Python Tools & Native Engines | `L4` | [Prompt](./L4_Expert/osuMania/PROJECT_PROMPT.md) \| [Rubric](./L4_Expert/osuMania/README.md) |
+| 40 | [`ArchPhotoreal`](./Image/ArchPhotoreal) | Architecture Photorealization | Image Generation & Editing | `Image` | [Prompt](./Image/ArchPhotoreal/PROJECT_PROMPT.md) \| [Rubric](./Image/ArchPhotoreal/README.md) |
+| 41 | [`StandardBooks3D`](./Image/StandardBooks3D) | National-Standard Books 3D Product Render | Image Generation & Editing | `Image` | [Prompt](./Image/StandardBooks3D/PROJECT_PROMPT.md) \| [Rubric](./Image/StandardBooks3D/README.md) |
+| 42 | [`ConstructivistPoster`](./Image/ConstructivistPoster) | Constructivist Promo Poster | Image Generation & Editing | `Image` | [Prompt](./Image/ConstructivistPoster/PROJECT_PROMPT.md) \| [Rubric](./Image/ConstructivistPoster/README.md) |
+| 43 | [`WindowGlitchPoster`](./Image/WindowGlitchPoster) | Window-Overlay Glitch Poster | Image Generation & Editing | `Image` | [Prompt](./Image/WindowGlitchPoster/PROJECT_PROMPT.md) \| [Rubric](./Image/WindowGlitchPoster/README.md) |
+| 44 | [`GovTechPPT`](./Image/GovTechPPT) | Government/Tech PPT Poster | Image Generation & Editing | `Image` | [Prompt](./Image/GovTechPPT/PROJECT_PROMPT.md) \| [Rubric](./Image/GovTechPPT/README.md) |
+| 45 | [`TextbookPeachBlossom`](./Image/TextbookPeachBlossom) | Peach Blossom Spring Textbook Spread | Image Generation & Editing | `Image` | [Prompt](./Image/TextbookPeachBlossom/PROJECT_PROMPT.md) \| [Rubric](./Image/TextbookPeachBlossom/README.md) |
 
 > See **[Image/README.md](./Image/README.md)** for the image partition overview.
 
@@ -119,7 +120,8 @@ Targeting state machine implementation, Canvas 2D games, UI animations, and phys
 
 Targeting WebGL/Three.js engines, custom GLSL shaders, rigid body dynamics, and PBR environments.
 
-- [`Bicycle3D`](./L3_Advanced/Bicycle3D): Parametric 3D bicycle studio & mechanical drivetrain
+- [`Bicycle3D`](./L3_Advanced/Bicycle3D): Parametric 3D bicycle studio & assembly simulator
+- [`BicycleDrivetrain`](./L3_Advanced/BicycleDrivetrain): Low-poly dynamic bicycle drivetrain display stand
 - [`EscapeFromDuckov`](./L3_Advanced/EscapeFromDuckov): Escape from Duckov game mechanics & fog shaders ⚠️ Planned, prompt to be published
 - [`FPV`](./L3_Advanced/FPV): FPV drone freestyle 3D simulator with SO(3) attitude integration & VTX noise shader
 - [`IndustrialDigitalTwin`](./L3_Advanced/IndustrialDigitalTwin): Industrial digital twin equipment monitoring & raycasting
