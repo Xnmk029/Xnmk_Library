@@ -2,7 +2,7 @@
 
 > 本文件是 `sandbox/` 工作区的**唯一 agent 入口协议**。  
 > 编排 agent、审阅 agent、临时工 agent 进入 `sandbox/` 后必须先读本文件。  
-> 自动适配：本协议依赖仓库既有文档约定，不硬编码单个题目的业务细节。
+> 机读摘要见 `sandbox/protocol.json`；自动适配：本协议依赖仓库既有文档约定，不硬编码单个题目的业务细节。
 
 ---
 
@@ -14,10 +14,16 @@
 | **受测模型** | 单个 `sandbox/runs/<model>/<run>/` | 仅该 run 内 `TASK.md`、`PROJECT_PROMPT.md` 及自建文件 | 仅该 run 目录 |
 | **审阅 Agent** | 单个 run 目录（只读题面+交付物） | 该 run 的 `PROJECT_PROMPT.md`、交付物、`meta.json`、`result.json` | 该 run 的 `REVIEW.md`、`meta.json` |
 
+**所有角色共享一条工具纪律**（违反视为接入不标准）：
+
+- 不得在 `sandbox/` 或任何 run 目录内创建 agent/IDE 工具状态：`.codeartsdoer`、`.arts`、`.cursor`、`.claude`、`.devin`、`.windsurf`、`.trae`、`.codebase` 索引、MCP/skills/rule 配置等。
+- 工具需要配置时写到**仓库根**或系统级目录；run 目录不是你的工作区根，`sandbox/` 也不是。
+- `sandbox/review-lab/` 是离线对照展示子系统，**与流水线解耦**；其 `reference-assets/`（SOTA 参考实现）对受测与审阅同样禁读。
+
 **审阅 Agent 禁止**（防止口径泄漏与串题）：
 
 - 读取项目 `README.md` 的「自动化验收建议 / 评分标准」（留给隔离的运行时验收会话）
-- 读取其他 run、`L*/*/模型名/` 历史输出、`暂存/`、`Vision/`、`.git`
+- 读取其他 run、`L*/*/模型名/` 历史输出、`暂存/`、`Vision/`、`review-lab/reference-assets/`、`.git`
 - 修改 `PROJECT_PROMPT.md` 或模型交付物本体
 
 ---
@@ -83,6 +89,12 @@ python sandbox/scripts/review_run.py --model <slug> --latest
 
 脚本产出 `REVIEW.md` 与 `meta.verdict`（`PASS` / `PASS_WITH_WARNINGS` / `FAIL` / `INVALID`）。
 
+机器层硬性规则（勿靠人工兜底）：
+
+- `integrity` 缺失或自报违规 → **INVALID**（I 字头检查 FAIL）。
+- `result.deliverable` 自报的文件不存在 → **FAIL**（D7）。
+- run 内出现禁入项（`.git` / `Vision` / `暂存` / 其他模型产物 / agent 工具状态目录）→ **FAIL**（L1）；其他子目录或点文件 → WARN（L2/L3）。
+
 ### 4.2 智能层（脚本无法覆盖时，可选增强）
 
 在**不读 rubric、不读其他模型**的前提下，审阅 Agent 可：
@@ -104,9 +116,10 @@ python sandbox/scripts/review_run.py --model <slug> --latest
 ## 5. 收卷 Agent 规则
 
 1. `collect_run.py` 校验题面 SHA 与正式树一致。  
-2. 默认只拷交付物 + `result.json` + `log.md`；`MIGRATION.md` 自动写入。  
-3. 已存在同名文件时默认改名 `~1`；仅在明确要求时 `--overwrite`。  
-4. 正式树子目录名 = `meta.model`（与历史 slug 风格一致：小写、连字符）。
+2. **verdict 闸门由脚本强制**：仅 `PASS` / `PASS_WITH_WARNINGS` 收卷；`FAIL` / `INVALID` / 未审阅一律拒绝（退出码 3）。人工确需强收时显式 `--force`，会写进 `MIGRATION.md` 留痕。  
+3. 默认只拷交付物 + `result.json` + `log.md`；`MIGRATION.md` 自动写入。  
+4. 已存在同名文件时默认改名 `~1`；仅在明确要求时 `--overwrite`。  
+5. 正式树子目录名 = `meta.model`（与历史 slug 风格一致：小写、连字符）。
 
 ---
 
@@ -114,9 +127,12 @@ python sandbox/scripts/review_run.py --model <slug> --latest
 
 | 情形 | 处理 |
 |---|---|
-| `integrity` 自报窥题 / 外援 | verdict=`INVALID`，不收卷 |
+| `integrity` 自报窥题 / 外援 / 字段缺失 | verdict=`INVALID`，不收卷 |
+| `result.deliverable` 自报文件不在位 | D7 FAIL；补齐或作废 |
+| run 内混入禁入项 / 工具状态目录 | L1 FAIL；污染目录作废，重开新 run |
 | 题面 SHA 与正式树不一致 | collect 拒绝入库 |
 | run 缺交付物 | D0 FAIL；重跑新 run，不复用污染目录 |
+| 未审阅即收卷 | collect 拒绝（verdict 闸门） |
 | 疑似读了 README 评分细项 | 人工标记；新 run 重测 |
 
 ---
@@ -125,8 +141,9 @@ python sandbox/scripts/review_run.py --model <slug> --latest
 
 - **运行时验收**（读 README 自动化建议）：保持**另一个** agent 角色与提示词，工作副本可从 run 目录复制到临时目录，**不要**放宽本审阅协议。  
 - **更强隔离**：把 `sandbox/runs` 指到仓库外磁盘路径。  
-- **多题联考**：循环 `prepare_run`；模型 slug 相同、run_id 不同；仍禁止共享目录。  
-- **与 Vision 对齐**：判分/审计继续用 `Vision/scripts/`；sandbox 只负责 L1–L4 / Image 的 HTML·脚本类临时测。
+- **多题联考**：循环 `prepare_run`；模型 slug 相同、run_id 不同（秒级冲突自动追加 `-2` 后缀）；仍禁止共享目录。  
+- **与 Vision 对齐**：判分/审计继续用 `Vision/scripts/`；sandbox 只负责 L1–L4 / Image 的 HTML·脚本类临时测。  
+- **对照展示**：`sandbox/review-lab/` 的构建/验证脚本只服务离线对比页，不进受测链路；新增批次后按 `review-lab/README.md` 重建。
 
 ---
 
@@ -135,8 +152,19 @@ python sandbox/scripts/review_run.py --model <slug> --latest
 ```text
 python sandbox/scripts/prepare_run.py --list
 python sandbox/scripts/prepare_run.py --project <P> --model <M>
-python sandbox/scripts/review_run.py  --model <M> --latest [--strict]
-python sandbox/scripts/collect_run.py --run <dir> [--dry-run] [--with-review] [--overwrite]
+python sandbox/scripts/status.py      [--model <M>] [--pending] [--json]
+python sandbox/scripts/review_run.py  --run <dir> | --model <M> --latest [--strict]
+python sandbox/scripts/collect_run.py --run <dir> [--dry-run] [--with-review] [--overwrite] [--force]
 ```
 
-本协议版本变更时，同步更新 `sandbox/README.md` 与 `Vision/AUTO_SCORING_PLAN.md` 中的纪律对齐说明（若有）。
+---
+
+## 9. 外部 Agent 接入清单（新 agent 进 sandbox 的最低标准）
+
+1. 读本文件（或 `protocol.json`）后再动手；不要凭仓库结构猜测流程。  
+2. 认领一个角色（编排 / 受测 / 审阅 / 收卷），只在该角色的可写范围内操作。  
+3. 工具自检：确认你的 agent/IDE 不会向 `sandbox/` 写入配置或索引目录；会写的话先改到仓库根或系统目录。  
+4. 流水线一律走 `sandbox/scripts/` 的四个命令，不要手工拼 run 目录或绕过审阅收卷。  
+5. 交付契约以 run 内 `TASK.md` 为准（含 `meta.expected_deliverable` 的主交付名）；不要沿用别处的默认文件名。
+
+本协议版本变更时，同步更新 `sandbox/README.md`、`sandbox/protocol.json` 与 `Vision/AUTO_SCORING_PLAN.md` 中的纪律对齐说明（若有）。

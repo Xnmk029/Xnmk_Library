@@ -1,13 +1,17 @@
 # -*- coding: utf-8 -*-
-"""Build sandbox/review.html — quick multi-batch review dashboard (live-test + live-pro)."""
+"""Build sandbox/review-lab/review.html — quick multi-batch review dashboard (live-test + live-pro)."""
 from __future__ import annotations
 
 import json
 import re
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
-OUT = ROOT / "sandbox" / "review.html"
+LAB = Path(__file__).resolve().parent          # sandbox/review-lab
+ROOT = LAB.parents[1]                           # repo root
+OUT = LAB / "review.html"
+REF_ASSETS = LAB / "reference-assets"
+# review.html sits at sandbox/review-lab/ → repo-root-relative links need "../../"
+URL_PREFIX = "../" * len(LAB.relative_to(ROOT).parts)
 
 QUESTIONS = [
     {
@@ -161,7 +165,7 @@ def record(path, question, model, batch, uid, reference=False, source=None):
     exists = path.is_file() and path.stat().st_size > 0
     relative = path.relative_to(ROOT).as_posix()
     return dict(id=uid, slug=question["slug"], model=model, batch=batch, reference=reference,
-        identitySource="用户确认", source=source or relative, path=relative, url="../" + relative,
+        identitySource="用户确认", source=source or relative, path=relative, url=URL_PREFIX + relative,
         file=path.name, bytes=path.stat().st_size if exists else 0,
         content=read_text(path) if exists else "", result=result,
         selfReport=result.get("model_self_report", {}), checks=checks, review=review,
@@ -182,7 +186,7 @@ def build_items():
             items.append(record(ROOT / "暂存" / refs[q["slug"]], q, "astra", "SOTA 参考", "reference/"+q["slug"], True))
     import zipfile
     archive=ROOT / "暂存" / "V4pro0902灰度测试.zip"
-    target=ROOT / "sandbox" / "reference-assets" / "v4-pro-0902"
+    target=REF_ASSETS / "v4-pro-0902"
     # Only production files; no probes, executables or archive path traversal.
     with zipfile.ZipFile(archive) as z:
         for info in z.infolist():
@@ -202,7 +206,7 @@ def build_items():
             files += sorted((target / "sh/src").rglob("*.js")) + [target / "sh/README.md"]
         elif not item["reference"]:
             files += [p for p in sorted(folder.iterdir()) if p.is_file() and p!=primary and p.suffix.lower() in {".md", ".json", ".js", ".css", ".html", ".svg", ".py"}]
-        item["files"]=[dict(name=p.relative_to(folder).as_posix() if p.is_relative_to(folder) else p.relative_to(target / "sh").as_posix(), path=p.relative_to(ROOT).as_posix(), url="../"+p.relative_to(ROOT).as_posix(), content=read_text(p), bytes=p.stat().st_size) for p in files if p.exists()]
+        item["files"]=[dict(name=p.relative_to(folder).as_posix() if p.is_relative_to(folder) else p.relative_to(target / "sh").as_posix(), path=p.relative_to(ROOT).as_posix(), url=URL_PREFIX+p.relative_to(ROOT).as_posix(), content=read_text(p), bytes=p.stat().st_size) for p in files if p.exists()]
     return items
 
 def main():
@@ -211,7 +215,7 @@ def main():
     questions=[dict(q, prompt=read_text(ROOT / project_paths[q["slug"]] / q["slug"] / "PROJECT_PROMPT.md")) for q in QUESTIONS]
     import base64
     vendor={}
-    for lib in sorted((ROOT / "sandbox/reference-assets/vendor").rglob("*.js")):
+    for lib in sorted((REF_ASSETS / "vendor").rglob("*.js")):
         vendor[lib.parent.name+"/"+lib.name]="data:text/javascript;base64,"+base64.b64encode(lib.read_bytes()).decode()
     payload=dict(items=items, questions=questions, original=read_text(ROOT / "暂存/续写网文.md"), vendor=vendor)
     data=json.dumps(payload, ensure_ascii=False).replace("<", "\\u003c")

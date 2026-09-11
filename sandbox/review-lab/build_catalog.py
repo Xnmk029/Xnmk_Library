@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
-"""Build sandbox/index.html (mobile app) from official PROJECT_PROMPT.md files."""
+"""Build sandbox/review-lab/index.html (mobile app) from official PROJECT_PROMPT.md files."""
 from __future__ import annotations
 
 import html
 import json
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
-OUT_HTML = ROOT / "sandbox" / "index.html"
-OUT_JSON = ROOT / "sandbox" / "catalog.json"
+LAB = Path(__file__).resolve().parent          # sandbox/review-lab
+ROOT = LAB.parents[1]                           # repo root
+OUT_HTML = LAB / "index.html"
+OUT_JSON = LAB / "catalog.json"
 
 CATALOG = [
     {

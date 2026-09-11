@@ -20,17 +20,36 @@ TASK_MD = "TASK.md"
 PROMPT_MD = "PROJECT_PROMPT.md"
 REVIEW_MD = "REVIEW.md"
 MANIFEST_NAME = "manifest.json"
+PROTOCOL_VERSION = "1.1"
 
-# Patterns that would indicate the runner (or an accidental copy) leaked neighbors.
+# Entry names that must never appear inside a run dir — their presence means
+# the tested model (or a bad copy) reached outside the isolated workspace.
 FORBIDDEN_DIR_NAMES = {
     ".git", "node_modules", "暂存", "_archives", "FARM100", "Vision",
     "DOMAIN_INDEX.zh.md", "DOMAIN_INDEX.en.md", "session.v2.jsonl",
+}
+
+# Well-known agent/IDE tool state — allowed nowhere inside sandbox/.
+AGENT_STATE_NAMES = {
+    ".arts", ".codeartsdoer", ".cursor", ".claude", ".devin", ".windsurf",
+    ".trae", ".codebase", ".vscode", ".idea",
 }
 
 DELIVERABLE_SKIP = {
     TASK_MD, PROMPT_MD, RUN_META, MANIFEST_NAME, REVIEW_MD,
     "log.md", "result.json", "PLAN.md",
 }
+
+# Extensions treated as candidate deliverables when result.json does not
+# declare one explicitly. result.json's `deliverable` field always wins.
+DELIVERABLE_EXTS = (
+    ".html", ".htm", ".js", ".mjs", ".css", ".user.js",
+    ".py", ".ts", ".tsx", ".jsx", ".svg", ".vue",
+    ".md", ".markdown", ".txt", ".csv", ".json", ".xml", ".yaml", ".yml",
+    ".go", ".rs", ".java", ".c", ".cc", ".cpp", ".h", ".hpp",
+    ".sh", ".ps1", ".rb", ".php", ".swift", ".kt", ".kts", ".lua",
+    ".sql", ".glsl", ".ipynb", ".toml",
+)
 
 
 def now_iso() -> str:
@@ -43,10 +62,6 @@ def ts_slug() -> str:
 
 def sha256_file(p: Path) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()
-
-
-def sha256_text(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
 def load_json(p: Path):
@@ -65,10 +80,12 @@ def load_meta(run_dir: Path) -> dict:
 
 
 def resolve_project_dir(project: str) -> Path:
-    """Accept 'USP', 'L3_Advanced/USP', or an absolute path to a project root."""
-    p = Path(project)
-    if p.is_dir() and (p / PROMPT_MD).is_file():
-        return p.resolve()
+    """Accept 'USP', 'L3_Advanced/USP', or a path to a project root.
+
+    Resolution is cwd-independent: repo-relative paths and bare names are
+    tried before treating the argument as a filesystem path, and any
+    filesystem-path result must live inside the repo root.
+    """
     cand = ROOT / project
     if cand.is_dir() and (cand / PROMPT_MD).is_file():
         return cand.resolve()
@@ -80,10 +97,17 @@ def resolve_project_dir(project: str) -> Path:
             hits.append(d)
     if len(hits) == 1:
         return hits[0].resolve()
-    if not hits:
-        raise FileNotFoundError(f"project not found: {project!r} (need {PROMPT_MD})")
-    names = ", ".join(str(h.relative_to(ROOT)) for h in hits)
-    raise RuntimeError(f"ambiguous project name {project!r}: {names}")
+    if len(hits) > 1:
+        names = ", ".join(str(h.relative_to(ROOT)) for h in hits)
+        raise RuntimeError(f"ambiguous project name {project!r}: {names}")
+    # last resort: filesystem path (cwd-relative or absolute), must be in-repo
+    p = Path(project)
+    if p.is_dir() and (p / PROMPT_MD).is_file():
+        p = p.resolve()
+        if not p.is_relative_to(ROOT):
+            raise RuntimeError(f"project dir outside repo root: {p}")
+        return p
+    raise FileNotFoundError(f"project not found: {project!r} (need {PROMPT_MD})")
 
 
 def project_rel(project_dir: Path) -> str:
@@ -97,12 +121,7 @@ def discover_projects() -> list[dict]:
         base = ROOT / lv
         if not base.is_dir():
             continue
-        if lv == "Image":
-            # Image items are also one level down
-            children = [d for d in base.iterdir() if d.is_dir()]
-        else:
-            children = [d for d in base.iterdir() if d.is_dir()]
-        for d in sorted(children):
+        for d in sorted(x for x in base.iterdir() if x.is_dir()):
             prompt = d / PROMPT_MD
             if prompt.is_file():
                 out.append({
@@ -161,12 +180,20 @@ def discipline_block() -> str:
    - `read_prompt_only`: true（是否只依据 TASK.md / PROJECT_PROMPT.md 作答）
    - `read_other_model_outputs`: false（是否读到其他模型输出）
    - `external_help`: false（是否使用外部代写/外部求解服务）
-6. `PROJECT_PROMPT.md` 为题面原文，禁止修改。"""
+6. `PROJECT_PROMPT.md` 为题面原文，禁止修改。
+7. 禁止在本目录创建 agent/IDE 工具的配置、索引或状态目录（如 `.codeartsdoer`、`.arts`、`.cursor`、`.codebase`）；工具状态一律写在本目录之外。"""
 
 
-def list_deliverables(run_dir: Path) -> list[str]:
-    """Candidate deliverable files in a run dir (exclude protocol files)."""
+def list_deliverables(run_dir: Path, declared: list[str] | None = None) -> list[str]:
+    """Candidate deliverable files in a run dir (exclude protocol files).
+
+    `declared` is the model's self-reported `deliverable` field from
+    result.json (str or list) — declared names are always accepted, whatever
+    their extension. Undeclared files must match DELIVERABLE_EXTS or the
+    `answer.*` convention.
+    """
     protocol = DELIVERABLE_SKIP | {"MIGRATION.md"}
+    declared_l = {str(d).strip().lower() for d in (declared or [])}
     out: list[str] = []
     for p in sorted(run_dir.iterdir()):
         if not p.is_file() or p.name.startswith("."):
@@ -174,19 +201,84 @@ def list_deliverables(run_dir: Path) -> list[str]:
         if p.name in protocol:
             continue
         name_l = p.name.lower()
-        if name_l.endswith((
-            ".html", ".htm", ".js", ".mjs", ".css", ".user.js",
-            ".py", ".ts", ".tsx", ".jsx", ".svg", ".vue",
-        )):
+        if name_l in declared_l or name_l.startswith("answer") or name_l.endswith(DELIVERABLE_EXTS):
             out.append(p.name)
-            continue
-        if name_l in {"result.json", "log.md"}:
-            out.append(p.name)
-            continue
-        if name_l.startswith("answer") and p.suffix.lower() in {".md", ".json", ".txt", ".svg"}:
-            out.append(p.name)
-            continue
     return out
+
+
+# NB: \b does not work next to CJK chars (they are \w in Python re) — use
+# ASCII-only lookarounds so "生成一个index.html" still extracts "index.html".
+_FILENAME_RE = re.compile(
+    r"(?<![A-Za-z0-9_.\-])[A-Za-z0-9_\-]+\."
+    r"(?:html?|svg|md|markdown|txt|py|js|mjs|cjs|ts|tsx|jsx|css|json|csv|xml)"
+    r"(?![A-Za-z0-9_\-])",
+    re.I,
+)
+
+PREFERRED_DELIVERABLES = (
+    "answer.html", "index.html", "answer.svg", "answer.md",
+    "answer.txt", "answer.py", "main.py",
+)
+
+# Library mentions (e.g. "Three.js 通过 CDN 引入") are not deliverable names.
+_LIB_TOKENS = {
+    "three.js", "vue.js", "react.js", "node.js", "deno.js", "d3.js",
+    "chart.js", "jquery.js", "lodash.js", "day.js", "moment.js", "pixi.js",
+    "phaser.js", "tone.js", "anime.js", "gsap.js", "babylon.js", "paper.js",
+    "p5.js", "two.js", "fabric.js", "leaflet.js", "marked.js", "axios.js",
+    "matter.js", "cannon.js", "echarts.js", "express.js", "next.js",
+    "nuxt.js", "ember.js", "backbone.js", "alpine.js", "htmx.js",
+}
+
+
+def extract_deliverable_name(prompt_text: str) -> str | None:
+    """Best-effort: the filename the prompt tells the model to produce.
+
+    Looks for `name.ext` tokens in the prompt; answer.* beats index.* beats
+    first mention. Protocol files and library tokens are never returned.
+    """
+    skip = {n.lower() for n in DELIVERABLE_SKIP} | {"readme.md", "project_prompt.md", "migration.md"}
+    cands = [
+        h for h in _FILENAME_RE.findall(prompt_text)
+        if h.lower() not in skip and h.lower() not in _LIB_TOKENS
+    ]
+    if not cands:
+        return None
+    for pref in ("answer.", "index."):
+        for h in cands:
+            if h.lower().startswith(pref):
+                return h
+    return cands[0]
+
+
+def expected_deliverable(project_dir: Path, prompt_text: str) -> str:
+    """Primary deliverable name for a run: explicit prompt filename, else the
+    dominant name across the project's existing model dirs, else answer.html."""
+    explicit = extract_deliverable_name(prompt_text)
+    if explicit:
+        return explicit
+    skip_l = {n.lower() for n in DELIVERABLE_SKIP} | {"migration.md"}
+    votes: dict[str, int] = {}
+    for d in project_dir.iterdir():
+        if not d.is_dir() or d.name.startswith((".", "_")):
+            continue
+        seen = set()
+        for f in d.iterdir():
+            nl = re.sub(r"~\d+(?=\.)", "", f.name.lower())
+            if f.is_file() and nl not in skip_l and nl.endswith(DELIVERABLE_EXTS):
+                seen.add(nl)
+        for nl in seen:
+            votes[nl] = votes.get(nl, 0) + 1
+    if not votes:
+        return "answer.html"
+    order = {n: i for i, n in enumerate(PREFERRED_DELIVERABLES)}
+    return max(votes, key=lambda n: (votes[n], -order.get(n, 99), n))
+
+
+def safe_fence(text: str) -> str:
+    """A backtick fence longer than any backtick run inside text."""
+    longest = max((len(m.group(0)) for m in re.finditer(r"`+", text)), default=0)
+    return "`" * max(3, longest + 1)
 
 
 def scan_forbidden_imports(text: str) -> list[str]:

@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from pathlib import Path
@@ -20,6 +21,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from sandbox_lib import (
+    AGENT_STATE_NAMES,
+    DELIVERABLE_SKIP,
+    FORBIDDEN_DIR_NAMES,
     PROMPT_MD,
     REVIEW_MD,
     ROOT,
@@ -48,11 +52,15 @@ def find_latest_run(model: str) -> Path:
 
 
 def integrity_check(meta: dict, result: dict | None) -> list[tuple[str, str, str]]:
-    """Return list of (check_id, status, detail). status: PASS|FAIL|WARN|N/A."""
+    """Return list of (check_id, status, detail). status: PASS|FAIL|WARN|N/A.
+
+    A missing/unverifiable integrity block is a hard failure: the protocol
+    cannot confirm the run stayed clean, so the verdict becomes INVALID.
+    """
     rows = []
     integ = (result or {}).get("integrity")
     if not isinstance(integ, dict):
-        rows.append(("I1", "WARN", "result.json 缺少 integrity 字段（无法核实自报）"))
+        rows.append(("I0", "FAIL", "result.json 缺失或无 integrity 字段——无法核实自报，判 INVALID"))
         return rows
     if integ.get("read_prompt_only") is True:
         rows.append(("I1", "PASS", "自报仅依据题面作答"))
@@ -67,6 +75,44 @@ def integrity_check(meta: dict, result: dict | None) -> list[tuple[str, str, str
     else:
         rows.append(("I3", "FAIL", f"external_help={integ.get('external_help')!r}"))
     return rows
+
+
+def leakage_check(run_dir: Path) -> list[tuple[str, str, str]]:
+    """Foreign entries inside the run dir: forbidden names → FAIL, other
+    subdirs/dotfiles → WARN (possible tool-state pollution or copied neighbors)."""
+    rows = []
+    try:
+        entries = list(run_dir.iterdir())
+    except OSError:
+        return rows
+    bad = [e.name for e in entries if e.name in FORBIDDEN_DIR_NAMES or e.name in AGENT_STATE_NAMES]
+    if bad:
+        rows.append(("L1", "FAIL", f"run 内出现禁入项: {', '.join(sorted(bad))}"))
+    dirs = [e.name for e in entries if e.is_dir() and e.name not in FORBIDDEN_DIR_NAMES and e.name not in AGENT_STATE_NAMES]
+    if dirs:
+        rows.append(("L2", "WARN", f"run 内存在子目录: {', '.join(sorted(dirs))}（确认非外部拷贝/工具状态）"))
+    dots = [e.name for e in entries if e.is_file() and e.name.startswith(".")]
+    if dots:
+        rows.append(("L3", "WARN", f"run 内存在点文件: {', '.join(sorted(dots))}（可能为工具状态泄漏）"))
+    return rows
+
+
+def declared_deliverable_check(run_dir: Path, result: dict | None, names: list[str]) -> list[tuple[str, str, str]]:
+    """result.json's declared deliverable must exist on disk."""
+    if not isinstance(result, dict):
+        return []
+    decl = result.get("deliverable")
+    if not decl:
+        return [("D7", "WARN", "result.json 未声明 deliverable 字段")]
+    declared = [decl] if isinstance(decl, str) else list(decl)
+    missing = [d for d in declared if not (run_dir / d).is_file()]
+    if missing:
+        return [("D7", "FAIL", f"自报交付物不存在: {', '.join(map(str, missing))}")]
+    extra = [n for n in names if n.lower() not in {str(d).lower() for d in declared}]
+    detail = f"自报交付物均在位: {', '.join(map(str, declared))}"
+    if extra:
+        detail += f"；另有未声明交付物: {', '.join(extra)}"
+    return [("D7", "PASS", detail)]
 
 
 def static_delivery_checks(run_dir: Path, names: list[str], html_path: Path | None, prompt_text: str) -> list[tuple[str, str, str]]:
@@ -181,13 +227,10 @@ def requirements_trace(req: dict) -> list[str]:
 
 
 def render_review(meta: dict, rows: list[tuple[str, str, str]], notes: list[str], verdict: str) -> str:
-    def status_icon(s: str) -> str:
-        return {"PASS": "PASS", "FAIL": "FAIL", "WARN": "WARN", "N/A": "N/A"}.get(s, s)
-
     table = ["| ID | Status | Detail |", "|---|---|---|"]
     for cid, st, detail in rows:
         detail_esc = detail.replace("|", "\\|")
-        table.append(f"| {cid} | **{status_icon(st)}** | {detail_esc} |")
+        table.append(f"| {cid} | **{st}** | {detail_esc} |")
 
     notes_md = "\n".join(f"- {n}" for n in notes) if notes else "- （无）"
 
@@ -220,7 +263,8 @@ def render_review(meta: dict, rows: list[tuple[str, str, str]], notes: list[str]
 ## 结论说明
 
 - `PASS`：静态检查通过。
-- `FAIL`：存在违反纪律自报或明确红线；`--strict` 时进程退出码非 0。
+- `FAIL`：存在明确红线（缺交付物、自报交付物不在位、run 内混入禁入项等）；`--strict` 时进程退出码非 0。
+- `INVALID`：integrity 自报违规或缺失——无法核实作答来源，作废不收卷。
 - `WARN`：需人工复核，不自动否决。
 - 本报告**不**替代 README「自动化验收建议」中的运行时/视觉验收；那些需要浏览器或专项工具在隔离环境中另测。
 
@@ -248,18 +292,23 @@ def review(run_dir: Path, strict: bool = False) -> int:
     rp = run_dir / "result.json"
     if rp.is_file():
         try:
-            import json
             result = json.loads(rp.read_text(encoding="utf-8"))
         except Exception as e:  # noqa: BLE001
             print(f"WARN: result.json parse failed: {e}", file=sys.stderr)
 
-    names = list_deliverables(run_dir)
+    declared = None
+    if isinstance(result, dict) and result.get("deliverable"):
+        d = result["deliverable"]
+        declared = [d] if isinstance(d, str) else list(d)
+    names = list_deliverables(run_dir, declared=declared)
     html_path = primary_html(run_dir, names)
 
     rows: list[tuple[str, str, str]] = []
     rows.append(("P1", "PASS", f"题面载入 {len(prompt_text)} chars"))
     rows.extend(integrity_check(meta, result))
+    rows.extend(leakage_check(run_dir))
     rows.extend(static_delivery_checks(run_dir, names, html_path, prompt_text))
+    rows.extend(declared_deliverable_check(run_dir, result, names))
 
     if result and isinstance(result, dict):
         status = result.get("status")

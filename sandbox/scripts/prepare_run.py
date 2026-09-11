@@ -7,8 +7,8 @@ Creates sandbox/runs/<model>/<ts>-<project>/ containing ONLY:
   meta.json          run metadata for collect / review / audit
 
 Usage:
+  python sandbox/scripts/prepare_run.py --list
   python sandbox/scripts/prepare_run.py --project USP --model my-model-slug
-  python sandbox/scripts/prepare_run.py --project L3_Advanced/USP --model hy4-prev --list
   python sandbox/scripts/prepare_run.py --project USP --model m1 --dry-run
 """
 from __future__ import annotations
@@ -21,23 +21,26 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from sandbox_lib import (  # noqa: E402
     PROMPT_MD,
+    PROTOCOL_VERSION,
     ROOT,
     RUNS,
     RUN_META,
     TASK_MD,
     discipline_block,
     dump_json,
+    expected_deliverable,
     extract_requirements,
     now_iso,
     project_rel,
     resolve_project_dir,
+    safe_fence,
     sha256_file,
     ts_slug,
     discover_projects,
 )
 
 
-def build_task_md(project: str, rel: str, prompt_text: str, req: dict) -> str:
+def build_task_md(project: str, rel: str, prompt_text: str, req: dict, deliverable: str) -> str:
     req_lines = []
     if req["delivery"]:
         req_lines.append("### 交付要点（从题面提取）")
@@ -52,6 +55,8 @@ def build_task_md(project: str, rel: str, prompt_text: str, req: dict) -> str:
         req_lines += [f"- {x}" for x in req["forbidden"]]
     req_block = "\n".join(req_lines) if req_lines else "（题面未识别到分节要点，以下原文为唯一标准）"
 
+    fence = safe_fence(prompt_text)
+
     return f"""# {project} · 隔离临时测试（sandbox run）
 
 ## 纪律（违反任一条即作废重测）
@@ -62,9 +67,9 @@ def build_task_md(project: str, rel: str, prompt_text: str, req: dict) -> str:
 
 > `PROJECT_PROMPT.md` 与本节提示词同源。**不要修改任何技术约束。**
 
-```markdown
+{fence}markdown
 {prompt_text}
-```
+{fence}
 
 ## 提取的要求摘要（非替代原文）
 
@@ -72,14 +77,14 @@ def build_task_md(project: str, rel: str, prompt_text: str, req: dict) -> str:
 
 ## 作答契约
 
-1. 在本目录生成题面要求的交付物（单文件 HTML 通常命名 `answer.html`）。
+1. 在本目录生成题面要求的交付物；主交付文件：**`{deliverable}`**（以题面原文为准）。
 2. 写入 `result.json`，至少包含：
 
 ```json
 {{
   "task": "{project}",
   "model": "<your-model-slug>",
-  "deliverable": "answer.html",
+  "deliverable": "{deliverable}",
   "status": "complete",
   "integrity": {{
     "read_prompt_only": true,
@@ -91,7 +96,8 @@ def build_task_md(project: str, rel: str, prompt_text: str, req: dict) -> str:
 ```
 
 3. 可选：`log.md` 记录实现与自测（同样不得泄露其他模型内容）。
-4. 工作目录最终尽量只保留：`TASK.md`、`PROJECT_PROMPT.md`、交付物、`result.json`、`log.md`。
+4. 本目录最终只应保留：`TASK.md`、`PROJECT_PROMPT.md`、交付物、`result.json`、`log.md`。
+   不要创建子目录、点文件或 agent 工具配置（.codeartsdoer / .cursor 等）——工具状态一律写在本目录之外。
 
 ## 环境提示
 
@@ -107,24 +113,27 @@ def prepare(project_arg: str, model: str, dry_run: bool = False) -> Path:
     prompt_text = prompt_path.read_text(encoding="utf-8")
     prompt_sha = sha256_file(prompt_path)
     req = extract_requirements(prompt_text)
+    deliverable = expected_deliverable(project_dir, prompt_text)
 
-    run_id = f"{ts_slug()}-{project_dir.name}"
+    base_id = f"{ts_slug()}-{project_dir.name}"
+    run_id, n = base_id, 1
+    while (RUNS / model / run_id).exists():
+        n += 1
+        run_id = f"{base_id}-{n}"
     run_dir = RUNS / model / run_id
 
     if dry_run:
         print(f"[dry-run] would create {run_dir}")
         print(f"  project={rel}")
         print(f"  prompt_sha256={prompt_sha}")
+        print(f"  expected_deliverable={deliverable}")
         print(f"  delivery_lines={len(req['delivery'])} limits={len(req['limits'])}")
         return run_dir
-
-    if run_dir.exists():
-        raise FileExistsError(f"run dir already exists: {run_dir}")
 
     run_dir.mkdir(parents=True, exist_ok=False)
     (run_dir / PROMPT_MD).write_bytes(prompt_path.read_bytes())
     (run_dir / TASK_MD).write_text(
-        build_task_md(project_dir.name, rel, prompt_text, req),
+        build_task_md(project_dir.name, rel, prompt_text, req, deliverable),
         encoding="utf-8",
     )
 
@@ -136,6 +145,8 @@ def prepare(project_arg: str, model: str, dry_run: bool = False) -> Path:
         "created_at": now_iso(),
         "prompt_sha256": prompt_sha,
         "prompt_source": rel + "/" + PROMPT_MD,
+        "expected_deliverable": deliverable,
+        "protocol_version": PROTOCOL_VERSION,
         "isolation": "dir+discipline",
         "review_scope": "project_prompt_only",
         "status": "prepared",
