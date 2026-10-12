@@ -1,9 +1,26 @@
 # -*- coding: utf-8 -*-
-"""Sandbox shared library: paths, discovery, integrity helpers."""
+"""Sandbox shared library: paths, discovery, harness-side observation.
+
+Protocol 2.0 ("bare"): the tested model's workspace is an EMPTY directory
+outside the repo containing only the verbatim task prompt. There is no
+discipline text, no contract, no result.json — isolation and integrity are
+enforced by the environment and observed by the harness, never instructed.
+
+Layout:
+    <RUNS_ROOT>/<model>/<run_id>/      workdir: prompt + model output only
+        PROMPT.md                      verbatim copy of PROJECT_PROMPT.md
+    sandbox/runs/<model>/<run_id>/     harness dir (never shown to model)
+        meta.json                      run metadata
+        snapshot.json                  workdir file hashes at prepare time
+
+RUNS_ROOT defaults to <repo_parent>/bench-runs (F:\\bench-runs here);
+override with env SANDBOX_RUNS_ROOT.
+"""
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,37 +28,36 @@ from pathlib import Path
 # sandbox/scripts/sandbox_lib.py → repo root is parents[2]
 ROOT = Path(__file__).resolve().parents[2]
 SANDBOX = ROOT / "sandbox"
-RUNS = SANDBOX / "runs"
+RUNS = SANDBOX / "runs"                      # harness-side bookkeeping only
 
-LEVEL_DIRS = ("L1_Basic", "L2_Intermediate", "L3_Advanced", "L4_Expert", "Image")
+# Tested-model workspaces live OUTSIDE the repo: nothing else to read there.
+RUNS_ROOT = Path(os.environ.get("SANDBOX_RUNS_ROOT", str(ROOT.parent / "bench-runs")))
+
+LEVEL_DIRS = ("L1_Basic", "L2_Intermediate", "L3_Advanced", "L4_Expert", "Image", "Vision/PairedVision/v1/public", "NativeWorkflowBench")
 
 RUN_META = "meta.json"
-TASK_MD = "TASK.md"
-PROMPT_MD = "PROJECT_PROMPT.md"
+SNAPSHOT = "snapshot.json"
+PROMPT_FILE = "PROMPT.md"                    # name inside the workdir
+PROMPT_MD = "PROJECT_PROMPT.md"              # name in the formal tree
 REVIEW_MD = "REVIEW.md"
-MANIFEST_NAME = "manifest.json"
-PROTOCOL_VERSION = "1.1"
+PROTOCOL_VERSION = "2.0"
 
-# Entry names that must never appear inside a run dir — their presence means
-# the tested model (or a bad copy) reached outside the isolated workspace.
+# Names that must never appear inside a workdir — their presence means the
+# tested model reached outside the isolated workspace and copied things in.
 FORBIDDEN_DIR_NAMES = {
     ".git", "node_modules", "暂存", "_archives", "FARM100", "Vision",
     "DOMAIN_INDEX.zh.md", "DOMAIN_INDEX.en.md", "session.v2.jsonl",
 }
 
-# Well-known agent/IDE tool state — allowed nowhere inside sandbox/.
+# Well-known agent/IDE tool state — pollution signal, WARN not FAIL.
 AGENT_STATE_NAMES = {
     ".arts", ".codeartsdoer", ".cursor", ".claude", ".devin", ".windsurf",
     ".trae", ".codebase", ".vscode", ".idea",
 }
 
-DELIVERABLE_SKIP = {
-    TASK_MD, PROMPT_MD, RUN_META, MANIFEST_NAME, REVIEW_MD,
-    "log.md", "result.json", "PLAN.md",
-}
+DELIVERABLE_SKIP = {PROMPT_FILE, PROMPT_MD, RUN_META, SNAPSHOT, REVIEW_MD}
 
-# Extensions treated as candidate deliverables when result.json does not
-# declare one explicitly. result.json's `deliverable` field always wins.
+# Extensions treated as candidate deliverables found in a workdir.
 DELIVERABLE_EXTS = (
     ".html", ".htm", ".js", ".mjs", ".css", ".user.js",
     ".py", ".ts", ".tsx", ".jsx", ".svg", ".vue",
@@ -49,6 +65,18 @@ DELIVERABLE_EXTS = (
     ".go", ".rs", ".java", ".c", ".cc", ".cpp", ".h", ".hpp",
     ".sh", ".ps1", ".rb", ".php", ".swift", ".kt", ".kts", ".lua",
     ".sql", ".glsl", ".ipynb", ".toml",
+    ".godot", ".gd", ".gdshader", ".gdshaderinc", ".tscn", ".scn", ".tres", ".res", ".cfg", ".uid",
+)
+
+# Transcript tokens that prove the tested session saw the repo. Any hit in a
+# pasted session transcript → H3 FAIL.
+LEAK_TOKENS = (
+    "DOMAIN_INDEX", "session.v2.jsonl", "review-lab", "reference-assets",
+    "sandbox/runs", "sandbox\\runs", "暂存", "_archives", "FARM100",
+    "Vision/", "Vision\\", ".git/",
+)
+LEAK_LEVELS = tuple(lv + "/" for lv in LEVEL_DIRS) + tuple(
+    lv + "\\" for lv in LEVEL_DIRS
 )
 
 
@@ -72,24 +100,33 @@ def dump_json(p: Path, data) -> None:
     p.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def load_meta(run_dir: Path) -> dict:
-    p = run_dir / RUN_META
+def load_meta(harness_dir: Path) -> dict:
+    p = harness_dir / RUN_META
     if not p.is_file():
-        raise FileNotFoundError(f"missing {RUN_META} in {run_dir}")
+        raise FileNotFoundError(f"missing {RUN_META} in {harness_dir}")
     return load_json(p)
 
 
-def resolve_project_dir(project: str) -> Path:
-    """Accept 'USP', 'L3_Advanced/USP', or a path to a project root.
+def workdir_of(meta: dict) -> Path:
+    """The tested-model workspace for a run (outside the repo)."""
+    return Path(meta["workdir"])
 
-    Resolution is cwd-independent: repo-relative paths and bare names are
-    tried before treating the argument as a filesystem path, and any
-    filesystem-path result must live inside the repo root.
-    """
+
+def new_run_id(model: str, project_name: str) -> str:
+    """Unique run id under both the harness tree and the workdir tree."""
+    base_id = f"{ts_slug()}-{project_name}"
+    run_id, n = base_id, 1
+    while (RUNS / model / run_id).exists() or (RUNS_ROOT / model / run_id).exists():
+        n += 1
+        run_id = f"{base_id}-{n}"
+    return run_id
+
+
+def resolve_project_dir(project: str) -> Path:
+    """Accept 'USP', 'L3_Advanced/USP', or a path to a project root."""
     cand = ROOT / project
     if cand.is_dir() and (cand / PROMPT_MD).is_file():
         return cand.resolve()
-    # bare name search (unique match required)
     hits = []
     for lv in LEVEL_DIRS:
         d = ROOT / lv / project
@@ -100,7 +137,6 @@ def resolve_project_dir(project: str) -> Path:
     if len(hits) > 1:
         names = ", ".join(str(h.relative_to(ROOT)) for h in hits)
         raise RuntimeError(f"ambiguous project name {project!r}: {names}")
-    # last resort: filesystem path (cwd-relative or absolute), must be in-repo
     p = Path(project)
     if p.is_dir() and (p / PROMPT_MD).is_file():
         p = p.resolve()
@@ -134,17 +170,17 @@ def discover_projects() -> list[dict]:
 
 
 def extract_requirements(prompt_text: str) -> dict:
-    """Heuristically pull deliverable/constraint lines from PROJECT_PROMPT."""
+    """Heuristically pull deliverable/constraint lines from PROJECT_PROMPT.
+    Reviewer-facing only — never injected into the tested model's view."""
     lines = [ln.strip() for ln in prompt_text.splitlines() if ln.strip()]
     section = None
-    buckets = {"交付": [], "限制": [], "禁用": [], "要求": []}
+    buckets = {"交付": [], "限制": [], "要求": []}
     heading_re = re.compile(r"^#{1,4}\s*(.+)$")
     for ln in lines:
         m = heading_re.match(ln)
         if m:
             title = m.group(1)
             if any(k in title for k in ("交付", "限制", "约束")):
-                # "交付与限制要求" groups both; file under 交付 once
                 section = "交付" if "交付" in title else "限制"
             elif any(k in title for k in ("需求", "要求", "实现")):
                 section = "要求"
@@ -153,7 +189,6 @@ def extract_requirements(prompt_text: str) -> dict:
             continue
         if section and ln.startswith(("-", "•", "*")):
             buckets[section].append(ln.lstrip("-•* ").strip())
-    # global forbidden patterns
     blob = prompt_text
     forbidden = []
     if re.search(r"TODO|未完成占位|占位符", blob):
@@ -170,146 +205,143 @@ def extract_requirements(prompt_text: str) -> dict:
     }
 
 
-def discipline_block() -> str:
-    """Numbered discipline list only (no heading)."""
-    return """1. 你只允许读取本 run 目录内的文件。禁止读取仓库其他任何路径（L1–L4 / Image / Vision / 暂存 / 模型输出目录 / DOMAIN_INDEX* / .git 等）。
-2. 禁止读取其他模型的 answer / log / result / 评分报告；禁止搜索、grep、glob 仓库根目录下的历史答案。
-3. 禁止外部联网拉取参考实现；禁止调用外部模型代写。允许 CDN 引入题面允许的库。
-4. 交付物全部写在本 run 目录。除规定的交付文件与可选 `log.md`、`result.json` 外，不得写入其他路径。
-5. 在 `result.json` 的 `integrity` 字段如实自报：
-   - `read_prompt_only`: true（是否只依据 TASK.md / PROJECT_PROMPT.md 作答）
-   - `read_other_model_outputs`: false（是否读到其他模型输出）
-   - `external_help`: false（是否使用外部代写/外部求解服务）
-6. `PROJECT_PROMPT.md` 为题面原文，禁止修改。
-7. 禁止在本目录创建 agent/IDE 工具的配置、索引或状态目录（如 `.codeartsdoer`、`.arts`、`.cursor`、`.codebase`）；工具状态一律写在本目录之外。"""
+def build_dispatch_text(project: str, workdir: Path) -> str:
+    """The ENTIRE prompt the tested model sees in bare mode: the dispatch
+    line points at the workdir; the task itself is PROMPT.md inside it.
+    No identity framing, no discipline, no contract, no rubric summary."""
+    return (
+        f"工作目录：{workdir}\n"
+        f"任务说明在该目录的 PROMPT.md，产出文件写在同一目录。"
+    )
 
 
-def list_deliverables(run_dir: Path, declared: list[str] | None = None) -> list[str]:
-    """Candidate deliverable files in a run dir (exclude protocol files).
+# --- harness-side observation -------------------------------------------------
 
-    `declared` is the model's self-reported `deliverable` field from
-    result.json (str or list) — declared names are always accepted, whatever
-    their extension. Undeclared files must match DELIVERABLE_EXTS or the
-    `answer.*` convention.
+def snapshot_dir(d: Path) -> dict:
+    """{relpath: {sha256, size}} for every file under d (recursive)."""
+    snap = {}
+    if not d.is_dir():
+        return snap
+    for p in sorted(d.rglob("*")):
+        if p.is_file():
+            rel = p.relative_to(d).as_posix()
+            snap[rel] = {"sha256": sha256_file(p), "size": p.stat().st_size}
+    return snap
+
+
+def diff_snapshot(before: dict, after: dict) -> dict:
+    """added / removed / modified file lists between two snapshots."""
+    b, a = set(before), set(after)
+    modified = [
+        k for k in b & a
+        if before[k]["sha256"] != after[k]["sha256"]
+    ]
+    return {
+        "added": sorted(a - b),
+        "removed": sorted(b - a),
+        "modified": sorted(modified),
+    }
+
+
+def scan_transcript(text: str) -> list[str]:
+    """Scan actual JSONL string values, not MIME data or JSON escape syntax.
+
+    Native image events contain mime=image/png and data-image attachments; these
+    are not the repository's Image/ directory. Decoding also prevents a Python
+    `from PIL import Image` followed by JSON's escaped newline matching Image\\.
+    Keep the original transcript unchanged for hashing and human inspection.
     """
-    protocol = DELIVERABLE_SKIP | {"MIGRATION.md"}
-    declared_l = {str(d).strip().lower() for d in (declared or [])}
+    parts = []
+    def visit(value, key=None):
+        if isinstance(value, dict):
+            for k, v in value.items(): visit(v, k)
+        elif isinstance(value, list):
+            for v in value: visit(v, key)
+        elif isinstance(value, str):
+            if key in {'mime', 'mimeType', 'mime_type', 'media_type'} and re.fullmatch(r'image/[a-zA-Z0-9.+-]+', value):
+                return
+            if re.fullmatch(r'data:image/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+', value):
+                return
+            parts.append(value)
+    for line in text.splitlines():
+        try: visit(json.loads(line))
+        except (ValueError, RecursionError): parts.append(line)
+    hits = []
+    root_l = str(ROOT).lower().rstrip("\\/")
+    tl = '\n'.join(parts).lower()
+    if root_l in tl.replace("/", "\\") or root_l.replace("\\", "/") in tl:
+        hits.append(str(ROOT))
+    for tok in LEAK_TOKENS + LEAK_LEVELS:
+        if tok.lower() in tl:
+            hits.append(tok)
+    return sorted(set(hits))
+
+
+# --- deliverable discovery ----------------------------------------------------
+
+def list_deliverables(workdir: Path) -> list[str]:
+    """Files in the workdir that look like model output: not the prompt, not
+    protocol files, not dotfiles. result.json/log.md count as deliverables
+    if the model happened to write them (no longer required)."""
+    skip_l = {n.lower() for n in DELIVERABLE_SKIP}
     out: list[str] = []
-    for p in sorted(run_dir.iterdir()):
-        if not p.is_file() or p.name.startswith("."):
+    if not workdir.is_dir():
+        return out
+    for p in sorted(workdir.rglob("*")):
+        if not p.is_file():
             continue
-        if p.name in protocol:
+        rel = p.relative_to(workdir).as_posix()
+        if any(part.startswith(".") for part in p.relative_to(workdir).parts):
             continue
-        name_l = p.name.lower()
-        if name_l in declared_l or name_l.startswith("answer") or name_l.endswith(DELIVERABLE_EXTS):
-            out.append(p.name)
+        if p.name.lower() in skip_l:
+            continue
+        if p.suffix.lower() in DELIVERABLE_EXTS or p.name.lower().startswith("answer"):
+            out.append(rel)
     return out
 
 
-# NB: \b does not work next to CJK chars (they are \w in Python re) — use
-# ASCII-only lookarounds so "生成一个index.html" still extracts "index.html".
-_FILENAME_RE = re.compile(
-    r"(?<![A-Za-z0-9_.\-])[A-Za-z0-9_\-]+\."
-    r"(?:html?|svg|md|markdown|txt|py|js|mjs|cjs|ts|tsx|jsx|css|json|csv|xml)"
-    r"(?![A-Za-z0-9_\-])",
-    re.I,
-)
-
-PREFERRED_DELIVERABLES = (
-    "answer.html", "index.html", "answer.svg", "answer.md",
-    "answer.txt", "answer.py", "main.py",
-)
-
-# Library mentions (e.g. "Three.js 通过 CDN 引入") are not deliverable names.
-_LIB_TOKENS = {
-    "three.js", "vue.js", "react.js", "node.js", "deno.js", "d3.js",
-    "chart.js", "jquery.js", "lodash.js", "day.js", "moment.js", "pixi.js",
-    "phaser.js", "tone.js", "anime.js", "gsap.js", "babylon.js", "paper.js",
-    "p5.js", "two.js", "fabric.js", "leaflet.js", "marked.js", "axios.js",
-    "matter.js", "cannon.js", "echarts.js", "express.js", "next.js",
-    "nuxt.js", "ember.js", "backbone.js", "alpine.js", "htmx.js",
-}
-
-
-def extract_deliverable_name(prompt_text: str) -> str | None:
-    """Best-effort: the filename the prompt tells the model to produce.
-
-    Looks for `name.ext` tokens in the prompt; answer.* beats index.* beats
-    first mention. Protocol files and library tokens are never returned.
-    """
-    skip = {n.lower() for n in DELIVERABLE_SKIP} | {"readme.md", "project_prompt.md", "migration.md"}
-    cands = [
-        h for h in _FILENAME_RE.findall(prompt_text)
-        if h.lower() not in skip and h.lower() not in _LIB_TOKENS
-    ]
-    if not cands:
-        return None
-    for pref in ("answer.", "index."):
-        for h in cands:
-            if h.lower().startswith(pref):
-                return h
-    return cands[0]
-
-
-def expected_deliverable(project_dir: Path, prompt_text: str) -> str:
-    """Primary deliverable name for a run: explicit prompt filename, else the
-    dominant name across the project's existing model dirs, else answer.html."""
-    explicit = extract_deliverable_name(prompt_text)
-    if explicit:
-        return explicit
-    skip_l = {n.lower() for n in DELIVERABLE_SKIP} | {"migration.md"}
-    votes: dict[str, int] = {}
-    for d in project_dir.iterdir():
-        if not d.is_dir() or d.name.startswith((".", "_")):
-            continue
-        seen = set()
-        for f in d.iterdir():
-            nl = re.sub(r"~\d+(?=\.)", "", f.name.lower())
-            if f.is_file() and nl not in skip_l and nl.endswith(DELIVERABLE_EXTS):
-                seen.add(nl)
-        for nl in seen:
-            votes[nl] = votes.get(nl, 0) + 1
-    if not votes:
+def normalize_deliverable(name: str) -> str:
+    """Collect-time renaming: a lone primary deliverable becomes answer.<ext>;
+    anything else keeps its name."""
+    ext = Path(name).suffix.lower()
+    if ext in (".html", ".htm"):
         return "answer.html"
-    order = {n: i for i, n in enumerate(PREFERRED_DELIVERABLES)}
-    return max(votes, key=lambda n: (votes[n], -order.get(n, 99), n))
-
-
-def safe_fence(text: str) -> str:
-    """A backtick fence longer than any backtick run inside text."""
-    longest = max((len(m.group(0)) for m in re.finditer(r"`+", text)), default=0)
-    return "`" * max(3, longest + 1)
+    if ext == ".svg":
+        return "answer.svg"
+    if ext in (".md", ".markdown"):
+        return "answer.md"
+    if ext == ".py":
+        return "answer.py"
+    if ext == ".txt":
+        return "answer.txt"
+    return Path(name).name
 
 
 def scan_forbidden_imports(text: str) -> list[str]:
-    """Static signals of leakage or placeholders inside HTML/JS deliverables."""
+    """Static signals of leakage or placeholders inside deliverables."""
     problems = []
     if re.search(r"TODO(?!\w)|FIXME|XXX\b|未实现|占位符", text, re.I):
         problems.append("placeholder_tokens")
-    # relative escapes
     if re.search(r"(\.\./)+|file:///", text):
-        # may be legit in comments; flag lightly
         problems.append("possible_path_escape")
     return problems
 
 
-def primary_html(run_dir: Path, names: list[str]) -> Path | None:
-    """Pick the main HTML deliverable."""
+def primary_html(workdir: Path, names: list[str]) -> Path | None:
     htmls = [n for n in names if n.lower().endswith((".html", ".htm"))]
     if not htmls:
         return None
     for pref in ("answer.html", "index.html", "demo.html", "main.html"):
         if pref in htmls:
-            return run_dir / pref
-    # largest html as primary
-    return run_dir / max(htmls, key=lambda n: (run_dir / n).stat().st_size)
+            return workdir / pref
+    return workdir / max(htmls, key=lambda n: (workdir / n).stat().st_size)
 
 
-def primary_svg(run_dir: Path, names: list[str]) -> Path | None:
+def primary_svg(workdir: Path, names: list[str]) -> Path | None:
     svgs = [n for n in names if n.lower().endswith(".svg")]
     if not svgs:
         return None
     for pref in ("answer.svg", "index.svg", "main.svg"):
         if pref in svgs:
-            return run_dir / pref
-    return run_dir / max(svgs, key=lambda n: (run_dir / n).stat().st_size)
+            return workdir / pref
+    return workdir / max(svgs, key=lambda n: (workdir / n).stat().st_size)

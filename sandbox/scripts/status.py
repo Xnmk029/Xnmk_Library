@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """Overview of sandbox runs for orchestration agents.
 
-Scans sandbox/runs/<model>/<run_id>/meta.json and prints a table
-(newest first). Useful before/after batch dispatch.
+Scans sandbox/runs/<model>/<run_id>/meta.json (harness side) and prints a
+table, newest first. Protocol-1.x runs are shown as [deprecated].
 
 Usage:
   python sandbox/scripts/status.py                 # all runs
@@ -38,13 +38,21 @@ def scan_runs(model: str | None = None) -> list[dict]:
                 m = load_json(meta_p)
             except (ValueError, OSError):
                 m = {}
+            proto = m.get("protocol_version", "1.1")
             rows.append({
                 "model": m.get("model", base.name),
                 "run_id": m.get("run_id", run.name),
                 "project": m.get("project_rel") or m.get("project", "?"),
+                "protocol": proto,
+                "mode": m.get("mode", "dir+discipline"),
+                "deprecated": proto != "2.0",
                 "status": m.get("status", "?"),
                 "verdict": m.get("verdict", "-"),
-                "expected_deliverable": m.get("expected_deliverable", "-"),
+                "profile": m.get("profile"),
+                "runtime_validation": m.get("runtime_validation"),
+                "visual_review": m.get("visual_review"),
+                "isolation_verification": m.get("isolation_verification", "unverified"),
+                "workdir": m.get("workdir", run.as_posix()),
                 "created_at": m.get("created_at", "-"),
                 "run_dir": run.as_posix(),
             })
@@ -61,7 +69,7 @@ def main(argv: list[str] | None = None) -> int:
 
     rows = scan_runs(args.model)
     if args.pending:
-        rows = [r for r in rows if r["status"] != "reviewed"]
+        rows = [r for r in rows if r["status"] == "prepared"]
 
     if args.json:
         print(json.dumps(rows, ensure_ascii=False, indent=2))
@@ -70,10 +78,11 @@ def main(argv: list[str] | None = None) -> int:
     if not rows:
         print("(no runs)", file=sys.stderr)
         return 0
-    head = ("MODEL", "RUN_ID", "PROJECT", "STATUS", "VERDICT", "DELIVERABLE", "CREATED")
+    head = ("MODEL", "RUN_ID", "PROJECT", "MODE", "STATUS", "VERDICT", "CREATED")
     data = [head] + [
-        (r["model"], r["run_id"], r["project"], r["status"], r["verdict"],
-         r["expected_deliverable"], r["created_at"][:19])
+        (r["model"],
+         r["run_id"] + (" [deprecated]" if r["deprecated"] else ""),
+         r["project"], r["mode"], r["status"], r["verdict"], r["created_at"][:19])
         for r in rows
     ]
     w = [max(len(str(row[i])) for row in data) for i in range(len(head))]

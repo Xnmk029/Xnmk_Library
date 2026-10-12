@@ -1,10 +1,15 @@
 # -*- coding: utf-8 -*-
-"""Prepare an isolated sandbox run for a formal benchmark project.
+"""Prepare an isolated sandbox run — protocol 2.0 "bare" mode.
 
-Creates sandbox/runs/<model>/<ts>-<project>/ containing ONLY:
-  TASK.md            discipline + verbatim PROJECT_PROMPT + answer contract
-  PROJECT_PROMPT.md  byte-identical copy of the source prompt (do not edit)
-  meta.json          run metadata for collect / review / audit
+Creates two trees:
+  workdir   <RUNS_ROOT>/<model>/<run_id>/       tested model sees ONLY this
+      PROMPT.md                                   verbatim PROJECT_PROMPT copy
+  harness   sandbox/runs/<model>/<run_id>/      orchestrator/reviewer only
+      meta.json                                   run metadata (incl. workdir)
+      snapshot.json                               workdir hashes at prepare
+
+The tested model gets no discipline text, no contract, no rubric summary,
+no result.json requirement — just the prompt and a one-line dispatch note.
 
 Usage:
   python sandbox/scripts/prepare_run.py --list
@@ -20,122 +25,75 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from sandbox_lib import (  # noqa: E402
+    PROMPT_FILE,
     PROMPT_MD,
     PROTOCOL_VERSION,
     ROOT,
-    RUNS,
     RUN_META,
-    TASK_MD,
-    discipline_block,
+    RUNS,
+    RUNS_ROOT,
+    SNAPSHOT,
+    build_dispatch_text,
+    discover_projects,
     dump_json,
-    expected_deliverable,
     extract_requirements,
+    new_run_id,
     now_iso,
     project_rel,
     resolve_project_dir,
-    safe_fence,
     sha256_file,
-    ts_slug,
-    discover_projects,
+    snapshot_dir,
 )
 
 
-def build_task_md(project: str, rel: str, prompt_text: str, req: dict, deliverable: str) -> str:
-    req_lines = []
-    if req["delivery"]:
-        req_lines.append("### 交付要点（从题面提取）")
-        req_lines += [f"- {x}" for x in req["delivery"]]
-    if req["limits"]:
-        req_lines.append("")
-        req_lines.append("### 限制要点（从题面提取）")
-        req_lines += [f"- {x}" for x in req["limits"]]
-    if req["forbidden"]:
-        req_lines.append("")
-        req_lines.append("### 静态红线（自动推断）")
-        req_lines += [f"- {x}" for x in req["forbidden"]]
-    req_block = "\n".join(req_lines) if req_lines else "（题面未识别到分节要点，以下原文为唯一标准）"
-
-    fence = safe_fence(prompt_text)
-
-    return f"""# {project} · 隔离临时测试（sandbox run）
-
-## 纪律（违反任一条即作废重测）
-
-{discipline_block()}
-
-## 试题提示词（原文，唯一标准）
-
-> `PROJECT_PROMPT.md` 与本节提示词同源。**不要修改任何技术约束。**
-
-{fence}markdown
-{prompt_text}
-{fence}
-
-## 提取的要求摘要（非替代原文）
-
-{req_block}
-
-## 作答契约
-
-1. 在本目录生成题面要求的交付物；主交付文件：**`{deliverable}`**（以题面原文为准）。
-2. 写入 `result.json`，至少包含：
-
-```json
-{{
-  "task": "{project}",
-  "model": "<your-model-slug>",
-  "deliverable": "{deliverable}",
-  "status": "complete",
-  "integrity": {{
-    "read_prompt_only": true,
-    "read_other_model_outputs": false,
-    "external_help": false
-  }},
-  "notes": "可选：实现要点与自验说明"
-}}
-```
-
-3. 可选：`log.md` 记录实现与自测（同样不得泄露其他模型内容）。
-4. 本目录最终只应保留：`TASK.md`、`PROJECT_PROMPT.md`、交付物、`result.json`、`log.md`。
-   不要创建子目录、点文件或 agent 工具配置（.codeartsdoer / .cursor 等）——工具状态一律写在本目录之外。
-
-## 环境提示
-
-- 运行目录：本文件所在目录。你是受测模型；不要尝试 `cd ..` 或读取上级目录。
-- 若需本地起服务预览，请在本目录内进行，产物仍以文件交付为准。
-"""
-
-
-def prepare(project_arg: str, model: str, dry_run: bool = False) -> Path:
+def prepare(project_arg: str, model: str, dry_run: bool = False) -> dict:
+    from vision_profile import safe_slug, no_links, payload, stage
+    safe_slug(model)
     project_dir = resolve_project_dir(project_arg)
+    profile = payload(project_dir)
+    if not profile:
+        from godot_profile import payload as godot_payload
+        profile = godot_payload(project_dir)
     rel = project_rel(project_dir)
     prompt_path = project_dir / PROMPT_MD
-    prompt_text = prompt_path.read_text(encoding="utf-8")
     prompt_sha = sha256_file(prompt_path)
-    req = extract_requirements(prompt_text)
-    deliverable = expected_deliverable(project_dir, prompt_text)
+    req = extract_requirements(prompt_path.read_text(encoding="utf-8"))
 
-    base_id = f"{ts_slug()}-{project_dir.name}"
-    run_id, n = base_id, 1
-    while (RUNS / model / run_id).exists():
-        n += 1
-        run_id = f"{base_id}-{n}"
-    run_dir = RUNS / model / run_id
+    run_id = new_run_id(model, project_dir.name)
+    workdir = RUNS_ROOT / model / run_id
+    harness = RUNS / model / run_id
+    no_links(workdir)
+    no_links(harness)
+    if workdir.resolve().is_relative_to(ROOT.resolve()):
+        raise RuntimeError("workdir must be outside repository")
+
+    info = {
+        "run_id": run_id,
+        "model": model,
+        "project": project_dir.name,
+        "project_rel": rel,
+        "workdir": str(workdir),
+        "harness": str(harness),
+        "prompt_sha256": prompt_sha,
+        "n_delivery_lines": len(req["delivery"]),
+        "n_limit_lines": len(req["limits"]),
+    }
 
     if dry_run:
-        print(f"[dry-run] would create {run_dir}")
-        print(f"  project={rel}")
-        print(f"  prompt_sha256={prompt_sha}")
-        print(f"  expected_deliverable={deliverable}")
-        print(f"  delivery_lines={len(req['delivery'])} limits={len(req['limits'])}")
-        return run_dir
+        print(f"[dry-run] would create")
+        print(f"  workdir : {workdir}")
+        print(f"  harness : {harness}")
+        for k, v in info.items():
+            if k not in ("workdir", "harness"):
+                print(f"  {k}={v}")
+        return info
 
-    run_dir.mkdir(parents=True, exist_ok=False)
-    (run_dir / PROMPT_MD).write_bytes(prompt_path.read_bytes())
-    (run_dir / TASK_MD).write_text(
-        build_task_md(project_dir.name, rel, prompt_text, req, deliverable),
-        encoding="utf-8",
-    )
+    workdir.mkdir(parents=True, exist_ok=False)
+    harness.mkdir(parents=True, exist_ok=False)
+
+    (workdir / PROMPT_FILE).write_bytes(prompt_path.read_bytes())
+    if profile and profile.get("profile") == "bare-vision-v1":
+        stage(project_dir, workdir, profile)
 
     meta = {
         "run_id": run_id,
@@ -145,25 +103,33 @@ def prepare(project_arg: str, model: str, dry_run: bool = False) -> Path:
         "created_at": now_iso(),
         "prompt_sha256": prompt_sha,
         "prompt_source": rel + "/" + PROMPT_MD,
-        "expected_deliverable": deliverable,
         "protocol_version": PROTOCOL_VERSION,
-        "isolation": "dir+discipline",
+        "mode": "bare",
+        "isolation": "external-empty-dir+observation",
+        "workdir": str(workdir),
         "review_scope": "project_prompt_only",
         "status": "prepared",
     }
-    dump_json(run_dir / RUN_META, meta)
+    if profile:
+        meta.update(profile)
+    dump_json(harness / RUN_META, meta)
+    dump_json(harness / SNAPSHOT, snapshot_dir(workdir))
 
-    print(f"prepared: {run_dir.relative_to(ROOT).as_posix()}")
-    print(f"  project: {rel}")
-    print(f"  prompt_sha256: {prompt_sha[:16]}…")
-    print(f"  next: open the run dir as the model workspace, deliver files, then review_run.py")
-    return run_dir
+    print(f"prepared(bare): {run_id}")
+    print(f"  workdir : {workdir}   ← 受测模型的工作区（题面及已登记的输入文件）")
+    print(f"  harness : {harness.relative_to(ROOT).as_posix()}")
+    print(f"  dispatch prompt ↓")
+    print("  " + "-" * 56)
+    for line in build_dispatch_text(project_dir.name, workdir).splitlines():
+        print("  " + line)
+    print("  " + "-" * 56)
+    return {"meta": meta, "dispatch_text": build_dispatch_text(project_dir.name, workdir)}
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Prepare isolated sandbox run")
+    ap = argparse.ArgumentParser(description="Prepare isolated sandbox run (bare mode)")
     ap.add_argument("--project", help="Project name or path, e.g. USP or L3_Advanced/USP")
-    ap.add_argument("--model", help="Model slug (sandbox runs/<model>/...)")
+    ap.add_argument("--model", default="anon", help="Model slug (runs root <model>/<run_id>, default: anon)")
     ap.add_argument("--list", action="store_true", help="List all discoverable projects")
     ap.add_argument("--dry-run", action="store_true", help="Validate and print without writing")
     args = ap.parse_args(argv)
@@ -175,8 +141,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"# {len(rows)} projects", file=sys.stderr)
         return 0
 
-    if not args.project or not args.model:
-        ap.error("--project and --model are required (or use --list)")
+    if not args.project:
+        ap.error("--project is required (or use --list)")
 
     try:
         prepare(args.project, args.model, dry_run=args.dry_run)

@@ -1,170 +1,171 @@
-# sandbox/AGENTS.md — 隔离测试与自动审阅 Agent 协议
+# sandbox/AGENTS.md — 隔离测试与自动审阅 Agent 协议（2.0 · bare）
 
-> 本文件是 `sandbox/` 工作区的**唯一 agent 入口协议**。  
-> 编排 agent、审阅 agent、临时工 agent 进入 `sandbox/` 后必须先读本文件。  
-> 机读摘要见 `sandbox/protocol.json`；自动适配：本协议依赖仓库既有文档约定，不硬编码单个题目的业务细节。
+> 本文件是 `sandbox/` 工作区的**唯一 agent 入口协议**。
+> 编排 agent、审阅 agent 进入 `sandbox/` 后必须先读本文件。
+> 机读摘要见 `sandbox/protocol.json`。
 
----
+## 0. 设计原则（2.0 核心变化）
 
-## 0. 角色与边界
+**受测方只看到题面原文。** 1.x 的「纪律七条 / 作答契约 / result.json 自报 / 要求摘要」
+全部移除——它们会污染测量（告知模型"你在被考试"、替模型预消化 rubric、把历史
+交付文件名写进提示）。2.0 的隔离与诚信完全由**环境强制 + harness 观测**实现：
+
+- **环境**：受测工作区在仓库外（默认 `F:\bench-runs\<model>\<run_id>`，可用
+  `SANDBOX_RUNS_ROOT` 覆盖），普通项目只含 `PROMPT.md`；登记的输入 profile 可额外携带白名单资产。
+  外部 cwd 只减少就地泄漏，不是访问控制；真正的读取/写入边界必须由宿主权限或容器落实，不能据此声称全盘权限 Agent 已隔离。
+- **观测**：`meta.json` + `snapshot.json` 存 harness 侧
+  `sandbox/runs/<model>/<run_id>/`（受测方不可见）。审阅时做快照 diff 与
+  可选 transcript 扫描（H1–H3），替代自报 integrity。
+
+## 1. 角色与边界
 
 | 角色 | 工作目录 | 可读 | 可写 |
 |---|---|---|---|
-| **编排 Agent** | 仓库根 / sandbox | 全仓库（题面、README、脚本） | 仅 `sandbox/runs/**`、本协议允许的文档 |
-| **受测模型** | 单个 `sandbox/runs/<model>/<run>/` | 仅该 run 内 `TASK.md`、`PROJECT_PROMPT.md` 及自建文件 | 仅该 run 目录 |
-| **审阅 Agent** | 单个 run 目录（只读题面+交付物） | 该 run 的 `PROJECT_PROMPT.md`、交付物、`meta.json`、`result.json` | 该 run 的 `REVIEW.md`、`meta.json` |
+| **编排 Agent** | 仓库根 | 全仓库 | `sandbox/runs/**`（harness）、prepare 时的 workdir |
+| **受测模型** | 仓库外 workdir | 仅 workdir 内文件 | 仅 workdir —— **无协议义务**（纪律不写在提示里，由环境保证） |
+| **审阅 Agent** | harness dir + workdir（只读） | 题面 + 交付物 + meta/snapshot | `REVIEW.md`、`meta.json`（harness dir） |
 
-**所有角色共享一条工具纪律**（违反视为接入不标准）：
+**工具纪律**（编排与审阅共享）：不得在 `sandbox/`、workdir 或任何 run 目录内创建
+agent/IDE 工具状态（`.codeartsdoer`、`.arts`、`.cursor`、`.devin`、`.codebase` 索引等）。
+`review-lab/reference-assets/` 对受测与审阅同样禁读。
 
-- 不得在 `sandbox/` 或任何 run 目录内创建 agent/IDE 工具状态：`.codeartsdoer`、`.arts`、`.cursor`、`.claude`、`.devin`、`.windsurf`、`.trae`、`.codebase` 索引、MCP/skills/rule 配置等。
-- 工具需要配置时写到**仓库根**或系统级目录；run 目录不是你的工作区根，`sandbox/` 也不是。
-- `sandbox/review-lab/` 是离线对照展示子系统，**与流水线解耦**；其 `reference-assets/`（SOTA 参考实现）对受测与审阅同样禁读。
-
-**审阅 Agent 禁止**（防止口径泄漏与串题）：
-
-- 读取项目 `README.md` 的「自动化验收建议 / 评分标准」（留给隔离的运行时验收会话）
-- 读取其他 run、`L*/*/模型名/` 历史输出、`暂存/`、`Vision/`、`review-lab/reference-assets/`、`.git`
-- 修改 `PROJECT_PROMPT.md` 或模型交付物本体
-
----
-
-## 1. 文档自动适配规则
-
-进入任意具体题目前，按下列顺序**机械发现**上下文，不要假设题目名：
-
-1. **题面**：`<project>/PROJECT_PROMPT.md` — 唯一标准；受测与审阅都以它为准。
-2. **项目元数据**：`<project>/README.md` 的「分类元数据 / 输出要求」— **仅编排 Agent** 可读，用于写 run 时的可选备注；不得注入受测 `TASK.md` 的评分细节。
-3. **全景索引**：根 `README.md` 表格 / `DOMAIN_INDEX.zh.md` — 仅编排 Agent 用来发现项目路径。
-4. **仓库纪律先例**：`Vision/scripts/vision_assemble.py` 中的 DISCIPLINE 块与 `Vision/AUTO_SCORING_PLAN.md` D4/D6 — sandbox 与之同构，改纪律时两处对齐。
-5. **落库惯例**：正式树为 `L1_Basic|L2_Intermediate|L3_Advanced|L4_Expert|Image / <Project> / <model-slug>/`，交付物文件名以题面与历史 run 为准（常见 `answer.html`、`log.md`、`result.json`）。
-
-若缺少 `PROJECT_PROMPT.md`：**不要**用 README 或 DOMAIN_INDEX 拼题面；应报错并等待正式题面。
-
----
+**审阅 Agent 禁止**：读项目 README 评分细则；读其他 run / 历史模型输出 / `暂存/` /
+`Vision/` / `.git`；修改题面或交付物。
 
 ## 2. 编排 Agent · 标准流程
 
 ```text
-prepare_run.py --project <名|路径> --model <slug>
-  → 将 run 目录（绝对路径）交给受测会话
-  → 受测完成后：
-review_run.py --run <run_dir>        # 或 --model <slug> --latest
-  → 阅读 REVIEW.md；若 verdict 为 PASS / PASS_WITH_WARNINGS：
-collect_run.py --run <run_dir>       # 先 --dry-run
-  → 按需 --with-review / --overwrite
+prepare_run.py --project <名> --model <slug>
+  → workdir:  <RUNS_ROOT>/<model>/<run_id>/   （受测方工作区，仅含 PROMPT.md）
+  → harness:  sandbox/runs/<model>/<run_id>/  （meta.json + snapshot.json）
+  → 派发词即 prepare 输出末两行（或 dispatch UI 的"派发词"按钮）
+
+受测完成后：
+review_run.py --run <harness_dir> [--transcript <会话记录>]
+  → REVIEW.md + meta.verdict（PASS / PASS_WITH_WARNINGS / FAIL / INVALID）
+collect_run.py --run <harness_dir> [--dry-run]
+  → 交付物拷入 <project>/<slug>/，孤立主交付归一化为 answer.<ext>
 ```
 
-编排 Agent 在向受测模型开口时，**只**应粘贴或挂载 run 目录；禁止附带：
+图形化发题：`python sandbox/scripts/dispatch_api.py --port 8787 --open`
+（项目勾选 → 组卷 → 复制派发词 → 审阅/收卷，全程同一页面）。
 
-- 其他模型的 `answer.html` / `log.md` / `result.json`
-- 项目 `README.md` 评分细项
-- `DOMAIN_INDEX*`、历史分数表
+向受测模型开口时**只**发派发词（工作目录 + "任务说明在 PROMPT.md，产出写在同目录"）。
+禁止附带：其他模型交付物、README 评分细项、DOMAIN_INDEX、纪律条款、result.json 模板。
 
-可选：在受测提示词开头加入一行：  
-`工作目录是隔离 sandbox run；只读本目录 TASK.md 与 PROJECT_PROMPT.md。详见 TASK.md。`
+## 3. 受测模型 · 协议义务：无
 
----
+2.0 下受测方不承担任何协议义务。`result.json`、`log.md` 若自愿写出会被收卷带上，
+但**缺失不影响 verdict**；integrity 不再自报，由 H 检查观测。
 
-## 3. 受测模型 · 最低契约（嵌入 TASK.md，由 prepare 生成）
-
-1. 只读本 run；禁读仓库其它路径与网络代写。  
-2. 按题面交付；HTML 项目默认 `answer.html`。  
-3. 写 `result.json`，必须含 `integrity` 三字段（见 prepare 生成的契约模板）。  
-4. 不得修改 `PROJECT_PROMPT.md`。  
-5. 如实自报；审阅将把 `integrity` 失败直接判 `INVALID`。
-
----
-
-## 4. 审阅 Agent · 自动审阅流程
-
-当被要求「审阅 / auto-review」某 run 时：
-
-### 4.1 机器层（必做）
+## 4. 审阅 Agent · 自动审阅
 
 ```powershell
-python sandbox/scripts/review_run.py --run <run_dir>
-# 或
+python sandbox/scripts/review_run.py --run <harness_dir>
 python sandbox/scripts/review_run.py --model <slug> --latest
+python sandbox/scripts/review_run.py --run <harness_dir> --transcript session.txt
 ```
 
-脚本产出 `REVIEW.md` 与 `meta.verdict`（`PASS` / `PASS_WITH_WARNINGS` / `FAIL` / `INVALID`）。
+机器层硬性规则：
 
-机器层硬性规则（勿靠人工兜底）：
+- **H1** workdir 在仓库外 → 否则隔离失效 FAIL。
+- **H2** 快照 diff：`PROMPT.md` 被改/删、已有文件被改动、新增禁入项 → FAIL（判 INVALID）。
+- **H3** transcript 含仓库路径痕迹（`F:\benchmark`、`L1_Basic/`、`DOMAIN_INDEX` 等）→ INVALID；未提供 transcript 记 N/A。
+- **L1** workdir 内出现禁入项 → FAIL；子目录/点文件 → WARN。
+- **D0–D6** 交付物检查（缺交付物、HTML/SVG 形态、占位符红线、外部 3D 引用等）同 1.x。
+- `result.json` 存在 → 记 D8 信息项，**不计入 verdict**。
 
-- `integrity` 缺失或自报违规 → **INVALID**（I 字头检查 FAIL）。
-- `result.deliverable` 自报的文件不存在 → **FAIL**（D7）。
-- run 内出现禁入项（`.git` / `Vision` / `暂存` / 其他模型产物 / agent 工具状态目录）→ **FAIL**（L1）；其他子目录或点文件 → WARN（L2/L3）。
+verdict 规则：任一 H/L1 FAIL → `INVALID`；其余 FAIL → `FAIL`；仅 WARN →
+`PASS_WITH_WARNINGS`；全净 → `PASS`。
 
-### 4.2 智能层（脚本无法覆盖时，可选增强）
-
-在**不读 rubric、不读其他模型**的前提下，审阅 Agent 可：
-
-1. 打开本 run 的 `PROJECT_PROMPT.md` 与主交付 HTML。  
-2. 对 `REVIEW.md` 中「题面要求对照」清单逐项勾选 `[x]` / `[ ]`，并把依据写进该项（引用代码行或结构名）。  
-3. 若需要运行时验证：在 run 目录内起本地服务或 headless 打开；**仍不得**读取 run 外文件。  
-4. 将补充结论**追加**到 `REVIEW.md` 的「智能层补记」一节；**不得**删除脚本生成的检查表。  
-5. 若判定需要推翻机器 verdict，在补记中写明，并可将 `meta.verdict` 改为更严值（禁止放宽为 PASS 而无说明）。
-
-### 4.3 禁止事项（再强调）
-
-- 禁止打开 `<project>/README.md` 的验收细项作为打分表（需要时应另开「运行时验收会话」）。  
-- 禁止用其他模型实现做 diff 对照。  
-- 禁止修改题面或为模型「补做」作业。
-
----
+智能层可选增强（不读 rubric、不读其他模型）：逐项勾选 REVIEW.md「题面要求对照」、
+run 副本内起本地服务做运行时验证、补记结论；可将 verdict 改严，禁止无理由放宽。
 
 ## 5. 收卷 Agent 规则
 
-1. `collect_run.py` 校验题面 SHA 与正式树一致。  
-2. **verdict 闸门由脚本强制**：仅 `PASS` / `PASS_WITH_WARNINGS` 收卷；`FAIL` / `INVALID` / 未审阅一律拒绝（退出码 3）。人工确需强收时显式 `--force`，会写进 `MIGRATION.md` 留痕。  
-3. 默认只拷交付物 + `result.json` + `log.md`；`MIGRATION.md` 自动写入。  
-4. 已存在同名文件时默认改名 `~1`；仅在明确要求时 `--overwrite`。  
-5. 正式树子目录名 = `meta.model`（与历史 slug 风格一致：小写、连字符）。
-
----
+1. 校验 workdir `PROMPT.md` SHA 与正式树题面一致。
+2. verdict 闸门：仅 `PASS` / `PASS_WITH_WARNINGS` 收卷（其余退出码 3）；
+   `--force` 强收写进 MIGRATION.md。
+3. 孤立主交付归一化为 `answer.<ext>`；多文件保留原名；原名映射写进 MIGRATION.md。
+4. 旧协议 run（meta.protocol_version ≠ 2.0）拒绝收卷（退出码 4）。
 
 ## 6. 失败与作废
 
 | 情形 | 处理 |
 |---|---|
-| `integrity` 自报窥题 / 外援 / 字段缺失 | verdict=`INVALID`，不收卷 |
-| `result.deliverable` 自报文件不在位 | D7 FAIL；补齐或作废 |
-| run 内混入禁入项 / 工具状态目录 | L1 FAIL；污染目录作废，重开新 run |
-| 题面 SHA 与正式树不一致 | collect 拒绝入库 |
-| run 缺交付物 | D0 FAIL；重跑新 run，不复用污染目录 |
+| H1 workdir 在仓库内 | INVALID，作废 |
+| H2 快照污染（题面被改/新增禁入项） | INVALID，作废 |
+| H3 transcript 出现仓库路径 | INVALID，作废 |
+| workdir 缺交付物 | D0 FAIL；重开新 run |
+| 交付物含 TODO/占位符 | D4 FAIL |
 | 未审阅即收卷 | collect 拒绝（verdict 闸门） |
-| 疑似读了 README 评分细项 | 人工标记；新 run 重测 |
+| 题面 SHA 与正式树不一致 | collect 拒绝入库 |
 
----
+## 7. 旧 run 处置
 
-## 7. 扩展点
-
-- **运行时验收**（读 README 自动化建议）：保持**另一个** agent 角色与提示词，工作副本可从 run 目录复制到临时目录，**不要**放宽本审阅协议。  
-- **更强隔离**：把 `sandbox/runs` 指到仓库外磁盘路径。  
-- **多题联考**：循环 `prepare_run`；模型 slug 相同、run_id 不同（秒级冲突自动追加 `-2` 后缀）；仍禁止共享目录。  
-- **与 Vision 对齐**：判分/审计继续用 `Vision/scripts/`；sandbox 只负责 L1–L4 / Image 的 HTML·脚本类临时测。  
-- **对照展示**：`sandbox/review-lab/` 的构建/验证脚本只服务离线对比页，不进受测链路；新增批次后按 `review-lab/README.md` 重建。
-
----
+`sandbox/runs/` 下 protocol 1.1 的 run（live-test/live-pro/pangu/candidate-1 等）
+由 `status.py` 标 `[deprecated]`，`review_run` / `collect_run` 对其退出码 4。
+分数对比只在同协议内进行；如需重测，用 bare 模式重新组卷。
 
 ## 8. 命令速查
 
 ```text
 python sandbox/scripts/prepare_run.py --list
 python sandbox/scripts/prepare_run.py --project <P> --model <M>
+python sandbox/scripts/dispatch_api.py --port 8787 [--open]     # 图形化发题
 python sandbox/scripts/status.py      [--model <M>] [--pending] [--json]
-python sandbox/scripts/review_run.py  --run <dir> | --model <M> --latest [--strict]
-python sandbox/scripts/collect_run.py --run <dir> [--dry-run] [--with-review] [--overwrite] [--force]
+python sandbox/scripts/review_run.py  --run <harness_dir> [--transcript f] [--strict]
+python sandbox/scripts/collect_run.py --run <harness_dir> [--dry-run] [--with-review] [--force]
 ```
 
----
+## 9. 外部 Agent 接入清单
 
-## 9. 外部 Agent 接入清单（新 agent 进 sandbox 的最低标准）
+1. 读本文件（或 `protocol.json`）后再动手。
+2. 认领角色，只在角色可写范围内操作。
+3. 工具状态写到仓库根或系统级目录，不进 `sandbox/` 与 workdir。
+4. 流水线只走 `sandbox/scripts/` 命令或 dispatch UI；不手工拼 run。
+5. 派发词只用 `prepare` / UI 生成的两行——**不要**自行添加纪律、契约或提示。
 
-1. 读本文件（或 `protocol.json`）后再动手；不要凭仓库结构猜测流程。  
-2. 认领一个角色（编排 / 受测 / 审阅 / 收卷），只在该角色的可写范围内操作。  
-3. 工具自检：确认你的 agent/IDE 不会向 `sandbox/` 写入配置或索引目录；会写的话先改到仓库根或系统目录。  
-4. 流水线一律走 `sandbox/scripts/` 的四个命令，不要手工拼 run 目录或绕过审阅收卷。  
-5. 交付契约以 run 内 `TASK.md` 为准（含 `meta.expected_deliverable` 的主交付名）；不要沿用别处的默认文件名。
+本协议版本变更时，同步更新 `sandbox/README.md`、`sandbox/protocol.json`。
 
-本协议版本变更时，同步更新 `sandbox/README.md`、`sandbox/protocol.json` 与 `Vision/AUTO_SCORING_PLAN.md` 中的纪律对齐说明（若有）。
+## 10. 可选视觉输入 profile：bare-vision-v1
+
+适用范围仅 `Vision/PairedVision/v1/public/PV1-*` 登记的 8 个条件；普通项目仍沿用原 bare 流程。
+入口为 `Vision/PairedVision/ORCHESTRATOR.zh.md`，批量命令 `vision_suite.py prepare/execute/finalize`。
+受测目录只含原题面及锁定图片，所有协议/评分/金标留在 harness 侧。
+本节授予**机器评分模块** `vision_profile.py` 最小读取例外：可校验该发布包 LOCK.json 并调用锁定的 private/score.py 与相应 gold；不授予审阅 Agent 读取金标、历史答案或源码的权限。
+机器输出写 `SCORE.json`、`REVIEW.md`、meta；组卷可写 suite manifest；收卷写 `Vision/PairedVision/results/<model>/<run_id>/`。
+仅 schema 合法且完整性未失败的答案可收卷；可评分不等于正确，低分/零分亦归档。`--force` 不得绕过此 profile 的收卷闸门。
+collect 必须再次核对全部输入、答案和快照、发布版本、评分报告、transcript，拒收审阅后变更。
+默认隔离状态为 `unverified`，即使 H1–H3 通过也不能证明 OS 权限隔离。宿主隔离证据由编排方另存并人工审阅。
+通用 CLI adapter 启动独立会话，保留原始输出与预算；身份与 usage 缺失保持 null，不能依据模型自述补全。
+
+## 11. 探索 profile：legacy-vision-explore-v1
+
+范围为 `Vision/catalog/BANK.json` 中有题面与金标的旧题（MusicTheory / Geometry / RealScene / AnimeID / Iteration），
+不含 PairedVision、Historical 副本、CuratedSubset、仅参考素材与降级题。入口 `legacy_vision.py prepare/finalize`。
+旧 `PROJECT_PROMPT.md` 是维护文档（含金标路径乃至答案），组卷只取其中唯一的 ```text 提示词块 + 图片（改名 stem_NN）；
+工作目录用不透明 `LV-<sha10>` 编号，原题 ID 只在 harness。`legacy_vision.py` 获同等最小金标读取例外，报告不写金标值。
+自由文本命中为暂定，未命中记 `pending_human` 而非零分；Iteration 在此为 Agent 工具协议，须与 `visual-only-api` 校准成绩分列。
+这是探索性 profile，不是正式发布，隔离恒为 `unverified`。
+
+## 12. 冻结 r6 的 Agent CLI 辅助测试（2026-09-29）
+
+用户明确要求暂不人工复审，使用本机 DeepSeek Harness、CodeBuddy 等 CLI 继续测试。
+新增 `iteration_cli.py prepare/execute/summarize`，profile 为 `iteration-r6-agent-cli-v1`。
+组卷严格复制 `Vision/iteration/20260921/holdout/holdout-v2-r6/SUITE.json` 中 12 条件的公开题面和图像，金标、清单、适配器、历史答案不进入仓库外工作目录。
+只有机器评分模块 `iteration_cli.py summarize` 获最小金标读取例外，调用原 strict-leaf-v1 评分；不授予受测 CLI 或独立审阅 Agent 金标访问。
+按原题内字段、轨内均分、跨轨等权规则报告，完整性或结构无效时不输出整卷总分。
+每题新进程、600 秒、不自动重试、保留错误与探针失败。状态、PID、原始输出、输入和输出快照均在 harness。
+本轮使用文件/图像工具；CLI 原生图片预处理与主测不同，不合并排行，也不视为人类复审。
+OS 级隔离仍为 unverified。协议只作专项扩展，不改变既有冻结主测与人工证据缺失事实。
+
+## 13. 原生 Godot profile：native-godot-v1
+
+登记文件为项目根的 BENCH_PROFILE.json，当前项目 NativeWorkflowBench/GodotShader。受测目录仍只复制原始题面；Godot 项目发现、审阅和收卷使用既有 prepare/review/collect 入口。操作见 GODOT_RUNS.md。
+
+机器模块 godot_profile.py 获本 profile 的最小运行权限：读取登记、题面、交付与快照，在 harness 的独立副本上调用固定 Godot 导入/GPU 启动/截图，不读取参考解或其他模型答案。原始提交不修改；每次验收有唯一 user://、TEMP/TMP 和进程，缓存不进入交付归档。
+
+收卷保留完整工程的相对路径与全部普通/二进制依赖，归档前核对已审阅快照与运行证据。完整性有效但运行失败的样本可保留 FAIL 归档，以避免只保留成功样本；此为本 profile 的专门例外。INVALID、陈旧证据和改动过的题面/交付拒收，force 不可绕过。原生工程不会被重命名或压平为 answer 文件。
+
+运行检查与视觉评分分开：GPU 启动不验证六模式、交互、像素稳定性或风格质量，视觉评分始终待人工；工程 fixtures 不属于模型成绩。宿主/Agent/MCP 的读取边界未经验证时，isolation_verification 必须保持 unverified，不因目录、哈希或运行检查通过而升级。

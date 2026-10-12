@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sandbox Dispatch — 发题控制台</title>
+<style>
+  :root { --bg:#0d1117; --panel:#161b22; --line:#30363d; --fg:#e6edf3;
+          --dim:#8b949e; --acc:#58a6ff; --ok:#3fb950; --warn:#d29922; --bad:#f85149; }
+  * { box-sizing:border-box }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.55 -apple-system,"Segoe UI","Microsoft YaHei",monospace; }
+  header { padding:14px 20px; border-bottom:1px solid var(--line);
+           display:flex; align-items:baseline; gap:14px; }
+  header h1 { font-size:16px; margin:0; }
+  header .sub { color:var(--dim); font-size:12px; }
+  main { display:grid; grid-template-columns:340px 1fr; gap:16px; padding:16px 20px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px;
+           padding:14px; }
+  .panel h2 { font-size:13px; margin:0 0 10px; color:var(--dim);
+              text-transform:uppercase; letter-spacing:.06em; }
+  label.field { display:block; margin-bottom:10px; color:var(--dim); font-size:12px; }
+  input[type=text] { width:100%; background:var(--bg); border:1px solid var(--line);
+                     color:var(--fg); border-radius:6px; padding:7px 9px; font:inherit; }
+  .plist { max-height:300px; overflow:auto; border:1px solid var(--line);
+           border-radius:6px; padding:6px; }
+  .plvl { color:var(--dim); font-size:11px; margin:6px 4px 2px; }
+  .pitem { display:flex; gap:8px; align-items:center; padding:3px 6px;
+           border-radius:4px; cursor:pointer; }
+  .pitem:hover { background:#1f2630; }
+  .pitem code { color:var(--acc); font-size:12px; }
+  button { background:#238636; border:0; color:#fff; border-radius:6px;
+           padding:7px 14px; font:inherit; cursor:pointer; }
+  button.ghost { background:transparent; border:1px solid var(--line); color:var(--fg);
+                 padding:4px 10px; font-size:12px; }
+  button:disabled { opacity:.4; cursor:default; }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th,td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line);
+          white-space:nowrap; }
+  th { color:var(--dim); font-weight:600; }
+  tr.sel { background:#1f2630; }
+  tr.depr { opacity:.45; }
+  .v-PASS { color:var(--ok) } .v-PASS_WITH_WARNINGS { color:var(--warn) }
+  .v-FAIL,.v-INVALID { color:var(--bad) } .v-- { color:var(--dim) }
+  .card { margin-top:16px; }
+  .prompt { width:100%; min-height:90px; background:var(--bg);
+            border:1px solid var(--line); border-radius:6px; color:var(--fg);
+            padding:10px; font:inherit; resize:vertical; white-space:pre; }
+  .row { display:flex; gap:8px; align-items:center; margin-top:8px; flex-wrap:wrap; }
+  .path { color:var(--dim); font-size:12px; word-break:break-all; }
+  .log { background:#0a0c10; border:1px solid var(--line); border-radius:6px;
+         padding:10px; font:12px/1.5 Consolas,monospace; white-space:pre-wrap;
+         max-height:220px; overflow:auto; color:var(--dim); }
+  .badge { font-size:11px; border:1px solid var(--line); border-radius:10px;
+           padding:1px 8px; color:var(--dim); }
+  .badge.depr { color:var(--warn); border-color:var(--warn); }
+  #toast { position:fixed; bottom:16px; right:16px; background:#238636; color:#fff;
+           padding:8px 14px; border-radius:6px; opacity:0; transition:.25s; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Sandbox Dispatch</h1>
+  <span class="sub">protocol 2.0 · bare 模式 · 受测方仅见题面</span>
+</header>
+<main>
+  <section class="panel">
+    <h2>1 · 组卷</h2>
+    <label class="field">model slug（留空默认 anon）
+      <input type="text" id="model" placeholder="anon">
+    </label>
+    <div class="plist" id="projects">加载中…</div>
+    <div class="row">
+      <button id="btnPrepare">组卷并生成派发词</button>
+      <span class="path" id="runsRoot"></span>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>2 · Runs</h2>
+    <table>
+      <thead><tr><th>model</th><th>run_id</th><th>project</th><th>mode</th>
+        <th>status</th><th>verdict</th><th>操作</th></tr></thead>
+      <tbody id="runs"><tr><td colspan="7" style="color:var(--dim)">—</td></tr></tbody>
+    </table>
+
+    <div class="card" id="dispatchCard" hidden>
+      <h2>3 · 派发提示词（粘贴给受测会话）</h2>
+      <textarea class="prompt" id="dispatchText" readonly></textarea>
+      <div class="row">
+        <button class="ghost" id="btnCopy">复制</button>
+        <span class="path" id="workdirPath"></span>
+      </div>
+    </div>
+
+    <div class="card" id="logCard" hidden>
+      <h2>输出</h2>
+      <div class="log" id="log"></div>
+    </div>
+  </section>
+</main>
+<div id="toast"></div>
+<script>
+const $ = s => document.querySelector(s);
+const api = async (path, body) => {
+  const r = await fetch(path, body ? {method:'POST',
+    headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)} : {});
+  return r.json();
+};
+const toast = t => { const e=$('#toast'); e.textContent=t; e.style.opacity=1;
+  setTimeout(()=>e.style.opacity=0,1800); };
+const esc = s => s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+
+let projects = [];
+async function loadProjects(){
+  const d = await api('/api/projects');
+  $('#runsRoot').textContent = 'workdir 根：' + (d.runs_root||'?');
+  projects = d.projects||[];
+  let html='', lvl='';
+  for(const p of projects){
+    if(p.level!==lvl){ lvl=p.level; html+=`<div class="plvl">${esc(lvl)}</div>`; }
+    html+=`<label class="pitem"><input type="checkbox" value="${esc(p.name)}">
+      <code>${esc(p.name)}</code><span style="color:var(--dim)">${esc(p.rel)}</span></label>`;
+  }
+  $('#projects').innerHTML = html || '无项目';
+}
+
+async function loadRuns(){
+  const m = $('#model').value.trim();
+  const d = await api('/api/runs' + (m?`?model=${encodeURIComponent(m)}`:''));
+  const rows = (d.runs||[]).map(r=>`
+    <tr class="${r.deprecated?'depr':''}" data-m="${esc(r.model)}" data-r="${esc(r.run_id)}">
+      <td>${esc(r.model)}</td><td>${esc(r.run_id)}
+        ${r.deprecated?'<span class="badge depr">deprecated</span>':''}</td>
+      <td>${esc(r.project)}</td><td>${esc(r.mode)}</td><td>${esc(r.status)}</td>
+      <td class="v-${esc(r.verdict)}">${esc(r.verdict)}${r.profile==='native-godot-v1'?`<br><small>运行 ${esc(r.runtime_validation||'pending')} · 视觉待审</small>`:''}</td>
+      <td>${r.deprecated?'':`<button class="ghost" onclick="showDispatch(this)">派发词</button>
+        <button class="ghost" onclick="doReview(this)">审阅</button>
+        <button class="ghost" onclick="doCollect(this,true)">收卷dry</button>
+        <button class="ghost" onclick="doCollect(this,false)">收卷</button>`}</td>
+    </tr>`).join('');
+  $('#runs').innerHTML = rows ||
+    '<tr><td colspan="7" style="color:var(--dim)">无 run</td></tr>';
+}
+
+$('#btnPrepare').onclick = async ()=>{
+  const model = $('#model').value.trim() || 'anon';
+  const sel = [...document.querySelectorAll('#projects input:checked')].map(i=>i.value);
+  if(!sel.length) return toast('勾选至少一个题目');
+  $('#btnPrepare').disabled = true;
+  for(const p of sel){
+    const d = await api('/api/prepare', {project:p, model});
+    if(d.ok){ toast(`已组卷 ${d.run_id}`); }
+    else showLog(`prepare ${p} 失败\n${d.error||''}`);
+  }
+  $('#btnPrepare').disabled = false;
+  loadRuns();
+};
+
+function runRef(el){ const tr = el.closest('tr');
+  return {model:tr.dataset.m, run_id:tr.dataset.r}; }
+
+async function showDispatch(el){
+  const {model, run_id} = runRef(el);
+  const d = await api(`/api/dispatch?model=${encodeURIComponent(model)}&run_id=${encodeURIComponent(run_id)}`);
+  if(d.error) return showLog(d.error);
+  $('#dispatchCard').hidden = false;
+  $('#dispatchText').value = d.dispatch_text;
+  $('#workdirPath').textContent = '受测工作区：' + d.workdir;
+}
+$('#btnCopy').onclick = ()=>{
+  navigator.clipboard.writeText($('#dispatchText').value).then(()=>toast('已复制'));
+};
+
+async function doReview(el){
+  const {model, run_id} = runRef(el);
+  const d = await api('/api/review', {model, run_id});
+  showLog(d.log || JSON.stringify(d));
+  if(d.verdict) toast(`verdict: ${d.verdict}`);
+  loadRuns();
+}
+async function doCollect(el, dry){
+  const {model, run_id} = runRef(el);
+  const d = await api('/api/collect', {model, run_id, dry_run:dry});
+  showLog(d.log || JSON.stringify(d));
+  toast(d.ok ? (dry?'收卷 dry-run 通过':'已收卷') : '收卷被拒绝');
+  loadRuns();
+}
+function showLog(t){ $('#logCard').hidden=false; $('#log').textContent=t; }
+
+$('#model').addEventListener('input', loadRuns);
+loadProjects(); loadRuns();
+</script>
+</body>
+</html>
