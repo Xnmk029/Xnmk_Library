@@ -39,6 +39,7 @@ RUN_META = "meta.json"
 SNAPSHOT = "snapshot.json"
 PROMPT_FILE = "PROMPT.md"                    # name inside the workdir
 PROMPT_MD = "PROJECT_PROMPT.md"              # name in the formal tree
+PROMPT_REGISTRY = "PROMPT_REGISTRY.json"     # optional: register a different dispatched prompt
 REVIEW_MD = "REVIEW.md"
 PROTOCOL_VERSION = "2.0"
 
@@ -78,6 +79,70 @@ LEAK_TOKENS = (
 LEAK_LEVELS = tuple(lv + "/" for lv in LEVEL_DIRS) + tuple(
     lv + "\\" for lv in LEVEL_DIRS
 )
+
+
+def registered_prompt(project_dir: Path) -> dict:
+    """The prompt a project dispatches, plus any registered input files.
+
+    Defaults to the formal <project>/PROJECT_PROMPT.md. A project may register a
+    different dispatched prompt — for example a ranked controlled-replay prompt
+    while PROJECT_PROMPT.md stays frozen as the historical entry — via
+    <project>/PROMPT_REGISTRY.json:
+
+        {
+          "schemaVersion": 1,
+          "dispatchPrompt": "prompts/REPLAY_V2.md",
+          "sha256": "<expected sha256 of that file, optional but recommended>",
+          "inputFiles": ["fixtures/CONTRACT.md"],
+          "note": "why this project dispatches a registered prompt"
+        }
+
+    Both the prompt and every input file must resolve inside the project. The
+    optional sha256 pins the bytes so a later edit cannot silently change what is
+    dispatched. Input files are staged into the workdir and are NOT deliverables.
+    """
+    default_source = project_rel(project_dir) + "/" + PROMPT_MD
+    reg = project_dir / PROMPT_REGISTRY
+    if not reg.is_file():
+        return {"prompt": project_dir / PROMPT_MD, "source": default_source,
+                "inputs": [], "registered": False}
+
+    data = load_json(reg)
+    rel_prompt = data.get("dispatchPrompt")
+    if not isinstance(rel_prompt, str) or not rel_prompt.strip():
+        raise RuntimeError(f"{PROMPT_REGISTRY}: dispatchPrompt must be a non-empty string")
+
+    root = project_dir.resolve()
+    prompt_path = (project_dir / rel_prompt).resolve()
+    if not prompt_path.is_relative_to(root):
+        raise RuntimeError(f"{PROMPT_REGISTRY}: dispatchPrompt escapes the project: {rel_prompt}")
+    if not prompt_path.is_file():
+        raise RuntimeError(f"{PROMPT_REGISTRY}: dispatchPrompt not found: {rel_prompt}")
+
+    expected = data.get("sha256")
+    if expected and sha256_file(prompt_path) != expected:
+        raise RuntimeError(
+            f"{PROMPT_REGISTRY}: {rel_prompt} sha256 does not match the registered value")
+
+    inputs: list[Path] = []
+    for name in data.get("inputFiles") or []:
+        if not isinstance(name, str) or not name.strip():
+            raise RuntimeError(f"{PROMPT_REGISTRY}: inputFiles entries must be non-empty strings")
+        p = (project_dir / name).resolve()
+        if not p.is_relative_to(root):
+            raise RuntimeError(f"{PROMPT_REGISTRY}: input file escapes the project: {name}")
+        if not p.is_file():
+            raise RuntimeError(f"{PROMPT_REGISTRY}: input file not found: {name}")
+        inputs.append(p)
+
+    return {"prompt": prompt_path,
+            "source": project_rel(project_dir) + "/" + Path(rel_prompt).as_posix(),
+            "inputs": inputs, "registered": True}
+
+
+def prompt_input_names(meta: dict) -> set[str]:
+    """Workdir-relative names of registered input files for a run, if any."""
+    return {str(n) for n in (meta.get("input_files") or [])}
 
 
 def now_iso() -> str:
@@ -258,10 +323,20 @@ def scan_transcript(text: str) -> list[str]:
         elif isinstance(value, list):
             for v in value: visit(v, key)
         elif isinstance(value, str):
-            if key in {'mime', 'mimeType', 'mime_type', 'media_type'} and re.fullmatch(r'image/[a-zA-Z0-9.+-]+', value):
+            if key in {'mime', 'mimeType', 'mime_type', 'media_type', 'content_type'} and re.fullmatch(r'image/[a-zA-Z0-9.+-]+', value):
                 return
             if re.fullmatch(r'data:image/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+', value):
                 return
+            # CLI read results may embed line-numbered JSON or an image-tool
+            # description inside one string. Ignore only those MIME positions;
+            # retain paths such as Image/png/reference.png and all other text.
+            value = re.sub(
+                r'("(?:mime|mimeType|mime_type|media_type|content_type)"\s*:\s*")'
+                r'image/[a-zA-Z0-9.+-]+(?=")',
+                r'\1[MIME]', value)
+            value = re.sub(
+                r'(?m)^image/[a-zA-Z0-9.+-]+(?= image, \d+x\d+ px(?:,|$))',
+                '[MIME]', value)
             parts.append(value)
     for line in text.splitlines():
         try: visit(json.loads(line))
@@ -269,9 +344,22 @@ def scan_transcript(text: str) -> list[str]:
     hits = []
     root_l = str(ROOT).lower().rstrip("\\/")
     tl = '\n'.join(parts).lower()
-    if root_l in tl.replace("/", "\\") or root_l.replace("\\", "/") in tl:
+    # A sibling such as F:\benchmark-tools is not inside F:\benchmark.
+    # Match an exact root or a child separator, not an arbitrary prefix.
+    root_pattern = re.escape(root_l.replace("\\", "/")) + r'''(?=$|[/\s'"`<>\)\]},;:!?])'''
+    if re.search(root_pattern, tl.replace("\\", "/")):
         hits.append(str(ROOT))
     for tok in LEAK_TOKENS + LEAK_LEVELS:
+        # “暂存” is ordinary Chinese for staging and occurs in valid task text.
+        # Treat the reserved folder as a path signal only with a separator.
+        if tok == "暂存":
+            if re.search(r"(?:[\\/]暂存(?:[\\/]|[\"'`\s]|$)|暂存[\\/])", tl):
+                hits.append(tok)
+            continue
+        # Directory tokens must start a path component: the suffix of
+        # "modRevision\\\"" is not a read of a "Vision\\" directory.
+        if ("/" in tok or "\\" in tok) and not re.search(r"(?<![\w.-])" + re.escape(tok.lower()), tl):
+            continue
         if tok.lower() in tl:
             hits.append(tok)
     return sorted(set(hits))
@@ -279,11 +367,16 @@ def scan_transcript(text: str) -> list[str]:
 
 # --- deliverable discovery ----------------------------------------------------
 
-def list_deliverables(workdir: Path) -> list[str]:
+def list_deliverables(workdir: Path, skip_extra: set[str] | None = None) -> list[str]:
     """Files in the workdir that look like model output: not the prompt, not
     protocol files, not dotfiles. result.json/log.md count as deliverables
-    if the model happened to write them (no longer required)."""
+    if the model happened to write them (no longer required).
+
+    skip_extra holds workdir-relative names that were staged as registered
+    inputs (e.g. a contract handed to the model); they are given files, not
+    model output, so they must never be collected as deliverables."""
     skip_l = {n.lower() for n in DELIVERABLE_SKIP}
+    skip_rel = {n.replace("\\", "/") for n in (skip_extra or set())}
     out: list[str] = []
     if not workdir.is_dir():
         return out
@@ -291,6 +384,8 @@ def list_deliverables(workdir: Path) -> list[str]:
         if not p.is_file():
             continue
         rel = p.relative_to(workdir).as_posix()
+        if rel in skip_rel or p.name in skip_rel:
+            continue
         if any(part.startswith(".") for part in p.relative_to(workdir).parts):
             continue
         if p.name.lower() in skip_l:

@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>USP Match — Low-poly / PS1 Exploded Animation</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #e6e6e6; overflow: hidden; font-family: "Microsoft YaHei", "Segoe UI", Tahoma, sans-serif; }
+  #canvas { display: block; width: 100%; height: 100%; background: #e6e6e6; }
+  #scan {
+    position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 5;
+    background:
+      linear-gradient(rgba(0,0,0,0.07) 50%, transparent 50%),
+      linear-gradient(90deg, rgba(255,255,255,0.04), transparent 70%);
+    background-size: 100% 4px, 100% 100%;
+  }
+  #hud {
+    position: absolute; top: 18px; left: 18px; pointer-events: none; z-index: 10;
+    color: #141414; text-shadow: 0 1px 1px rgba(255,255,255,0.8);
+  }
+  #hud h1 { margin: 0 0 7px 0; font-size: 17px; letter-spacing: 2px; text-transform: uppercase; border-bottom: 2px solid #141414; display: inline-block; padding-bottom: 3px; }
+  #hud p { margin: 2.5px 0; font-size: 12.5px; line-height: 1.55; }
+  #hud b { color: #7a1212; }
+  #phase { margin-top: 10px; font-size: 12px; font-family: ui-monospace, monospace; background: rgba(0,0,0,0.10); padding: 5px 9px; border-left: 3px solid #7a1212; display: inline-block; }
+</style>
+</head>
+<body>
+<div id="scan"></div>
+<div id="hud">
+  <h1>USP Match — Low-poly / PS1</h1>
+  <p>Half-Life / PS1 审美 · 全程序化建模（Three.js）· 平直着色 · 像素化纹理</p>
+  <p>分解件：<b>深色滑套（后锁）</b> · <b>亮银裸枪管</b> · <b>聚合物下机匣</b> · <b>前 Match 配重</b> · <b>分离弹匣</b></p>
+  <p>光纤准星：<b style="color:#00d84a">前 · 绿</b> &nbsp; <b style="color:#ff2424">后 · 红</b></p>
+  <div id="phase">初始化 …</div>
+</div>
+<canvas id="canvas"></canvas>
+<script type="module">
+import * as THREE from 'https://unpkg.com/three@0.164.0/build/three.module.js';
+
+const LOOP_SEC = 8;
+const C = {
+  frame: 0x3c3c3c, frameEdge: 0x2a2a2a,
+  slide: 0x1f1f1f,
+  barrel: 0xb9b9b9, comp: 0x262626,
+  mag: 0x363636,
+  sightGreen: 0x00d84a, sightRed: 0xff2424,
+  edge: 0x080808,
+  bg: 0xe6e6e6
+};
+
+const CYL_SEG = 7;
+
+// 像素化 90s 纹理（最近邻过滤，无插值）
+function pixelTexture(c1, c2) {
+  const size = 32;
+  const cvs = document.createElement('canvas');
+  cvs.width = size; cvs.height = size;
+  const ctx = cvs.getContext('2d');
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      ctx.fillStyle = Math.random() < 0.6 ? c1 : c2;
+      ctx.fillRect(x, y, 1, 1);
+    }
+  }
+  const t = new THREE.CanvasTexture(cvs);
+  t.magFilter = THREE.NearestFilter;
+  t.minFilter = THREE.NearestFilter;
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  return t;
+}
+
+const texFrame = pixelTexture('#444444', '#383838');
+const texMag = pixelTexture('#3d3d3d', '#313131');
+
+// 带黑色锐利轮廓线的网格（PS1 平直着色风格）
+function part(geom, color, map) {
+  const mat = new THREE.MeshLambertMaterial({ color, flatShading: true, map });
+  const m = new THREE.Mesh(geom, mat);
+  const edges = new THREE.EdgesGeometry(geom);
+  const line = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: C.edge }));
+  m.add(line);
+  return m;
+}
+
+// 自发光光纤准星
+function sight(color, w, h, d) {
+  return new THREE.Mesh(new THREE.BoxGeometry(w, h, d), new THREE.MeshBasicMaterial({ color }));
+}
+
+let scene, camera, renderer, parts, phaseEl;
+
+function init() {
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(C.bg);
+
+  const aspect = window.innerWidth / window.innerHeight;
+  const view = 28;
+  camera = new THREE.OrthographicCamera(-view * aspect, view * aspect, view, -view, 1, 500);
+  camera.position.set(-19, 13, 25);
+  camera.lookAt(0, 0, 0);
+
+  renderer = new THREE.WebGLRenderer({ canvas: document.getElementById('canvas'), antialias: false });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(1);
+
+  const amb = new THREE.AmbientLight(0xffffff, 0.75);
+  scene.add(amb);
+  const key = new THREE.DirectionalLight(0xffffff, 1.0);
+  key.position.set(15, 22, 12);
+  scene.add(key);
+  const fill = new THREE.DirectionalLight(0xffffff, 0.3);
+  fill.position.set(-12, 6, -14);
+  scene.add(fill);
+
+  buildGun();
+
+  window.addEventListener('resize', onResize);
+  phaseEl = document.getElementById('phase');
+  renderer.setAnimationLoop(tick);
+}
+
+function smooth(t) { return t * t * (3 - 2 * t); }
+function lerp(a, b, t) { return a + (b - a) * t; }
+
+function buildGun() {
+  const root = new THREE.Group();
+  scene.add(root);
+
+  parts = {
+    slide: new THREE.Group(),
+    barrel: new THREE.Group(),
+    magazine: new THREE.Group()
+  };
+  root.add(parts.slide, parts.barrel, parts.magazine);
+
+  // ===== 下机匣：聚合物框架（固定）=====
+  const frame = new THREE.Group();
+  const body = part(new THREE.BoxGeometry(5.6, 6.4, 20, 1, 1, 1), C.frame, texFrame);
+  body.position.set(0, 0, -3);
+  frame.add(body);
+  const grip = part(new THREE.BoxGeometry(4.6, 10.4, 5.4, 1, 1, 1), C.frame, texFrame);
+  grip.position.set(0, -2.6, -10.8);
+  frame.add(grip);
+  // 扳机护圈：低多边形圆环弧
+  const guard = new THREE.Mesh(new THREE.TorusGeometry(1.55, 0.22, 8, 8, Math.PI * 1.7), new THREE.MeshLambertMaterial({ color: C.frameEdge, flatShading: true }));
+  guard.rotation.x = -Math.PI / 2;
+  guard.position.set(0, -2.4, -7.4);
+  guard.add(new THREE.LineSegments(new THREE.EdgesGeometry(guard.geometry), new THREE.LineBasicMaterial({ color: C.edge })));
+  frame.add(guard);
+  root.add(frame);
+
+  // ===== 滑套（沿 Z 轴后拉锁定 / 复位）=====
+  const slide = parts.slide;
+  const slideBody = part(new THREE.BoxGeometry(5.3, 5.6, 15, 1, 1, 1), C.slide);
+  slideBody.position.set(0, 5.8, -2);
+  slide.add(slideBody);
+  // 后准星（红光纤），固定于滑套，随滑套同步移动
+  const rear = sight(C.sightRed, 0.6, 1.1, 0.14);
+  rear.position.set(0, 9.0, -9.4);
+  slide.add(rear);
+  // 滑尾锯齿细节
+  for (let i = 0; i < 4; i++) {
+    const s = part(new THREE.BoxGeometry(0.12, 1.0, 0.14), 0x121212);
+    s.position.set(-1.1 + i * 0.72, 7.9, -9.35);
+    slide.add(s);
+  }
+
+  // ===== 枪管与前 Match 配重（固定；滑套后拉时枪管裸露）=====
+  const barrel = parts.barrel;
+  const tube = part(new THREE.CylinderGeometry(0.85, 0.85, 11, CYL_SEG, 1), C.barrel);
+  tube.rotation.x = -Math.PI / 2;
+  tube.position.set(0, 2.15, 7.2);
+  barrel.add(tube);
+  // 前准星（绿光纤）
+  const front = sight(C.sightGreen, 0.16, 0.16, 1.0);
+  front.position.set(0, 3.63, 11.9);
+  barrel.add(front);
+  // 前 Match 配重/补偿器
+  const comp = part(new THREE.CylinderGeometry(1.2, 1.2, 2.8, CYL_SEG, 1), C.comp);
+  comp.rotation.x = -Math.PI / 2;
+  comp.position.set(0, 2.15, 14.0);
+  barrel.add(comp);
+  // 配重前端环口
+  const muzzle = new THREE.Mesh(new THREE.TorusGeometry(1.22, 0.1, 6, 6), new THREE.MeshLambertMaterial({ color: 0x111111, flatShading: true }));
+  muzzle.rotation.x = -Math.PI / 2;
+  muzzle.position.set(0, 2.15, 15.45);
+  muzzle.add(new THREE.LineSegments(new THREE.EdgesGeometry(muzzle.geometry), new THREE.LineBasicMaterial({ color: C.edge })));
+  barrel.add(muzzle);
+
+  // ===== 弹匣（沿 Y 轴上滑入握把 / 分离至下方）=====
+  const mag = parts.magazine;
+  const magBody = part(new THREE.BoxGeometry(4.2, 9.2, 1.6, 1, 1, 1), C.mag, texMag);
+  magBody.position.set(0, 0, 0);
+  mag.add(magBody);
+  const base = part(new THREE.BoxGeometry(4.6, 0.5, 2.0, 1, 1, 1), C.frameEdge);
+  base.position.set(0, -4.85, 0);
+  mag.add(base);
+  // group.position.y 在 tick 中按相位设置：-4.85 为插入状态，-18.6 为分离状态
+}
+
+// ---------- 主循环 ----------
+
+function tick(time) {
+  const t = (time * 0.001) % LOOP_SEC;
+  const p = t / LOOP_SEC;
+
+  let magY = -4.85, slideZ = 0, text = '';
+
+  if (p < 0.15) {
+    const e = smooth(p / 0.15);
+    magY = lerp(-4.85, -18.6, e);
+    text = '弹匣下滑，脱离握把';
+  } else if (p < 0.35) {
+    const e = smooth((p - 0.15) / 0.20);
+    magY = lerp(-18.6, -4.85, e);
+    text = '弹匣向上滑入握把';
+  } else if (p < 0.50) {
+    magY = -4.85;
+    text = '就位：弹匣已装入握把';
+  } else if (p < 0.65) {
+    const e = smooth((p - 0.50) / 0.15);
+    slideZ = lerp(0, -7.6, e);
+    text = '滑套后拉，锁定在后';
+  } else if (p < 0.75) {
+    slideZ = -7.6;
+    text = '滑套锁定在后，枪管完全裸露';
+  } else if (p < 0.90) {
+    const e = smooth((p - 0.75) / 0.15);
+    slideZ = lerp(-7.6, 0, e);
+    text = '滑套复位，闭锁';
+  } else {
+    slideZ = 0;
+    magY = -4.85;
+    text = '循环就绪';
+  }
+
+  parts.magazine.position.y = magY;
+  parts.slide.position.z = slideZ;
+
+  // 慢速转台：正交投影下保持锐利机械轮廓
+  const ang = -0.62 + time * 0.0005;
+  const R = 30;
+  camera.position.set(R * Math.sin(ang), 13, R * Math.cos(ang));
+  camera.lookAt(0, 0, 0);
+
+  phaseEl.textContent = text;
+  renderer.render(scene, camera);
+}
+
+function onResize() {
+  const aspect = window.innerWidth / window.innerHeight;
+  const view = 28;
+  camera.left = -view * aspect;
+  camera.right = view * aspect;
+  camera.top = view;
+  camera.bottom = -view;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+}
+
+init();
+</script>
+</body>
+</html>

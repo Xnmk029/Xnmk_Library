@@ -1,0 +1,560 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>replay</title>
+<!-- 脚本在 document-start 注入：早于组件注册与页面渲染 -->
+<script src="/answer.user.js"></script>
+<script>
+  window.__ERRORS = [];
+  window.__XSS = undefined;
+  window.addEventListener('error', function (e) {
+    window.__ERRORS.push('error: ' + (e.message || e.type));
+  });
+  window.addEventListener('unhandledrejection', function (e) {
+    var r = e.reason;
+    window.__ERRORS.push('rejection: ' + ((r && r.message) || String(r)));
+  });
+</script>
+</head>
+<body>
+<div id="stage"></div>
+<script>
+(function () {
+  'use strict';
+  var R = { pass: [], fail: [] };
+  var TAG = '.bili-ip-region-tag';
+  window.__containers = [];
+
+  function check(name, cond, extra) {
+    if (cond) R.pass.push(name);
+    else R.fail.push(name + ' :: ' + (extra === undefined ? '' : String(extra)));
+  }
+  function D(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  function txt(el) { return el ? String(el.textContent).replace(/\s+/g, ' ').trim() : null; }
+  function tagsIn(container) {
+    if (!container) return [];
+    return Array.prototype.slice.call(container.querySelectorAll(TAG));
+  }
+  function tagIn(container) {
+    var t = tagsIn(container);
+    return t.length ? t[0] : null;
+  }
+  function allTags(root, acc, seen) {
+    acc = acc || [];
+    seen = seen || new Set();
+    var nodes = (root.querySelectorAll ? root.querySelectorAll('*') : []);
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      if (seen.has(el)) continue;
+      seen.add(el);
+      if (el.classList && el.classList.contains('bili-ip-region-tag')) acc.push(el);
+      if (el.shadowRoot) allTags(el.shadowRoot, acc, seen);
+    }
+    return acc;
+  }
+  function rectsOverlap(a, b) {
+    return !(a.right <= b.left + 0.5 || b.right <= a.left + 0.5 ||
+      a.bottom <= b.top + 0.5 || b.bottom <= a.top + 0.5);
+  }
+  function deepButtons(container) {
+    var out = [];
+    var all = container.querySelectorAll('button,.btn-reply,.btn-more,[class*="reply-btn"],[class*="more"]');
+    for (var i = 0; i < all.length; i++) {
+      var el = all[i];
+      if (el.classList && el.classList.contains('bili-ip-region-tag')) continue;
+      out.push(el);
+    }
+    return out;
+  }
+
+  /* ======================= 合成数据（契约样例） ======================= */
+  var main1 = {
+    rpid_str: '9007199254740992', rpid: 9007199254740992,
+    reply_control: { location: 'IP属地：广东' },
+    member: { mid: '10001', uname: '测试用户', location: '资料城市：北京' },
+    content: { message: '我来自上海' }
+  };
+  var sub1 = Object.assign({}, main1, {
+    rpid_str: '9007199254740993', root_str: main1.rpid_str, parent_str: main1.rpid_str,
+    reply_control: { location: 'IP属地：湖北' }
+  });
+
+  function mkData(id, location) {
+    return {
+      rpid_str: id, rpid: Number(id),
+      reply_control: { location: location },
+      member: { mid: '10001', uname: '测试用户', location: '资料城市：北京' },
+      content: { message: '我来自上海' }
+    };
+  }
+
+  function defineComps() {
+    var defs = {
+      'bili-comments': 1, 'bili-comment-thread-renderer': 1, 'bili-comment-renderer': 1,
+      'bili-comment-reply-renderer': 1, 'bili-comment-action-buttons-renderer': 1
+    };
+    Object.keys(defs).forEach(function (name) {
+      if (customElements.get(name)) return;
+      /* 统一用 class 继承，jsdom 只对这种形态给出可用的元素对象与 attachShadow */
+      customElements.define(name, class extends HTMLElement {});
+    });
+  }
+  /* jsdom 对自定义元素不提供 attachShadow：补一个最小实现，使回放可跑。
+   * 仅影响验证环境的 DOM 构造，被测脚本看到的仍是标准 attachShadow 语义。 */
+  function installShadowFallbackFor(host) {
+    if (typeof host.attachShadow === 'function') return host.attachShadow({ mode: 'open' });
+    var root = document.createElement('div');
+    Object.defineProperty(root, 'host', { configurable: true, get: function () { return host; } });
+    Object.defineProperty(host, 'shadowRoot', { configurable: true, get: function () { return root; } });
+    host.appendChild(root);
+    return root;
+  }
+  function makeActionBar(replyText, withNative) {
+    var action = document.createElement('bili-comment-action-buttons-renderer');
+    var root = installShadowFallbackFor(action);
+    root.innerHTML = '<div id="footer"><span id="pubdate">' + replyText + '</span>' +
+      (withNative ? '<span id="location">IP属地：北京</span>' : '') +
+      '<button class="btn-reply">回复</button><button class="btn-more">更多</button></div>';
+    return { host: action, root: root, footer: root.querySelector('#footer') };
+  }
+
+  /* ======================= 场景一：Lit / Open Shadow DOM ======================= */
+  async function litCase(stage) {
+    defineComps();
+    var comments = document.createElement('bili-comments');
+    stage.appendChild(comments);
+    var cRoot = installShadowFallbackFor(comments);
+    var thread = document.createElement('bili-comment-thread-renderer');
+    cRoot.appendChild(thread);
+    var tRoot = installShadowFallbackFor(thread);
+    var mainR = document.createElement('bili-comment-renderer');
+    var subR = document.createElement('bili-comment-reply-renderer');
+    tRoot.appendChild(mainR);
+    tRoot.appendChild(subR);
+    await D(60);
+
+    /* Open Shadow Root 在宿主插入之后才附加 */
+    var mRoot = installShadowFallbackFor(mainR);
+    var sRoot = installShadowFallbackFor(subR);
+    await D(60);
+
+    var mBar = makeActionBar('2024-01-01 12:00', false);
+    var sBar = makeActionBar('2024-01-02 13:00', false);
+    mRoot.appendChild(mBar.host);
+    sRoot.appendChild(sBar.host);
+    await D(60);
+
+    /* 节点先于数据 */
+    await D(200);
+    mBar.host.data = main1;              /* 只保留操作栏 .data 的变体 */
+    sBar.host.data = sub1;
+    mainR.__data = main1;                /* renderer 也带 __data 的变体 */
+    await D(300);
+
+    check('lit main tag text', txt(tagIn(mBar.footer)) === 'IP属地：广东', txt(tagIn(mBar.footer)));
+    check('lit sub tag text', txt(tagIn(sBar.footer)) === 'IP属地：湖北', txt(tagIn(sBar.footer)));
+    check('lit main one tag', tagsIn(mBar.footer).length === 1, tagsIn(mBar.footer).length);
+    check('lit sub one tag', tagsIn(sBar.footer).length === 1, tagsIn(sBar.footer).length);
+    check('lit tag sits next to pubdate',
+      tagIn(mBar.footer) && tagIn(mBar.footer).parentNode === mBar.footer &&
+      mBar.footer.querySelector('#pubdate').nextSibling === tagIn(mBar.footer));
+    check('lit sub is not root location', txt(tagIn(sBar.footer)) !== 'IP属地：广东');
+
+    /* 原生 #location 存在：保留原生，不再增加第二份 */
+    var nativeBar = makeActionBar('2024-01-03 14:00', true);
+    mRoot.appendChild(nativeBar.host);
+    nativeBar.host.data = mkData('9007199254740994', 'IP属地：福建');
+    window.__nativeContainers = window.__nativeContainers || [];
+    window.__nativeContainers.push(nativeBar.footer);
+    await D(300);
+    check('lit native kept', txt(nativeBar.footer.querySelector('#location')) === 'IP属地：北京');
+    check('lit native no dup tag', tagsIn(nativeBar.footer).length === 0, tagsIn(nativeBar.footer).length);
+    check('lit native single locator node',
+      nativeBar.footer.querySelectorAll('#location,[class~="ip-location"]').length === 1);
+
+    /* 操作栏组件 update() 生命周期：DOM 复用为另一条评论 */
+    mBar.host.data = mkData('9007199254740995', 'IP属地：四川');
+    mainR.__data = mBar.host.data;
+    if (typeof mBar.host.update === 'function') mBar.host.update();
+    await D(300);
+    check('lit reuse updates tag', txt(tagIn(mBar.footer)) === 'IP属地：四川', txt(tagIn(mBar.footer)));
+    check('lit reuse still one tag', tagsIn(mBar.footer).length === 1, tagsIn(mBar.footer).length);
+
+    /* 属地字段被清空 -> 移除旧值，给出未获取状态 */
+    mBar.host.data = { rpid_str: '9007199254740995', reply_control: {}, member: {}, content: {} };
+    await D(300);
+    check('lit cleared shows pending', txt(tagIn(mBar.footer)) === 'IP属地：未获取', txt(tagIn(mBar.footer)));
+    check('lit cleared one tag', tagsIn(mBar.footer).length === 1, tagsIn(mBar.footer).length);
+
+    /* 恢复，供布局检查使用 */
+    mBar.host.data = main1;
+    await D(200);
+
+    window.__containers.push({ c: mBar.footer, kind: 'lit' });
+    window.__containers.push({ c: sBar.footer, kind: 'lit' });
+  }
+
+  /* ======================= 场景二：Vue 3 ======================= */
+  function vueItem(className, infoClass, timeClass, id) {
+    var item = document.createElement('div');
+    item.className = className;
+    item.setAttribute('data-id', id);
+    item.innerHTML = '<div class="comment-body">正文 ' + id + '</div>' +
+      '<div class="' + infoClass + '"><span class="' + timeClass + '">2024-02-01</span>' +
+      '<button class="btn-reply">回复</button><button class="btn-more">更多</button></div>';
+    return item;
+  }
+
+  async function vueCase(stage) {
+    var main2 = mkData('9007199254741001', 'IP属地：浙江');
+    var sub2 = mkData('9007199254741002', 'IP属地：四川');
+    sub2.root_str = main2.rpid_str;
+
+    /* 数据先于节点：先挂实例，再把节点插入文档 */
+    var item = vueItem('reply-item', 'reply-info', 'reply-time', main2.rpid_str);
+    item.__vueParentComponent = { props: { reply: main2 }, vnode: { props: { reply: main2 } } };
+    var subItem = vueItem('sub-reply-item', 'sub-reply-info', 'sub-reply-time', sub2.rpid_str);
+    subItem.__vueParentComponent = { props: { subReply: sub2, rootReply: main2 } };
+
+    var list = document.createElement('div');
+    list.className = 'reply-list';
+    list.appendChild(item);
+    list.appendChild(subItem);
+    await D(150);
+    stage.appendChild(list);   /* 节点后到 */
+    await D(400);
+
+    var mainInfo = item.querySelector('.reply-info');
+    var subInfo = subItem.querySelector('.sub-reply-info');
+    check('vue main tag', txt(tagIn(mainInfo)) === 'IP属地：浙江', txt(tagIn(mainInfo)));
+    check('vue sub tag', txt(tagIn(subInfo)) === 'IP属地：四川', txt(tagIn(subInfo)));
+    check('vue sub must not use rootReply', txt(tagIn(subInfo)) !== 'IP属地：浙江');
+    check('vue one tag each', tagsIn(mainInfo).length === 1 && tagsIn(subInfo).length === 1);
+    check('vue tag next to time',
+      mainInfo.querySelector('.reply-time').nextSibling === tagIn(mainInfo));
+
+    /* 兼容钩子：__vue__ 挂 Proxy({_: component})，实例只在 vnode.props 上 */
+    var main3 = mkData('9007199254741003', 'IP属地：山东');
+    var proxyItem = vueItem('reply-item', 'reply-info', 'reply-time', main3.rpid_str);
+    proxyItem.__vue__ = new Proxy({ _: { vnode: { props: { reply: main3 } } } }, {});
+    stage.appendChild(proxyItem);
+    await D(400);
+    var proxyInfo = proxyItem.querySelector('.reply-info');
+    check('vue proxy __vue__ + vnode.props', txt(tagIn(proxyInfo)) === 'IP属地：山东', txt(tagIn(proxyInfo)));
+
+    /* SPA 路由切换后继续工作 */
+    history.pushState({ page: 'topic' }, '', '/blackboard/feed-topic.html');
+    var main4 = mkData('9007199254741004', 'IP属地：广西');
+    var spaItem = vueItem('reply-item', 'reply-info', 'reply-time', main4.rpid_str);
+    spaItem.__vueParentComponent = { props: { reply: main4 } };
+    stage.appendChild(spaItem);
+    await D(400);
+    check('spa pushState still works', txt(tagIn(spaItem.querySelector('.reply-info'))) === 'IP属地：广西',
+      txt(tagIn(spaItem.querySelector('.reply-info'))));
+    history.replaceState({ page: 'video' }, '', '/video/BV1xx411c7mD');
+    await D(150);
+    window.dispatchEvent(new PopStateEvent('popstate', { state: {} }));
+    await D(200);
+    check('spa replaceState/popstate keeps tag', txt(tagIn(spaItem.querySelector('.reply-info'))) === 'IP属地：广西');
+
+    /* 字段缺失 / 空字符串 -> 轻量未获取状态 */
+    var broken = mkData('9007199254741005', '');
+    var brokenItem = vueItem('reply-item', 'reply-info', 'reply-time', broken.rpid_str);
+    brokenItem.__vueParentComponent = { props: { reply: broken } };
+    stage.appendChild(brokenItem);
+    await D(350);
+    check('vue empty location pending', txt(tagIn(brokenItem.querySelector('.reply-info'))) === 'IP属地：未获取',
+      txt(tagIn(brokenItem.querySelector('.reply-info'))));
+
+    var noControl = { rpid_str: '9007199254741006', member: { uname: 'x' }, content: { message: '正文' } };
+    var ncItem = vueItem('reply-item', 'reply-info', 'reply-time', noControl.rpid_str);
+    ncItem.__vueParentComponent = { props: { reply: noControl } };
+    stage.appendChild(ncItem);
+    await D(350);
+    check('vue missing field pending', txt(tagIn(ncItem.querySelector('.reply-info'))) === 'IP属地：未获取',
+      txt(tagIn(ncItem.querySelector('.reply-info'))));
+
+    /* 不显示完整 IP / 不用 member.location / 不用正文 */
+    var liar = mkData('9007199254741007', 'IP属地：广东');
+    liar.member.location = '资料城市：北京';
+    liar.content.message = '我来自上海';
+    liar.location = 'IP属地：新疆';
+    var liarItem = vueItem('reply-item', 'reply-info', 'reply-time', liar.rpid_str);
+    liarItem.__vueParentComponent = { props: { reply: liar } };
+    stage.appendChild(liarItem);
+    await D(350);
+    check('only reply_control.location', txt(tagIn(liarItem.querySelector('.reply-info'))) === 'IP属地：广东',
+      txt(tagIn(liarItem.querySelector('.reply-info'))));
+
+    /* 属地字符串按纯文本处理 */
+    var evil = mkData('9007199254741008', 'IP属地：<img src=x onerror="window.__XSS=1"><b>bold</b>');
+    var evilItem = vueItem('reply-item', 'reply-info', 'reply-time', evil.rpid_str);
+    evilItem.__vueParentComponent = { props: { reply: evil } };
+    stage.appendChild(evilItem);
+    await D(350);
+    var evilTag = tagIn(evilItem.querySelector('.reply-info'));
+    check('xss textContent', evilTag && evilTag.textContent.indexOf('<img') >= 0, txt(evilTag));
+    check('xss no element injected', evilTag && evilTag.querySelector('img') === null && evilTag.querySelector('b') === null);
+    check('xss not executed', window.__XSS === undefined);
+
+    /* 楼中楼 DOM 复用：subReply 换成另一条 */
+    subItem.__vueParentComponent = { props: { subReply: mkData('9007199254741009', 'IP属地：云南'), rootReply: main2 } };
+    await D(350);
+    check('vue sub reuse', txt(tagIn(subItem.querySelector('.sub-reply-info'))) === 'IP属地：云南',
+      txt(tagIn(subItem.querySelector('.sub-reply-info'))));
+    subItem.__vueParentComponent = { props: { subReply: sub2, rootReply: main2 } };
+    await D(250);
+
+    window.__containers.push({ c: mainInfo, kind: 'vue' });
+    window.__containers.push({ c: subInfo, kind: 'vue' });
+    window.__containers.push({ c: proxyInfo, kind: 'vue' });
+    window.__containers.push({ c: spaItem.querySelector('.reply-info'), kind: 'vue' });
+  }
+
+  /* ======================= 场景三：bbComment 旧形态 ======================= */
+  async function bbCase(stage) {
+    /* 变体 A：赋值构造函数时原型方法已存在 */
+    function BbA() {}
+    BbA.prototype._createListCon = function (item) {
+      return '<div class="reply-wrap" data-id="' + item.rpid_str + '">' +
+        '<div class="comment-body">' + item.content.message + '</div>' +
+        '<div class="info"><span class="reply-time">2024-03-01</span>' +
+        '<button class="btn-reply">回复</button><button class="btn-more">更多</button></div></div>';
+    };
+    BbA.prototype._createSubReplyItem = function (item) {
+      return '<div class="sub-reply-item" data-id="' + item.rpid_str + '">' +
+        '<div class="comment-body">' + item.content.message + '</div>' +
+        '<div class="info"><span class="reply-time">2024-03-02</span>' +
+        '<button class="btn-reply">回复</button><button class="btn-more">更多</button></div></div>';
+    };
+    window.bbComment = BbA;
+
+    var bbMain = mkData('9007199254741011', 'IP属地：陕西');
+    var bbSub = mkData('9007199254741012', 'IP属地：甘肃');
+    var inst = new window.bbComment();
+    var holder = document.createElement('div');
+    stage.appendChild(holder);
+    holder.insertAdjacentHTML('beforeend', inst._createListCon(bbMain, 0, 'main'));
+    holder.insertAdjacentHTML('beforeend', inst._createSubReplyItem(bbSub, 0));
+    await D(400);
+
+    var mainItem = holder.querySelector('.reply-wrap');
+    var subItem = holder.querySelector('.sub-reply-item');
+    var mainInfo = mainItem.querySelector('.info');
+    var subInfo = subItem.querySelector('.info');
+    check('bb main tag', txt(tagIn(mainInfo)) === 'IP属地：陕西', txt(tagIn(mainInfo)));
+    check('bb sub tag', txt(tagIn(subInfo)) === 'IP属地：甘肃', txt(tagIn(subInfo)));
+    check('bb content preserved', mainItem.querySelector('.comment-body').textContent === '我来自上海');
+    check('bb controls preserved', mainItem.querySelectorAll('button').length === 2);
+    check('bb one tag', tagsIn(mainInfo).length === 1 && tagsIn(subInfo).length === 1);
+    check('bb tag near time',
+      mainInfo.querySelector('.reply-time').nextSibling === tagIn(mainInfo) ||
+      mainInfo.firstChild === tagIn(mainInfo),
+      mainInfo.innerHTML.slice(0, 160));
+    check('bb data-id intact', mainItem.getAttribute('data-id') === '9007199254741011');
+
+    /* 变体 B：先赋值构造函数，后补原型方法，再立即渲染 */
+    function BbB() {}
+    window.bbComment = BbB;
+    BbB.prototype._createListCon = function (item) {
+      return '<div class="reply-wrap" data-id="' + item.rpid_str + '">' +
+        '<div class="comment-body">x</div>' +
+        '<div class="info"><span class="reply-time">2024-03-03</span>' +
+        '<button class="btn-reply">回复</button><button class="btn-more">更多</button></div></div>';
+    };
+    var bbLate = mkData('9007199254741013', 'IP属地：青海');
+    var instB = new window.bbComment();
+    holder.insertAdjacentHTML('beforeend', instB._createListCon(bbLate, 0, 'main'));
+    await D(400);
+    var lateItem = holder.querySelectorAll('.reply-wrap')[1];
+    check('bb late-patched tag', txt(tagIn(lateItem.querySelector('.info'))) === 'IP属地：青海',
+      txt(tagIn(lateItem.querySelector('.info'))));
+
+    window.__containers.push({ c: mainInfo, kind: 'bb' });
+    window.__containers.push({ c: subInfo, kind: 'bb' });
+    window.__containers.push({ c: lateItem.querySelector('.info'), kind: 'bb' });
+  }
+
+  function startServerFixture() {
+    /* 页面自身会发起真实 GET；这里的 fetch 由 runner 在注入脚本前桥接到本地服务。
+     * 只有在完全离线（无 fetch）时，才退化为最小夹具，保证回放仍可运行。 */
+    if (typeof window.fetch === 'function') return;
+    function makeResponse(payload, status) {
+      var body = JSON.stringify(payload);
+      var headers = { get: function () { return 'application/json'; } };
+      return {
+        status: status, url: 'http://127.0.0.1/x/v2/reply/main', ok: status === 200, headers: headers,
+        clone: function () { return makeResponse(payload, status); },
+        json: function () { return Promise.resolve(JSON.parse(body)); },
+        text: function () { return Promise.resolve(body); }
+      };
+    }
+    window.Response = undefined;
+    window.fetch = function (input) {
+      var url = String(typeof input === 'string' ? input : (input && input.url) || '');
+      if (url.indexOf('/x/v2/reply/fail') >= 0) {
+        return Promise.resolve(makeResponse({ code: -412 }, 500));
+      }
+      return Promise.resolve(makeResponse(window.__FETCH_FIXTURE__ || {}, 200));
+    };
+  }
+  startServerFixture();
+
+  /* ======================= 场景四：被动读取页面已有请求 ======================= */
+  async function fetchCase(stage) {
+    var fetchedMain = mkData('9007199254741015', 'IP属地：海南');
+    var fetchedSub = mkData('9007199254741016', 'IP属地：贵州');
+    fetchedSub.root_str = fetchedMain.rpid_str;
+    window.__FETCH_FIXTURE__ = { code: 0, data: { replies: [fetchedMain] } };
+    var res = await window.fetch('/x/v2/reply/main?type=1&oid=1&mode=3');
+    var json = await res.json();
+    check('page fetch response intact', json.code === 0 && json.data.replies.length === 1 &&
+      json.data.replies[0].rpid_str === '9007199254741015', JSON.stringify(json).slice(0, 120));
+
+    /* 失败请求：不产生未处理异常，也不影响状态展示 */
+    var failed = false;
+    try {
+      var bad = await window.fetch('/x/v2/reply/fail?oid=1');
+      failed = bad.status === 500;
+    } catch (e) { failed = false; }
+    check('failed request observable', failed);
+    await D(300);
+
+    /* 该条评论没有可用的组件数据，只有完整 rpid_str 关联 */
+    var item = vueItem('reply-item', 'reply-info', 'reply-time', fetchedMain.rpid_str);
+    stage.appendChild(item);
+    await D(400);
+    check('registry by rpid_str', txt(tagIn(item.querySelector('.reply-info'))) === 'IP属地：海南',
+      txt(tagIn(item.querySelector('.reply-info'))));
+    check('registry not mixed with sub', txt(tagIn(item.querySelector('.reply-info'))) !== 'IP属地：贵州');
+
+    /* 无关联数据时给出未获取状态，不猜测 */
+    var orphan = vueItem('reply-item', 'reply-info', 'reply-time', '9999999999999999');
+    stage.appendChild(orphan);
+    await D(350);
+    check('orphan pending', txt(tagIn(orphan.querySelector('.reply-info'))) === 'IP属地：未获取',
+      txt(tagIn(orphan.querySelector('.reply-info'))));
+
+    window.__containers.push({ c: item.querySelector('.reply-info'), kind: 'vue' });
+  }
+
+  /* ======================= 场景五：长文本截断与重复扫描 ======================= */
+  async function stressCase(stage) {
+    var long = 'IP属地：' + new Array(40).join('很长的属地文本');
+    var longReply = mkData('9007199254741017', long);
+    var item = vueItem('reply-item', 'reply-info', 'reply-time', longReply.rpid_str);
+    item.__vueParentComponent = { props: { reply: longReply } };
+    stage.appendChild(item);
+    await D(400);
+    var info = item.querySelector('.reply-info');
+    var tag = tagIn(info);
+    check('long text one tag', tagsIn(info).length === 1);
+    check('long text truncated', tag && tag.getBoundingClientRect().width <= info.getBoundingClientRect().width + 1,
+      tag ? tag.getBoundingClientRect().width + '>' + info.getBoundingClientRect().width : 'no tag');
+    check('long text plain', tag && tag.textContent.indexOf('很长的属地文本') >= 0);
+
+    /* 反复触发观察与巡检：仍然每条一个标签 */
+    document.body.appendChild(document.createElement('span'));
+    await D(1200);
+    check('idempotent after sweeps', tagsIn(info).length === 1, tagsIn(info).length);
+
+    window.__containers.push({ c: info, kind: 'vue' });
+  }
+
+  /* ======================= 布局检查（由 CDP 在 720 / 1280 下调用） ======================= */
+  window.__layoutCheck = function () {
+    var problems = [];
+    var width = window.innerWidth;
+    window.__containers.forEach(function (entry, index) {
+      var container = entry.c;
+      if (!container || !container.isConnected) return;
+      var label = entry.kind + '#' + index;
+      var tags = tagsIn(container);
+      if (tags.length !== 1) {
+        problems.push(label + ': tag count=' + tags.length);
+        return;
+      }
+      var tag = tags[0];
+      var root = container.getRootNode();
+      if (tag.parentNode !== container) problems.push(label + ': tag not attached to time bar');
+      var time = container.querySelector('.reply-time,.sub-reply-time,#pubdate');
+      if (!time) problems.push(label + ': no time element');
+      else if (time.parentNode !== container) problems.push(label + ': time not in same bar');
+      var tagRect = tag.getBoundingClientRect();
+      var barRect = container.getBoundingClientRect();
+      if (tagRect.width <= 0 || tagRect.height <= 0) problems.push(label + ': tag invisible');
+      if (tagRect.right > barRect.right + 1 || tagRect.left < barRect.left - 1) {
+        problems.push(label + ': tag overflows bar');
+      }
+      if (container.scrollWidth > container.clientWidth + 2) {
+        problems.push(label + ': bar overflows (' + container.scrollWidth + '>' + container.clientWidth + ')');
+      }
+      if (barRect.right > width + 1 || barRect.left < -1) problems.push(label + ': bar out of viewport');
+      var buttons = deepButtons(container);
+      if (buttons.length < 2) problems.push(label + ': controls missing ' + buttons.length);
+      buttons.forEach(function (btn, bi) {
+        var br = btn.getBoundingClientRect();
+        var view = btn.ownerDocument.defaultView;
+        var cs = view.getComputedStyle(btn);
+        if (cs.display === 'none' || cs.visibility === 'hidden' || cs.pointerEvents === 'none') {
+          problems.push(label + ': control ' + bi + ' not visible');
+        }
+        if (br.width <= 0 || br.height <= 0) problems.push(label + ': control ' + bi + ' zero size');
+        if (br.left < -1 || br.right > width + 1) problems.push(label + ': control ' + bi + ' out of viewport');
+        if (rectsOverlap(tagRect, br)) problems.push(label + ': tag overlaps control ' + bi);
+        if (root === document) {
+          var hit = document.elementFromPoint(br.left + br.width / 2, br.top + br.height / 2);
+          if (hit !== btn && !btn.contains(hit)) problems.push(label + ': control ' + bi + ' occluded by ' + (hit && hit.className));
+        }
+      });
+    });
+    return problems;
+  };
+
+  /* ======================= 主流程 ======================= */
+  window.__runReplay = async function () {
+    var stage = document.getElementById('stage');
+    var steps = [litCase, vueCase, bbCase, fetchCase, stressCase];
+    for (var i = 0; i < steps.length; i++) {
+      try {
+        await steps[i](stage);
+      } catch (e) {
+        R.fail.push('scenario ' + steps[i].name + ' threw: ' + (e && e.message));
+      }
+    }
+    /* 让兜底巡检再跑几轮，确认不会重复添加或抛错 */
+    await D(1400);
+    var all = allTags(document);
+    var parentCounts = new Map();
+    all.forEach(function (t) {
+      parentCounts.set(t.parentNode, (parentCounts.get(t.parentNode) || 0) + 1);
+    });
+    var shared = [];
+    parentCounts.forEach(function (n, p) {
+      if (n > 1) shared.push((p && p.className) + ' x' + n);
+    });
+    check('no two tags share a time bar', shared.length === 0, shared.join(', '));
+    check('every tag is attached', all.every(function (t) { return !!t.isConnected; }));
+    check('no leftover empty slots', all.filter(function (t) {
+      return t.getAttribute('data-bili-ip-slot') === '1';
+    }).length === 0);
+    check('no uncaught errors', window.__ERRORS.length === 0, window.__ERRORS.join(' | '));
+    window.__RESULT__ = {
+      pass: R.pass.length, fail: R.fail.length,
+      failures: R.fail, passes: R.pass, errors: window.__ERRORS.slice(),
+      tags: all.length, containers: window.__containers.length
+    };
+    document.title = 'DONE';
+    return window.__RESULT__;
+  };
+
+  if (!window.__NO_AUTORUN) {
+    (async function main() {
+      await window.__runReplay();
+    })();
+  }
+})();
+</script>
+</body>
+</html>

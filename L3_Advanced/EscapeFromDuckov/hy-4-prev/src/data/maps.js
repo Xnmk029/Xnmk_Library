@@ -1,0 +1,83 @@
+// 五张地图的生成参数（文档 §3）。同一套生成器按 theme 切换素材与密度。
+// TILE = 1 世界单位；坐标以图中心为 (0,0)。
+export const MAPS = [
+  {
+    id: 'zone0', name: '零号区', code: 'ZONE 0', seed: 10001,
+    w: 72, h: 72, theme: 'town',
+    ground: 'grass', road: 'asphalt',
+    buildings: { count: 12, minW: 7, maxW: 13, minD: 7, maxD: 12, house: 0.7 },
+    props: { tree: 46, crate: 22, barrel: 14, car: 7, fence: 16, sandbag: 8, container: 2, rock: 12 },
+    containers: ['crate', 'cabinet', 'fridge', 'shelf', 'toolbox'],
+    lootTable: 'town',
+    enemies: { scav: 26, rampager: 2, invisible: 0, boss: null },
+    exits: [{ x: -30, z: -30, name: '南哨卡' }, { x: 30, z: 28, name: '东小路' }],
+    ambientLight: 1.0, indoor: false, unlock: null,
+    quest: 'jeffrey_intro',
+  },
+  {
+    id: 'warehouse', name: '仓库区', code: 'WAREHOUSE', seed: 20002,
+    w: 80, h: 80, theme: 'industrial',
+    ground: 'dirt', road: 'concrete',
+    buildings: { count: 9, minW: 12, maxW: 22, minD: 10, maxD: 18, house: 0.12 },
+    props: { tree: 14, crate: 46, barrel: 30, car: 10, fence: 22, sandbag: 14, container: 14, rock: 8 },
+    containers: ['crate', 'shelf', 'toolbox', 'locker', 'cardboard'],
+    lootTable: 'industrial',
+    enemies: { scav: 34, rampager: 5, invisible: 0, boss: 'warden' },
+    exits: [{ x: -34, z: 30, name: '西门' }, { x: 32, z: -32, name: '北货运口' }],
+    ambientLight: 0.82, indoor: false, unlock: { type: 'wall', from: 'zone0' },
+    quest: 'mud_supply',
+  },
+  {
+    id: 'farm', name: '农场镇', code: 'FARM TOWN', seed: 30003,
+    w: 96, h: 96, theme: 'farm',
+    ground: 'grass', road: 'dirt',
+    buildings: { count: 14, minW: 9, maxW: 16, minD: 8, maxD: 14, house: 0.5 },
+    props: { tree: 70, crate: 26, barrel: 22, car: 12, fence: 40, sandbag: 6, container: 4, rock: 16 },
+    containers: ['crate', 'cabinet', 'fridge', 'shelf', 'toolbox', 'cardboard'],
+    lootTable: 'farm',
+    enemies: { scav: 40, rampager: 8, invisible: 0, boss: 'farmMine' },
+    exits: [{ x: -42, z: -38, name: '镇口' }, { x: 40, z: 40, name: '锯木厂便道' }],
+    ambientLight: 1.0, indoor: false, unlock: { type: 'wall', from: 'warehouse' },
+    quest: 'merchant_meet',
+  },
+  {
+    id: 'jlab', name: 'J-Lab 实验室', code: 'J-LAB', seed: 40004,
+    w: 64, h: 64, theme: 'lab',
+    ground: 'tile', road: 'tile',
+    buildings: { count: 1, minW: 52, maxW: 52, minD: 52, maxD: 52, house: 0 },
+    props: { tree: 0, crate: 18, barrel: 10, car: 0, fence: 0, sandbag: 0, container: 2, rock: 0 },
+    containers: ['labcabinet', 'crate', 'locker', 'cardboard'],
+    lootTable: 'lab',
+    enemies: { scav: 22, rampager: 6, invisible: 8, boss: 'roadblock' },
+    exits: [{ x: -26, z: 26, name: 'B1 电梯井' }],
+    ambientLight: 0.22, indoor: true, powered: false,
+    unlock: { type: 'credential', level: 1 },
+    quest: 'xiaoming_credential',
+  },
+  {
+    id: 'storm', name: '风暴区', code: 'STORM ZONE', seed: 50005,
+    w: 88, h: 88, theme: 'storm',
+    ground: 'asphalt', road: 'concrete',
+    buildings: { count: 10, minW: 10, maxW: 18, minD: 9, maxD: 16, house: 0.2 },
+    props: { tree: 10, crate: 30, barrel: 26, car: 22, fence: 12, sandbag: 20, container: 10, rock: 14 },
+    containers: ['crate', 'military', 'locker', 'cardboard'],
+    lootTable: 'military',
+    enemies: { scav: 30, rampager: 16, invisible: 6, boss: 'fourKnights' },
+    exits: [{ x: -38, z: -36, name: '撤离直升机坪' }],
+    ambientLight: 0.42, indoor: false, storm: true,
+    unlock: { type: 'credential', level: 3 },
+    quest: 'final_spacecraft',
+  },
+];
+
+export const MAP_BY_ID = Object.fromEntries(MAPS.map((m) => [m.id, m]));
+
+/** 建筑类型 → 墙体材质与用途 */
+export const BUILDING_KINDS = {
+  house: { wall: 0x8a7a68, wallTop: 0xa2957f, height: 2.6, roofless: true, containers: 4, name: '民宅' },
+  shop: { wall: 0x7d8590, wallTop: 0x98a1ac, height: 3.2, roofless: true, containers: 6, name: '商铺' },
+  warehouse: { wall: 0x6b7076, wallTop: 0x81878e, height: 4.4, roofless: true, containers: 8, name: '仓库' },
+  factory: { wall: 0x5f656b, wallTop: 0x767c83, height: 5.0, roofless: true, containers: 7, name: '厂房' },
+  barn: { wall: 0x8a5a3a, wallTop: 0xa06c46, height: 3.6, roofless: true, containers: 5, name: '谷仓' },
+  lab: { wall: 0x8f959b, wallTop: 0xa8aeb4, height: 3.4, roofless: true, containers: 9, name: '实验区' },
+};

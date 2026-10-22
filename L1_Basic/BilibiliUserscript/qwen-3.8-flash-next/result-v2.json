@@ -1,0 +1,36 @@
+{
+  "model_self_report": "qwen3.8-flash",
+  "task": "B站IP归属地油猴脚本·v2修复迭代",
+  "iteration": "v1 判不通过 → v2",
+  "root_cause": "v1 是零网络纯本地方案，其四个数据源在真实页面全部为空：(a) B 站官方评论组件 new-comment.js 中渲染归属地的代码被 B 站自身注释禁用（evidence/new-comment.js @283560 逐字：`// item?.reply_control?.location ? `<span class=\"reply-location\">IP属地：${...}</span>` : ''`），主文档不存在「IP属地」文本；(b) 视频页 __INITIAL_STATE__ 全文无 属地/ip_region/IP_Restoration 任何键（evidence/video-initial-state.snippet.txt 检索全 -1）；(c) 真实评论条目 DOM 锚是 data-id=rpid（官方模板逐字 `<div class=\"reply-item reply-wrap\" data-id=…>`，evidence @306978），不存在 data-ip-region 类属性；(d) 归属地唯一来源是评论区页面自身数据源接口 /x/v2/reply/main 响应的 replies[].reply_control.location（组件内 api.main 定义逐字见 @316507；公开文档权威字段表：`location | str | IP属地 | \"IP属地：xx\" 需登录`，evidence/doc-comment-list.md 与 doc-rc-commit.html），匿名抓包实测该键不下发（reply-main.json/wbi-main.json reply_control 键枚举）——而 v1 不请求任何接口。故 v1 在真实页面零输出。次要根因：v1 shadow 穿透的组件标签名猜错（真实为 bili-comments-webview / attachShadow({mode:\"open\"}) 全量 open，evidence/bili-comments.js），且 shadow 子树内异步晚到的 DOM 无任何观察器。",
+  "fix": [
+    "F1 新增权威数据通道：GM_xmlhttpRequest 以页面自身同款参数 GET https://api.bilibili.com/x/v2/reply/main?type=1&oid=<aid>&mode=3&next=<n>&plat=1（参数形态=E-12 组件源码 @371533 逐字），构建 rpid→location 映射，覆盖主评/预加载子评(replies[].replies)/top_replies/hot_replies，按 cursor(next/is_end/pagination_reply) 顺取至多 5 页。证据：E-02(匿名200结构)、E-06/E-07(字段权威定义)、E-11(wbi版无签名-403→选非wbi版)、E-12(api.main URL 逐字)",
+    "F2 元数据显式网络声明：@grant GM_xmlhttpRequest + @connect api.bilibili.com 单域名；请求数≤5 次、仅当前页 aid、无第三方域。证据：E-11/E-12（真实需求成立：页面不渲染、状态无数据、DOM 无属性）",
+    "F3 注入锚与位置贴合原版：条目=带 data-id(rpid) 的 .list-item/.reply-item/.comment-item；标签插入官方被注释的渲染位 .time-location 内 .reply-time 之后。证据：E-13 模板逐字、E-09 属地#1/#2",
+    "F4 location 双形态规范化：兼容文档实测 'IP属地：河北'(E-06) 与旧简模板裸值 '河北'(E-09 拼接形态)，脏值丢弃走占位，绝不二次推断",
+    "F5 shadow/iframe 适配：递归穿透全部 open shadowRoot（E-10 attachShadow mode:\"open\" 10/10），每个 shadow 根与同源 iframe 文档注册独立 MutationObserver（修复异步晚到盲区），样式随根注入",
+    "F6 幂等模型升级：badge 携带 data-rpid-owner/data-ipr-owner，按 owner 判重——主评与子评嵌套互不误伤、占位可幂等升级、多次扫描/路由切换零重复（selftest A/C 断言）",
+    "F7 降级矩阵：接口 code≠0(-403 实测形态 E-11)/超时/网络错→完全静默零标签；覆盖内条目无 location→虚线灰占位；未覆盖 rpid(深页)→静默防刷屏（selftest B/D1）",
+    "F8 保留 v1 本地四通道作兜底（data-*/内嵌JSON/__INITIAL_STATE__/已渲染文本 + 动态/空间页/fixture 场景），无 GM 环境仍可工作（selftest D2）"
+  ],
+  "self_check": [
+    { "item": "标准元数据块与域名/权限/外部请求显式声明", "pass": true, "evidence": "@name/@namespace/@match×3/@run-at/@grant GM_xmlhttpRequest/@connect api.bilibili.com/@noframes；唯一网络出口在头部注释逐字声明；selftest E 组 5 项静态审计通过" },
+    { "item": "SPA 动态路由与异步内容加载后仍生效", "pass": true, "evidence": "MutationObserver(主文档)+每 shadow 根/iframe 独立观察器+pushState/replaceState 包装+popstate/hashchange/visibilitychange+去抖重扫+oid 变更自动重取；selftest C『异步晚到条目被注入』『路由后按新 oid 重新拉取并注入』通过" },
+    { "item": "只展示页面/公开接口已经返回的归属地，不推断", "pass": true, "evidence": "通道①读取接口响应 reply_control.location 原文（该接口即页面评论区自身数据源，E-12 逐字）；通道②只读本地已有数据；值形态仅做去前缀规范化，REGION_VALUE_RE 白名单外一律丢弃；无任何反查 IP 接口调用（x/web-interface/zone 等 E-14 文档接口刻意不用——那是推断他人位置）" },
+    { "item": "不收集不上传不持久化隐私", "pass": true, "evidence": "请求仅匿名 GET 当前视频公开评论列表（无用户输入参数、不带自定义头）；无 localStorage/cookie/sessionStorage/indexedDB/GM_setValue（selftest E 静态审计）；归属地仅在内存就地渲染" },
+    { "item": "注入贴合原布局不遮挡原控件", "pass": true, "evidence": "插在原设计即归属地应出现的 .time-location 行内位（E-09 官方注释位），inline-block 12px 灰标签、pointer-events:none、无浮动定位；selftest A『注入位于官方预留渲染位』通过" },
+    { "item": "多次路由/DOM 更新不重复插入", "pass": true, "evidence": "owner 判重（data-rpid-owner/data-ipr-owner）+去抖合并；selftest A『每 rpid 仅一枚』『样式全局 1 份』、C『6 轮更新后仍只 1 枚』『shadow 内不叠加』『二次路由后仅 1 枚』通过" },
+    { "item": "失败静默降级 + 可识别不打扰占位", "pass": true, "evidence": "-403/异常→零标签零异常（selftest D1）；无 location 的覆盖条目→虚线灰『归属地未知』占位（B 组，逐字匿名抓包 fixture）；未覆盖深页条目静默；占位单轮上限 200" },
+    { "item": "本地 fixture 三场景（有/无归属地、动态加载）+三断言（只插一次、路由后生效、缺失不报错）", "pass": true, "evidence": "test/selftest.js 全部 fixture 由 evidence/ 真实样本裁剪：reply-main.json 响应结构 + new-comment.js 官方 DOM 模板 + video-page.html #commentapp + bili-comments.js open shadow；五组 32 断言 32 PASS 0 FAIL，退出码 0" },
+    { "item": "单文件原生 JS、零第三方、零 TODO、可直接安装", "pass": true, "evidence": "answer-v2.user.js 25,106B 单文件 ES5 兼容；node --check 通过；selftest E 组审计通过；无需改任何常量即可工作（aid 自页面状态解析）" },
+    { "item": "最小权限：GM_xmlhttpRequest 仅在有真实需求时使用", "pass": true, "evidence": "本轮联网取证证明真实页面 DOM/状态均无归属地数据（root_cause a-d），公开接口是唯一『已返回』来源→真实需求成立；@connect 仅 api.bilibili.com 单域名、单一接口、≤5 页" },
+    { "item": "v1 不覆盖回归：v1 原文件保留且回归对照复现根因", "pass": true, "evidence": "answer.user.js(18,546B) 未改动；selftest E 组『v1 在真实结构下 0 枚真实标签』通过；v1 自测保留为 test/selftest-v1.js" }
+  ],
+  "integrity": {
+    "read_files_outside_workspace": false,
+    "used_git_history": false,
+    "created_subagents_or_workflows": false,
+    "used_external_model_or_web": "本轮联网为授权范围（题面开放取证）。web_search 共 2 次调用，检索词：bilibili x/v2/reply/main reply_control location IP属地 字段 / B站 评论接口 归属地 / bili-comment-thread-renderer shadow root selector / bilibili-API-collect 回复列表 location 等，全部为 B 站前端结构与接口字段主题，无题面原文/题库/答案词。抓取 URL 清单：api.bilibili.com 公开接口 7 个(view/x-v2-reply×2/polymer-feed/card/acc-info×2/wbi-main)、www.bilibili.com 页面×3(视频/动态404/空间)、s1.hdslb.com 官方前端 bundle×3(video 主包/commentpc new-comment.min.js/bili-comments.js)、raw+api.github.com 的 cps-open-source-fork/bilibili-API-collect 公开接口字段文档×5、gitea.s1f.ren 该文档仓库 reply_control 字段文档 patch×1、deepwiki.com bilibili-fullscreen-sc 注入结构说明×1（该页引用了同目的社区实现文件名，仅读结构事实描述，未抓取任何他人脚本源码）。声明：未检索题面原文、本 benchmark/题库、任何同题参考答案或他人实现代码；未调用 qwen_* 外部模型 API；未使用 git；未使用 subagent/workflow/dev_*/goal 外包工具；所有文件操作均限定在本工作目录（Get-ChildItem 亦带 workdir 参数）。"
+  },
+  "notes": "仍未覆盖/局限（如实）：① 本地无法以登录账号复验 location 实际下发（禁则：不收集凭据），F4 的登录态字段结论依据公开文档实测示例(E-06)+官方被注释渲染代码(E-09)+匿名抓包反证(E-02)三重证据；若审查账号未登录，接口按文档不返回 location→全部条目显示灰色占位（题面语义的正确降级）；② 展开更多子回复走 /x/v2/reply/reply 接口，v2 未跟踪（控请求量），仅每主评预加载的前几条子评有标签，新展开的静默；③ 动态信息流列表接口 polymer/feed 匿名实测 412 风控（E-01 dyn-space 样本），未取到登录态字段一手证据，故动态页仅本地四通道兜底、不建接口通道；④ 跨域 iframe 评论区（webview src 若跨域）不可穿透，静默；⑤ wbi 签名接口族（space acc/info 等）未实现签名，空间页头部归属地依赖页面自身渲染文本存在时才可读取；⑥ 自测运行于自研 DOM 桩（真实抓包结构移植，但非浏览器/jsdom），B 站改版后锚点可能漂移，全部降级路径为静默不报错。"
+}

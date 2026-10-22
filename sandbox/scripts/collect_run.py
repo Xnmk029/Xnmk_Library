@@ -35,6 +35,8 @@ from sandbox_lib import (  # noqa: E402
     now_iso,
     primary_html,
     project_rel,
+    prompt_input_names,
+    registered_prompt,
     resolve_project_dir,
     sha256_file,
     workdir_of,
@@ -63,6 +65,10 @@ def collect(harness_dir: Path, dry_run: bool = False, with_review: bool = False,
         from godot_profile import collect as godot_collect
         return godot_collect(harness_dir, dry_run=dry_run, with_review=with_review,
                              overwrite=overwrite, force=force)
+    if meta.get("profile") == "native-blender-v1":
+        from blender_profile import collect as blender_collect
+        return blender_collect(harness_dir, dry_run=dry_run, with_review=with_review,
+                               overwrite=overwrite, force=force)
 
     model = meta.get("model") or "unknown-model"
     project_dir = resolve_project_dir(meta.get("project_rel") or meta.get("project"))
@@ -78,15 +84,16 @@ def collect(harness_dir: Path, dry_run: bool = False, with_review: bool = False,
             return 3
         print(f"WARN: --force 绕过 verdict 闸门（{reason}）", file=sys.stderr)
 
-    # prompt integrity: workdir prompt must still match the formal tree
-    formal_prompt = project_dir / PROMPT_MD
+    # prompt integrity: workdir prompt must still match the prompt dispatched
+    formal_prompt = registered_prompt(project_dir)["prompt"]
     run_prompt = workdir / PROMPT_FILE
     if formal_prompt.is_file() and run_prompt.is_file():
         if sha256_file(formal_prompt) != sha256_file(run_prompt):
-            print("ERROR: workdir PROMPT.md differs from formal tree prompt", file=sys.stderr)
+            print("ERROR: workdir PROMPT.md differs from the dispatched formal prompt",
+                  file=sys.stderr)
             return 2
 
-    names = list_deliverables(workdir)
+    names = list_deliverables(workdir, prompt_input_names(meta))
     if with_review and (harness_dir / REVIEW_MD).is_file():
         pass  # review file lives in harness dir, handled below
     if not names:

@@ -1,0 +1,248 @@
+﻿<span
+style='font-weight:bold' lang=zh-CN>Grok</span><span style='font-weight:bold'
+lang=en-US> 4.7 </span>
+
+
+
+<span
+style='font-weight:bold'>绿灯亮起，侯天一右脚离开刹车，稳稳踩进油门，脚腕绷住，深度就停在那儿。</span>
+
+<span
+style='font-weight:bold'>奥德赛车头抬了一下，前轮碾过停止线，雪水从胎纹里挤出去，整台车驶出路口。</span>
+
+<span
+style='font-weight:bold'>雨刮器吱地刮过风挡，侯天一眉心跳了跳，眼睛仍盯着车道正中那块发亮的湿沥青。</span>
+
+<span
+style='font-weight:bold'>小智后背重重陷进座椅，安全带咔地锁死，胸口被勒得发紧，气一下吐不匀。</span>
+
+<span
+style='font-weight:bold'>打包杯歪在他手里，冰块撞上杯壁，剩下的冰美式洒出来，凉液顺着指缝淌到裤子上。</span>
+
+<span
+style='font-weight:bold;font-family:"Fira Code"'>“</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>我操，哥，你来真的啊。</span><span
+style='font-weight:bold;font-family:"Fira Code"'>”</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>小智声音劈了，一手抠住车门扶手，指头在塑料上打滑。</span>
+
+<span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>左边粉色</span><span
+style='font-weight:bold;font-family:"Fira Code"'>86</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>的转速先吼起来，后轮在湿沥青上打空，车尾甩向奥德赛这一侧，后叶子板擦着车道线压过来。</span>
+
+<span
+style='font-weight:bold'>小智身子往左一歪，视线越过侯天一的肩膀，看见副驾上那双黑丝腿绷直，小姐姐的嘴张得老大。</span>
+
+<span
+style='font-weight:bold'>侯天一把方向盘握稳，奥德赛照直往前走，左车门和那片粉色后叶子板错开一道窄缝，雪粒从缝里刮过去。</span>
+
+<span
+style='font-weight:bold;font-family:"Fira Code"'>86</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>驾驶员猛打方向，车头晃了两晃才扳正。尾灯落到后面，隔着雪只剩两团红光。</span>
+
+<span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>小智这口气总算吐出来，手心黏着咖啡，说话带喘。</span><span
+style='font-weight:bold;font-family:"Fira Code"'>“</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>卧槽，再过来一巴掌，咱们车门就凹了。</span><span
+style='font-weight:bold;font-family:"Fira Code"'>”</span>
+
+<span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>侯天一目光钉在路面上，油门还是那个深度，只回了一句。</span><span
+style='font-weight:bold;font-family:"Fira Code"'>“</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>凹不了。他胎抓不住，甩过来也是滑的。</span><span
+style='font-weight:bold;font-family:"Fira Code"'>”</span>
+
+<span
+style='font-weight:bold'>小智扭头去找左侧后视镜。粉车落在后头，油门一补，车尾就扭一下，雪水被甩开。</span>
+
+<span
+style='font-weight:bold;font-family:"Fira Code"'>“</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>你就等这个呢？</span><span
+style='font-weight:bold;font-family:"Fira Code"'>”</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>小智问完，自己先咽了口唾沫，喉咙里又干又苦，咖啡味还挂在舌根上。</span>
+
+<span
+style='font-weight:bold'>侯天一抬手把音量拨高一格。音响里的鼓点一下一下撞着耳膜，小智太阳穴也跟着跳。</span>
+
+<span
+style='font-weight:bold;font-family:"Fira Code"'>“</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>水中芭蕾，头文字</span><span
+style='font-weight:bold;font-family:"Fira Code"'>D</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>啊这是。</span><span
+style='font-weight:bold;font-family:"Fira Code"'>”</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>小智抹了把嘴，咖啡糊到嘴唇上，苦得舌头发麻。</span><span
+style='font-weight:bold;font-family:"Fira Code"'>“</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>人可还在奥德赛里呢。</span><span
+style='font-weight:bold;font-family:"Fira Code"'>”</span>
+
+<span
+style='font-weight:bold;font-family:"Fira Code"'>“</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>听着就行。</span><span
+style='font-weight:bold;font-family:"Fira Code"'>”</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>侯天一把油门松下来半寸，车速稳住，</span><span
+style='font-weight:bold;font-family:"Fira Code"'>“</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>半热熔这会儿热不起来，后驱一轰油，尾巴指定摆。</span><span
+style='font-weight:bold;font-family:"Fira Code"'>”</span>
+
+<span
+style='font-weight:bold'>前面路口的灯已经变黄。侯天一收油，顺手把音量拨回去，奥德赛平顺停在线后。</span>
+
+<span
+style='font-weight:bold'>车厢里只剩下雨刮的吱呀。侯天一眉心跳了跳，把雨刮拨到最慢，嘴上啧了一下。</span>
+
+<span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>粉色</span><span
+style='font-weight:bold;font-family:"Fira Code"'>86</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>从左后方贴上来，靠着奥德赛这一侧的车窗降下一道缝，骂声混着雪风灌进来，那只手还在比划。</span>
+
+<span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>小智火气顶上来，伸手去按玻璃键。</span><span
+style='font-weight:bold;font-family:"Fira Code"'>“</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>操</span><span
+style='font-weight:bold;font-family:"Fira Code"'>X</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>妈，这下停住了，哥你开窗，我跟他说两句。</span><span
+style='font-weight:bold;font-family:"Fira Code"'>”</span>
+
+<span
+style='font-weight:bold'>侯天一先按住车窗锁，小智那侧玻璃纹丝不动。他连戳好几下按键，指头发麻，窗子还关得严严实实。</span>
+
+<span
+style='font-weight:bold;font-family:"Fira Code"'>“</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>你锁窗干啥！</span><span
+style='font-weight:bold;font-family:"Fira Code"'>”</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>小智脖子上的筋绷起来，脸凑近玻璃，哈出一团白气，</span><span
+style='font-weight:bold;font-family:"Fira Code"'>“</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>人骂到你头上了，你就这么受着？</span><span
+style='font-weight:bold;font-family:"Fira Code"'>”</span>
+
+<span
+style='font-weight:bold;font-family:"Fira Code"'>“</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>红灯底下把脑袋伸出去对骂，罚单算我这台奥德赛的。</span><span
+style='font-weight:bold;font-family:"Fira Code"'>”</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>侯天一说完，目光重新落到红灯上。</span>
+
+<span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>绿灯再亮，</span><span
+style='font-weight:bold;font-family:"Fira Code"'>86</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>先窜出去。后轮空转了半秒，车尾扭了一小下，接着抓住地面，粉色车身拉开一截，开进雪里。</span>
+
+<span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>小智盯着那两团红光，胸口那口气没处放，只挤出一句。</span><span
+style='font-weight:bold;font-family:"Fira Code"'>“</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>他这就走了？你也不追？</span><span
+style='font-weight:bold;font-family:"Fira Code"'>”</span>
+
+<span
+style='font-weight:bold;font-family:"Fira Code"'>“</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>追什么。</span><span
+style='font-weight:bold;font-family:"Fira Code"'>”</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>侯天一轻给油，奥德赛重新起步，</span><span
+style='font-weight:bold;font-family:"Fira Code"'>“</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>尾巴还在扭，再补油就该横在路中间了。</span><span
+style='font-weight:bold;font-family:"Fira Code"'>”</span>
+
+<span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>小智低头看裤子上那片深色，把杯子里剩下的底子晃了晃。</span><span
+style='font-weight:bold;font-family:"Fira Code"'>“</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>瑰夏洒我腿上了。一百八，你刚才还偷喝。</span><span
+style='font-weight:bold;font-family:"Fira Code"'>”</span>
+
+<span
+style='font-weight:bold;font-family:"Fira Code"'>“</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>拿不稳就怪你自己。</span><span
+style='font-weight:bold;font-family:"Fira Code"'>”</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>侯天一从手套箱里抽出两张纸巾扔过去，</span><span
+style='font-weight:bold;font-family:"Fira Code"'>“</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>钱照旧记着，压岁钱那套别拿出来抵。</span><span
+style='font-weight:bold;font-family:"Fira Code"'>”</span>
+
+<span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>纸巾按在湿裤子上，咖啡渍越擦越开。小智擦了两下就停手，侧过脸，声音低下去。</span><span
+style='font-weight:bold;font-family:"Fira Code"'>“</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>哥，你是算准了他会漂。</span><span
+style='font-weight:bold;font-family:"Fira Code"'>”</span>
+
+<span
+style='font-weight:bold;font-family:"Fira Code"'>“</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>半热熔得热起来才咬得住。雪粒子砸在胎面上，温度起不来，油门一给，后轮就打空。</span><span
+style='font-weight:bold;font-family:"Fira Code"'>”</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>侯天一说完，侧过脸看了他一眼。</span>
+
+<span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>小智把纸巾团成一团，攥紧，指缝里还残留着凉意。</span><span
+style='font-weight:bold;font-family:"Fira Code"'>“</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>那我要是开</span><span
+style='font-weight:bold;font-family:"Fira Code"'>86</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>，给油也会这样？</span><span
+style='font-weight:bold;font-family:"Fira Code"'>”</span>
+
+<span
+style='font-weight:bold;font-family:"Fira Code"'>“</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>你给不到那个油，车就停在原地干转，后面的喇叭能把你从头骂到尾。</span><span
+style='font-weight:bold;font-family:"Fira Code"'>”</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>侯天一说这话时，嘴角倒是松着的。</span>
+
+<span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>小智嘿嘿笑了一声，跟着又问那台老轿车。</span><span
+style='font-weight:bold;font-family:"Fira Code"'>“</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>咱家那台不用的，我妈说盖在二伯厂子后面。借我练练起步，我轻给油。</span><span
+style='font-weight:bold;font-family:"Fira Code"'>”</span>
+
+<span
+style='font-weight:bold'>暖气风口轻轻响着。侯天一盯着前方，奥德赛拐进老城区，车速跟着慢下来。</span>
+
+<span
+style='font-weight:bold'>巷子口霓虹少了，路灯把雪照得发灰。地面结着一层薄冰，轮胎碾上去，发出细碎的脆响。</span>
+
+<span
+style='font-weight:bold;font-family:"Fira Code"'>“</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>车可以看。</span><span
+style='font-weight:bold;font-family:"Fira Code"'>”</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>侯天一开口时，厂子的铁门已经出现在路灯下面，</span><span
+style='font-weight:bold;font-family:"Fira Code"'>“</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>打火不行。那车后驱，离合还沉，你本儿新，雪天一给油就得学刚才那台</span><span
+style='font-weight:bold;font-family:"Fira Code"'>86</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>。</span><span
+style='font-weight:bold;font-family:"Fira Code"'>”</span>
+
+<span
+style='font-weight:bold'>小智嘴张了张，到嘴边的话又咽了回去。他摸出一根白将军，指头还黏，烟纸粘在指腹上，只好别回口袋。</span>
+
+<span
+style='font-weight:bold'>奥德赛在铁门前停稳，发动机声音落下去。侯天一拉上手刹，解开了安全带。</span>
+
+<span
+style='font-weight:bold'>铁门关得死死的，门缝里往外钻风。灰布被雪压塌一角，露出半截掉了漆的保险杠，旁边还有一枚蒙着灰的圆灯。</span>
+
+<span
+style='font-weight:bold'>小智捏着杯子下车，人往门缝凑，冷风灌进领口，他打了个哆嗦，眼睛盯住那枚圆灯。</span>
+
+<span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>侯天一锁好车，走到他侧边，抬手把人拨回巷子中间。</span><span
+style='font-weight:bold;font-family:"Fira Code"'>“</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>灯罩上全是灰，牌子看不清。明天除夕，先回家吃饭。</span><span
+style='font-weight:bold;font-family:"Fira Code"'>”</span>
+
+<span
+style='font-weight:bold;font-family:"Fira Code"'>“</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>吃完我去拿那台的钥匙，布可以掀，打火的事别想。</span><span
+style='font-weight:bold;font-family:"Fira Code"'>”</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>侯天一说完，把奥德赛的钥匙在指间转了一圈。</span>
+
+<span
+style='font-weight:bold;font-family:"Fira Code"'>“</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>行行行，我今晚就用眼睛看，手指头不碰车。</span><span
+style='font-weight:bold;font-family:"Fira Code"'>”</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>小智笑出了声，空杯子被他捏得咔咔响，裤腿上的咖啡渍已经发暗。</span>
+
+<span
+style='font-weight:bold'>一阵风顺着门缝灌出来，灰布掀起一寸。圆灯边上露出半块缺了角的车标，雪粒落上去，很快化成水。</span>
+
+<span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>侯天一转身往家里的灯光走，开口喊他。</span><span
+style='font-weight:bold;font-family:"Fira Code"'>“</span><span
+style='font-weight:bold;font-family:"Microsoft YaHei"'>跟上。我想喝口热的，咖啡这玩意儿今晚够了。</span><span
+style='font-weight:bold;font-family:"Fira Code"'>”</span>
+
+<span
+style='font-weight:bold'>小智又盯着那块缺角的车标看了两秒，到底没问出口，小跑着跟上去。薄冰在脚下碎开，巷子里留下一串湿脚印。</span>

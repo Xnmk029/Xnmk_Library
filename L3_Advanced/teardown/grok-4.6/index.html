@@ -1,0 +1,751 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TEARDOWN · Micro-Voxel City Diorama</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #07090c; }
+    canvas { display: block; width: 100%; height: 100%; }
+    #hud {
+      position: fixed; left: 18px; top: 16px; z-index: 2; pointer-events: none;
+      font-family: ui-monospace, "Cascadia Mono", Consolas, "Segoe UI", monospace;
+      color: #e8edf2; text-shadow: 0 1px 8px rgba(0,0,0,.55);
+    }
+    #hud .kicker {
+      font-size: 10px; letter-spacing: .28em; color: #f0c14a; margin-bottom: 6px;
+    }
+    #hud h1 { font-size: 15px; font-weight: 600; letter-spacing: .04em; }
+    #hud p { margin-top: 6px; font-size: 11px; line-height: 1.55; color: #b7c2cc; max-width: 420px; }
+    #stats {
+      position: fixed; right: 18px; bottom: 16px; z-index: 2; pointer-events: none;
+      font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+      font-size: 11px; color: #c5d0da; text-align: right; line-height: 1.6;
+      text-shadow: 0 1px 8px rgba(0,0,0,.55);
+    }
+    #err {
+      display: none; position: fixed; inset: 0; z-index: 9; align-items: center; justify-content: center;
+      background: #120b0b; color: #ffd0d0; font-family: Consolas, monospace; padding: 24px;
+    }
+  </style>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.1/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.1/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="hud">
+    <div class="kicker">MICRO-VOXEL · PBR · TILT-SHIFT</div>
+    <h1>TEARDOWN CITY DIORAMA</h1>
+    <p>左键旋转 · 右键平移 · 滚轮缩放<br/>统一体素 · InstancedMesh 合批 · 无贴图</p>
+  </div>
+  <div id="stats">初始化…</div>
+  <div id="err"></div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+    import { SSAOPass } from 'three/addons/postprocessing/SSAOPass.js';
+    import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+    import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+    import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+    const VOX = 0.145;
+    const GAP = 0.935;
+    const CW = 40;
+    const CD = 40;
+    const PED_M = 5;
+    const PED_H = 7;
+
+    const PAL = {
+      concrete: [0xc9c6be, 0xb7b3aa, 0xd4d0c7, 0xaaa69d, 0xc0bcb3],
+      brick:    [0x8f3d2c, 0xa34733, 0x7a3224, 0xb85c42, 0x6e2c20, 0xc46a50, 0x933f2e],
+      wood:     [0x6a4328, 0x5a3820, 0x7b5130, 0x4a2e18, 0x8a5a38],
+      metal:    [0xc8ced6, 0xb0b7c0, 0xdcdce3, 0x9aa3ad, 0xd5dbe3],
+      rust:     [0x8d4b30, 0x6e3a24, 0xa85a38, 0x5c301c, 0x9a5534],
+      glass:    [0xb7d8e6, 0xc4e3f0, 0xa5cddc, 0xd2eef8],
+      water:    [0x2a7390, 0x1f6280, 0x3386a4, 0x185570],
+      silt:     [0x5a5346, 0x4a453c, 0x6a6254, 0x3f3a32],
+      asphalt:  [0x3c3d42, 0x33343a, 0x47484e, 0x2c2d32],
+      grass:    [0x3a6b32, 0x2f5a29, 0x47803c, 0x345c2c, 0x416e38],
+      leaf:     [0x2d6a28, 0x3d8a34, 0x245820, 0x4a9a3c],
+      stone:    [0x2c2f36, 0x24272e, 0x353840, 0x1c1f25, 0x3c4048],
+      cap:      [0xb4b0a7, 0xc2beb5, 0xa6a29a, 0xccc8bf],
+      walk:     [0xb0aca4, 0xa39e96, 0xbbb7af],
+      lineY:    0xe4cc5c,
+      lineW:    0xeae7e0,
+      lamp:     [0xffd9a0, 0xffe6bc],
+      neon:     [0x7ec8ff, 0xb0e4ff],
+      car:      [0xc43b2e, 0xd8d5ce, 0x2c5f9a, 0xd2a126, 0x2e2f33, 0x3a7a48]
+    };
+    function mulberry32(a) {
+      return function () {
+        let t = a += 0x6D2B79F5;
+        t = Math.imul(t ^ t >>> 15, t | 1);
+        t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+        return ((t ^ t >>> 14) >>> 0) / 4294967296;
+      };
+    }
+    const rng = mulberry32(0x7E4D01);
+
+    function pick(arr) { return arr[(rng() * arr.length) | 0]; }
+    function jitter(hex, amt) {
+      const c = new THREE.Color(hex);
+      const h = { h: 0, s: 0, l: 0 };
+      c.getHSL(h);
+      h.h += (rng() - 0.5) * amt * 0.045;
+      h.s = THREE.MathUtils.clamp(h.s + (rng() - 0.5) * amt * 0.08, 0, 1);
+      h.l = THREE.MathUtils.clamp(h.l + (rng() - 0.5) * amt * 0.07, 0.06, 0.92);
+      c.setHSL(h.h, h.s, h.l);
+      return c.getHex();
+    }
+
+    const grid = new Map();
+    const k = (x, y, z) => `${x|0},${y|0},${z|0}`;
+    function put(x, y, z, mat, color) {
+      grid.set(k(x, y, z), { mat, color });
+    }
+    function inCity(x, z) { return x >= 0 && z >= 0 && x < CW && z < CD; }
+
+    function riverZ(x) {
+      return 16 + Math.round(Math.sin(x * 0.18) * 3.2 + Math.sin(x * 0.07) * 1.15);
+    }
+    function riverDist(x, z) { return Math.abs(z - riverZ(x)); }
+    function isRiver(x, z) { return riverDist(x, z) <= 2; }
+
+    function fillBox(x0, y0, z0, w, h, d, mat, colors, solid) {
+      for (let x = x0; x < x0 + w; x++) {
+        for (let y = y0; y < y0 + h; y++) {
+          for (let z = z0; z < z0 + d; z++) {
+            if (!solid) {
+              const edge = x === x0 || x === x0 + w - 1 || z === z0 || z === z0 + d - 1;
+              const slab = y === y0 || y === y0 + h - 1;
+              if (!edge && !slab) continue;
+            }
+            const col = Array.isArray(colors) ? jitter(pick(colors), 1) : colors;
+            put(x, y, z, mat, col);
+          }
+        }
+      }
+    }
+
+    function pipe(x0, y0, z0, x1, y1, z1, mat, colors, rad) {
+      const n = Math.max(1, Math.abs(x1 - x0), Math.abs(y1 - y0), Math.abs(z1 - z0));
+      for (let i = 0; i <= n; i++) {
+        const t = i / n;
+        const x = Math.round(x0 + (x1 - x0) * t);
+        const y = Math.round(y0 + (y1 - y0) * t);
+        const z = Math.round(z0 + (z1 - z0) * t);
+        for (let dy = 0; dy < rad; dy++) {
+          for (let dz = 0; dz < rad; dz++) {
+            put(x, y + dy, z + dz, mat, jitter(pick(colors), 0.7));
+          }
+        }
+      }
+    }
+
+    function tree(tx, tz) {
+      const th = 3 + (rng() * 2) | 0;
+      for (let y = 2; y < 2 + th; y++) put(tx, y, tz, 'wood', jitter(pick(PAL.wood), 0.6));
+      const r = 1 + (rng() > 0.5 ? 1 : 0);
+      const top = 2 + th;
+      for (let dx = -r; dx <= r; dx++) {
+        for (let dy = 0; dy <= r + 1; dy++) {
+          for (let dz = -r; dz <= r; dz++) {
+            if (Math.abs(dx) + Math.abs(dy) + Math.abs(dz) > r + 1) continue;
+            if (rng() < 0.12) continue;
+            put(tx + dx, top + dy, tz + dz, 'leaf', jitter(pick(PAL.leaf), 1));
+          }
+        }
+      }
+    }
+
+    function lamp(x, z) {
+      for (let y = 2; y <= 5; y++) put(x, y, z, 'metal', jitter(pick(PAL.metal), 0.4));
+      put(x, 6, z, 'lamp', pick(PAL.lamp));
+    }
+
+    function car(x, z, dir) {
+      const col = pick(PAL.car);
+      const body = dir === 'x';
+      for (let i = 0; i < 3; i++) {
+        for (let w = 0; w < 2; w++) {
+          const vx = body ? x + i : x + w;
+          const vz = body ? z + w : z + i;
+          put(vx, 2, vz, 'metal', jitter(col, 0.35));
+          if (i === 1) put(vx, 3, vz, 'glass', jitter(pick(PAL.glass), 0.3));
+        }
+      }
+    }
+
+    function generateWorld() {
+      const px0 = -PED_M, px1 = CW + PED_M, pz0 = -PED_M, pz1 = CD + PED_M;
+      for (let y = -PED_H; y <= 0; y++) {
+        for (let x = px0; x < px1; x++) {
+          for (let z = pz0; z < pz1; z++) {
+            const cap = y === 0;
+            const rim = cap && (x < 0 || z < 0 || x >= CW || z >= CD);
+            const col = cap
+              ? (rim ? jitter(pick(PAL.cap), 0.5) : jitter(pick(PAL.cap), 0.35))
+              : jitter(pick(PAL.stone), y < -4 ? 0.4 : 0.7);
+            put(x, y, z, cap ? 'concrete' : 'stone', col);
+          }
+        }
+      }
+
+      for (let x = 0; x < CW; x++) {
+        for (let z = 0; z < CD; z++) {
+          if (isRiver(x, z)) {
+            put(x, 0, z, 'silt', jitter(pick(PAL.silt), 0.8));
+            put(x, 1, z, 'water', jitter(pick(PAL.water), 0.55));
+            if (riverDist(x, z) === 0 && rng() < 0.18) put(x, 2, z, 'water', jitter(pick(PAL.water), 0.4));
+          } else if (riverDist(x, z) === 3) {
+            put(x, 1, z, 'silt', jitter(pick(PAL.silt), 0.7));
+            if (rng() < 0.35) put(x, 2, z, 'silt', jitter(pick(PAL.stone), 0.5));
+          } else {
+            const plaza = x >= 22 && x <= 33 && z >= 20 && z <= 28;
+            put(x, 1, z, plaza ? 'concrete' : 'grass', jitter(pick(plaza ? PAL.concrete : PAL.grass), 0.8));
+          }
+        }
+      }
+
+      function paintRoad(x, z, alongX) {
+        if (!inCity(x, z) || isRiver(x, z)) return;
+        put(x, 1, z, 'asphalt', jitter(pick(PAL.asphalt), 0.55));
+        if (alongX && (x % 4 === 0) && (z % 3 === 1)) put(x, 1, z, 'asphalt', PAL.lineY);
+        if (!alongX && (z % 4 === 0) && (x % 3 === 1)) put(x, 1, z, 'asphalt', PAL.lineY);
+      }
+      function sidewalk(x, z) {
+        if (!inCity(x, z) || isRiver(x, z)) return;
+        put(x, 1, z, 'walk', jitter(pick(PAL.walk), 0.45));
+      }
+
+      for (let x = 0; x < CW; x++) {
+        for (let t = 0; t < 3; t++) {
+          paintRoad(x, 8 + t, true);
+          paintRoad(x, 26 + t, true);
+        }
+        sidewalk(x, 7); sidewalk(x, 11);
+        sidewalk(x, 25); sidewalk(x, 29);
+      }
+      for (let z = 0; z < CD; z++) {
+        for (let t = 0; t < 3; t++) paintRoad(20 + t, z, false);
+        sidewalk(19, z); sidewalk(23, z);
+      }
+      for (let i = 0; i < 5; i++) {
+        put(16 + i, 1, 8, 'walk', PAL.lineW);
+        put(16 + i, 1, 10, 'walk', PAL.lineW);
+        put(20, 1, 22 + i, 'walk', PAL.lineW);
+        put(22, 1, 22 + i, 'walk', PAL.lineW);
+      }
+
+      const bx0 = 19, bx1 = 23;
+      for (let x = bx0; x <= bx1; x++) {
+        const cz = riverZ(x);
+        for (let z = cz - 3; z <= cz + 3; z++) {
+          put(x, 2, z, 'asphalt', jitter(pick(PAL.asphalt), 0.4));
+          if (z === cz - 3 || z === cz + 3) {
+            put(x, 3, z, 'metal', jitter(pick(PAL.metal), 0.3));
+            put(x, 4, z, 'metal', jitter(pick(PAL.metal), 0.3));
+          }
+        }
+        if (x === bx0 || x === bx1) {
+          for (let y = 0; y <= 2; y++) {
+            put(x, y, riverZ(x) - 3, 'concrete', jitter(pick(PAL.concrete), 0.4));
+            put(x, y, riverZ(x) + 3, 'concrete', jitter(pick(PAL.concrete), 0.4));
+          }
+        }
+      }
+
+      for (let x = 1; x <= 16; x++) {
+        for (let z = 1; z <= 13; z++) {
+          if (isRiver(x, z)) continue;
+          put(x, 1, z, 'concrete', jitter(pick(PAL.concrete), 0.7));
+        }
+      }
+
+      const wallX0 = 3, wallZ0 = 3, wallLen = 13, wallH = 8, wallT = 2;
+      const hx = wallLen * 0.58, hy = wallH * 0.42;
+      for (let ix = 0; ix < wallLen; ix++) {
+        for (let iy = 2; iy < 2 + wallH; iy++) {
+          for (let iz = 0; iz < wallT; iz++) {
+            const dist = Math.hypot(ix - hx, (iy - 2) - hy);
+            const nse = rng() * 2.1;
+            if (dist + nse < 3.85) {
+              if (iy <= 3 && rng() > 0.35) {
+                const rx = wallX0 + ix + ((rng() * 3) | 0) - 1;
+                const rz = wallZ0 + iz + 2 + ((rng() * 3) | 0);
+                if (inCity(rx, rz) && !isRiver(rx, rz)) put(rx, 2, rz, 'brick', jitter(pick(PAL.brick), 1));
+              }
+              continue;
+            }
+            put(wallX0 + ix, iy, wallZ0 + iz, 'brick', jitter(pick(PAL.brick), 1));
+          }
+        }
+      }
+      fillBox(3, 2, 5, 6, 5, 5, 'brick', PAL.brick, false);
+      for (let y = 2; y <= 5; y++) {
+        put(3, y, 6, 'wood', jitter(pick(PAL.wood), 0.5));
+        put(3, y, 8, 'wood', jitter(pick(PAL.wood), 0.5));
+      }
+
+      pipe(5, 2, 10, 14, 2, 10, 'metal', PAL.metal, 2);
+      pipe(14, 2, 10, 14, 5, 10, 'metal', PAL.metal, 2);
+      pipe(14, 5, 10, 14, 5, 6, 'metal', PAL.metal, 2);
+      pipe(8, 2, 12, 12, 2, 12, 'rust', PAL.rust, 2);
+      pipe(12, 2, 12, 12, 2, 8, 'rust', PAL.rust, 1);
+      pipe(2, 2, 11, 2, 4, 11, 'rust', PAL.rust, 2);
+      pipe(2, 4, 11, 6, 4, 11, 'metal', PAL.metal, 1);
+      for (let i = 0; i < 7; i++) {
+        put(10 + (i % 3), 2, 7 + ((i / 3) | 0), rng() > 0.45 ? 'metal' : 'rust', jitter(pick(rng() > 0.45 ? PAL.metal : PAL.rust), 0.6));
+      }
+
+      for (let ix = 0; ix < 5; ix++) {
+        for (let iy = 0; iy < 6; iy++) {
+          for (let iz = 0; iz < 2; iz++) {
+            const frame = ix === 0 || ix === 4 || iy === 0 || iy === 5 || iz === 0;
+            if (frame && !(ix > 0 && ix < 4 && iy > 0 && iy < 5 && iz === 1)) {
+              put(8 + ix, 2 + iy, 8 + iz, 'metal', jitter(pick(PAL.metal), 0.35));
+            } else if (!frame) {
+              put(8 + ix, 2 + iy, 8 + iz, 'glass', jitter(pick(PAL.glass), 0.4));
+            }
+          }
+        }
+      }
+      for (let dx = -1; dx <= 1; dx++) {
+        for (let dy = 0; dy <= 3; dy++) {
+          for (let dz = -1; dz <= 1; dz++) {
+            const core = dx === 0 && dz === 0 && dy < 3;
+            put(13 + dx, 2 + dy, 5 + dz, core ? 'neon' : 'glass', jitter(pick(core ? PAL.neon : PAL.glass), 0.3));
+          }
+        }
+      }
+
+      const mastH = 16;
+      for (let y = 2; y <= mastH; y++) put(15, y, 4, 'metal', jitter(pick(PAL.metal), 0.25));
+      for (let i = -3; i <= 11; i++) put(15 + i, mastH, 4, 'metal', jitter(pick(PAL.metal), 0.25));
+      put(12, mastH - 1, 4, 'concrete', jitter(pick(PAL.concrete), 0.3));
+      put(12, mastH - 2, 4, 'concrete', jitter(pick(PAL.concrete), 0.3));
+      put(24, mastH - 1, 4, 'rust', jitter(pick(PAL.rust), 0.4));
+      put(24, mastH - 2, 4, 'rust', jitter(pick(PAL.rust), 0.4));
+      put(24, mastH - 3, 4, 'metal', jitter(pick(PAL.metal), 0.3));
+
+      function building(x0, z0, w, d, h, wallMat, wallPal, opts) {
+        opts = opts || {};
+        for (let ix = 0; ix < w; ix++) {
+          for (let iz = 0; iz < d; iz++) {
+            for (let iy = 2; iy <= h; iy++) {
+              const edge = ix === 0 || ix === w - 1 || iz === 0 || iz === d - 1;
+              const roof = iy === h;
+              if (!edge && !roof) continue;
+              const win = !roof && iy > 2 && iy < h && (iy % 2 === 1) &&
+                ((ix % 2 === 1 && (iz === 0 || iz === d - 1)) || (iz % 2 === 1 && (ix === 0 || ix === w - 1)));
+              if (roof) {
+                put(x0 + ix, iy, z0 + iz, opts.roofMat || 'concrete', jitter(pick(opts.roofPal || PAL.concrete), 0.5));
+              } else if (win && opts.windows) {
+                put(x0 + ix, iy, z0 + iz, 'glass', jitter(pick(PAL.glass), 0.35));
+              } else {
+                put(x0 + ix, iy, z0 + iz, wallMat, jitter(pick(wallPal), 0.85));
+              }
+            }
+          }
+        }
+        if (opts.ac) {
+          put(x0 + 1, h + 1, z0 + 1, 'metal', jitter(pick(PAL.metal), 0.3));
+          put(x0 + 2, h + 1, z0 + 1, 'metal', jitter(pick(PAL.metal), 0.3));
+        }
+      }
+
+      function glassTower(x0, z0, w, d, h) {
+        for (let ix = 0; ix < w; ix++) {
+          for (let iz = 0; iz < d; iz++) {
+            for (let iy = 2; iy <= h; iy++) {
+              const edge = ix === 0 || ix === w - 1 || iz === 0 || iz === d - 1;
+              const roof = iy === h;
+              if (!edge && !roof) continue;
+              const frame = roof || iy === 2 || ix % 3 === 0 || iz % 3 === 0 || iy % 4 === 0;
+              if (roof) put(x0 + ix, iy, z0 + iz, 'metal', jitter(pick(PAL.metal), 0.3));
+              else if (frame) put(x0 + ix, iy, z0 + iz, 'concrete', jitter(pick(PAL.concrete), 0.4));
+              else put(x0 + ix, iy, z0 + iz, 'glass', jitter(pick(PAL.glass), 0.4));
+            }
+          }
+        }
+        put(x0 + (w >> 1), h + 1, z0 + (d >> 1), 'neon', pick(PAL.neon));
+      }
+
+      building(2, 30, 7, 6, 6, 'wood', PAL.wood, { windows: true, roofMat: 'wood', roofPal: PAL.wood });
+      building(10, 31, 6, 5, 5, 'brick', PAL.brick, { windows: true, ac: true });
+      building(2, 21, 6, 4, 5, 'wood', PAL.wood, { windows: true });
+      building(25, 31, 8, 7, 10, 'brick', PAL.brick, { windows: true, ac: true, roofMat: 'concrete' });
+      building(25, 21, 5, 5, 7, 'concrete', PAL.concrete, { windows: true, ac: true });
+      glassTower(33, 30, 6, 8, 15);
+      building(33, 21, 6, 5, 8, 'concrete', PAL.concrete, { windows: true, roofMat: 'metal', roofPal: PAL.metal });
+      building(33, 2, 6, 6, 6, 'metal', PAL.metal, { windows: false, roofMat: 'rust', roofPal: PAL.rust });
+      fillBox(34, 2, 9, 4, 4, 3, 'rust', PAL.rust, true);
+      pipe(33, 3, 8, 38, 3, 8, 'metal', PAL.metal, 2);
+      pipe(38, 3, 8, 38, 6, 8, 'rust', PAL.rust, 2);
+
+      building(24, 2, 7, 5, 6, 'brick', PAL.brick, { windows: true });
+
+      for (let i = 0; i < 5; i++) {
+        const fx = 24 + i * 2;
+        const fz = 24;
+        put(fx, 2, fz, 'concrete', jitter(pick(PAL.concrete), 0.3));
+        put(fx, 2, fz + 3, 'concrete', jitter(pick(PAL.concrete), 0.3));
+        put(fx, 2, fz + 1, 'water', jitter(pick(PAL.water), 0.4));
+        put(fx, 2, fz + 2, 'water', jitter(pick(PAL.water), 0.4));
+      }
+      for (let dx = -1; dx <= 1; dx++) {
+        for (let dz = -1; dz <= 1; dz++) {
+          put(28 + dx, 3, 25 + dz, 'glass', jitter(pick(PAL.glass), 0.3));
+        }
+      }
+      put(28, 4, 25, 'neon', pick(PAL.neon));
+
+      const trees = [[3, 36], [5, 38], [7, 35], [12, 37], [4, 33], [16, 34], [18, 37], [6, 24], [8, 22], [36, 16], [38, 14], [1, 18]];
+      for (const [tx, tz] of trees) if (!isRiver(tx, tz)) tree(tx, tz);
+
+      const lamps = [[7, 7], [13, 7], [24, 7], [30, 7], [36, 7], [7, 11], [18, 11], [24, 11], [7, 25], [13, 25], [24, 25], [30, 25], [36, 25], [19, 14], [23, 14], [19, 32], [23, 34], [19, 5], [23, 3]];
+      for (const [lx, lz] of lamps) if (inCity(lx, lz) && !isRiver(lx, lz)) lamp(lx, lz);
+
+      car(4, 8, 'x'); car(10, 9, 'x'); car(26, 8, 'x'); car(32, 26, 'x');
+      car(20, 13, 'z'); car(21, 32, 'z'); car(33, 27, 'x');
+
+      put(18, 2, 7, 'rust', jitter(0xb33a2a, 0.2));
+      put(18, 3, 7, 'rust', jitter(0xb33a2a, 0.2));
+      put(12, 2, 25, 'rust', jitter(0xb33a2a, 0.2));
+      put(12, 3, 25, 'rust', jitter(0xb33a2a, 0.2));
+
+      for (let i = 0; i < 3; i++) {
+        put(26 + i, 2, 12, 'wood', jitter(pick(PAL.wood), 0.4));
+        put(26 + i, 2, 13, 'wood', jitter(pick(PAL.wood), 0.4));
+      }
+      put(27, 2, 30, 'wood', jitter(pick(PAL.wood), 0.3));
+      put(28, 2, 30, 'wood', jitter(pick(PAL.wood), 0.3));
+      put(27, 2, 31, 'wood', jitter(pick(PAL.wood), 0.3));
+
+      put(20, 2, 26, 'metal', jitter(pick(PAL.metal), 0.2));
+      put(20, 3, 26, 'lamp', 0x3ad46a);
+      put(20, 4, 26, 'lamp', 0xe8c43a);
+      put(20, 5, 26, 'lamp', 0xe24b3a);
+
+      for (let x = 1; x <= 6; x++) {
+        for (let z = 14; z <= 15; z++) {
+          if (isRiver(x, z) || riverDist(x, z) <= 3) put(x, 2, z, 'wood', jitter(pick(PAL.wood), 0.5));
+        }
+      }
+      put(2, 3, 15, 'metal', jitter(pick(PAL.metal), 0.3));
+      put(5, 3, 15, 'metal', jitter(pick(PAL.metal), 0.3));
+
+      for (let i = 0; i < 18; i++) {
+        const x = 1 + ((rng() * (CW - 2)) | 0);
+        const z = 1 + ((rng() * (CD - 2)) | 0);
+        if (isRiver(x, z)) continue;
+        put(x, 1, z, 'asphalt', jitter(0x2a2b30, 0.2));
+      }
+    }
+
+    const TiltBokehShader = {
+      uniforms: {
+        tDiffuse: { value: null },
+        tDepth: { value: null },
+        resolution: { value: new THREE.Vector2(1, 1) },
+        cameraNear: { value: 0.1 },
+        cameraFar: { value: 80 },
+        focus: { value: 14.0 },
+        focalRange: { value: 2.8 },
+        maxBlur: { value: 0.016 },
+        tilt: { value: 0.72 },
+        focusY: { value: 0.48 }
+      },
+      vertexShader: `
+        varying vec2 vUv;
+        void main() {
+          vUv = uv;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+      fragmentShader: `
+        #include <packing>
+        uniform sampler2D tDiffuse;
+        uniform sampler2D tDepth;
+        uniform vec2 resolution;
+        uniform float cameraNear;
+        uniform float cameraFar;
+        uniform float focus;
+        uniform float focalRange;
+        uniform float maxBlur;
+        uniform float tilt;
+        uniform float focusY;
+        varying vec2 vUv;
+
+        float viewDist(vec2 uv) {
+          float ndcZ = unpackRGBAToDepth(texture2D(tDepth, uv));
+          float viewZ = perspectiveDepthToViewZ(ndcZ, cameraNear, cameraFar);
+          return -viewZ;
+        }
+
+        void main() {
+          float dist = viewDist(vUv);
+          float cocD = abs(dist - focus) / max(focalRange, 0.001);
+          float cocT = abs(vUv.y - focusY) * 2.35;
+          float coc = clamp(max(cocD, cocT * tilt), 0.0, 1.0);
+          float blur = coc * maxBlur;
+          vec3 acc = texture2D(tDiffuse, vUv).rgb;
+          if (blur < 0.00025) {
+            gl_FragColor = vec4(acc, 1.0);
+            return;
+          }
+          vec2 k[16];
+          k[0] = vec2(-0.942, -0.399); k[1] = vec2(0.945, -0.768);
+          k[2] = vec2(-0.094, -0.929); k[3] = vec2(0.344, 0.293);
+          k[4] = vec2(-0.915, 0.457);  k[5] = vec2(-0.382, 0.276);
+          k[6] = vec2(0.443, -0.975);  k[7] = vec2(0.537, 0.473);
+          k[8] = vec2(-0.528, -0.851); k[9] = vec2(0.751, -0.256);
+          k[10] = vec2(-0.078, 0.978); k[11] = vec2(0.192, 0.668);
+          k[12] = vec2(-0.673, -0.081);k[13] = vec2(0.807, 0.846);
+          k[14] = vec2(-0.248, -0.481);k[15] = vec2(0.081, -0.142);
+          float wsum = 1.0;
+          for (int i = 0; i < 16; i++) {
+            vec2 uv = vUv + k[i] * blur * vec2(1.0, resolution.x / resolution.y);
+            float d2 = viewDist(uv);
+            float coc2 = clamp(max(abs(d2 - focus) / max(focalRange, 0.001), abs(uv.y - focusY) * 2.35 * tilt), 0.0, 1.0);
+            float w = 0.35 + 0.65 * coc2;
+            acc += texture2D(tDiffuse, uv).rgb * w;
+            wsum += w;
+          }
+          gl_FragColor = vec4(acc / wsum, 1.0);
+        }
+      `
+    };
+
+    const errBox = document.getElementById('err');
+    const statsEl = document.getElementById('stats');
+    function fail(msg) {
+      errBox.style.display = 'flex';
+      errBox.textContent = msg;
+    }
+
+    try {
+      generateWorld();
+
+      const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = 1.08;
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+      document.body.appendChild(renderer.domElement);
+
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x8fa6c2);
+
+      const pmrem = new THREE.PMREMGenerator(renderer);
+      scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.06).texture;
+      pmrem.dispose();
+
+      const camera = new THREE.PerspectiveCamera(30, window.innerWidth / window.innerHeight, 0.12, 90);
+      const isoDist = 14.8;
+      const az = Math.PI / 4;
+      const el = Math.PI / 4;
+      const look = new THREE.Vector3(0, 0.92, 0);
+      camera.position.set(
+        look.x + isoDist * Math.cos(el) * Math.sin(az),
+        look.y + isoDist * Math.sin(el),
+        look.z + isoDist * Math.cos(el) * Math.cos(az)
+      );
+      camera.lookAt(look);
+
+      const hemi = new THREE.HemisphereLight(0xb7d2f0, 0x5a4e42, 0.62);
+      scene.add(hemi);
+      const amb = new THREE.AmbientLight(0x6e7c8c, 0.16);
+      scene.add(amb);
+
+      const sun = new THREE.DirectionalLight(0xfff1d6, 4.35);
+      sun.position.set(9.5, 16.5, 7.2);
+      sun.castShadow = true;
+      sun.shadow.mapSize.set(2048, 2048);
+      sun.shadow.bias = -0.00018;
+      sun.shadow.normalBias = 0.026;
+      sun.shadow.radius = 2.2;
+      const sc = 7.4;
+      sun.shadow.camera.left = -sc;
+      sun.shadow.camera.right = sc;
+      sun.shadow.camera.top = sc;
+      sun.shadow.camera.bottom = -sc;
+      sun.shadow.camera.near = 2;
+      sun.shadow.camera.far = 42;
+      sun.target.position.copy(look);
+      scene.add(sun);
+      scene.add(sun.target);
+
+      const fill = new THREE.DirectionalLight(0x9bb7d4, 0.55);
+      fill.position.set(-8, 6, -5);
+      scene.add(fill);
+
+      const geo = new THREE.BoxGeometry(VOX * GAP, VOX * GAP, VOX * GAP);
+      const mats = {
+        concrete: new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.86, metalness: 0.045, envMapIntensity: 0.38 }),
+        brick:    new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.93, metalness: 0.02, envMapIntensity: 0.22 }),
+        wood:     new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.95, metalness: 0.0, envMapIntensity: 0.18 }),
+        grass:    new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.9, metalness: 0.0, envMapIntensity: 0.2 }),
+        leaf:     new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.88, metalness: 0.0, envMapIntensity: 0.22 }),
+        walk:     new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.84, metalness: 0.04, envMapIntensity: 0.3 }),
+        asphalt:  new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.8, metalness: 0.07, envMapIntensity: 0.32 }),
+        stone:    new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.78, metalness: 0.05, envMapIntensity: 0.28 }),
+        silt:     new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.92, metalness: 0.02, envMapIntensity: 0.2 }),
+        metal:    new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.16, metalness: 0.96, envMapIntensity: 1.35 }),
+        rust:     new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.5, metalness: 0.74, envMapIntensity: 0.95 }),
+        glass:    new THREE.MeshPhysicalMaterial({
+          color: 0xffffff, roughness: 0.055, metalness: 0.0,
+          transmission: 1.0, ior: 1.5, thickness: 0.38,
+          transparent: true, opacity: 1.0, envMapIntensity: 1.15,
+          attenuationColor: new THREE.Color(0x9fd0e4), attenuationDistance: 0.55,
+          specularIntensity: 1.0
+        }),
+        water:    new THREE.MeshPhysicalMaterial({
+          color: 0xffffff, roughness: 0.12, metalness: 0.06,
+          transmission: 0.86, ior: 1.333, thickness: 0.62,
+          transparent: true, opacity: 1.0, envMapIntensity: 1.05,
+          attenuationColor: new THREE.Color(0x17607a), attenuationDistance: 0.72
+        }),
+        lamp:     new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.42, metalness: 0.05, emissive: 0xffd090, emissiveIntensity: 2.4, envMapIntensity: 0.2 }),
+        neon:     new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.28, metalness: 0.08, emissive: 0x7ec8ff, emissiveIntensity: 2.8, envMapIntensity: 0.25 })
+      };
+
+      const buckets = Object.create(null);
+      const dummy = new THREE.Object3D();
+      const icol = new THREE.Color();
+      let total = 0;
+      for (const [key, v] of grid) {
+        const p = key.split(',');
+        const x = +p[0], y = +p[1], z = +p[2];
+        (buckets[v.mat] || (buckets[v.mat] = [])).push({ x, y, z, color: v.color });
+        total++;
+      }
+
+      const batches = [];
+      for (const matName of Object.keys(buckets)) {
+        const list = buckets[matName];
+        const material = mats[matName];
+        if (!material || !list.length) continue;
+        const mesh = new THREE.InstancedMesh(geo, material, list.length);
+        mesh.castShadow = matName !== 'water';
+        mesh.receiveShadow = true;
+        mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+        for (let i = 0; i < list.length; i++) {
+          const v = list[i];
+          dummy.position.set(
+            (v.x - CW * 0.5 + 0.5) * VOX,
+            (v.y + 0.5) * VOX,
+            (v.z - CD * 0.5 + 0.5) * VOX
+          );
+          dummy.rotation.set(0, 0, 0);
+          dummy.scale.set(1, 1, 1);
+          dummy.updateMatrix();
+          mesh.setMatrixAt(i, dummy.matrix);
+          icol.setHex(v.color);
+          mesh.setColorAt(i, icol);
+        }
+        mesh.instanceMatrix.needsUpdate = true;
+        if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+        mesh.computeBoundingSphere();
+        mesh.computeBoundingBox();
+        scene.add(mesh);
+        batches.push({ name: matName, count: list.length });
+      }
+
+      const controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.07;
+      controls.target.copy(look);
+      controls.minDistance = 5.5;
+      controls.maxDistance = 32;
+      controls.maxPolarAngle = Math.PI * 0.49;
+      controls.update();
+
+      const depthMat = new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking });
+      const depthRT = new THREE.WebGLRenderTarget(window.innerWidth, window.innerHeight, {
+        minFilter: THREE.NearestFilter,
+        magFilter: THREE.NearestFilter
+      });
+
+      const composer = new EffectComposer(renderer);
+      const ssaoPass = new SSAOPass(scene, camera, window.innerWidth, window.innerHeight);
+      ssaoPass.kernelRadius = 14;
+      ssaoPass.minDistance = 0.0012;
+      ssaoPass.maxDistance = 0.085;
+      ssaoPass.output = SSAOPass.OUTPUT.Default;
+      composer.addPass(ssaoPass);
+
+      const dofPass = new ShaderPass(TiltBokehShader);
+      dofPass.uniforms.tDepth.value = depthRT.texture;
+      dofPass.uniforms.resolution.value.set(window.innerWidth, window.innerHeight);
+      dofPass.uniforms.cameraNear.value = camera.near;
+      dofPass.uniforms.cameraFar.value = camera.far;
+      composer.addPass(dofPass);
+      composer.addPass(new OutputPass());
+
+      const batchLine = batches.map((b) => b.name + ':' + b.count).join('  ');
+      function setStats(ms) {
+        statsEl.innerHTML =
+          'InstancedMesh 批次 ' + batches.length + '<br>' +
+          '体素实例 ' + total.toLocaleString() + '<br>' +
+          (ms != null ? ('帧 ' + ms.toFixed(1) + ' ms') : '') +
+          '<br><span style="opacity:.65">' + batchLine + '</span>';
+      }
+      setStats(null);
+
+      function onResize() {
+        const w = window.innerWidth, h = window.innerHeight;
+        camera.aspect = w / h;
+        camera.updateProjectionMatrix();
+        renderer.setSize(w, h);
+        composer.setSize(w, h);
+        ssaoPass.setSize(w, h);
+        depthRT.setSize(w, h);
+        dofPass.uniforms.tDepth.value = depthRT.texture;
+        dofPass.uniforms.resolution.value.set(w, h);
+      }
+      window.addEventListener('resize', onResize);
+
+      const clock = new THREE.Clock();
+      const depthBg = new THREE.Color(0x000000);
+      let acc = 0, frames = 0, fpsMs = 16;
+      function frame() {
+        const dt = clock.getDelta();
+        acc += dt; frames++;
+        if (acc >= 0.4) { fpsMs = (acc / frames) * 1000; acc = 0; frames = 0; setStats(fpsMs); }
+        controls.update();
+        const focus = camera.position.distanceTo(controls.target);
+        dofPass.uniforms.focus.value = focus;
+        dofPass.uniforms.cameraNear.value = camera.near;
+        dofPass.uniforms.cameraFar.value = camera.far;
+
+        scene.overrideMaterial = depthMat;
+        const prevBg = scene.background;
+        scene.background = depthBg;
+        renderer.setRenderTarget(depthRT);
+        renderer.render(scene, camera);
+        renderer.setRenderTarget(null);
+        scene.background = prevBg;
+        scene.overrideMaterial = null;
+
+        composer.render();
+        requestAnimationFrame(frame);
+      }
+      requestAnimationFrame(frame);
+    } catch (e) {
+      fail((e && e.stack) ? e.stack : String(e));
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>USP Match / AR-15 Retro Low-Poly Mechanical Demo</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; overflow:hidden; background:#c8ccd1; }
+  body { font-family: "Courier New", monospace; }
+  #canvas-wrap { position:fixed; inset:0; }
+  canvas { display:block; width:100%; height:100%; image-rendering:pixelated; }
+  #hud {
+    position:fixed; top:12px; left:12px; color:#1a1c20; background:rgba(255,255,255,0.55);
+    padding:8px 12px; border:1px solid #9aa0a6; font-size:13px; line-height:1.4; max-width:420px;
+  }
+  #hud h1 { margin:0 0 4px; font-size:14px; }
+  #hud button {
+    margin-top:6px; padding:4px 10px; cursor:pointer; background:#d6dae0; border:1px solid #7a8088; font-family:inherit;
+  }
+  #legend { position:fixed; bottom:10px; left:12px; color:#2b2f35; font-size:12px; background:rgba(255,255,255,0.45); padding:6px 10px; }
+</style>
+</head>
+<body>
+<div id="canvas-wrap"></div>
+<div id="hud">
+  <h1>USP MATCH — PS1 / HALF-LIFE RETRO</h1>
+  <div>程序化低多边形 · 平直着色 · 像素化纹理 · 分解/组装循环 60fps</div>
+  <div id="modeLabel">模式：USP Match</div>
+  <button id="modeBtn">切换到 AR-15 分解演示</button>
+</div>
+<div id="legend">
+  部件：深色金属套筒 · 亮银色枪管 · 聚合物下机匣 · 前部 Match 补偿器 · 分离弹匣 · 绿色前准星 / 红色后准星
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- renderer / scene / camera ----------
+  const wrap = document.getElementById('canvas-wrap');
+  const renderer = new THREE.WebGLRenderer({ antialias: false, alpha: false });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(1);
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.shadowMap.enabled = false;
+  wrap.appendChild(renderer.domElement);
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0xc8ccd1);
+
+  const aspect = window.innerWidth / window.innerHeight;
+  let camSize = 9;
+  const camera = new THREE.OrthographicCamera(-camSize * aspect, camSize * aspect, camSize, -camSize, 0.1, 200);
+  camera.position.set(11, 7, 13);
+  camera.lookAt(0, 0, 0);
+
+  function setCamSize(size) {
+    camSize = size;
+    const a = window.innerWidth / window.innerHeight;
+    camera.left = -size * a;
+    camera.right = size * a;
+    camera.top = size;
+    camera.bottom = -size;
+    camera.updateProjectionMatrix();
+  }
+
+  window.addEventListener('resize', () => {
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    setCamSize(camSize);
+  });
+
+  // ---------- pixel texture ----------
+  function makePixelTex() {
+    const c = document.createElement('canvas');
+    c.width = 48; c.height = 48;
+    const ctx = c.getContext('2d');
+    for (let y = 0; y < 48; y++) {
+      for (let x = 0; x < 48; x++) {
+        const v = 180 + Math.floor(Math.random() * 60);
+        ctx.fillStyle = 'rgb(' + v + ',' + v + ',' + v + ')';
+        ctx.fillRect(x, y, 1, 1);
+      }
+    }
+    const tex = new THREE.CanvasTexture(c);
+    tex.magFilter = THREE.NearestFilter;
+    tex.minFilter = THREE.NearestFilter;
+    tex.wrapS = THREE.RepeatWrapping;
+    tex.wrapT = THREE.RepeatWrapping;
+    tex.repeat.set(3, 3);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    return tex;
+  }
+  const pixTex = makePixelTex();
+
+  function M(color, opts) {
+    opts = opts || {};
+    return new THREE.MeshStandardMaterial({
+      color: color,
+      map: pixTex,
+      flatShading: true,
+      metalness: (opts.metal !== undefined) ? opts.metal : 0.15,
+      roughness: (opts.rough !== undefined) ? opts.rough : 0.75,
+      emissive: (opts.emissive !== undefined) ? opts.emissive : 0x000000,
+      emissiveIntensity: (opts.ei !== undefined) ? opts.ei : 1.0
+    });
+  }
+
+  function mesh(geom, material) {
+    const m = new THREE.Mesh(geom, material);
+    m.castShadow = false;
+    m.receiveShadow = false;
+    return m;
+  }
+
+  function box(w, h, d) { return new THREE.BoxGeometry(w, h, d); }
+  function cyl(r, h, seg) { return new THREE.CylinderGeometry(r, r, h, seg || 12); }
+
+  const SMOOTH = (t) => {
+    t = Math.max(0, Math.min(1, t));
+    return t * t * (3 - 2 * t);
+  };
+
+  // =========================================================
+  // USP MATCH
+  // =========================================================
+  const usp = new THREE.Group();
+  scene.add(usp);
+
+  const polymerMat = M(0x262a31, { metal: 0.05, rough: 0.85 });
+  const darkSteelMat = M(0x2b2f36, { metal: 0.85, rough: 0.35 });
+  const silverMat = M(0xcfd4da, { metal: 0.95, rough: 0.22 });
+  const compMat = M(0x30343b, { metal: 0.7, rough: 0.4 });
+  const greenMat = M(0x39ff14, { metal: 0.1, rough: 0.3, emissive: 0x39ff14, ei: 2.4 });
+  const redMat = M(0xff2b2b, { metal: 0.1, rough: 0.3, emissive: 0xff2b2b, ei: 2.4 });
+
+  // frame
+  const frameGroup = new THREE.Group();
+  usp.add(frameGroup);
+  frameGroup.add((() => { const m = mesh(box(16, 4, 3), polymerMat); return m; })());
+  const rail = mesh(box(13, 0.9, 3.6), polymerMat); rail.position.set(0, 2.15, 0); frameGroup.add(rail);
+  const grip = mesh(box(4.6, 8.6, 2.7), polymerMat); grip.position.set(-7, -2.6, 0); frameGroup.add(grip);
+  const backstrap = mesh(box(2.2, 6.2, 2.5), polymerMat); backstrap.position.set(-9.4, -1.6, 0); frameGroup.add(backstrap);
+  const beaver = mesh(box(2.4, 1.4, 3.0), polymerMat); beaver.position.set(-8.2, 2.7, 0); frameGroup.add(beaver);
+  const tgFront = mesh(box(0.8, 2.6, 2.8), polymerMat); tgFront.position.set(-1.2, -2.1, 0); frameGroup.add(tgFront);
+  const tgBot = mesh(box(5.6, 0.8, 2.8), polymerMat); tgBot.position.set(1.6, -3.2, 0); frameGroup.add(tgBot);
+  const trigger = mesh(box(0.7, 2.4, 0.5), darkSteelMat); trigger.position.set(2.0, -1.5, 0); frameGroup.add(trigger);
+
+  // barrel (fixed)
+  const barrelGroup = new THREE.Group();
+  usp.add(barrelGroup);
+  const barrel = mesh(cyl(0.55, 18, 16), silverMat);
+  barrel.rotation.z = Math.PI / 2;
+  barrelGroup.add(barrel);
+  // chamber swell
+  const chamber = mesh(cyl(0.72, 4, 16), silverMat);
+  chamber.rotation.z = Math.PI / 2;
+  chamber.position.x = -6;
+  barrelGroup.add(chamber);
+  barrelGroup.position.set(1, 0.6, 0);
+
+  // slide
+  const slideGroup = new THREE.Group();
+  usp.add(slideGroup);
+  const slide = mesh(box(18, 3.4, 3.6), darkSteelMat);
+  slideGroup.add(slide);
+  // front serrations hint
+  const s1 = mesh(box(0.3, 2.0, 3.6), darkSteelMat); s1.position.set(5.5, 0, 0); slideGroup.add(s1);
+  // rear sight (red)
+  const rearSightBase = mesh(box(1.6, 0.7, 2.4), darkSteelMat); rearSightBase.position.set(-6.5, 2.0, 0); slideGroup.add(rearSightBase);
+  const rearDot1 = mesh(box(0.15, 0.4, 0.6), redMat); rearDot1.position.set(-6.5, 2.45, -0.7); slideGroup.add(rearDot1);
+  const rearDot2 = mesh(box(0.15, 0.4, 0.6), redMat); rearDot2.position.set(-6.5, 2.45, 0.7); slideGroup.add(rearDot2);
+
+  // comp
+  const compGroup = new THREE.Group();
+  usp.add(compGroup);
+  const compMesh = mesh(box(3.2, 2.3, 2.9), compMat); compGroup.add(compMesh);
+  // side vents
+  const vent1 = mesh(box(1.4, 0.6, 2.95), compMat); vent1.position.set(0, 0.2, 0); vent1.scale.x = 0.4; compGroup.add(vent1);
+  // front sight (green)
+  const frontSight = mesh(box(0.35, 1.3, 0.6), greenMat); frontSight.position.set(0, 1.75, 0); compGroup.add(frontSight);
+
+  // magazine
+  const magGroup = new THREE.Group();
+  usp.add(magGroup);
+  const magBody = mesh(box(3.6, 8.8, 2.2), polymerMat); magGroup.add(magBody);
+  const magBase = mesh(box(4.0, 1.0, 2.4), darkSteelMat); magBase.position.set(0, -4.9, 0); magGroup.add(magBase);
+
+  // exploded / assembled transforms
+  const slideAsm = new THREE.Vector3(1, 2.9, 0);
+  const slideExp = new THREE.Vector3(-5, 5.9, -4);
+  const compAsm = new THREE.Vector3(9.2, 0.6, 0);
+  const compExp = new THREE.Vector3(10.5, 3.6, 4.5);
+  const magAsm = new THREE.Vector3(-7, -2.5, 0);
+  const magExp = new THREE.Vector3(-7, -10.8, 3.2);
+
+  // init exploded (phase 0)
+  slideGroup.position.copy(slideExp);
+  compGroup.position.copy(compExp);
+  magGroup.position.copy(magExp);
+  barrelGroup.position.set(1, 0.6, 0);
+
+  // =========================================================
+  // AR-15 (optional)
+  // =========================================================
+  const ar = new THREE.Group();
+  ar.scale.setScalar(0.42);
+  scene.add(ar);
+  ar.visible = false;
+
+  const aluMat = M(0x1c1e22, { metal: 0.6, rough: 0.5 });
+  const steelDarkMat = M(0x2a2e34, { metal: 0.9, rough: 0.3 });
+  const polyMat2 = M(0x202328, { metal: 0.05, rough: 0.85 });
+  const brassMat = M(0xb8860b, { metal: 0.8, rough: 0.35 });
+
+  // lower receiver pivot for upper
+  const frontPivot = new THREE.Vector3(11, 2.2, 0);
+
+  // lower receiver
+  const lowerGroup = new THREE.Group();
+  ar.add(lowerGroup);
+  // receiver body
+  const lowerBody = mesh(box(22, 4.5, 3.6), aluMat); lowerGroup.add(lowerBody);
+  // magwell
+  const magwell = mesh(box(7, 7, 3.6), aluMat); magwell.position.set(-3, -5.5, 0); lowerGroup.add(magwell);
+  // grip
+  const arGrip = mesh(box(4, 8, 3.0), polyMat2); arGrip.position.set(-9, -3.5, 0); lowerGroup.add(arGrip);
+  // trigger guard
+  const arTg = mesh(box(8, 1.2, 3.6), aluMat); arTg.position.set(1, -2.6, 0); lowerGroup.add(arTg);
+  const arTg2 = mesh(box(0.8, 2.4, 3.6), aluMat); arTg2.position.set(5, -1.4, 0); lowerGroup.add(arTg2);
+  // buffer tube
+  const bufferTube = mesh(cyl(1.1, 16, 16), aluMat);
+  bufferTube.rotation.z = Math.PI / 2;
+  bufferTube.position.set(-19, 0.5, 0);
+  lowerGroup.add(bufferTube);
+  const stock = mesh(box(6, 3.5, 3.0), polyMat2); stock.position.set(-29, 0.5, 0); lowerGroup.add(stock);
+  // trigger
+  const arTrigger = mesh(box(0.6, 2.6, 0.6), steelDarkMat); arTrigger.position.set(2, -1.0, 0); lowerGroup.add(arTrigger);
+  // hammer (group with pivot)
+  const hammerGroup = new THREE.Group();
+  hammerGroup.position.set(-4, 2.6, 0);
+  lowerGroup.add(hammerGroup);
+  const hammerMesh = mesh(box(2.2, 0.8, 3.0), steelDarkMat); hammerMesh.position.set(-0.9, 0, 0);
+  hammerGroup.add(hammerMesh);
+  // safety
+  const safety = mesh(cyl(0.4, 3.6, 12), steelDarkMat);
+  safety.rotation.x = Math.PI / 2;
+  safety.position.set(0, 0, 2.0);
+  lowerGroup.add(safety);
+  // mag
+  const arMag = mesh(box(3.2, 9, 2.0), polyMat2); arMag.position.set(-2, -9, 0); lowerGroup.add(arMag);
+  // takedown pin
+  const pinGroup = new THREE.Group();
+  pinGroup.position.set(-10, 2.2, 0);
+  lowerGroup.add(pinGroup);
+  const takedownPin = mesh(cyl(0.45, 4.2, 12), steelDarkMat);
+  takedownPin.rotation.z = Math.PI / 2;
+  takedownPin.position.z = 0;
+  pinGroup.add(takedownPin);
+  // pivot pin front (visual)
+  const pivotPin = mesh(cyl(0.45, 4.2, 12), steelDarkMat);
+  pivotPin.rotation.z = Math.PI / 2;
+  pivotPin.position.set(11, 2.2, 0);
+  lowerGroup.add(pivotPin);
+
+  // upper receiver via pivot
+  const upperPivot = new THREE.Group();
+  upperPivot.position.copy(frontPivot);
+  ar.add(upperPivot);
+
+  const upperBody = mesh(box(26, 4.5, 3.8), aluMat);
+  upperBody.position.set(-13, 2.2, 0);
+  upperPivot.add(upperBody);
+  // barrel inside upper
+  const arBarrel = mesh(cyl(0.62, 20, 16), steelDarkMat);
+  arBarrel.rotation.z = Math.PI / 2;
+  arBarrel.position.set(-4, 0.4, 0);
+  upperPivot.add(arBarrel);
+  // gas block / tube
+  const gasBlock = mesh(box(1.4, 1.6, 2.0), steelDarkMat); gasBlock.position.set(2, 1.3, 0); upperPivot.add(gasBlock);
+  const gasTube = mesh(cyl(0.25, 18, 10), steelDarkMat);
+  gasTube.rotation.z = Math.PI / 2;
+  gasTube.position.set(-5, 2.6, 0);
+  upperPivot.add(gasTube);
+  // front sight
+  const arFrontSight = mesh(box(0.4, 1.0, 0.6), steelDarkMat); arFrontSight.position.set(-18, 4.6, 0); upperPivot.add(arFrontSight);
+  const arCarry = mesh(box(10, 2.6, 3.8), aluMat); arCarry.position.set(-16, 5.2, 0); upperPivot.add(arCarry);
+  // ejection port
+  const eport = mesh(box(4, 2.0, 4.0), aluMat); eport.position.set(-9, 2.2, 2.2); upperPivot.add(eport);
+
+  // BCG group (child of upperPivot, moves along x)
+  const bcgGroup = new THREE.Group();
+  bcgGroup.position.set(-13, 1.0, 0);
+  upperPivot.add(bcgGroup);
+  const bcgBody = mesh(box(15, 2.6, 2.4), steelDarkMat); bcgGroup.add(bcgBody);
+  const boltHead = mesh(cyl(0.75, 4, 14), steelDarkMat);
+  boltHead.rotation.z = Math.PI / 2;
+  boltHead.position.set(8.5, 0, 0);
+  bcgGroup.add(boltHead);
+  // charging handle
+  const chHandle = mesh(box(3.0, 1.2, 1.2), steelDarkMat); chHandle.position.set(-8.5, 0.8, 0); bcgGroup.add(chHandle);
+  const chLatch = mesh(box(0.6, 0.6, 0.6), steelDarkMat); chLatch.position.set(-8.5, 0.8, 1.6); bcgGroup.add(chLatch);
+
+  // BCG base positions (relative to upperPivot)
+  const bcgAsmX = -13;
+  const bcgExpX = -13 - 8.5;
+
+  // ---------- animation state ----------
+  let mode = 'usp';
+  let phase = 0;
+  let clock = new THREE.Clock();
+
+  const modeLabel = document.getElementById('modeLabel');
+  const modeBtn = document.getElementById('modeBtn');
+
+  function setMode(m) {
+    mode = m;
+    phase = 0;
+    clock.getDelta();
+    usp.visible = (mode === 'usp');
+    ar.visible = (mode === 'ar');
+    if (mode === 'usp') {
+      setCamSize(9);
+      modeLabel.textContent = '模式：USP Match';
+      modeBtn.textContent = '切换到 AR-15 分解演示';
+    } else {
+      setCamSize(13);
+      modeLabel.textContent = '模式：AR-15 分解演示';
+      modeBtn.textContent = '切换到 USP Match';
+    }
+  }
+  modeBtn.addEventListener('click', () => {
+    setMode(mode === 'usp' ? 'ar' : 'usp');
+  });
+
+  function lerp(a, b, t) { return a + (b - a) * t; }
+
+  function updateUSP(dt) {
+    const period = 4.6;
+    phase = (phase + dt / period) % 1;
+    const f = phase;
+    let magP, slideP, compP;
+    if (f < 0.5) {
+      const u = f * 2;
+      magP = SMOOTH((u - 0.0) / 0.55);
+      slideP = SMOOTH((u - 0.35) / 0.60);
+      compP = SMOOTH((u - 0.0) / 0.40);
+    } else {
+      const u = (f - 0.5) * 2;
+      slideP = 1.0 - SMOOTH((u - 0.0) / 0.50);
+      compP = 1.0 - SMOOTH((u - 0.2) / 0.40);
+      magP = 1.0 - SMOOTH((u - 0.55) / 0.45);
+    }
+    // slider position
+    slideGroup.position.x = lerp(slideExp.x, slideAsm.x, slideP);
+    slideGroup.position.y = lerp(slideExp.y, slideAsm.y, slideP);
+    slideGroup.position.z = lerp(slideExp.z, slideAsm.z, slideP);
+    // comp
+    compGroup.position.x = lerp(compExp.x, compAsm.x, compP);
+    compGroup.position.y = lerp(compExp.y, compAsm.y, compP);
+    compGroup.position.z = lerp(compExp.z, compAsm.z, compP);
+    // mag
+    magGroup.position.x = lerp(magExp.x, magAsm.x, magP);
+    magGroup.position.y = lerp(magExp.y, magAsm.y, magP);
+    magGroup.position.z = lerp(magExp.z, magAsm.z, magP);
+  }
+
+  function updateAR(dt) {
+    const period = 6.0;
+    phase = (phase + dt / period) % 1;
+    const f = phase;
+    const d = 0.5 * (1 - Math.cos(2 * Math.PI * f)); // decomposed amount 0..1
+
+    const pinT = SMOOTH(d / 0.22);
+    const pivotT = SMOOTH((d - 0.14) / 0.32);
+    const bcgT = SMOOTH((d - 0.38) / 0.38);
+    const boltT = SMOOTH((d - 0.58) / 0.30);
+
+    // takedown pin slides out (Z)
+    takedownPin.position.z = lerp(0, 2.6, pinT);
+    // upper pivot opens (negative Z rotation)
+    upperPivot.rotation.z = lerp(0, -0.95, pivotT);
+    // BCG retracts
+    const bcgX = lerp(bcgAsmX, bcgExpX, bcgT);
+    bcgGroup.position.x = bcgX;
+    // bolt rotates for unlock
+    boltHead.rotation.x = lerp(0, 1.15, boltT);
+    // charging handle follows
+    chHandle.position.x = -8.5 + (bcgX - bcgAsmX);
+    // hammer cocks back slightly
+    hammerGroup.rotation.z = lerp(0, -0.9, pivotT);
+  }
+
+  // initial
+  updateUSP(0);
+
+  // ---------- loop ----------
+  function animate() {
+    requestAnimationFrame(animate);
+    const dt = clock.getDelta();
+    if (mode === 'usp') updateUSP(dt);
+    else updateAR(dt);
+    renderer.render(scene, camera);
+  }
+  animate();
+})();
+</script>
+</body>
+</html>

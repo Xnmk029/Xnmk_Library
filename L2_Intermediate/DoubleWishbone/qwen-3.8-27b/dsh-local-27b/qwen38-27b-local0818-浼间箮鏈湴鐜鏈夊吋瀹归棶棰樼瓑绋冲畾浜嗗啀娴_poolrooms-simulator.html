@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>POOLROOMS — 池核模拟器 (Web)</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #05070a; }
+  canvas { display: block; }
+  #vignette {
+    position: fixed; inset: 0; pointer-events: none; z-index: 5;
+    background: radial-gradient(ellipse at center, rgba(0,0,0,0) 46%, rgba(0,0,0,0.55) 100%);
+  }
+  #lock {
+    position: fixed; inset: 0; z-index: 10; display: flex; align-items: center; justify-content: center;
+    background: radial-gradient(ellipse at center, rgba(6,10,14,0.82), rgba(2,4,6,0.96));
+    backdrop-filter: blur(4px);
+    font-family: "Segoe UI", system-ui, sans-serif; color: #cfe6ee; text-align: center;
+    transition: opacity .35s ease;
+  }
+  #lock.hidden { opacity: 0; pointer-events: none; }
+  #lock .inner { max-width: 540px; padding: 40px; }
+  #lock h1 { font-size: 42px; letter-spacing: 14px; font-weight: 200; margin: 0 0 6px;
+    color: #eaf7fc; text-shadow: 0 0 24px rgba(90,180,220,0.55); }
+  #lock h1 b { font-weight: 700; color: #7fd4ff; }
+  #lock p { line-height: 1.9; font-size: 15px; color: #9fbcc7; font-weight: 300; }
+  #lock .k { display:inline-block; min-width: 26px; padding: 2px 9px; margin: 0 3px; border: 1px solid rgba(150,200,220,.35);
+    border-radius: 5px; background: rgba(120,180,205,.10); color:#d6eefb; font-size:13px; letter-spacing:1px; }
+  #lock .btn { margin-top: 26px; display:inline-block; padding: 13px 34px; border:1px solid rgba(130,210,255,.5);
+    border-radius: 8px; color:#eafaff; letter-spacing:3px; font-size:14px; cursor:pointer;
+    background: linear-gradient(180deg, rgba(80,170,220,.22), rgba(30,90,130,.18));
+    box-shadow: 0 0 26px rgba(60,160,210,.25), inset 0 0 12px rgba(120,210,255,.12); transition: all .2s; }
+  #lock .btn:hover { background: linear-gradient(180deg, rgba(100,190,240,.35), rgba(40,110,160,.28)); box-shadow: 0 0 40px rgba(70,180,230,.5); }
+  #hud { position: fixed; bottom: 10px; right: 14px; z-index: 6; font-family: monospace; font-size: 12px;
+    color: rgba(120,220,255,.55); pointer-events:none; }
+</style>
+</head>
+<body>
+<div id="vignette"></div>
+<div id="hud"></div>
+<div id="lock">
+  <div class="inner">
+    <h1>POOL<b>ROOMS</b></h1>
+    <p>池核 空间模拟器 &nbsp;·&nbsp; 无限 湿地 泳池 大厅</p>
+    <p style="margin-top:22px">
+      <span class="k">W</span><span class="k">A</span><span class="k">S</span><span class="k">D</span> 移动 &nbsp;
+      <span class="k">Shift</span> 疾跑 &nbsp;
+      <span class="k">Space</span> 跳跃 / 上浮 &nbsp;
+      <span class="k">鼠标</span> 视角
+    </p>
+    <p style="margin-top:14px; font-size:13px; color:#7c9aa6">无任务 · 无 UI · 仅自由探索潮湿的无限空间</p>
+    <div class="btn" id="startBtn">进 入 空 间</div>
+  </div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.1/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.1/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { ReflectorForSSRPass } from 'three/addons/objects/ReflectorForSSRPass.js';
+import { SSRPass } from 'three/addons/postprocessing/SSRPass.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { TAARenderPass } from 'three/addons/postprocessing/TAARenderPass.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+// ============================================================
+//  0. 世界尺度
+// ============================================================
+const TILE = 0.6;
+const CELL = 4;                 // 网格单元边长 (米)
+const CHUNK = 4 * CELL;         // chunk 边长 = 16m (4x4 cell)
+const VIEW = 3;                 // 环绕玩家 chunk 半径
+const CEIL = 4.4;               // 天花板高度
+const DEEP = 1.9;               // 深水区地面 (低于水面)
+const SHALLOW = -0.25;          // 浅水区地面 (高于水面)
+const WATER_Y = 0.0;            // 水面高度
+const EYE = 1.7;                // 玩家眼高
+const GRAV = 26.0;
+const FOGD = 30, FOGN = 120;
+
+const DEPTHS = [
+  new THREE.Color(0x1f7f8f), new THREE.Color(0x2f9c6b),
+  new THREE.Color(0x3f79cf), new THREE.Color(0x6f5fcf),
+  new THREE.Color(0x2fa8a0), new THREE.Color(0x9c4fb0)
+];
+
+// ============================================================
+//  1. 渲染器 / 场景 / 相机
+// ============================================================
+const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.6));
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.15;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0a0d10);
+scene.fog = new THREE.Fog(0x26414d, FOGD, FOGN);
+
+const camera = new THREE.PerspectiveCamera(74, innerWidth / innerHeight, 0.08, 700);
+camera.position.set(0, EYE + DEEP, 0);
+
+// HDRI 式环境光照 + 反射 (程序化房间环境, 用于 PBR 环境映射)
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+pmrem.dispose();
+
+// ============================================================
+//  2. 程序化 PBR 贴图 (颜色 / 法线 / 粗糙度 / AO)
+// ============================================================
+function makeCanvas(n){ const c = document.createElement('canvas'); c.width = c.height = n; return c; }
+
+function heightToNormal(hc, strength){
+  const n = hc.width, out = makeCanvas(n), ctx = out.getContext('2d');
+  const src = hc.getContext('2d').getImageData(0,0,n,n).data;
+  const dst = ctx.createImageData(n,n);
+  const h = (x,y) => src[(((y+n)%n)*n + ((x+n)%n))*4];
+  for(let y=0;y<n;y++) for(let x=0;x<n;x++){
+    const dx = (h(x+1,y)-h(x-1,y))/255*strength;
+    const dy = (h(x,y+1)-h(x,y-1))/255*strength;
+    let nx=-dx, ny=-dy, nz=1; const l=Math.hypot(nx,ny,nz); nx/=l; ny/=l; nz/=l;
+    const i=(y*n+x)*4;
+    dst.data[i]=(nx*0.5+0.5)*255; dst.data[i+1]=(ny*0.5+0.5)*255; dst.data[i+2]=(nz*0.5+0.5)*255; dst.data[i+3]=255;
+  }
+  ctx.putImageData(dst,0,0);
+  return out;
+}
+function noiseImage(g, N, base, varr){
+  const img = g.createImageData(N,N);
+  for(let i=0;i<img.data.length;i+=4){ const v = base + (Math.random()*varr);
+    img.data[i]=v; img.data[i+1]=v; img.data[i+2]=v; img.data[i+3]=255; }
+  g.putImageData(img,0,0);
+}
+function speckle(g, N, alpha, dark){
+  const d = g.getImageData(0,0,N,N);
+  for(let i=0;i<d.data.length;i+=4){ if(Math.random()<alpha){ const s=((Math.random()*(dark?70:50))|(0)) - (dark?35:0);
+    d.data[i]+=s; d.data[i+1]+=s; d.data[i+2]+=s; } }
+  g.putImageData(d,0,0);
+}
+function blotch(g, N, count, rgb, a0){
+  for(let k=0;k<count;k++){ const x=Math.random()*N,y=Math.random()*N,r=15+Math.random()*70;
+    const rg=g.createRadialGradient(x,y,1,x,y,r);
+    rg.addColorStop(0, `rgba(${rgb},${a0})`); rg.addColorStop(1,`rgba(${rgb},0)`);
+    g.fillStyle=rg; g.beginPath(); g.arc(x,y,r,0,7); g.fill(); }
+}
+function tex(canvas, srgb=false){
+  const t = new THREE.CanvasTexture(canvas);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  if (srgb) t.colorSpace = THREE.SRGBColorSpace;
+  t.needsUpdate = true;
+  return t;
+}
+
+// 通用接缝式高度场 (grid 块, 缝凹陷, 中心凸)
+function groutHeight(N, grid, seam=4, tileIn='#b6b6b6', groutIn='#363636'){
+  const hC = makeCanvas(N), hi = hC.getContext('2d'), cell = N/grid;
+  hi.fillStyle = groutIn; hi.fillRect(0,0,N,N);
+  for(let j=0;j<grid;j++) for(let i=0;i<grid;i++){
+    const x=i*cell,y=j*cell, m=seam;
+    const grd = hi.createRadialGradient(x+cell/2,y+cell/2,2, x+cell/2,y+cell/2,cell*0.62);
+    grd.addColorStop(0, tileIn); grd.addColorStop(1, '#969696');
+    hi.fillStyle = grd; hi.fillRect(x+m,y+m,cell-2*m,cell-2*m);
+  }
+  return hC;
+}
+
+// ---- 瓷砖 ----
+function buildTile(){
+  const N=512, grid=4;
+  const colC=makeCanvas(N), g=colC.getContext('2d');
+  const grC=makeCanvas(N), gr=grC.getContext('2d');
+  const aoC=makeCanvas(N), ao=aoC.getContext('2d');
+  g.fillStyle='#d0d8da'; g.fillRect(0,0,N,N);
+  gr.fillStyle='#2c2c2c'; gr.fillRect(0,0,N,N);
+  ao.fillStyle='#ffffff'; ao.fillRect(0,0,N,N);
+  const hC = groutHeight(N, grid);
+  const hi=hC.getContext('2d'), cell=N/grid;
+  for(let j=0;j<grid;j++) for(let i=0;i<grid;i++){
+    const x=i*cell,y=j*cell, v=196+(Math.random()*40-20)|0;
+    g.fillStyle=`rgb(${v},${v+3},${v+5})`; g.fillRect(x+4,y+4,cell-8,cell-8);
+    const rg=g.createRadialGradient(x+cell/2,y+cell/2,6,x+cell/2,y+cell/2,cell*0.6);
+    rg.addColorStop(0,'rgba(255,255,255,0.22)'); rg.addColorStop(1,'rgba(255,255,255,0)');
+    g.fillStyle=rg; g.fillRect(x+4,y+4,cell-8,cell-8);
+    gr.fillStyle='#1c1c1c'; gr.fillRect(x+4,y+4,cell-8,cell-8);
+    ao.fillStyle='#565656'; ao.fillRect(x,y,cell,4); ao.fillRect(x,y,4,cell);
+  }
+  speckle(g,N,0.04,true); speckle(gr,N,0.04,false);
+  blotch(g,N,10,'120,150,155',0.08);
+  return { map:tex(colC,true), normalMap:tex(heightToNormal(hC,2.2)), roughnessMap:tex(grC), aoMap:tex(aoC) };
+}
+// ---- 混凝土 ----
+function buildConcrete(){
+  const N=512;
+  const colC=makeCanvas(N), g=colC.getContext('2d');
+  const grC=makeCanvas(N), gr=grC.getContext('2d');
+  const aoC=makeCanvas(N), ao=aoC.getContext('2d');
+  let img=g.createImageData(N,N);
+  for(let i=0;i<img.data.length;i+=4){ const b=48+(Math.random()*30); img.data[i]=b; img.data[i+1]=b*1.02; img.data[i+2]=b*1.05; img.data[i+3]=255; }
+  g.putImageData(img,0,0);
+  blotch(g,N,60,'16,18,22',0.22); blotch(g,N,40,'120,128,134',0.12);
+  for(let k=0;k<24;k++){ const x=Math.random()*N,y=Math.random()*N,w=6+Math.random()*22,h=40+Math.random()*180;
+    const rg=g.createLinearGradient(x,y,x,y+h); rg.addColorStop(0,'rgba(14,16,20,0)');
+    rg.addColorStop(0.4,'rgba(12,14,18,0.35)'); rg.addColorStop(1,'rgba(12,14,18,0)');
+    g.fillStyle=rg; g.fillRect(x,y,w,h); }
+  gr.fillStyle='#a0a0a0'; gr.fillRect(0,0,N,N); speckle(gr,N,0.12,true);
+  const hC=makeCanvas(N), hi=hC.getContext('2d'); noiseImage(hi,N,120,40);
+  for(let k=0;k<40;k++){ const x=Math.random()*N,y=Math.random()*N,r=10+Math.random()*50;
+    const rg=hi.createRadialGradient(x,y,1,x,y,r); rg.addColorStop(0,'rgba(55,55,55,0.5)'); rg.addColorStop(1,'rgba(0,0,0,0)');
+    hi.fillStyle=rg; hi.beginPath(); hi.arc(x,y,r,0,7); hi.fill(); }
+  ao.fillStyle='#e4e4e4'; ao.fillRect(0,0,N,N); blotch(ao,N,30,'80,86,92',0.2);
+  return { map:tex(colC,true), normalMap:tex(heightToNormal(hC,1.5)), roughnessMap:tex(grC), aoMap:tex(aoC) };
+}
+// ---- 池底 ----
+function buildFloor(){
+  const N=512, grid=4;
+  const colC=makeCanvas(N), g=colC.getContext('2d');
+  const grC=makeCanvas(N), gr=grC.getContext('2d');
+  const aoC=makeCanvas(N), ao=aoC.getContext('2d');
+  g.fillStyle='#33525b'; g.fillRect(0,0,N,N);
+  gr.fillStyle='#6f6f6f'; gr.fillRect(0,0,N,N);
+  ao.fillStyle='#c8c8c8'; ao.fillRect(0,0,N,N);
+  const hC=groutHeight(N,grid,'#7a7a7a','#2a2a2a');
+  const hi=hC.getContext('2d'), cell=N/grid;
+  for(let j=0;j<grid;j++) for(let i=0;i<grid;i++){ const x=i*cell,y=j*cell,v=92+(Math.random()*24-12)|0;
+    g.fillStyle=`rgb(${v},${v+24},${v+30})`; g.fillRect(x+4,y+4,cell-8,cell-8);
+    ao.fillStyle='rgba(60,72,78,0.6)'; ao.fillRect(x,y,cell,4); ao.fillRect(x,y,4,cell); }
+  blotch(g,N,18,'16,40,46',0.4); speckle(g,N,0.05,true);
+  return { map:tex(colC,true), normalMap:tex(heightToNormal(hC,2.0)), roughnessMap:tex(grC), aoMap:tex(aoC) };
+}
+// ---- 金属 ----
+function buildMetal(){
+  const N=256;
+  const colC=makeCanvas(N), g=colC.getContext('2d');
+  let img=g.createImageData(N,N);
+  for(let y=0;y<N;y++){ const band=(Math.random()*44)|0;
+    for(let x=0;x<N;x++){ const i=(y*N+x)*4, v=92+band+(Math.random()*24); img.data[i]=v; img.data[i+1]=v+4; img.data[i+2]=v+9; img.data[i+3]=255; } }
+  g.putImageData(img,0,0);
+  const grC=makeCanvas(N), gr=grC.getContext('2d'); gr.fillStyle='#565656'; gr.fillRect(0,0,N,N); speckle(gr,N,0.05,false);
+  return { map:tex(colC,true), roughnessMap:tex(grC) };
+}
+
+const TX = { tile:buildTile(), concrete:buildConcrete(), floor:buildFloor(), metal:buildMetal() };
+
+// ============================================================
+//  3. 材质
+// ============================================================
+function std(o){ const m=new THREE.MeshStandardMaterial(o); m.envMapIntensity=o.envMapIntensity??0.5; return m; }
+
+const MAT = {
+  tile: std({ map:TX.tile.map, normalMap:TX.tile.normalMap, roughnessMap:TX.tile.roughnessMap, aoMap:TX.tile.aoMap,
+    metalness:0, roughness:1, normalScale:new THREE.Vector2(0.85,0.85), aoMapIntensity:0.8, envMapIntensity:0.7 }),
+  concrete: std({ map:TX.concrete.map, normalMap:TX.concrete.normalMap, roughnessMap:TX.concrete.roughnessMap, aoMap:TX.concrete.aoMap,
+    metalness:0, roughness:1, normalScale:new THREE.Vector2(1.0,1.0), aoMapIntensity:0.75, envMapIntensity:0.3 }),
+  floor: std({ map:TX.floor.map, normalMap:TX.floor.normalMap, roughnessMap:TX.floor.roughnessMap, aoMap:TX.floor.aoMap,
+    metalness:0.02, roughness:1, normalScale:new THREE.Vector2(0.9,0.9), aoMapIntensity:0.65, envMapIntensity:0.5 }),
+  metal: std({ map:TX.metal.map, roughnessMap:TX.metal.roughnessMap, metalness:0.95, roughness:0.35, envMapIntensity:1.2 }),
+  ceiling: std({ color:0x8f999b, roughness:0.72, metalness:0, envMapIntensity:0.22 }),
+  water: new THREE.MeshPhysicalMaterial({
+    color:0x1c6c78, metalness:0, roughness:0.05, transmission:0.92, ior:1.33, thickness:3.2,
+    attenuationColor:0x0a4a52, attenuationDistance:3.5, envMapIntensity:1.25, clearcoat:0.55, clearcoatRoughness:0.06,
+    side:THREE.DoubleSide
+  })
+};
+
+// 共享几何 (克隆用于 UV2)
+const BGEO = new THREE.BoxGeometry(1,1,1);
+const cylGeo = new THREE.CylinderGeometry(0.5,0.5,0.12,20);
+const ringGeo = new THREE.RingGeometry(0.34,0.5,22);
+const planeGeo = new THREE.PlaneGeometry(1,1);
+function geo2(geo){ geo.setAttribute('uv2', geo.attributes.uv); return geo; }
+
+// ============================================================
+//  4. 水面 (SSR 反射) + 焦散 + 全局水覆盖
+// ============================================================
+const waterReflector = new ReflectorForSSRPass(new THREE.PlaneGeometry(CHUNK*80, CHUNK*80), {
+  clipBias: 0.003, textureWidth: innerWidth*0.5, textureHeight: innerHeight*0.5, color: 0x1f6c74, fog: true
+});
+waterReflector.rotation.x = -Math.PI/2;
+waterReflector.position.y = WATER_Y + 0.02;
+scene.add(waterReflector);
+
+// 焦散 / 波纹叠加 (随时间动, 半透明)
+const causticMat = new THREE.ShaderMaterial({
+  transparent:true, depthWrite:false, side:THREE.DoubleSide,
+  uniforms:{ uTime:{value:0}, uScale:{value:CHUNK} },
+  vertexShader:`varying vec2 vUv; void main(){ vUv=uv; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0); }`,
+  fragmentShader:`
+    uniform float uTime; uniform float uScale; varying vec2 vUv;
+    float wv(vec2 p){ return sin(p.x*3.1+uTime)*0.5+sin(p.y*2.7-uTime*1.2)*0.5+sin((p.x+p.y)*4.3+uTime*0.8)*0.4; }
+    void main(){ vec2 p=vUv*uScale; float c=wv(p); c=smoothstep(0.5,1.0,c*0.5+0.5);
+      gl_FragColor=vec4(0.6,0.95,1.0, c*0.15); }`
+});
+const caustic = new THREE.Mesh(new THREE.PlaneGeometry(CHUNK*80,CHUNK*80), causticMat);
+caustic.rotation.x=-Math.PI/2; caustic.position.y=WATER_Y+0.005; caustic.renderOrder=1;
+scene.add(caustic);
+
+// 全局深水覆盖 (玩家所在 chunk 范围), 提供折射/水色; 反射水覆盖其余区域
+const DEPTH_PLANE = CHUNK*(VIEW*2+1) - 0.5;
+const depthMesh = new THREE.Mesh(new THREE.PlaneGeometry(DEPTH_PLANE,DEPTH_PLANE), MAT.water);
+depthMesh.rotation.x=-Math.PI/2; depthMesh.position.y=WATER_Y;
+scene.add(depthMesh);
+
+// ============================================================
+//  5. 世界生成
+// ============================================================
+const chunks = new Map();
+let chunkCount = 0;
+const ckey = (ci,cj)=>ci+','+cj;
+function hash2(i,j){ let n=(i*374761393 + j*668265263)|0; n=(n^(n>>13))*1274126177|0; n=n^(n>>16); return (n>>>0)/4294967295; }
+
+const cellType = (cx,cy)=>{ const r=hash2(cx,cy);
+  if(r<0.30)return 0; if(r<0.52)return 1; if(r<0.70)return 2; if(r<0.82)return 3; if(r<0.92)return 4; return 5; };
+const typeHeight = t=> t===0||t===5 ? DEEP : t===4 ? SHALLOW : (1<<t);
+function depthColor(cx,cy){ return DEPTHS[(hash2(cx*7+1,cy*7+1)*DEPTHS.length)|0]; }
+
+function addBox(group, x,y,z, sx,sy,sz, mat, useUV2){
+  const geo = useUV2 ? geo2(BGEO.clone()) : BGEO;
+  const m = new THREE.Mesh(geo, mat);
+  m.position.set(x,y,z); m.scale.set(sx,sy,sz);
+  m.castShadow=true; m.receiveShadow=true;
+  group.add(m); return m;
+}
+
+// 一条带门洞的墙 (本地 [0,len] 沿轴)
+function buildSegment(group, x0,y0,z0, len, wallH, thickness, mat, openings){
+  const segY = y0 + wallH/2;
+  let cursor = 0;
+  const sorted = openings.slice().sort((a,b)=>a.start-b.start);
+  for(const o of sorted){
+    const solidStart = cursor, solidEnd = o.start;
+    if (solidEnd - solidStart > 0.02)
+      addBox(group, x0+(solidStart+solidEnd)/2, segY, z0, thickness, wallH, len, mat, false);
+    const lintelH = wallH - o.h;
+    if (lintelH > 0.02)
+      addBox(group, x0+(o.start+o.end)/2, y0+o.h+lintelH/2, z0, thickness, lintelH, (o.end-o.start), mat, false);
+    cursor = o.end;
+  }
+  const tail = len - cursor;
+  if (tail > 0.02)
+    addBox(group, x0+(cursor+len)/2, segY, z0, thickness, wallH, tail, mat, false);
+}
+
+function buildCell(group, cx, cy){
+  const ox = cx*CELL, oz = cy*CELL;
+  const t = cellType(cx,cy);
+  const floorY = typeHeight(t);
+  const concrete = hash2(cx-5, cy+29) > 0.55;
+  const wallMat = concrete ? MAT.concrete : MAT.tile;
+  const floorMat = (t===0||t===5) ? MAT.floor : (concrete?MAT.concrete:MAT.tile);
+  const depth = depthColor(cx,cy);
+
+  // 地面
+  addBox(group, ox+CELL/2, floorY, oz+CELL/2, CELL, 0.5, CELL, floorMat, floorMat===MAT.floor);
+  // 水池着色层 (假水体 + 深浅渐变)
+  if (t===0 || t===5){
+    const wc = new THREE.Mesh(planeGeo, new THREE.MeshStandardMaterial({
+      color:depth, transparent:true, opacity:0.55, roughness:0.12, metalness:0, envMapIntensity:0.6, depthWrite:false }));
+    wc.rotation.x=-Math.PI/2; wc.position.set(ox+CELL/2, WATER_Y+0.001, oz+CELL/2); wc.scale.set(CELL*0.98,CELL*0.98,1);
+    wc.renderOrder=2; group.add(wc);
+    const dr = new THREE.Mesh(cylGeo, MAT.metal); dr.position.set(ox+CELL/2, floorY+0.06, oz+CELL/2); group.add(dr);
+    const rn = new THREE.Mesh(ringGeo, MAT.metal); rn.rotation.x=-Math.PI/2; rn.position.set(ox+CELL/2, floorY+0.14, oz+CELL/2); group.add(rn);
+  }
+
+  // 四壁 (随机门洞 → 连通)
+  const wTop = CEIL, wBot = floorY, wH = wTop - wBot;
+  const doorW = 1.4, doorH = 2.3, th = TILE*0.4;
+  const openAt = (seed)=>{ if (hash2(cx*5+seed, cy*5+seed) <= 0.30) return null;
+    const c = 0.25 + Math.floor(hash2(cx+seed*3, cy-seed*2)*3)/2; // 0.25/0.5/0.75
+    const start = Math.max(0, c*CELL - doorW/2), end = Math.min(CELL, c*CELL + doorW/2);
+    return { start, end, h: Math.min(doorH, wH) }; };
+
+  const south = openAt(0); buildSegment(group, ox, wBot, oz,         CELL, wH, th, wallMat, south?[{start:south.start,end:south.end,h:south.h}]:[]);
+  const north = openAt(1); buildSegment(group, ox, wBot, oz+CELL,    CELL, wH, th, wallMat, north?[{start:north.start,end:north.end,h:north.h}]:[]);
+  const west  = openAt(2); buildSegment(group, ox,     wBot, oz,     CELL, wH, th, wallMat, west ?[{start:west.start, end:west.end,  h:west.h }] :[]);
+  const east  = openAt(3); buildSegment(group, ox+CELL,wBot, oz,     CELL, wH, th, wallMat, east ?[{start:east.start, end:east.end,  h:east.h }] :[]);
+
+  // 顶板 + 灯光
+  addBox(group, ox+CELL/2, CEIL, oz+CELL/2, CELL, 0.3, CELL, MAT.ceiling, false);
+  addLightBox(group, ox + CELL*(0.3 + hash2(cx+9,cy+2)*0.4), oz + CELL*(0.3 + hash2(cx+2,cy+9)*0.4), lightColor(cx,cy));
+
+  // 楼梯
+  if (t===3) buildStairs(group, ox, oz, floorY, wallMat);
+  // 扶手
+  if ((t===1||t===0) && hash2(cx+4,cy+4)>0.5) addHandrail(group, ox, oz, floorY, hash2(cx+8,cy+8)>0.5);
+}
+
+function lightColor(cx,cy){ return hash2(cx*3+11, cy*3+7) > 0.6 ? new THREE.Color(0xffd9a0) : new THREE.Color(0xcdeeff); }
+
+function addLightBox(group, x, z, color){
+  const m = new THREE.Mesh(planeGeo, new THREE.MeshStandardMaterial({ color:0x0a0a0a, emissive:color, emissiveIntensity:1.4, roughness:1, metalness:0 }));
+  m.rotation.x=Math.PI/2; m.position.set(x, CEIL-0.02, z); m.scale.set(1.1,1.1,1); group.add(m);
+  const f = new THREE.Mesh(BGEO, new THREE.MeshStandardMaterial({ color:0x111416, emissive:color, emissiveIntensity:0.7, roughness:1 }));
+  f.position.set(x, CEIL-0.01, z); f.scale.set(1.3,0.05,1.3); group.add(f);
+}
+
+function addHandrail(group, ox, oz, floorY, far){
+  const len=CELL*0.8, bx=ox+CELL/2, bz=far? oz+CELL-0.3 : oz+0.3;
+  const post=(px,pz)=>{ const m=new THREE.Mesh(cylGeo, MAT.metal); m.scale.set(0.4,1.0,0.4); m.position.set(px, floorY+0.5, pz); m.castShadow=true; group.add(m); };
+  post(bx-len/2, bz); post(bx+len/2, bz);
+  const b=new THREE.Mesh(BGEO, MAT.metal); b.position.set(bx, floorY+1.0, bz); b.scale.set(len,0.06,0.07); b.castShadow=true; group.add(b);
+  const b2=b.clone(); b2.position.y=floorY+0.62; group.add(b2);
+}
+
+function buildStairs(group, ox, oz, baseY, mat){
+  const n=5, rise=0.32, run=0.3, dir=hash2(ox,oz)>0.5?1:-1;
+  const sx=ox+CELL*0.5, sz=oz+(dir>0? CELL*0.25 : CELL*0.75);
+  for(let i=0;i<n;i++){ addBox(group, sx, baseY+rise*(i+1)/2+0.02, sz+dir*run*i, CELL*0.8, rise, run*1.1, mat, false); }
+  addBox(group, sx, baseY+rise*n+0.03, sz+dir*run*n, CELL*0.8, 0.12, run*1.2, mat, false);
+}
+
+function makeChunk(ci, cj){
+  const g = new THREE.Group();
+  for(let j=0;j<4;j++) for(let i=0;i<4;i++) buildCell(g, ci*4+i, cj*4+j);
+  scene.add(g);
+  chunks.set(ckey(ci,cj), { group:g, ci, cj });
+  chunkCount++;
+}
+function disposeGroup(g){ scene.remove(g); }
+
+function updateChunks(px, pz){
+  const pci=Math.floor(px/CHUNK), pcj=Math.floor(pz/CHUNK);
+  for(let j=pcj-VIEW;j<=pcj+VIEW;j++) for(let i=pci-VIEW;i<=pci+VIEW;i++){
+    const k=ckey(i,j); if(!chunks.has(k)) makeChunk(i,j);
+  }
+  for(const [k,e] of chunks){
+    if (Math.abs(e.ci-pci)>VIEW+1 || Math.abs(e.cj-pcj)>VIEW+1){ disposeGroup(e.group); chunks.delete(k); chunkCount--; }
+  }
+}
+function followWater(){
+  const x=Math.round(camera.position.x/CHUNK)*CHUNK, z=Math.round(camera.position.z/CHUNK)*CHUNK;
+  waterReflector.position.set(x, WATER_Y+0.02, z);
+  caustic.position.set(x, WATER_Y+0.005, z);
+  depthMesh.position.set(x, WATER_Y, z);
+}
+
+// ============================================================
+//  6. 灯光
+// ============================================================
+const hemi = new THREE.HemisphereLight(0xbfe4ef, 0x1c2a30, 0.55); scene.add(hemi);
+const key = new THREE.PointLight(0xdff2ff, 8, 30, 2);
+key.castShadow = true; key.shadow.mapSize.set(1024,1024); key.shadow.bias = -0.005; key.shadow.radius = 4; scene.add(key);
+const pts = [];
+for(let i=0;i<5;i++){ const p=new THREE.PointLight(0xbfe8ff, 3, 16, 2); scene.add(p); pts.push(p); }
+function updateLights(){
+  key.position.set(camera.position.x, CEIL-1.0, camera.position.z);
+  const ci=Math.floor(camera.position.x/CELL), cj=Math.floor(camera.position.z/CELL);
+  for(let i=0;i<5;i++){ const a=i*Math.PI*2/5, r=7;
+    const px=camera.position.x+Math.cos(a)*r, pz=camera.position.z+Math.sin(a)*r;
+    pts[i].position.set(px, CEIL-1.2, pz);
+    pts[i].color.lerp(lightColor(ci+Math.floor(px/CELL), cj+Math.floor(pz/CELL)), 0.2); }
+}
+
+// ============================================================
+//  7. 后处理 (渲染 → SSR → TAA → Bloom → Output)
+// ============================================================
+const composer = new EffectComposer(renderer);
+const renderPass = new RenderPass(scene, camera);
+const ssrPass = new SSRPass({ renderer, scene, camera, width:innerWidth, height:innerHeight, groundReflector:waterReflector });
+ssrPass.minDistance = 0.001; ssrPass.maxDistance = 6.0; ssrPass.maxStep = 96; ssrPass.thickness = 0.09; ssrPass.blur = true;
+const taaPass = new TAARenderPass(scene, camera, { samples: 4, halton: true });
+const bloomPass = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.30, 0.55, 0.82);
+const outputPass = new OutputPass();
+composer.addPass(renderPass);
+composer.addPass(ssrPass);
+composer.addPass(taaPass);
+composer.addPass(bloomPass);
+composer.addPass(outputPass);
+
+// ============================================================
+//  8. 第一人称控制 + 物理
+// ============================================================
+const player = { pos:new THREE.Vector3(0, DEEP, 0), vel:new THREE.Vector3(), yaw:0.6, pitch:-0.08, onGround:false, walk:4.6, sprint:8.2 };
+const keys = {};
+addEventListener('keydown', e=>{ keys[e.code]=true; if(e.code==='Space') e.preventDefault(); });
+addEventListener('keyup',   e=>{ keys[e.code]=false; });
+addEventListener('blur', ()=>{ for(const k in keys) keys[k]=false; });
+
+let locked=false;
+const lockEl=document.getElementById('lock'), startBtn=document.getElementById('startBtn');
+function requestLock(){ renderer.domElement.requestPointerLock(); }
+lockEl.addEventListener('click', requestLock);
+startBtn.addEventListener('click', requestLock);
+document.addEventListener('pointerlockchange', ()=>{ locked = document.pointerLockElement===renderer.domElement; lockEl.classList.toggle('hidden', locked); });
+addEventListener('mousemove', e=>{ if(!locked) return; const s=0.0022;
+  player.yaw -= e.movementX*s; player.pitch -= e.movementY*s;
+  const lim=Math.PI/2-0.02; player.pitch=Math.max(-lim, Math.min(lim, player.pitch)); });
+
+function groundAt(px, pz){
+  const ci=Math.floor(px/CELL), cj=Math.floor(pz/CELL), h=typeHeight(cellType(ci,cj));
+  const lx=(px-ci*CELL)-CELL/2, lz=(pz-cj*CELL)-CELL/2;
+  if (cellType(ci,cj)===3 && Math.abs(lx)<CELL*0.4){
+    const dir=hash2(ci*CELL,cj*CELL)>0.5?1:-1;
+    const base=CELL*0.25, sz=dir>0? (lz-base) : (base - lz);
+    if (sz>=0 && sz<CELL*0.9) return Math.min(1.6, Math.floor(sz/0.3)*0.32 + h);
+  }
+  return h;
+}
+
+let prevTime=performance.now();
+function physics(dt){
+  const fwd=new THREE.Vector3(-Math.sin(player.yaw),0,-Math.cos(player.yaw));
+  const rgt=new THREE.Vector3( Math.cos(player.yaw),0,-Math.sin(player.yaw));
+  const wish=new THREE.Vector3();
+  if(keys['KeyW']) wish.add(fwd); if(keys['KeyS']) wish.sub(fwd);
+  if(keys['KeyD']) wish.add(rgt); if(keys['KeyA']) wish.sub(rgt);
+  if(wish.lengthSq()>0) wish.normalize();
+  const sp=(keys['ShiftLeft']||keys['ShiftRight'])?player.sprint:player.walk;
+  const inWater = player.pos.y < WATER_Y+0.2;
+  const accel = inWater? 9 : 16;
+  player.vel.x = THREE.MathUtils.lerp(player.vel.x, wish.x*sp, 1-Math.exp(-accel*dt));
+  player.vel.z = THREE.MathUtils.lerp(player.vel.z, wish.z*sp, 1-Math.exp(-accel*dt));
+
+  if(inWater){
+    if(keys['Space']) player.vel.y += 40*dt;
+    player.vel.y = THREE.MathUtils.lerp(player.vel.y, 0.6, 1-Math.exp(-1.6*dt));
+  } else {
+    player.vel.y -= GRAV*dt;
+    if(keys['Space'] && player.onGround){ player.vel.y=9.4; player.onGround=false; }
+  }
+  player.pos.addScaledVector(player.vel, dt);
+
+  const g=groundAt(player.pos.x, player.pos.z);
+  player.onGround=false;
+  if(player.pos.y < g){ player.pos.y=g;
+    if(player.vel.y<0){ const imp=player.vel.y; player.vel.y= imp<-4 ? imp*0.2 : 0; }
+    player.onGround=true; }
+  if(player.pos.y+EYE > CEIL) player.pos.y=CEIL-EYE;
+
+  camera.position.set(player.pos.x, player.pos.y+EYE, player.pos.z);
+  camera.quaternion.setFromEuler(new THREE.Euler(player.pitch, player.yaw, 0, 'YXZ'));
+}
+
+// ============================================================
+//  9. 主循环
+// ============================================================
+const hud=document.getElementById('hud');
+let frames=0, fpsTime=0, fps=60;
+function animate(){
+  requestAnimationFrame(animate);
+  const now=performance.now(); let dt=(now-prevTime)/1000; prevTime=now; dt=Math.min(dt,0.05);
+  if(locked) physics(dt); else camera.position.set(player.pos.x, player.pos.y+EYE, player.pos.z);
+  causticMat.uniforms.uTime.value = now*0.001;
+  followWater(); updateLights(); updateChunks(camera.position.x, camera.position.z);
+  composer.render();
+  frames++; fpsTime+=dt; if(fpsTime>=0.5){ fps=Math.round(frames/fpsTime); frames=0; fpsTime=0; hud.textContent=`chunks ${chunkCount} · ${fps} fps`; }
+}
+
+updateChunks(camera.position.x, camera.position.z);
+animate();
+
+addEventListener('resize', ()=>{
+  camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  composer.setSize(innerWidth, innerHeight);
+  ssrPass.setSize(innerWidth, innerHeight);
+  bloomPass.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>

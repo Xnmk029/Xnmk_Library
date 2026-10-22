@@ -1,0 +1,13 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import {createHash} from 'node:crypto';
+const root=path.resolve(import.meta.dirname,'../..'),file=path.join(root,'Backend/PILOT_REPORT.md'),dir=path.join(root,'Backend/pilots/20261015');
+const frozen=path.join(dir,'PILOT_REPORT.frozen.md');
+if(fs.existsSync(frozen))throw Error('Historical report already frozen');
+fs.copyFileSync(file,frozen);
+const sha=createHash('sha256').update(fs.readFileSync(frozen)).digest('hex');
+fs.writeFileSync(path.join(dir,'REPORT_FREEZE.json'),JSON.stringify({source:'Backend/PILOT_REPORT.md',frozen:'Backend/pilots/20261015/PILOT_REPORT.frozen.md',sha256:sha,date:'2026-10-16',changesToNavigableReport:'Historical-date banner and retired prompt link relocation only; no results, timing or scores changed.'},null,2)+'\n');
+let text=fs.readFileSync(file,'utf8');
+text='> 历史报告：以下“当前”均指 2026-10-15 的题库状态。2026-10-16 两道 L4 已升级，现行状态见 [BANK.json](BANK.json) 和 [新报告](EXPERT_UPGRADE_REPORT.md)。[原始字节快照](pilots/20261015/PILOT_REPORT.frozen.md) 已冻结；本页仅修正退役题链接。\n\n'+text;
+for(const name of ['LedgerAudit','InventoryTransactions'])text=text.replaceAll('../L4_Expert/'+name+'/PROJECT_PROMPT.md','retired/'+name+'/PROJECT_PROMPT.md');
+fs.writeFileSync(file,text);

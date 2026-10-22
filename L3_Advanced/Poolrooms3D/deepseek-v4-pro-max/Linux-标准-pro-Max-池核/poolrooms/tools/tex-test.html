@@ -1,0 +1,545 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" href="data:," />
+    <title>Poolrooms · TextureFactory preview</title>
+    <style>
+      :root { color-scheme: dark; }
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      html, body { width: 100%; height: 100%; overflow: hidden; background: #0a0d10; }
+      body { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+      #view { display: block; width: 100%; height: 100%; }
+      #ui { position: fixed; inset: 0; pointer-events: none; }
+      #ui .name {
+        position: absolute; color: #d8f2f8; font-size: 11px; letter-spacing: 0.06em;
+        text-shadow: 0 1px 2px #000; white-space: nowrap;
+      }
+      #ui .sub {
+        position: absolute; color: rgba(190, 225, 235, 0.66); font-size: 9px;
+        letter-spacing: 0.08em; text-transform: uppercase; text-shadow: 0 1px 2px #000;
+      }
+      #ui .ws { color: rgba(150, 210, 225, 0.7); }
+      #head {
+        position: fixed; left: 8px; bottom: 6px; color: rgba(190, 225, 235, 0.6);
+        font-size: 10px; letter-spacing: 0.05em;
+      }
+      #fatal {
+        position: fixed; inset: 0; z-index: 20; display: none; padding: 30px;
+        background: #07080a; color: #ff9d9d; font: 12px/1.6 ui-monospace, monospace; white-space: pre-wrap;
+      }
+    </style>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "../vendor/three.module.js",
+          "three/addons/": "../vendor/jsm/"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <canvas id="view"></canvas>
+    <div id="ui"></div>
+    <div id="head"></div>
+    <pre id="fatal"></pre>
+
+    <script type="module">
+      import * as THREE from 'three';
+      import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+      import { PRESETS, TextureFactory } from '../src/materials/TextureFactory.js';
+
+      const fatal = (err) => {
+        const el = document.getElementById('fatal');
+        el.style.display = 'block';
+        el.textContent = 'tex-test failed.\n\n' + (err && (err.stack || err.message || err));
+        console.error(err);
+      };
+      window.addEventListener('error', (e) => fatal(e.error || e.message));
+      window.addEventListener('unhandledrejection', (e) => fatal(e.reason));
+
+      // ---- options: ?only=poolTile,concrete   ?rep=3   ?size=1024 -------------
+      const qs = new URLSearchParams(location.search);
+      const only = (qs.get('only') || '').split(',').map((s) => s.trim()).filter(Boolean);
+      const REP = Number(qs.get('rep') || 3);
+      const SIZE = Number(qs.get('size') || 1024);
+      const names = Object.keys(PRESETS).filter((n) => only.length === 0 || only.includes(n));
+
+      // ---- renderer ----------------------------------------------------------
+      const canvas = document.getElementById('view');
+      const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false });
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = 1.05;
+      renderer.setClearColor(0x0a0d10, 1);
+
+      // ---- procedural environment (no assets) --------------------------------
+      const pmrem = new THREE.PMREMGenerator(renderer);
+      pmrem.compileEquirectangularShader();
+      const roomEnv = new RoomEnvironment();
+      const envRT = pmrem.fromScene(roomEnv, 0.04);
+      roomEnv.traverse((o) => {
+        if (o.material) o.material.dispose();
+        if (o.geometry) o.geometry.dispose();
+      });
+      pmrem.dispose();
+
+      // ---- sanity probe: does an sRGB render target really encode on write? ---
+      // (TextureFactory writes LINEAR albedo into an SRGB8_ALPHA8 target and relies on the
+      // hardware encode; linear 0.2159 must land on byte ~128.)
+      const probeSRGB = () => {
+        const rt = new THREE.WebGLRenderTarget(1, 1, {
+          format: THREE.RGBAFormat, type: THREE.UnsignedByteType,
+          colorSpace: THREE.SRGBColorSpace, depthBuffer: false, stencilBuffer: false,
+        });
+        const scene = new THREE.Scene();
+        const cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+        const mat = new THREE.ShaderMaterial({
+          vertexShader: 'void main(){ gl_Position = vec4(position.xy, 0.0, 1.0); }',
+          fragmentShader: 'void main(){ gl_FragColor = vec4(vec3(0.2158605), 1.0); }',
+          depthTest: false, depthWrite: false,
+        });
+        scene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), mat));
+        const prev = renderer.getRenderTarget();
+        renderer.setRenderTarget(rt);
+        renderer.render(scene, cam);
+        const px = new Uint8Array(4);
+        renderer.readRenderTargetPixels(rt, 0, 0, 1, 1, px); // also forces a GPU sync
+        renderer.setRenderTarget(prev);
+        rt.dispose();
+        mat.dispose();
+        scene.children[0].geometry.dispose();
+        return px[0];
+      };
+
+      // ---- bake --------------------------------------------------------------
+      const factory = new TextureFactory(renderer, { size: SIZE, anisotropy: 8 });
+      const t0 = performance.now();
+      const sets = names.map((n) => factory.bake(n));
+      // cache check: a second bake must be free and hand back identical objects
+      const cacheOk = names.every((n, i) => factory.bake(n).map === sets[i].map);
+      const probeByte = probeSRGB(); // forces the GPU to finish everything above
+      renderer.getContext().finish();
+      const bakeMs = Math.round((performance.now() - t0) * 10) / 10;
+
+      const bytesPerSet = (s) => {
+        const w = s.map.image.width, h = s.map.image.height;
+        return 3 * w * h * 4 * (4 / 3); // 3 maps, RGBA8, +1/3 for the mip chain
+      };
+      const memMB = Math.round((sets.reduce((a, s) => a + bytesPerSet(s), 0) / 1048576) * 10) / 10;
+
+      // Steady-state cost: bake all 8 again in a throw-away factory, with the shader
+      // programs already compiled and cached, then release it immediately.
+      const warmFactory = new TextureFactory(renderer, { size: SIZE, anisotropy: 8 });
+      const w0 = performance.now();
+      const warmSets = names.map((n) => warmFactory.bake(n));
+      renderer.readRenderTargetPixels; // (no-op reference; the sync happens below)
+      const warmProbe = probeSRGB();
+      renderer.getContext().finish();
+      const warmMs = Math.round((performance.now() - w0) * 10) / 10;
+      warmFactory.dispose();
+      factory.releaseScratch();       // reclaim the ~8 MB scratch target; the sets stay valid
+      void warmSets; void warmProbe;
+
+      console.log(`[tex] baked ${sets.length} presets in ${bakeMs} ms (${SIZE}px) · ~${memMB} MB VRAM`);
+      console.log(`[tex] warm re-bake of all ${sets.length} (shaders already compiled): ${warmMs} ms`);
+      console.log(`[tex] sRGB render-target probe: linear 0.2159 -> byte ${probeByte} (expect 126..130)`);
+      console.log(`[tex] cache returns identical textures: ${cacheOk}`);
+      for (let i = 0; i < names.length; i++) {
+        const s = sets[i];
+        console.log(
+          `[tex] ${names[i].padEnd(13)} worldScale=${s.worldScale}m  size=${s.map.image.width}` +
+            `  aniso=${s.map.anisotropy}  channel=${s.map.channel}` +
+            `  params=${JSON.stringify(s.params)}`,
+        );
+      }
+
+      // ---- flat map views (raw texture inspection, no tone mapping) -----------
+      const flatScene = new THREE.Scene();
+      const flatCam = new THREE.OrthographicCamera(-0.5, 0.5, 0.5, -0.5, 0, 2);
+      flatCam.position.z = 1;
+      const flatMat = new THREE.ShaderMaterial({
+        uniforms: { tMap: { value: null }, uRep: { value: new THREE.Vector2(1, 1) }, uEncode: { value: 0 } },
+        vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+        fragmentShader: `
+          precision highp float;
+          varying vec2 vUv;
+          uniform sampler2D tMap;
+          uniform vec2 uRep;
+          uniform float uEncode;
+          float l2s(float c){ return c < 0.0031308 ? c * 12.92 : 1.055 * pow(c, 0.4166667) - 0.055; }
+          void main(){
+            vec3 c = texture2D(tMap, vUv * uRep).rgb;
+            // the albedo map is sampled through the hardware sRGB decode, so re-encode it
+            // for the sRGB canvas; normal/ORM are raw data and pass straight through.
+            if (uEncode > 0.5) c = vec3(l2s(c.r), l2s(c.g), l2s(c.b));
+            gl_FragColor = vec4(c, 1.0);
+          }`,
+        depthTest: false,
+        depthWrite: false,
+      });
+      flatScene.add(new THREE.Mesh(new THREE.PlaneGeometry(1, 1), flatMat));
+
+      // ---- automated numeric self-checks -------------------------------------
+      // Tileability is measured, not eyeballed: copy a map 1:1 into a plain RGBA8 target,
+      // then compare the wrap-around column/row pair against genuine interior neighbours.
+      // A seam would make the wrap difference several times larger than the interior one.
+      const checks = (() => {
+        const N = sets[0].map.image.width;
+        const rtOpts = {
+          format: THREE.RGBAFormat, type: THREE.UnsignedByteType, colorSpace: THREE.NoColorSpace,
+          depthBuffer: false, stencilBuffer: false, generateMipmaps: false,
+          minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+        };
+        const full = new THREE.WebGLRenderTarget(N, N, rtOpts);
+        const copy = (tex) => {
+          flatMat.uniforms.tMap.value = tex;
+          flatMat.uniforms.uEncode.value = 0;
+          flatMat.uniforms.uRep.value.set(1, 1);
+          renderer.autoClear = true;
+          renderer.setRenderTarget(full);
+          renderer.render(flatScene, flatCam);
+          renderer.setRenderTarget(null);
+        };
+        const px = (x, y, w, h) => {
+          const b = new Uint8Array(w * h * 4);
+          renderer.readRenderTargetPixels(full, x, y, w, h, b);
+          return b;
+        };
+        const lane = (buf, w, n, i, vertical) => {
+          const o = new Uint8Array(n * 3);
+          for (let k = 0; k < n; k++) {
+            const base = (vertical ? k * w + i : i * w + k) * 4;
+            o[k * 3] = buf[base]; o[k * 3 + 1] = buf[base + 1]; o[k * 3 + 2] = buf[base + 2];
+          }
+          return o;
+        };
+        const mad = (a, b) => {
+          let s = 0;
+          for (let i = 0; i < a.length; i++) s += Math.abs(a[i] - b[i]);
+          return s / a.length;
+        };
+        const seam = (tex) => {
+          copy(tex);
+          const L = px(0, 0, 2, N), R = px(N - 2, 0, 2, N);
+          const B = px(0, 0, N, 2), T = px(0, N - 2, N, 2);
+          const M = px(N >> 1, 0, 2, N); // control: an unrelated column pair
+          const c0 = lane(L, 2, N, 0, true), c1 = lane(L, 2, N, 1, true);
+          const cA = lane(R, 2, N, 0, true), cB = lane(R, 2, N, 1, true);
+          const r0 = lane(B, N, N, 0, false), r1 = lane(B, N, N, 1, false);
+          const rA = lane(T, N, N, 0, false), rB = lane(T, N, N, 1, false);
+          const inX = 0.5 * (mad(c0, c1) + mad(cA, cB));
+          const inY = 0.5 * (mad(r0, r1) + mad(rA, rB));
+          // The interior reference is also averaged over several other places: sampled in a
+          // single spot it is phase-dependent for high-frequency fields and cries false seam.
+          let sX = inX * 2, sY = inY * 2, nX = 2, nY = 2;
+          for (const q of [0.13, 0.37, 0.61, 0.83]) {
+            const at = (Math.round(N * q) >> 1) << 1;
+            const sv = px(at, 0, 2, N), sh = px(0, at, N, 2);
+            sX += mad(lane(sv, 2, N, 0, true), lane(sv, 2, N, 1, true)); nX++;
+            sY += mad(lane(sh, N, N, 0, false), lane(sh, N, N, 1, false)); nY++;
+          }
+          const refX = sX / nX, refY = sY / nY;
+          const wrapX = mad(cB, c0), wrapY = mad(rB, r0);
+          const ctl = mad(lane(M, 2, N, 0, true), c0);
+          // Absolute wrap difference in 8-bit levels (columns 0 and N-1 are exactly one
+          // texel apart across the wrap) plus its ratio to real interior neighbours.
+          return {
+            u: +wrapX.toFixed(2), v: +wrapY.toFixed(2),
+            ru: +(wrapX / Math.max(refX, 0.05)).toFixed(2),
+            rv: +(wrapY / Math.max(refY, 0.05)).toFixed(2),
+            ctl: +ctl.toFixed(1),
+          };
+        };
+
+        // A seam is visible only if the wrap discontinuity is large in absolute terms AND
+        // out of proportion with the field's own texel-to-texel variation.
+        const bad = (s) => (s.u > 2 && s.ru > 2.5) || (s.v > 2 && s.rv > 2.5);
+
+        const out = {};
+        let worst = 0;
+        let seamOk = true;
+        // probe rows are placed inside a tile face for every preset (0.37 * tiles is never
+        // an integer for 10 / 6 / 3 tiles) so the structure numbers mean what they claim.
+        const ROW = Math.round(N * 0.37);
+        for (let i = 0; i < names.length; i++) {
+          const s = sets[i], o = PRESETS[names[i]];
+          const r = { seam: {} };
+          r.seam.map = seam(s.map);
+          r.seam.normalMap = seam(s.normalMap);
+          r.seam.ormMap = seam(s.ormMap);
+          for (const k in r.seam) {
+            worst = Math.max(worst, r.seam[k].u, r.seam[k].v);
+            if (bad(r.seam[k])) seamOk = false;
+          }
+
+          // normal map: must be a flat blue-lavender field (B high, R/G centred on 128)
+          copy(s.normalMap);
+          const nrow = lane(px(0, ROW, N, 1), N, N, 0, false);
+          let sr = 0, sg = 0, sb = 0, minB = 255, dev = 0;
+          for (let x = 0; x < N; x++) {
+            sr += nrow[x * 3]; sg += nrow[x * 3 + 1]; sb += nrow[x * 3 + 2];
+            minB = Math.min(minB, nrow[x * 3 + 2]);
+            dev += Math.abs(nrow[x * 3] - 128) + Math.abs(nrow[x * 3 + 1] - 128);
+          }
+          r.normalMean = [Math.round(sr / N), Math.round(sg / N), Math.round(sb / N)];
+          r.normalMinB = minB;
+          r.normalDev = +(dev / (2 * N)).toFixed(2); // mean |xy - 128|: relief strength
+
+          if (o.family === 'tile') {
+            // grooves must point the right way: on the right flank of the groove at u=0 the
+            // surface climbs to the right, so nx < 0 (R < 128); the left flank mirrors it.
+            const pitch = N / o.tiles;
+            const flank = Math.max(2, Math.round((o.grout + o.bevel * 0.5) * pitch));
+            r.grooveR = nrow[flank * 3];
+            r.grooveL = nrow[((N - flank) % N) * 3];
+            r.grooveOk = r.grooveR < 124 && r.grooveL > 132;
+
+            // AO must darken inside the grout, and tiles must differ from each other.
+            copy(s.ormMap);
+            const orow = lane(px(0, ROW, N, 1), N, N, 0, false);
+            r.aoGrout = orow[0];
+            r.aoFace = orow[Math.round(pitch * 0.5) * 3];
+            r.aoOk = r.aoGrout < r.aoFace - 6;
+            r.roughGrout = orow[1];
+            r.roughFace = orow[Math.round(pitch * 0.5) * 3 + 1];
+
+            copy(s.map);
+            const arow = lane(px(0, ROW, N, 1), N, N, 0, false);
+            const means = [];
+            for (let t = 0; t < o.tiles; t++) {
+              let acc = 0, cnt = 0;
+              for (let x = Math.round((t + 0.2) * pitch); x < Math.round((t + 0.8) * pitch); x++) {
+                acc += arow[x * 3] + arow[x * 3 + 1] + arow[x * 3 + 2]; cnt += 3;
+              }
+              means.push(acc / cnt);
+            }
+            const mu = means.reduce((a, b) => a + b, 0) / means.length;
+            r.tileVariance = +Math.sqrt(means.reduce((a, b) => a + (b - mu) ** 2, 0) / means.length).toFixed(2);
+            r.tileVarianceOk = r.tileVariance > 1.0;
+
+            // Grout geometry. rough(x,y) = mix( faceRough(x,y), groutRough, band(x) ), so the
+            // level half way between the local face value and the grout plateau is exactly the
+            // band = 0.5 contour: a purely geometric, sub-texel edge locator. Its spread across
+            // scanlines measures straightness, its offset from the lattice line measures the
+            // grout half width. AO dip depth is reported separately.
+            copy(s.ormMap);
+            const plane = new Uint8Array(N * N * 4);
+            renderer.readRenderTargetPixels(full, 0, 0, N, N, plane);
+            const wrapX = (x) => (((Math.round(x) % N) + N) % N);
+            const edgeOf = (row, k) => {
+              const off = row * N * 4;
+              const g = (x) => plane[off + wrapX(x) * 4 + 1];      // roughness channel
+              const c0 = k * pitch;
+              const faceV = g(c0 + pitch * 0.5);
+              const groutV = g(c0);
+              if (Math.abs(groutV - faceV) < 20) return null;
+              const target = (faceV + groutV) / 2;
+              for (let dx = 0; dx > -pitch * 0.45; dx--) {
+                const a = g(c0 + dx), b = g(c0 + dx - 1);
+                if ((a - target) * (b - target) <= 0 && a !== b) {
+                  return c0 + dx - 1 + (target - b) / (a - b);
+                }
+              }
+              return null;
+            };
+            const QROWS = [0.07, 0.19, 0.31, 0.43, 0.57, 0.69, 0.81, 0.93];
+            let spread = 0, halfSum = 0, halfN = 0;
+            for (let k = 0; k < o.tiles; k++) {
+              const es = [];
+              for (const q of QROWS) {
+                const e = edgeOf(Math.round(N * q), k);
+                if (e !== null) es.push(e);
+              }
+              if (es.length < 2) continue;
+              spread = Math.max(spread, Math.max(...es) - Math.min(...es));
+              for (const e of es) { halfSum += k * pitch - e; halfN++; }
+            }
+            const aoCol = new Float64Array(N);
+            for (let y = 0; y < N; y++) {
+              const off = y * N * 4;
+              for (let x = 0; x < N; x++) aoCol[x] += plane[off + x * 4];
+            }
+            let aoHi = 0, aoLo = 255 * N;
+            for (let x = 0; x < N; x++) { aoHi = Math.max(aoHi, aoCol[x]); aoLo = Math.min(aoLo, aoCol[x]); }
+            r.groutAoDip = +((aoHi - aoLo) / N).toFixed(1);         // AO levels, column-averaged
+            r.groutEdgeSpread = +spread.toFixed(3);                 // texels of wobble, 0 = perfect
+            r.groutHalfWidth = +(halfSum / Math.max(halfN, 1)).toFixed(2);
+            // ideal band = 0.5 contour of the ORM grout mask (smoothstep midpoint)
+            const aaT = o.tiles / N;
+            r.groutHalfWidthIdeal =
+              +(((o.grout * 0.75 + o.grout + Math.max(aaT, o.bevel * 0.35)) * 0.5) * pitch).toFixed(2);
+            // deckTile carries puddles, whose multiplicative roughness change perturbs the
+            // locator by ~1 texel near a puddle edge; the lattice itself is analytic.
+            r.groutOk = halfN > 0 && spread < 1.5 * (N / 1024) &&
+              Math.abs(r.groutHalfWidth - r.groutHalfWidthIdeal) < 1.5 * (N / 1024);
+          }
+          out[names[i]] = r;
+        }
+        full.dispose();
+        renderer.setRenderTarget(null);
+        out.worstWrapDelta = +worst.toFixed(2);
+        out.seamOk = seamOk;
+        return out;
+      })();
+
+      console.log(`[check] largest wrap-around discontinuity: ${checks.worstWrapDelta} of 255 ` +
+        `levels over one texel -> ${checks.seamOk ? 'SEAMLESS' : 'SEAM!'}`);
+      for (const n of names) {
+        const c = checks[n];
+        const f = (s) => `${s.u}/${s.v} (x${s.ru}/${s.rv})`;
+        const bits = [
+          `wrap map ${f(c.seam.map)} [ctl ${c.seam.map.ctl}]`,
+          `nrm ${f(c.seam.normalMap)}`,
+          `orm ${f(c.seam.ormMap)}`,
+          `normalMean ${c.normalMean.join(',')} minB ${c.normalMinB} dev ${c.normalDev}`,
+        ];
+        if (c.grooveOk !== undefined) {
+          bits.push(`groove ${c.grooveR}<128<${c.grooveL} ${c.grooveOk ? 'ok' : 'BAD'}`);
+          bits.push(`ao ${c.aoGrout} vs ${c.aoFace} ${c.aoOk ? 'ok' : 'BAD'}`);
+          bits.push(`rough grout/face ${c.roughGrout}/${c.roughFace}`);
+          bits.push(`tileVar ${c.tileVariance} ${c.tileVarianceOk ? 'ok' : 'BAD'}`);
+          bits.push(`grout aoDip ${c.groutAoDip} wobble ${c.groutEdgeSpread}px halfWidth ${c.groutHalfWidth}/${c.groutHalfWidthIdeal}px ${c.groutOk ? 'straight+even' : 'CROOKED'}`);
+        }
+        console.log(`[check] ${n.padEnd(13)} ${bits.join(' · ')}`);
+      }
+
+      // ---- PBR preview -------------------------------------------------------
+      const pbrScene = new THREE.Scene();
+      pbrScene.environment = envRT.texture;
+      const key = new THREE.DirectionalLight(0xf3fbff, 2.1);
+      key.position.set(2.6, 4.2, 2.2);
+      pbrScene.add(key);
+      pbrScene.add(new THREE.AmbientLight(0x7fa6b4, 0.25));
+
+      const BOX_M = 2.0; // the preview box is 2 metres across, so tiling shows real scale
+      const geos = sets.map((s) => {
+        const g = new THREE.BoxGeometry(BOX_M, BOX_M, BOX_M, 1, 1, 1);
+        const rep = BOX_M / s.worldScale;
+        const uv = g.attributes.uv;
+        for (let i = 0; i < uv.count; i++) uv.setXY(i, uv.getX(i) * rep, uv.getY(i) * rep);
+        uv.needsUpdate = true;
+        return g;
+      });
+      const mats = sets.map((s) => new THREE.MeshStandardMaterial({
+        map: s.map,
+        normalMap: s.normalMap,
+        normalScale: new THREE.Vector2(s.params.normalScale, s.params.normalScale),
+        aoMap: s.ormMap,            // one packed map feeds all three slots
+        roughnessMap: s.ormMap,
+        metalnessMap: s.ormMap,
+        aoMapIntensity: s.params.aoIntensity,
+        roughness: s.params.roughness,
+        metalness: s.params.metalness,
+        envMapIntensity: 1.0,
+      }));
+      const pbrMesh = new THREE.Mesh(geos[0], mats[0]);
+      pbrMesh.rotation.set(-0.30, 0.62, 0);
+      pbrScene.add(pbrMesh);
+      const pbrCam = new THREE.PerspectiveCamera(30, 1, 0.05, 60);
+      pbrCam.position.set(0, 0, 5.4);
+
+      // ---- layout ------------------------------------------------------------
+      const ui = document.getElementById('ui');
+      const SUB = ['albedo ' + REP + '×' + REP, 'normal', 'orm (ao/rough/metal)', 'pbr · box 2m'];
+      let cells = [];
+
+      const layout = () => {
+        const W = window.innerWidth, H = window.innerHeight;
+        renderer.setSize(W, H, false);
+        ui.innerHTML = '';
+        cells = [];
+
+        const n = names.length;
+        const cols = Math.min(n, Math.max(1, Math.round(Math.sqrt(n * (W / H) * 0.6))));
+        const rows = Math.ceil(n / cols);
+        const bw = W / cols, bh = H / rows;
+        const HEAD = 16, GAP = 3, PAD = 5;
+
+        for (let i = 0; i < n; i++) {
+          const bx = (i % cols) * bw, by = Math.floor(i / cols) * bh;
+          const label = document.createElement('div');
+          label.className = 'name';
+          label.style.left = bx + PAD + 'px';
+          label.style.top = by + 2 + 'px';
+          label.innerHTML = names[i] + ' <span class="ws">· ' + sets[i].worldScale + ' m/repeat · ' +
+            sets[i].map.image.width + 'px</span>';
+          ui.appendChild(label);
+
+          const iw = (bw - PAD * 2 - GAP) / 2;
+          const ih = (bh - HEAD - PAD - GAP) / 2;
+          for (let k = 0; k < 4; k++) {
+            const cx = bx + PAD + (k % 2) * (iw + GAP);
+            const cy = by + HEAD + Math.floor(k / 2) * (ih + GAP);
+            cells.push({ preset: i, kind: k, x: cx, y: cy, w: iw, h: ih });
+            const sub = document.createElement('div');
+            sub.className = 'sub';
+            sub.style.left = cx + 3 + 'px';
+            sub.style.top = cy + 2 + 'px';
+            sub.textContent = SUB[k];
+            ui.appendChild(sub);
+          }
+        }
+        document.getElementById('head').textContent =
+          `TextureFactory · ${n} presets · bake ${bakeMs} ms · ~${memMB} MB · srgb-probe ${probeByte}`;
+      };
+
+      const draw = () => {
+        const H = window.innerHeight;
+        renderer.autoClear = false;
+        renderer.setScissorTest(false);
+        renderer.clear(); // full-canvas clear must happen before the scissor is armed
+        renderer.setScissorTest(true);
+        for (const c of cells) {
+          const gy = H - c.y - c.h; // GL viewports are bottom-up
+          renderer.setViewport(c.x, gy, c.w, c.h);
+          renderer.setScissor(c.x, gy, c.w, c.h);
+          const s = sets[c.preset];
+          if (c.kind === 3) {
+            pbrMesh.geometry = geos[c.preset];
+            pbrMesh.material = mats[c.preset];
+            pbrCam.aspect = c.w / c.h;
+            pbrCam.updateProjectionMatrix();
+            renderer.render(pbrScene, pbrCam);
+          } else {
+            const tex = c.kind === 0 ? s.map : c.kind === 1 ? s.normalMap : s.ormMap;
+            flatMat.uniforms.tMap.value = tex;
+            flatMat.uniforms.uEncode.value = c.kind === 0 ? 1 : 0;
+            const r = c.kind === 0 ? REP : 1;
+            flatMat.uniforms.uRep.value.set(r, r);
+            renderer.render(flatScene, flatCam);
+          }
+        }
+        renderer.setScissorTest(false);
+        renderer.setViewport(0, 0, window.innerWidth, H);
+      };
+
+      layout();
+      const tick = () => { draw(); requestAnimationFrame(tick); };
+      tick();
+      window.addEventListener('resize', layout);
+
+      // Deep diagnostics live on a separate global so window.__texTest stays readable.
+      window.__texDiag = { cells, checks, sets, factory };
+      window.__texTest = {
+        ok: true,
+        presets: names,
+        bakeMs,
+        warmMs,
+        memMB,
+        size: sets[0].map.image.width,
+        srgbProbeByte: probeByte,
+        cacheOk,
+        seamOk: checks.seamOk,
+        worstWrapDelta: checks.worstWrapDelta,
+        groutOk: names.every((n) => checks[n].groutOk !== false),
+        grooveOk: names.every((n) => checks[n].grooveOk !== false),
+        aoOk: names.every((n) => checks[n].aoOk !== false),
+        worldScale: names.reduce((a, n, i) => ((a[n] = sets[i].worldScale), a), {}),
+        params: names.reduce((a, n, i) => ((a[n] = sets[i].params), a), {}),
+      };
+      console.log('[tex] ready');
+    </script>
+  </body>
+</html>

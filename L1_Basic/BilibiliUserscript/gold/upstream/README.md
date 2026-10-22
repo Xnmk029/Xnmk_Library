@@ -1,0 +1,147 @@
+<p align="center">
+    <img src="https://github.com/user-attachments/assets/095348fe-4179-4470-999e-4eadc5ef5ae7" width = "50%"><br/>
+    <i><small>我不喜欢 IP 属地，但是你手机都显示了，为什么电脑不显示呢？</small></i>
+</p>
+
+# BiliReveal
+
+![Greasy Fork 总下载量](https://img.shields.io/greasyfork/dt/466815?style=flat-square&color=444)
+
+<img src="./assets/preview.png" width = "50%" align="right">
+
+一个用户脚本，让哔哩哔哩网页版评论区也能显示 IP 属地，支持<a href="#目前支持的场景">大部分场景</a>。
+
+## 使用环境
+
+- **浏览器**：最新版 Chrome / Edge / Firefox / Safari 等支持 [扩展 API](https://developer.chrome.google.cn/docs/extensions) 的现代浏览器。
+- **用户脚本管理器**：**推荐**
+  - Chrome/Edge/Firefox： [Tampermonkey](https://www.tampermonkey.net/) 或 [Violentmonkey](https://violentmonkey.github.io/)
+  - Safari： [Stay](https://github.com/shenruisi/Stay)（主要功能免费）或 [Tampermonkey](https://apps.apple.com/app/tampermonkey/id6738342400)（付费）。
+
+> [!TIP]
+> 如果你使用非推荐环境，请确保你的用户脚本管理器支持 [`unsafeWindow`](https://www.tampermonkey.net/documentation.php#api:unsafeWindow)。
+
+## 安装方式
+
+推荐的用户脚本管理器（Tampermonkey、Violentmonkey、Stay 等）：
+
+- [从 Greasy Fork 安装](https://greasyfork.org/scripts/466815)
+- [从 Github Release 安装](https://github.com/MaxChang3/Bilibili-Web-Show-IP-Location/releases/latest/download/bilireveal.user.js)
+
+<details>
+<summary>Lite 版本（FireMonkey 等对沙箱隔离要求严格的脚本管理器 / 需要 Page Context 注入的场景）</summary>
+
+我们额外提供了一个 **Lite 版本**。不依赖 GM API（用户脚本的 metadata 在其他环境中会被视作单纯的注释），因此可以运行在更多环境中，而不仅限于传统的用户脚本管理器。
+
+由于移除了 GM API，「文本替换」功能将不可用。同时，Lite 版本额外添加了 `@inject-into page` 配置，使脚本能够直接完整地注入网页上下文中（目前仅 Firefox 支持）。
+
+对于 FireMonkey，由于目前无法通过常规方式兼容运行，因此推荐使用 Lite 版本。
+
+得益于运行时无关的设计，Lite 版本也可以更加灵活地部署到各种环境中，例如：
+
+- FireMonkey；
+- AdGuard 的用户脚本功能；
+- 自定义浏览器扩展；
+
+[从 GitHub Releases 安装 Lite 版本](https://github.com/MaxChang3/Bilibili-Web-Show-IP-Location/releases/latest/download/bilireveal.lite.user.js)
+
+</details>
+
+## 常见问题
+
+- **为什么个人主页的 IP 属地没有显示？**
+  - 个人主页需要额外的逻辑处理，已单独实现：
+    - [Greasy Fork](https://greasyfork.org/scripts/534807)
+    - [Github](https://github.com/maxchang3/userscripts/blob/main/BiliRevealForSpace/README.md)
+
+- **为什么我的评论区没有显示 IP 属地？**
+  - 注意：在「[B 站上线 IP 属地功能](https://www.bilibili.com/read/cv17590180)」前发布的评论不会显示。
+  - 部分场景可能未适配。请检查[是否支持](#目前支持的场景)该场景，并确认脚本已在当前页面激活。
+  - 请确保脚本为最新版本且运行正常。可尝试关闭其他可能冲突的脚本来排查问题。
+  - 如果您是首次使用用户脚本管理器，需要开启[「开发者模式」与「允许用户脚本」](https://www.tampermonkey.net/faq.php?locale=zh#Q209)。
+
+## 目前支持的场景
+
+<details>
+<summary>点击展开完整列表</summary>
+
+- 视频（普通视频、番剧（影视）、收藏列表播放页）评论区
+- 话题评论区
+- 动态评论区
+- 个人主页动态评论区
+- 专栏（文章）作者 & 评论区
+- 节日页（festival）评论区（如「拜年祭」」
+- 活动页（blackboard）评论区（如「拜年祭预约页」）
+- 课程评论区
+- 小黑屋评论区
+- 漫画详情页评论区
+
+> （未作特殊说明均支持新旧版）
+
+</details>
+
+## 配置选项
+
+### 文本替换
+
+支持对 **IP 属地文本** 进行自定义替换，用于优化展示效果或满足国际化需求。
+
+**使用步骤：**
+
+1. 打开脚本管理器菜单，点击 **「更新替换规则」**
+2. 在弹出的对话框中输入 JSON 格式的替换规则，例如：
+
+   去除「IP 属地：」前缀，仅显示地区名称，可以使用如下规则：
+
+   ```json
+   { "IP属地：": "" }
+   ```
+
+3. 点击确定后，页面会自动刷新并应用新规则
+
+**规则说明：**
+
+- 规则需为 JSON 对象：键表示原始文本，值表示替换后的文本
+- 支持配置多条规则，并按顺序依次执行
+- 所有页面中的 IP 属地信息都会应用这些替换规则
+
+## 原理
+
+虽然 B 站未在 Web 前端界面展示 IP 属地信息，但相关数据实际上仍存在于后端接口及前端组件内。本脚本的工作原理是：在评论组件（完成）渲染时，将 IP 属地数据注入到 DOM 中。
+
+具体来说，目前 B 站前端评论区存在三种实现：
+
+- 旧版评论（Vue 2）：基于 Vue 2 实现，目前仅在旧版页面存在。
+  - 策略：通过 Hook `window.bbComment` ，重写评论插入事件，在期间插入 IP 属地。
+
+- 新版评论（Vue 3）：基于 Vue 3 实现（comment-pc-vue.next.js）。
+  - 策略：
+    - 由于不存在全局的 `bbComment` 对象，通过 `MutationObserver` 监听评论区的 DOM 变更，捕获新插入的评论节点，解析其原始数据并渲染 IP 属地。
+    - 自 V1.5.8+ 起，由于某次更新后 `__vue__` 不再存在于元素下，引入 [Hook Vue3 app](https://greasyfork.org/scripts/449444) 将 `__vue__` 实例手动挂载至目标 DOM 元素。
+
+- 新版评论（Lit）：基于 Lit 的 Web Components（comment-pc-elements.next.js），目前存在于大部分常用场景。
+  - 策略：通过 Hook `window.customElements.define`，拦截 `ActionButtonsRender`，继承并重写其生命周期方法 `update()`，在组件更新渲染时完成 IP 属地的插入。
+
+## 感谢
+
+- [B站评论区开盒](https://greasyfork.org/zh-CN/scripts/448434)
+  - 灵感来源
+  - 参考了部分代码
+
+- [vite-plugin-monkey](https://github.com/lisonge/vite-plugin-monkey)
+  - 提供最佳开发体验
+
+- [Hook Vue3 app](https://greasyfork.org/scripts/449444)
+  - 提供了继续保持原有脚本逻辑的底层支持
+
+- 帮助测试 & 提供反馈的朋友们
+
+## Star History
+
+<a href="https://www.star-history.com/?repos=maxchang3%2Fbilireveal&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=maxchang3/bilireveal&type=date&theme=dark&legend=top-left&sealed_token=K3wSzkbw-hX-BhOXrFbD1xvz3gcoQ9o6NHk4pBFunmKh8kBr22I9RR8DAyfU1n0WzWqAW-KmCPH88zkJCU4v7qeGUMjb7PPxF8oVDRJjiom1mXwtRHaPpVAVw65Arg-dvffe2RNjS4EpBtS2IoMwii1LeJpBnmq7_R70cPX_oZG8DYbm0eOCsaEFeBlx" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=maxchang3/bilireveal&type=date&legend=top-left&sealed_token=K3wSzkbw-hX-BhOXrFbD1xvz3gcoQ9o6NHk4pBFunmKh8kBr22I9RR8DAyfU1n0WzWqAW-KmCPH88zkJCU4v7qeGUMjb7PPxF8oVDRJjiom1mXwtRHaPpVAVw65Arg-dvffe2RNjS4EpBtS2IoMwii1LeJpBnmq7_R70cPX_oZG8DYbm0eOCsaEFeBlx" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=maxchang3/bilireveal&type=date&legend=top-left&sealed_token=K3wSzkbw-hX-BhOXrFbD1xvz3gcoQ9o6NHk4pBFunmKh8kBr22I9RR8DAyfU1n0WzWqAW-KmCPH88zkJCU4v7qeGUMjb7PPxF8oVDRJjiom1mXwtRHaPpVAVw65Arg-dvffe2RNjS4EpBtS2IoMwii1LeJpBnmq7_R70cPX_oZG8DYbm0eOCsaEFeBlx" />
+ </picture>
+</a>

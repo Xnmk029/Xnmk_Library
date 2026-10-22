@@ -1,0 +1,923 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>USP Match — PS1 Low-Poly Mechanical Breakdown</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #c5c5c8; font-family: "Lucida Console", "Courier New", monospace; }
+  canvas { display: block; }
+  #hud {
+    position: absolute; inset: 0; pointer-events: none;
+    color: #1a1a1a; text-shadow: 0 1px 0 rgba(255,255,255,.35);
+  }
+  #hud .panel {
+    pointer-events: auto;
+    position: absolute; background: rgba(214,214,218,.78);
+    border: 1px solid #8a8a90; box-shadow: 2px 2px 0 #9a9aa0;
+  }
+  #title {
+    top: 16px; left: 16px; padding: 10px 14px; max-width: 520px;
+  }
+  #title h1 { margin: 0 0 4px; font-size: 13px; letter-spacing: 2px; font-weight: 700; }
+  #title p { margin: 0; font-size: 10px; letter-spacing: 1px; color: #333; line-height: 1.45; }
+  #modes { top: 16px; right: 16px; padding: 8px; display: flex; gap: 6px; }
+  #modes button, #hint button {
+    pointer-events: auto; cursor: pointer;
+    font-family: inherit; font-size: 11px; letter-spacing: 1px;
+    background: #d8d8dc; color: #111; border: 1px solid #6e6e74;
+    padding: 6px 10px; box-shadow: 1px 1px 0 #fff inset, -1px -1px 0 #9a9aa0 inset;
+  }
+  #modes button.active { background: #2a2a2e; color: #b8ff64; border-color: #111; }
+  #readout {
+    bottom: 16px; left: 16px; padding: 8px 12px; font-size: 10px; line-height: 1.55; min-width: 280px;
+  }
+  #hint { bottom: 16px; right: 16px; padding: 8px 12px; font-size: 10px; line-height: 1.5; text-align: right; }
+  #phasebar {
+    position: absolute; left: 50%; bottom: 18px; transform: translateX(-50%);
+    width: min(560px, 70vw); height: 8px; background: #b0b0b6; border: 1px solid #6a6a70;
+    pointer-events: none;
+  }
+  #phasebar > i { display: block; height: 100%; width: 0; background: #2a2a2e; }
+  #err {
+    display: none; position: absolute; inset: 0; align-items: center; justify-content: center;
+    background: #c5c5c8; color: #400; font-size: 14px; padding: 24px; text-align: center;
+  }
+</style>
+</head>
+<body>
+<div id="hud">
+  <div id="title" class="panel">
+    <h1>H&amp;K USP MATCH // GOLDSRC BREAKDOWN</h1>
+    <p>PROCEDURAL LOW-POLY &nbsp;·&nbsp; FLAT SHADE &nbsp;·&nbsp; FIBER OPTIC SIGHTS<br>MAGAZINE UP → SLIDE RACK / RESET ON EXPOSED BARREL</p>
+  </div>
+  <div id="modes" class="panel">
+    <button id="btnUsp" class="active" type="button">USP MATCH</button>
+    <button id="btnAr" type="button">AR-15</button>
+  </div>
+  <div id="readout" class="panel">
+    <div id="fps">FPS 60</div>
+    <div id="phase">PHASE —</div>
+    <div id="parts">PARTS —</div>
+  </div>
+  <div id="hint" class="panel">
+    DRAG orbit &nbsp; WHEEL zoom &nbsp; SPACE pause<br>
+    <button id="btnPause" type="button">PAUSE</button>
+  </div>
+  <div id="phasebar"><i id="phasefill"></i></div>
+</div>
+<div id="err"></div>
+<script src="https://cdn.jsdelivr.net/npm/three@0.160.1/build/three.min.js"></script>
+<script>
+(function () {
+  'use strict';
+  var errBox = document.getElementById('err');
+  if (typeof THREE === 'undefined') {
+    errBox.style.display = 'flex';
+    errBox.textContent = 'Three.js CDN failed to load. Open this file while online, then double-click again.';
+    return;
+  }
+
+  var TAU = Math.PI * 2;
+  var DEG = Math.PI / 180;
+
+  function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+  function smooth(t) { t = clamp(t, 0, 1); return t * t * (3 - 2 * t); }
+  function smoother(t) { t = clamp(t, 0, 1); return t * t * t * (t * (t * 6 - 15) + 10); }
+  function env(t, a, b) {
+    if (t <= a) return 0;
+    if (t >= b) return 1;
+    return smoother((t - a) / (b - a));
+  }
+  function gate(t, a, b, c, d) { return env(t, a, b) * (1 - env(t, c, d)); }
+
+  function seeded(n) {
+    var x = Math.sin(n * 127.1 + 311.7) * 43758.5453;
+    return x - Math.floor(x);
+  }
+
+  function pixelTex(w, h, fn) {
+    var c = document.createElement('canvas');
+    c.width = w; c.height = h;
+    var ctx = c.getContext('2d');
+    fn(ctx, w, h);
+    var tex = new THREE.CanvasTexture(c);
+    tex.magFilter = THREE.NearestFilter;
+    tex.minFilter = THREE.NearestFilter;
+    tex.wrapS = THREE.RepeatWrapping;
+    tex.wrapT = THREE.RepeatWrapping;
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.needsUpdate = true;
+    return tex;
+  }
+
+  function noiseTex(size, r, g, b, amp, grain) {
+    return pixelTex(size, size, function (ctx, w, h) {
+      var img = ctx.createImageData(w, h);
+      var d = img.data;
+      for (var y = 0; y < h; y++) {
+        for (var x = 0; x < w; x++) {
+          var i = (y * w + x) * 4;
+          var n = (seeded(x * 12.9898 + y * 78.233) - 0.5) * amp;
+          var str = grain ? ((x + y * 3) % 7 === 0 ? -8 : 0) : 0;
+          d[i] = clamp(r + n + str, 0, 255);
+          d[i + 1] = clamp(g + n + str * 0.8, 0, 255);
+          d[i + 2] = clamp(b + n * 0.9, 0, 255);
+          d[i + 3] = 255;
+        }
+      }
+      ctx.putImageData(img, 0, 0);
+    });
+  }
+
+  function brushTex(size, r, g, b) {
+    return pixelTex(size, size, function (ctx, w, h) {
+      var img = ctx.createImageData(w, h);
+      var d = img.data;
+      for (var y = 0; y < h; y++) {
+        for (var x = 0; x < w; x++) {
+          var i = (y * w + x) * 4;
+          var n = (seeded(y * 19.1 + Math.floor(x / 2) * 0.37) - 0.5) * 28;
+          d[i] = clamp(r + n, 0, 255);
+          d[i + 1] = clamp(g + n, 0, 255);
+          d[i + 2] = clamp(b + n * 0.7, 0, 255);
+          d[i + 3] = 255;
+        }
+      }
+      ctx.putImageData(img, 0, 0);
+    });
+  }
+
+  function waffleTex() {
+    return pixelTex(32, 32, function (ctx, w, h) {
+      ctx.fillStyle = '#3a3a3e';
+      ctx.fillRect(0, 0, w, h);
+      for (var y = 0; y < 8; y++) {
+        for (var x = 0; x < 8; x++) {
+          ctx.fillStyle = ((x + y) % 2) ? '#2a2a2e' : '#4a4a50';
+          ctx.fillRect(x * 4 + 1, y * 4 + 1, 2, 2);
+        }
+      }
+    });
+  }
+
+  function checkTex() {
+    return pixelTex(16, 16, function (ctx, w, h) {
+      ctx.fillStyle = '#2c2c2a';
+      ctx.fillRect(0, 0, w, h);
+      ctx.fillStyle = '#242422';
+      for (var y = 0; y < 8; y++) {
+        for (var x = 0; x < 8; x++) {
+          if ((x + y) % 2 === 0) ctx.fillRect(x * 2, y * 2, 2, 2);
+        }
+      }
+    });
+  }
+
+  function stencilTex(text, fg, bg) {
+    return pixelTex(64, 16, function (ctx, w, h) {
+      ctx.fillStyle = bg;
+      ctx.fillRect(0, 0, w, h);
+      ctx.fillStyle = fg;
+      ctx.font = 'bold 11px monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(text, w / 2, h / 2 + 1);
+    });
+  }
+
+  function captionTex(text, color) {
+    var c = document.createElement('canvas');
+    c.width = 256; c.height = 32;
+    var ctx = c.getContext('2d');
+    ctx.fillStyle = 'rgba(18,18,20,0.82)';
+    ctx.fillRect(0, 0, 256, 32);
+    ctx.strokeStyle = color;
+    ctx.strokeRect(0.5, 0.5, 255, 31);
+    ctx.fillStyle = color;
+    ctx.font = 'bold 13px monospace';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(text, 10, 17);
+    var tex = new THREE.CanvasTexture(c);
+    tex.magFilter = THREE.NearestFilter;
+    tex.minFilter = THREE.NearestFilter;
+    tex.colorSpace = THREE.SRGBColorSpace;
+    return tex;
+  }
+
+  var texPolymer = noiseTex(32, 44, 44, 40, 18, true);
+  texPolymer.repeat.set(2, 2);
+  var texSlide = brushTex(32, 28, 28, 32);
+  texSlide.repeat.set(3, 1);
+  var texBarrel = brushTex(16, 198, 202, 210);
+  texBarrel.repeat.set(4, 1);
+  var texDarkAl = noiseTex(16, 22, 22, 24, 10, false);
+  var texSteel = brushTex(16, 58, 58, 62);
+  var texWaffle = waffleTex();
+  texWaffle.repeat.set(2, 6);
+  var texGrip = checkTex();
+  texGrip.repeat.set(3, 5);
+  var texUspMark = stencilTex('USP', '#c8c8c4', '#1a1a1e');
+  var texMatchMark = stencilTex('MATCH', '#b8ff64', '#1a1a1e');
+  var texHk = stencilTex('HK', '#d0d0cc', '#1a1a1e');
+
+  function mat(color, map, opts) {
+    var o = opts || {};
+    return new THREE.MeshLambertMaterial({
+      color: color,
+      map: map || null,
+      flatShading: true,
+      emissive: o.emissive || 0x000000,
+      emissiveIntensity: o.emissiveIntensity || 0,
+      transparent: !!o.transparent,
+      opacity: o.opacity == null ? 1 : o.opacity,
+      side: o.side || THREE.FrontSide
+    });
+  }
+
+  function matBasic(color, o) {
+    o = o || {};
+    return new THREE.MeshBasicMaterial({
+      color: color,
+      transparent: !!o.transparent,
+      opacity: o.opacity == null ? 1 : o.opacity,
+      depthWrite: o.depthWrite !== false
+    });
+  }
+
+  var M = {
+    polymer: mat(0x3a3a36, texPolymer),
+    grip: mat(0x32322e, texGrip),
+    slide: mat(0x1c1c20, texSlide),
+    slideDark: mat(0x121214, texSlide),
+    barrel: mat(0xd8dce2, texBarrel),
+    barrelBright: mat(0xe8ecf0, texBarrel),
+    comp: mat(0x1a1a1e, texDarkAl),
+    mag: mat(0x4a4a50, texWaffle),
+    magBase: mat(0x1e1e20, texDarkAl),
+    steel: mat(0x6a6a70, texSteel),
+    darkSteel: mat(0x2a2a2e, texSteel),
+    pin: mat(0xb8bcc0, texBarrel),
+    trigger: mat(0x2e2e32, texDarkAl),
+    fiberG: mat(0x33ff66, null, { emissive: 0x22ff55, emissiveIntensity: 1.4 }),
+    fiberR: mat(0xff3344, null, { emissive: 0xff2233, emissiveIntensity: 1.4 }),
+    glowG: matBasic(0x66ff88, { transparent: true, opacity: 0.35, depthWrite: false }),
+    glowR: matBasic(0xff6680, { transparent: true, opacity: 0.35, depthWrite: false }),
+    black: mat(0x0c0c0e),
+    gold: mat(0xb08a3a),
+    arLower: mat(0x1a1a1c, texDarkAl),
+    arUpper: mat(0x161618, texDarkAl),
+    arSteel: mat(0x3a3a40, texSteel),
+    arBolt: mat(0x8a8e94, texBarrel),
+    cadEdge: new THREE.LineBasicMaterial({ color: 0x7ad0ff, transparent: true, opacity: 0.55 }),
+    shadow: matBasic(0x000000, { transparent: true, opacity: 0.18, depthWrite: false })
+  };
+
+  function box(w, h, d, material) {
+    var m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), material);
+    m.castShadow = false;
+    m.receiveShadow = false;
+    return m;
+  }
+  function cyl(rt, rb, h, seg, material) {
+    var m = new THREE.Mesh(new THREE.CylinderGeometry(rt, rb, h, seg || 7), material);
+    return m;
+  }
+  function put(parent, mesh, x, y, z, rx, ry, rz) {
+    mesh.position.set(x || 0, y || 0, z || 0);
+    if (rx || ry || rz) mesh.rotation.set(rx || 0, ry || 0, rz || 0);
+    parent.add(mesh);
+    return mesh;
+  }
+  function edges(mesh, parent, material) {
+    var e = new THREE.LineSegments(new THREE.EdgesGeometry(mesh.geometry, 28), material || M.cadEdge);
+    e.position.copy(mesh.position);
+    e.rotation.copy(mesh.rotation);
+    e.scale.copy(mesh.scale);
+    (parent || mesh.parent).add(e);
+    return e;
+  }
+  function decal(tex, w, h) {
+    var g = new THREE.PlaneGeometry(w, h);
+    var m = new THREE.MeshLambertMaterial({ map: tex, flatShading: true, transparent: true });
+    return new THREE.Mesh(g, m);
+  }
+  function caption(text, color) {
+    var s = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: captionTex(text, color),
+      transparent: true,
+      depthTest: false,
+      sizeAttenuation: true
+    }));
+    s.scale.set(5.2, 0.65, 1);
+    s.userData.isCaption = true;
+    return s;
+  }
+
+  function helixSpring(len, radius, turns, tubeR, material) {
+    var pts = [];
+    var n = Math.floor(turns * 10);
+    for (var i = 0; i <= n; i++) {
+      var t = i / n;
+      var a = t * turns * TAU;
+      pts.push(new THREE.Vector3(t * len - len * 0.5, Math.cos(a) * radius, Math.sin(a) * radius));
+    }
+    var curve = new THREE.CatmullRomCurve3(pts);
+    return new THREE.Mesh(new THREE.TubeGeometry(curve, n, tubeR, 5, false), material);
+  }
+
+  /* ===================== USP MATCH ===================== */
+  function buildUSP() {
+    var root = new THREE.Group();
+    root.name = 'USP_MATCH';
+
+    var barrelG = new THREE.Group();
+    barrelG.name = 'barrel';
+    var chamber = put(barrelG, cyl(0.72, 0.72, 2.6, 8, M.barrel), 1.1, 0, 0, 0, 0, Math.PI / 2);
+    var hood = put(barrelG, box(1.4, 0.55, 1.15, M.barrelBright), 1.35, 0.55, 0);
+    var tube = put(barrelG, cyl(0.48, 0.48, 12.4, 8, M.barrel), 8.4, 0, 0, 0, 0, Math.PI / 2);
+    var muzzle = put(barrelG, cyl(0.52, 0.42, 0.7, 8, M.barrelBright), 14.85, 0, 0, 0, 0, Math.PI / 2);
+    var lug = put(barrelG, box(1.6, 0.7, 1.05, M.barrel), 2.2, -0.55, 0);
+    var ramp = put(barrelG, box(1.1, 0.35, 0.85, M.barrelBright), 0.15, -0.55, 0);
+    ramp.rotation.z = -0.35;
+    var land;
+    for (var li = 0; li < 6; li++) {
+      land = box(8.5, 0.06, 0.08, M.barrelBright);
+      put(barrelG, land, 8.2, Math.cos(li / 6 * TAU) * 0.46, Math.sin(li / 6 * TAU) * 0.46);
+    }
+    put(root, barrelG, 0, 0, 0);
+
+    var rod = put(root, cyl(0.14, 0.14, 9.2, 6, M.steel), 7.4, -0.95, 0, 0, 0, Math.PI / 2);
+    var spring = helixSpring(8.6, 0.32, 11, 0.055, M.steel);
+    spring.position.set(7.3, -0.95, 0);
+    spring.name = 'recoilSpring';
+    root.add(spring);
+
+    var slide = new THREE.Group();
+    slide.name = 'slide';
+    put(slide, box(15.2, 0.55, 2.55, M.slide), 6.1, 1.12, 0);
+    put(slide, box(4.8, 2.15, 2.55, M.slide), 0.55, 0.22, 0);
+    put(slide, box(6.4, 2.15, 2.55, M.slide), 11.0, 0.22, 0);
+    put(slide, box(4.2, 2.15, 0.42, M.slide), 5.6, 0.22, 1.06);
+    put(slide, box(4.2, 0.42, 0.42, M.slide), 5.6, -0.68, -1.06);
+    put(slide, box(0.42, 1.55, 0.42, M.slide), 3.7, 0.12, -1.06);
+    put(slide, box(0.42, 1.55, 0.42, M.slide), 7.5, 0.12, -1.06);
+    put(slide, box(0.22, 0.95, 0.18, M.black), 3.55, 0.35, -1.15);
+    var ext = put(slide, box(2.4, 0.42, 0.28, M.steel), 3.9, 0.55, -1.28);
+    ext.rotation.z = 0.08;
+    put(slide, cyl(0.12, 0.12, 0.5, 6, M.pin), -1.55, 0.15, 0, 0, 0, Math.PI / 2);
+    put(slide, box(0.35, 1.7, 2.2, M.slideDark), -1.85, 0.15, 0);
+    var si;
+    for (si = 0; si < 8; si++) {
+      put(slide, box(0.16, 1.55, 2.62, M.slideDark), -0.55 + si * 0.28, 0.18, 0);
+    }
+    for (si = 0; si < 6; si++) {
+      put(slide, box(0.14, 1.35, 2.62, M.slideDark), 12.35 + si * 0.26, 0.28, 0);
+    }
+    put(slide, box(0.9, 0.22, 2.2, M.black), 6.1, 1.38, 0);
+    var rearBlock = put(slide, box(1.35, 0.72, 2.15, M.slide), -1.15, 1.55, 0);
+    put(slide, box(0.55, 0.62, 0.85, M.black), -1.05, 1.72, 0);
+    put(slide, box(0.28, 0.38, 0.22, M.fiberR), -1.05, 1.78, 0.55);
+    put(slide, box(0.28, 0.38, 0.22, M.fiberR), -1.05, 1.78, -0.55);
+    put(slide, cyl(0.22, 0.22, 0.18, 6, M.glowR), -1.05, 1.95, 0.55);
+    put(slide, cyl(0.22, 0.22, 0.18, 6, M.glowR), -1.05, 1.95, -0.55);
+    put(slide, decal(texUspMark, 1.6, 0.4), 10.4, 0.55, -1.30, 0, Math.PI, 0);
+    put(slide, decal(texHk, 0.7, 0.32), 0.4, 0.7, -1.30, 0, Math.PI, 0);
+    var rearCap = caption('REAR SIGHT  FIBER RED', '#ff6677');
+    put(slide, rearCap, -1.2, 2.55, 0);
+    var slideCap = caption('SLIDE  LOCKED AFT', '#d0d0d0');
+    put(slide, slideCap, 4.2, 2.35, 0);
+    root.add(slide);
+
+    var comp = new THREE.Group();
+    comp.name = 'compensator';
+    put(comp, box(6.4, 2.35, 2.7, M.comp), 0, 0.15, 0);
+    put(comp, box(6.4, 0.85, 2.9, M.comp), 0, -1.05, 0);
+    put(comp, box(5.6, 0.55, 2.2, M.slideDark), 0.1, 1.22, 0);
+    put(comp, cyl(0.55, 0.55, 6.5, 8, M.black), 0.1, 0, 0, 0, 0, Math.PI / 2);
+    var p;
+    for (p = 0; p < 3; p++) {
+      put(comp, box(1.15, 0.55, 1.6, M.black), -1.7 + p * 1.7, 1.28, 0);
+      put(comp, cyl(0.28, 0.28, 1.7, 6, M.black), -1.7 + p * 1.7, 0.95, 0);
+    }
+    put(comp, box(0.45, 1.9, 2.5, M.comp), 3.35, 0.1, 0);
+    put(comp, cyl(0.5, 0.42, 0.55, 8, M.barrel), 3.55, 0, 0, 0, 0, Math.PI / 2);
+    var fs = put(comp, box(0.7, 0.85, 0.42, M.comp), -2.55, 1.55, 0);
+    put(comp, box(0.22, 0.7, 0.16, M.fiberG), -2.55, 1.72, 0);
+    put(comp, cyl(0.2, 0.2, 0.16, 6, M.glowG), -2.55, 2.12, 0);
+    put(comp, decal(texMatchMark, 2.0, 0.38), 0.2, 0.2, -1.37, 0, Math.PI, 0);
+    var fsCap = caption('FRONT SIGHT  FIBER GREEN', '#66ff88');
+    put(comp, fsCap, -2.4, 2.7, 0);
+    var compCap = caption('MATCH COMPENSATOR / WEIGHT', '#c8c8c8');
+    put(comp, compCap, 0.4, -1.85, 0);
+    put(root, comp, 17.55, 0.05, 0);
+
+    var frame = new THREE.Group();
+    frame.name = 'frame';
+    put(frame, box(12.6, 1.15, 2.45, M.polymer), 6.3, -1.35, 0);
+    put(frame, box(8.8, 0.55, 2.2, M.polymer), 7.6, -2.05, 0);
+    var rail;
+    for (rail = 0; rail < 6; rail++) {
+      put(frame, box(0.7, 0.18, 2.25, M.polymer), 4.4 + rail * 1.15, -2.28, 0);
+    }
+    put(frame, box(12.2, 0.22, 2.55, M.darkSteel), 6.2, -0.72, 0);
+    put(frame, box(0.35, 0.7, 2.55, M.darkSteel), 0.15, -0.95, 0);
+    put(frame, box(0.35, 0.7, 2.55, M.darkSteel), 12.35, -0.95, 0);
+    put(frame, box(2.4, 1.6, 2.45, M.polymer), 0.4, -1.55, 0);
+    put(frame, box(2.8, 0.45, 2.5, M.polymer), 2.35, -2.85, 0);
+    put(frame, box(0.45, 1.7, 2.5, M.polymer), 3.55, -3.5, 0);
+    put(frame, box(2.5, 0.4, 2.5, M.polymer), 2.4, -4.25, 0);
+    put(frame, box(0.55, 1.55, 0.55, M.trigger), 2.35, -3.15, 0);
+    var trig = box(0.7, 1.35, 0.42, M.trigger);
+    trig.rotation.z = 0.12;
+    put(frame, trig, 2.15, -3.35, 0);
+    trig.name = 'trigger';
+    var ham = new THREE.Group();
+    ham.name = 'hammer';
+    put(ham, box(0.55, 1.15, 0.7, M.steel), 0, 0.4, 0);
+    put(ham, box(0.85, 0.35, 0.7, M.steel), -0.15, 1.05, 0);
+    put(ham, cyl(0.22, 0.22, 0.85, 6, M.pin), 0, 0, 0, Math.PI / 2, 0, 0);
+    put(frame, ham, -1.35, -0.15, 0);
+    put(frame, box(1.15, 0.32, 0.22, M.darkSteel), 3.9, -0.95, 1.28);
+    put(frame, box(1.15, 0.32, 0.22, M.darkSteel), 3.9, -0.95, -1.28);
+    put(frame, box(0.7, 0.55, 0.22, M.darkSteel), -0.15, -0.55, 1.28);
+    put(frame, box(0.7, 0.55, 0.22, M.darkSteel), -0.15, -0.55, -1.28);
+    put(frame, box(0.85, 0.45, 0.28, M.steel), 1.15, -1.85, 1.32);
+    put(frame, box(0.85, 0.45, 0.28, M.steel), 1.15, -1.85, -1.32);
+    put(frame, box(1.1, 0.7, 1.8, M.polymer), -1.55, -0.85, 0);
+    var beaver = put(frame, box(1.4, 0.55, 2.1, M.polymer), -1.7, -1.45, 0);
+    beaver.rotation.z = 0.4;
+    var grip = new THREE.Group();
+    grip.name = 'grip';
+    put(grip, box(3.35, 8.4, 2.55, M.grip), 0, -4.2, 0);
+    put(grip, box(3.55, 2.4, 2.75, M.grip), 0.05, -2.4, 0);
+    put(grip, box(3.15, 2.2, 2.85, M.grip), 0.0, -5.1, 0);
+    put(grip, box(3.45, 1.3, 2.65, M.polymer), 0.05, -7.85, 0);
+    put(grip, box(0.35, 1.1, 2.15, M.polymer), 1.55, -2.55, 0);
+    put(grip, box(0.35, 1.1, 2.15, M.polymer), 1.55, -4.05, 0);
+    put(grip, box(0.35, 1.1, 2.15, M.polymer), 1.55, -5.55, 0);
+    put(grip, box(0.55, 0.7, 1.6, M.polymer), -1.7, -8.15, 0);
+    var mag = new THREE.Group();
+    mag.name = 'magazine';
+    put(mag, box(2.55, 10.2, 1.85, M.mag), 0, 0, 0);
+    put(mag, box(2.75, 0.85, 2.05, M.magBase), 0, -5.35, 0);
+    put(mag, box(2.35, 0.45, 1.55, M.steel), 0, 5.15, 0);
+    put(mag, box(1.7, 0.35, 1.15, M.pin), 0, 4.55, 0);
+    var hole;
+    for (hole = 0; hole < 5; hole++) {
+      put(mag, cyl(0.12, 0.12, 1.9, 6, M.black), 0.2, 3.2 - hole * 1.55, 0, Math.PI / 2, 0, 0);
+    }
+    var magCap = caption('MAGAZINE', '#e0e0e0');
+    put(mag, magCap, 0, -6.3, 0);
+    mag.position.set(0.05, -3.9, 0);
+    grip.add(mag);
+    put(frame, grip, 0.15, -2.15, 0);
+    grip.rotation.z = -0.30;
+    var frameCap = caption('POLYMER FRAME', '#d8d8d0');
+    put(frame, frameCap, 6.5, -3.1, 0);
+    var barrelCap = caption('EXPOSED MATCH BARREL', '#e8e8f0');
+    put(barrelG, barrelCap, 8.5, 0.85, -1.8);
+    root.add(frame);
+
+    var lightG = new THREE.PointLight(0x66ff88, 0.55, 8, 2);
+    lightG.position.set(15.0, 2.2, 0.4);
+    root.add(lightG);
+    var lightR = new THREE.PointLight(0xff4466, 0.45, 7, 2);
+    lightR.position.set(-1.1, 2.0, 0);
+    slide.add(lightR);
+
+    var blob = new THREE.Mesh(new THREE.CircleGeometry(7.5, 16), M.shadow);
+    blob.rotation.x = -Math.PI / 2;
+    blob.position.set(7.5, -12.2, 0);
+    root.add(blob);
+
+    root.userData = {
+      slide: slide, mag: mag, grip: grip, comp: comp, hammer: ham,
+      spring: spring, trigger: trig, captions: [rearCap, slideCap, fsCap, compCap, magCap, frameCap, barrelCap]
+    };
+    return root;
+  }
+
+  /* ===================== AR-15 ===================== */
+  function buildAR15() {
+    var root = new THREE.Group();
+    root.name = 'AR15';
+
+    var lower = new THREE.Group();
+    lower.name = 'lower';
+    put(lower, box(9.6, 2.6, 2.55, M.arLower), 0.2, 0.2, 0);
+    put(lower, box(3.6, 7.2, 2.4, M.arLower), 1.55, -3.4, 0);
+    put(lower, box(4.0, 0.7, 2.55, M.arLower), 1.55, -7.05, 0);
+    put(lower, box(2.6, 1.15, 2.4, M.arLower), -3.7, 0.55, 0);
+    put(lower, box(2.2, 2.4, 2.4, M.arLower), -5.85, 1.35, 0);
+    put(lower, box(1.5, 0.35, 2.2, M.arLower), 0.3, -1.55, 0);
+    put(lower, box(0.35, 1.5, 2.2, M.arLower), 1.55, -2.15, 0);
+    put(lower, box(1.6, 0.3, 2.2, M.arLower), 0.85, -2.85, 0);
+    var gripL = new THREE.Group();
+    put(gripL, box(2.3, 6.4, 2.15, M.arLower), 0, -2.6, 0);
+    put(gripL, box(2.5, 1.1, 2.25, M.arLower), 0.05, -5.5, 0);
+    put(lower, gripL, -3.55, -1.35, 0);
+    gripL.rotation.z = -0.38;
+    var bufferTube = put(lower, cyl(1.15, 1.15, 18.5, 8, M.arLower), -16.0, 1.55, 0, 0, 0, Math.PI / 2);
+    put(lower, box(1.4, 2.4, 2.5, M.arLower), -7.35, 1.5, 0);
+    var stock = new THREE.Group();
+    put(stock, box(14.2, 3.4, 2.7, M.arLower), 0, 0.2, 0);
+    put(stock, box(1.3, 8.2, 2.5, M.arLower), -6.2, -2.2, 0);
+    put(stock, box(3.2, 1.1, 2.5, M.arLower), -5.3, -6.0, 0);
+    put(lower, stock, -18.6, 1.2, 0);
+    var buffer = new THREE.Group();
+    buffer.name = 'buffer';
+    put(buffer, cyl(0.95, 0.95, 3.6, 8, M.arSteel), 0, 0, 0, 0, 0, Math.PI / 2);
+    put(buffer, cyl(0.35, 0.35, 8.5, 6, M.steel), -5.4, 0, 0, 0, 0, Math.PI / 2);
+    var bufSpring = helixSpring(8.2, 0.55, 9, 0.06, M.steel);
+    bufSpring.position.set(-5.2, 0, 0);
+    buffer.add(bufSpring);
+    put(lower, buffer, -10.2, 1.55, 0);
+    var rearPin = put(lower, cyl(0.22, 0.22, 3.4, 8, M.pin), -5.55, 1.25, 0, Math.PI / 2, 0, 0);
+    rearPin.name = 'rearPin';
+    var frontPin = put(lower, cyl(0.22, 0.22, 3.2, 8, M.pin), 5.85, 1.15, 0, Math.PI / 2, 0, 0);
+    frontPin.name = 'frontPin';
+
+    var hammer = new THREE.Group();
+    hammer.name = 'hammer';
+    put(hammer, box(0.7, 1.7, 0.7, M.arSteel), 0, 0.7, 0);
+    put(hammer, box(1.1, 0.4, 0.7, M.arSteel), 0.2, 1.55, 0);
+    put(lower, hammer, -1.6, -0.15, 0);
+    var trigger = new THREE.Group();
+    put(trigger, box(0.45, 1.7, 0.4, M.trigger), 0.15, -0.55, 0);
+    put(trigger, box(1.1, 0.35, 0.4, M.trigger), -0.2, 0.35, 0);
+    put(lower, trigger, 0.35, -1.15, 0);
+    trigger.name = 'trigger';
+    var sear = put(lower, box(0.9, 0.28, 0.35, M.steel), -0.55, -0.35, 0);
+    sear.name = 'sear';
+    var safety = new THREE.Group();
+    put(safety, cyl(0.45, 0.45, 2.7, 8, M.pin), 0, 0, 0, Math.PI / 2, 0, 0);
+    put(safety, box(1.3, 0.28, 0.18, M.arSteel), 0.55, 0, 1.35);
+    put(lower, safety, -2.55, 0.35, 0);
+    safety.name = 'safety';
+    var magRel = put(lower, box(0.7, 0.45, 0.28, M.steel), 2.55, -1.55, 1.28);
+    magRel.name = 'magRelease';
+    var boltCatch = put(lower, box(0.85, 1.15, 0.22, M.steel), 3.35, -0.15, -1.28);
+    boltCatch.name = 'boltCatch';
+
+    var magAR = new THREE.Group();
+    magAR.name = 'magazine';
+    put(magAR, box(2.55, 9.4, 2.15, M.mag), 0, 0, 0);
+    put(magAR, box(2.75, 0.7, 2.3, M.magBase), 0, -4.85, 0);
+    put(magAR, box(2.2, 0.4, 1.7, M.steel), 0, 4.7, 0);
+    magAR.rotation.z = -0.12;
+    put(lower, magAR, 1.55, -3.5, 0);
+
+    root.add(lower);
+
+    var pivot = new THREE.Group();
+    pivot.name = 'pivot';
+    pivot.position.set(5.85, 1.15, 0);
+    root.add(pivot);
+
+    var upper = new THREE.Group();
+    upper.name = 'upper';
+    upper.position.set(-5.85, -1.15, 0);
+    pivot.add(upper);
+
+    put(upper, box(14.4, 2.55, 2.55, M.arUpper), 1.4, 2.55, 0);
+    put(upper, box(14.4, 0.45, 2.2, M.arSteel), 1.4, 3.95, 0);
+    var pic;
+    for (pic = 0; pic < 12; pic++) {
+      put(upper, box(0.55, 0.22, 2.25, M.arSteel), -4.6 + pic * 1.05, 4.22, 0);
+    }
+    put(upper, box(3.6, 1.7, 0.2, M.black), 0.6, 2.35, 1.28);
+    var dust = put(upper, box(3.5, 1.5, 0.12, M.arSteel), 0.6, 2.35, 1.38);
+    dust.name = 'dustCover';
+    put(upper, box(0.7, 1.1, 0.55, M.arSteel), 3.5, 2.55, 1.45);
+    put(upper, cyl(0.35, 0.35, 0.7, 6, M.arSteel), 4.55, 2.7, 1.45, Math.PI / 2, 0, 0);
+    put(upper, box(1.6, 1.4, 2.4, M.arUpper), 8.2, 2.45, 0);
+
+    var barrelAR = put(upper, cyl(0.55, 0.48, 28.5, 8, M.arSteel), 23.2, 2.35, 0, 0, 0, Math.PI / 2);
+    put(upper, cyl(1.15, 1.15, 2.2, 8, M.arSteel), 8.9, 2.35, 0, 0, 0, Math.PI / 2);
+    put(upper, cyl(0.85, 0.85, 1.6, 8, M.darkSteel), 36.8, 2.35, 0, 0, 0, Math.PI / 2);
+    var prong;
+    for (prong = 0; prong < 6; prong++) {
+      var fin = box(1.5, 0.18, 0.7, M.darkSteel);
+      fin.position.set(37.7, 2.35, 0);
+      fin.rotation.x = prong / 6 * TAU;
+      upper.add(fin);
+    }
+    var gasBlock = put(upper, box(2.2, 1.7, 1.5, M.arSteel), 27.4, 3.15, 0);
+    put(upper, cyl(0.18, 0.18, 18.6, 6, M.steel), 18.4, 3.55, 0, 0, 0, Math.PI / 2);
+    put(upper, box(16.5, 2.1, 3.15, M.arUpper), 18.2, 2.45, 0);
+    put(upper, box(16.5, 0.2, 3.35, M.arSteel), 18.2, 3.55, 0);
+    put(upper, box(16.5, 0.2, 3.35, M.arSteel), 18.2, 1.35, 0);
+
+    var ch = new THREE.Group();
+    ch.name = 'chargingHandle';
+    put(ch, box(12.2, 0.28, 1.15, M.arSteel), 0, 0, 0);
+    put(ch, box(1.5, 0.35, 3.1, M.arSteel), -6.3, 0, 0);
+    put(upper, ch, -0.4, 3.55, 0);
+
+    var bcg = new THREE.Group();
+    bcg.name = 'bcg';
+    put(bcg, cyl(0.85, 0.85, 6.8, 8, M.arSteel), 0, 0, 0, 0, 0, Math.PI / 2);
+    put(bcg, box(2.4, 0.7, 0.9, M.arSteel), 1.6, 0.7, 0);
+    put(bcg, box(1.5, 0.45, 0.7, M.darkSteel), 2.4, 1.05, 0);
+    var bolt = new THREE.Group();
+    bolt.name = 'bolt';
+    put(bolt, cyl(0.55, 0.55, 2.6, 8, M.arBolt), 0, 0, 0, 0, 0, Math.PI / 2);
+    var lug;
+    for (lug = 0; lug < 8; lug++) {
+      var lg = box(0.35, 0.22, 0.32, M.arBolt);
+      var ang = lug / 8 * TAU;
+      lg.position.set(1.15, Math.cos(ang) * 0.52, Math.sin(ang) * 0.52);
+      bolt.add(lg);
+    }
+    put(bolt, cyl(0.12, 0.12, 2.2, 6, M.pin), 0.2, 0, 0, 0, 0, Math.PI / 2);
+    var cam = put(bolt, cyl(0.16, 0.16, 1.15, 6, M.pin), 0.35, 0.45, 0);
+    cam.rotation.z = 0.4;
+    put(bcg, bolt, 4.3, 0, 0);
+    put(upper, bcg, -0.6, 2.35, 0);
+
+    var ejector = put(upper, box(0.25, 0.25, 0.7, M.pin), 3.4, 2.35, -0.7);
+    ejector.name = 'ejector';
+
+    function cad(mesh, host) { edges(mesh, host || upper); }
+    cad(upper.children[0], upper);
+    cad(barrelAR, upper);
+    cad(gasBlock, upper);
+    edges(lower.children[0], lower);
+    edges(bufferTube, lower);
+
+    var labels = [];
+    function lab(text, parent, x, y, z, col) {
+      var s = caption(text, col || '#7ad0ff');
+      put(parent, s, x, y, z);
+      labels.push(s);
+      return s;
+    }
+    lab('UPPER RECEIVER', upper, 1.5, 5.1, 0);
+    lab('LOWER RECEIVER', lower, 0.2, 2.2, 0);
+    lab('BCG', bcg, 0, 1.6, 0);
+    lab('BOLT HEAD', bolt, 1.2, 1.3, 0);
+    lab('CHARGING HANDLE', ch, 0, 0.9, 0);
+    lab('BUFFER / SPRING', buffer, -2, 1.5, 0);
+    lab('REAR TAKEDOWN PIN', lower, -5.55, 2.6, 0);
+    lab('FRONT PIVOT', lower, 5.85, 2.5, 0);
+    lab('HAMMER', hammer, -1.6, 2.3, 0);
+    lab('TRIGGER / SEAR', trigger, 0.4, -2.6, 0);
+    lab('SAFETY', safety, -2.55, 1.5, 0);
+    lab('MAG RELEASE', lower, 2.55, -2.4, 1.8);
+    lab('GAS BLOCK / TUBE', upper, 27.4, 4.6, 0);
+    lab('MAGAZINE', magAR, 0, -6.3, 0);
+
+    var blob = new THREE.Mesh(new THREE.CircleGeometry(16, 18), M.shadow);
+    blob.rotation.x = -Math.PI / 2;
+    blob.position.set(6, -12.5, 0);
+    root.add(blob);
+
+    root.userData = {
+      pivot: pivot, upper: upper, lower: lower, bcg: bcg, bolt: bolt, ch: ch,
+      buffer: buffer, rearPin: rearPin, mag: magAR, hammer: hammer, trigger: trigger,
+      safety: safety, dust: dust, labels: labels
+    };
+    return root;
+  }
+
+  /* ===================== SCENE ===================== */
+  var renderer = new THREE.WebGLRenderer({ antialias: false, alpha: false, powerPreference: 'high-performance' });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setClearColor(0xc5c5c8, 1);
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  document.body.appendChild(renderer.domElement);
+
+  var scene = new THREE.Scene();
+  scene.background = new THREE.Color(0xc5c5c8);
+  scene.fog = new THREE.Fog(0xc5c5c8, 90, 160);
+
+  var aspect = window.innerWidth / window.innerHeight;
+  var orthoSize = 13;
+  var camera = new THREE.OrthographicCamera(-orthoSize * aspect, orthoSize * aspect, orthoSize, -orthoSize, -80, 200);
+  var camTarget = new THREE.Vector3(7.2, -1.2, 0);
+  var camSph = { theta: -2.48, phi: 0.34, dist: 42, zoom: 1 };
+
+  var hemi = new THREE.HemisphereLight(0xf0f0f4, 0x8a8a90, 0.85);
+  scene.add(hemi);
+  var key = new THREE.DirectionalLight(0xffffff, 1.05);
+  key.position.set(18, 28, 22);
+  scene.add(key);
+  var fill = new THREE.DirectionalLight(0xd8dce8, 0.45);
+  fill.position.set(-22, 10, -8);
+  scene.add(fill);
+  var rim = new THREE.DirectionalLight(0xffffff, 0.35);
+  rim.position.set(-10, 8, 30);
+  scene.add(rim);
+
+  var usp = buildUSP();
+  var ar = buildAR15();
+  ar.visible = false;
+  scene.add(usp);
+  scene.add(ar);
+
+  var mode = 'usp';
+  var paused = false;
+  var clock = new THREE.Clock();
+  var animT = 0;
+  var USP_DUR = 12;
+  var AR_DUR = 18;
+  var fpsAcc = 0, fpsN = 0, fpsShow = 60;
+
+  var u = usp.userData;
+  var a = ar.userData;
+  var slideHome = u.slide.position.clone();
+  var magHome = u.mag.position.clone();
+  var compHome = u.comp.position.clone();
+  var hamHome = u.hammer.rotation.clone();
+  var bcgHome = a.bcg.position.clone();
+  var chHome = a.ch.position.clone();
+  var bufHome = a.buffer.position.clone();
+  var magARHome = a.mag.position.clone();
+  var pinHome = a.rearPin.position.clone();
+
+  function setCaptions(group, alpha) {
+    var list = group.userData.captions || group.userData.labels || [];
+    for (var i = 0; i < list.length; i++) {
+      list[i].material.opacity = alpha;
+      list[i].visible = alpha > 0.04;
+    }
+  }
+
+  function applyUSP(t) {
+    var magIn = gate(t, 0.08, 0.20, 0.70, 0.84);
+    var compDock = gate(t, 0.18, 0.26, 0.62, 0.72);
+    var overpull = gate(t, 0.27, 0.33, 0.33, 0.36);
+    var slideFwd = gate(t, 0.34, 0.44, 0.54, 0.64);
+    var slideBack = 1 - slideFwd;
+    var slideX = -3.85 * slideBack - 0.7 * overpull;
+    u.slide.position.x = slideHome.x + slideX;
+    u.mag.position.y = magHome.y + (1 - magIn) * -9.6;
+    u.comp.position.x = compHome.x + (1 - compDock) * 2.15;
+    u.hammer.rotation.z = hamHome.z - slideBack * 0.72 - overpull * 0.12;
+    u.spring.scale.x = lerp(0.42, 1.0, slideBack);
+    u.trigger.rotation.z = 0.12 + magIn * 0.02;
+    var explodeLook = 1 - Math.max(magIn, slideFwd) * 0.85;
+    setCaptions(usp, clamp(explodeLook, 0.12, 1));
+    var phase;
+    if (t < 0.08) phase = 'EXPLODED HOLD  ·  slide locked aft, barrel exposed';
+    else if (t < 0.20) phase = 'MAGAZINE  ↑  sliding into polymer grip';
+    else if (t < 0.27) phase = 'MATCH COMPENSATOR docking at muzzle';
+    else if (t < 0.34) phase = 'SLIDE OVERPULL on exposed silver barrel';
+    else if (t < 0.44) phase = 'SLIDE RESET  →  returning to battery';
+    else if (t < 0.54) phase = 'ASSEMBLED HOLD  ·  fiber sights aligned';
+    else if (t < 0.64) phase = 'SLIDE LOCKBACK  ·  barrel uncovered';
+    else if (t < 0.72) phase = 'COMPENSATOR separating forward';
+    else if (t < 0.84) phase = 'MAGAZINE  ↓  dropping from magwell';
+    else phase = 'EXPLODED HOLD  ·  loop seam';
+    return phase;
+  }
+
+  function applyAR(t) {
+    var p = t <= 0.5 ? smoother(t / 0.5) : smoother(1 - (t - 0.5) / 0.5);
+    var magOut = env(p, 0.00, 0.10);
+    var pinOut = env(p, 0.08, 0.20);
+    var open = env(p, 0.18, 0.40);
+    var bcgBack = env(p, 0.38, 0.58);
+    var boltRot = env(p, 0.52, 0.68);
+    var bufOut = env(p, 0.60, 0.80);
+    a.mag.position.y = magARHome.y - magOut * 8.5;
+    a.rearPin.position.z = pinHome.z + pinOut * 2.6;
+    a.pivot.rotation.z = -open * 48 * DEG;
+    a.bcg.position.x = bcgHome.x - bcgBack * 7.4;
+    a.ch.position.x = chHome.x - bcgBack * 7.8;
+    a.bolt.rotation.x = boltRot * 22.5 * DEG;
+    a.buffer.position.x = bufHome.x - bufOut * 7.2;
+    a.hammer.rotation.z = -0.15 - bcgBack * 0.85;
+    a.trigger.rotation.z = open * 0.08;
+    a.safety.rotation.z = open * 0.4;
+    a.dust.rotation.x = -open * 1.2;
+    setCaptions(ar, 0.25 + p * 0.75);
+    var phase;
+    if (p < 0.10) phase = 'STANAG mag dropping from magwell';
+    else if (p < 0.20) phase = 'REAR TAKEDOWN PIN exiting laterally';
+    else if (p < 0.40) phase = 'UPPER pivoting open on FRONT PIN';
+    else if (p < 0.58) phase = 'CHARGING HANDLE + BCG riding receiver rails aft';
+    else if (p < 0.68) phase = 'BOLT HEAD rotating 22.5° to unlock lugs';
+    else if (p < 0.82) phase = 'BUFFER / RECOIL SPRING withdrawing from tube';
+    else phase = 'FIELD-STRIP HOLD  ·  CAD overlay';
+    return phase;
+  }
+
+  function framing() {
+    if (mode === 'usp') {
+      camTarget.set(7.4, -1.4, 0);
+      orthoSize = 13.2;
+    } else {
+      camTarget.set(8.5, 0.4, 0);
+      orthoSize = 24.5;
+    }
+  }
+  framing();
+
+  function updateCamera() {
+    var z = camSph.zoom;
+    var dist = camSph.dist;
+    var x = dist * Math.sin(camSph.theta) * Math.cos(camSph.phi);
+    var y = dist * Math.sin(camSph.phi);
+    var zz = dist * Math.cos(camSph.theta) * Math.cos(camSph.phi);
+    camera.position.set(camTarget.x + x, camTarget.y + y, camTarget.z + zz);
+    camera.lookAt(camTarget);
+    camera.zoom = z;
+    var a = window.innerWidth / window.innerHeight;
+    camera.left = -orthoSize * a;
+    camera.right = orthoSize * a;
+    camera.top = orthoSize;
+    camera.bottom = -orthoSize;
+    camera.updateProjectionMatrix();
+  }
+
+  var dragging = false, lx = 0, ly = 0;
+  renderer.domElement.addEventListener('pointerdown', function (e) {
+    dragging = true; lx = e.clientX; ly = e.clientY;
+    renderer.domElement.setPointerCapture(e.pointerId);
+  });
+  renderer.domElement.addEventListener('pointerup', function () { dragging = false; });
+  renderer.domElement.addEventListener('pointermove', function (e) {
+    if (!dragging) return;
+    var dx = e.clientX - lx, dy = e.clientY - ly;
+    lx = e.clientX; ly = e.clientY;
+    camSph.theta -= dx * 0.005;
+    camSph.phi = clamp(camSph.phi + dy * 0.004, 0.08, 1.25);
+  });
+  renderer.domElement.addEventListener('wheel', function (e) {
+    e.preventDefault();
+    camSph.zoom = clamp(camSph.zoom * (e.deltaY > 0 ? 0.92 : 1.08), 0.45, 2.4);
+  }, { passive: false });
+
+  function setMode(m) {
+    mode = m;
+    usp.visible = m === 'usp';
+    ar.visible = m === 'ar15';
+    document.getElementById('btnUsp').className = m === 'usp' ? 'active' : '';
+    document.getElementById('btnAr').className = m === 'ar15' ? 'active' : '';
+    document.getElementById('title').querySelector('h1').innerHTML =
+      m === 'usp' ? 'H&amp;K USP MATCH // GOLDSRC BREAKDOWN' : 'AR-15 // STUDIO CAD FIELD STRIP';
+    document.getElementById('title').querySelector('p').innerHTML =
+      m === 'usp'
+        ? 'PROCEDURAL LOW-POLY &nbsp;·&nbsp; FLAT SHADE &nbsp;·&nbsp; FIBER OPTIC SIGHTS<br>MAGAZINE UP → SLIDE RACK / RESET ON EXPOSED BARREL'
+        : 'MATTE ANODIZED + DARK STEEL &nbsp;·&nbsp; PIVOT / RAIL KINEMATICS<br>PIN OUT → UPPER HINGE → BCG AFT → BOLT UNLOCK';
+    framing();
+    animT = 0;
+  }
+  document.getElementById('btnUsp').onclick = function () { setMode('usp'); };
+  document.getElementById('btnAr').onclick = function () { setMode('ar15'); };
+  document.getElementById('btnPause').onclick = function () {
+    paused = !paused;
+    document.getElementById('btnPause').textContent = paused ? 'PLAY' : 'PAUSE';
+  };
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space') {
+      e.preventDefault();
+      document.getElementById('btnPause').click();
+    }
+    if (e.key === '1') setMode('usp');
+    if (e.key === '2') setMode('ar15');
+  });
+  window.addEventListener('resize', function () {
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  var phaseEl = document.getElementById('phase');
+  var partsEl = document.getElementById('parts');
+  var fpsEl = document.getElementById('fps');
+  var fillEl = document.getElementById('phasefill');
+
+  function tick() {
+    requestAnimationFrame(tick);
+    var dt = Math.min(clock.getDelta(), 0.05);
+    fpsAcc += dt; fpsN++;
+    if (fpsAcc >= 0.4) {
+      fpsShow = Math.round(fpsN / fpsAcc);
+      fpsN = 0; fpsAcc = 0;
+    }
+    if (!paused) {
+      var dur = mode === 'usp' ? USP_DUR : AR_DUR;
+      animT += dt;
+      if (animT >= dur) animT -= dur;
+    }
+    var dur = mode === 'usp' ? USP_DUR : AR_DUR;
+    var nt = animT / dur;
+    var phase = mode === 'usp' ? applyUSP(nt) : applyAR(nt);
+    updateCamera();
+    renderer.render(scene, camera);
+    fpsEl.textContent = 'FPS ' + fpsShow + (paused ? '  PAUSED' : '  LOOPING');
+    phaseEl.textContent = 'PHASE  ' + phase;
+    partsEl.textContent = mode === 'usp'
+      ? 'PARTS  slide · barrel · polymer frame · match comp · mag · fiber sights'
+      : 'PARTS  upper/lower · pins · BCG/bolt · CH · buffer · FCG · gas · mag';
+    fillEl.style.width = (nt * 100).toFixed(2) + '%';
+  }
+  tick();
+})();
+</script>
+</body>
+</html>

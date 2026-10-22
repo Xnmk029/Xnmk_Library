@@ -1,0 +1,796 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Voxel Lujiazui · 体素上海陆家嘴</title>
+<style>
+  :root { --ui-bg: rgba(10,14,26,0.88); --ui-accent: #4fc3f7; --ui-text: #e0e0e0; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { overflow:hidden; background:#0a0e1a; font-family:'Segoe UI','PingFang SC',sans-serif; color:var(--ui-text); }
+  canvas { display:block; }
+  #ui { position:fixed; top:0; left:0; right:0; z-index:10; pointer-events:none; }
+  #title-bar { display:flex; align-items:center; justify-content:space-between; padding:14px 22px;
+    background:var(--ui-bg); border-bottom:1px solid rgba(79,195,247,0.25); backdrop-filter:blur(10px); }
+  #title-bar h1 { font-size:17px; font-weight:600; letter-spacing:1px; color:var(--ui-accent); }
+  #title-bar h1 span { color:#fff; font-weight:300; margin-left:8px; font-size:13px; }
+  #controls { display:flex; gap:10px; align-items:center; pointer-events:auto; }
+  .btn { padding:7px 16px; border:1px solid var(--ui-accent); background:transparent; color:var(--ui-accent);
+    border-radius:4px; cursor:pointer; font-size:13px; font-weight:500; transition:all .2s; letter-spacing:0.5px; }
+  .btn:hover { background:var(--ui-accent); color:#0a0e1a; }
+  .btn.active { background:var(--ui-accent); color:#0a0e1a; font-weight:700; }
+  #info-panel { position:fixed; bottom:20px; left:22px; z-index:10; background:var(--ui-bg);
+    padding:14px 18px; border-radius:6px; border:1px solid rgba(79,195,247,0.2); backdrop-filter:blur(10px);
+    max-width:320px; font-size:12px; line-height:1.7; pointer-events:auto; }
+  #info-panel h3 { font-size:13px; color:var(--ui-accent); margin-bottom:6px; letter-spacing:1px; }
+  #info-panel kbd { background:rgba(79,195,247,0.15); border:1px solid rgba(79,195,247,0.3);
+    border-radius:3px; padding:1px 5px; font-size:11px; font-family:inherit; }
+  #mode-label { position:fixed; top:70px; right:22px; z-index:10; background:var(--ui-bg);
+    padding:6px 14px; border-radius:4px; border:1px solid rgba(79,195,247,0.3); font-size:12px;
+    color:var(--ui-accent); letter-spacing:1px; backdrop-filter:blur(10px); pointer-events:none; }
+  #crosshair { position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); z-index:10;
+    width:2px; height:12px; background:rgba(255,255,255,0.6); pointer-events:none; display:none; }
+  #crosshair::after { content:''; position:absolute; top:5px; left:-5px; width:12px; height:2px; background:rgba(255,255,255,0.6); }
+  #fps { position:fixed; bottom:20px; right:22px; z-index:10; font-size:11px; color:rgba(255,255,255,0.4); }
+</style>
+</head>
+<body>
+
+<div id="ui">
+  <div id="title-bar">
+    <h1>VOXEL LUJIAZI<span>体素上海陆家嘴数字沙盘</span></h1>
+    <div id="controls">
+      <button class="btn active" id="btn-god" onclick="setMode('god')">🌍 上帝视角</button>
+      <button class="btn" id="btn-fps" onclick="setMode('fps')">🎮 第一人称</button>
+      <button class="btn" id="btn-day" onclick="toggleDayNight()">🌓 昼夜切换</button>
+    </div>
+  </div>
+</div>
+<div id="mode-label">GOD VIEW · 轨道相机</div>
+<div id="crosshair"></div>
+<div id="info-panel">
+  <h3>CONTROLS · 操作说明</h3>
+  <div id="help-text">
+    <kbd>鼠标拖拽</kbd> 旋转 · <kbd>滚轮</kbd> 缩放 · <kbd>右键拖拽</kbd> 平移<br>
+    <button class="btn" onclick="setMode('fps')" style="margin-top:6px;padding:4px 10px;font-size:11px;">切换第一人称 →</button>
+  </div>
+</div>
+<div id="fps"></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.152.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.152.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
+
+// ============ CONSTANTS ============
+const VOXEL = 1;          // 1 unit = 10m
+const GRID_W = 160;       // ~1.6km
+const GRID_D = 120;       // ~1.2km
+const RIVER_Y = 0.15;
+const GROUND_Y = 0;
+const ROAD_Y = 0.02;
+const WATER_Y = 0.08;
+
+// ============ SCENE SETUP ============
+const scene = new THREE.Scene();
+scene.fog = new THREE.Fog(0x0a0e1a, 80, 250);
+scene.background = new THREE.Color(0x0a0e1a);
+
+const camera = new THREE.PerspectiveCamera(55, window.innerWidth/window.innerHeight, 0.5, 2000);
+camera.position.set(80, 70, 120);
+camera.lookAt(80, 0, 60);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference:'high-performance' });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.1;
+document.body.appendChild(renderer.domElement);
+
+// ============ LIGHTING ============
+const ambientLight = new THREE.AmbientLight(0x334466, 0.7);
+scene.add(ambientLight);
+
+const sunLight = new THREE.DirectionalLight(0xfff5e6, 2.2);
+sunLight.position.set(60, 100, 40);
+sunLight.castShadow = true;
+sunLight.shadow.mapSize.set(2048, 2048);
+sunLight.shadow.camera.left = -100;
+sunLight.shadow.camera.right = 100;
+sunLight.shadow.camera.top = 100;
+sunLight.shadow.camera.bottom = -100;
+sunLight.shadow.camera.near = 0.5;
+sunLight.shadow.camera.far = 300;
+sunLight.shadow.bias = -0.0003;
+scene.add(sunLight);
+
+const hemiLight = new THREE.HemisphereLight(0x88aaff, 0x443322, 0.4);
+scene.add(hemiLight);
+
+// ============ MATERIALS ============
+const mats = {
+  ground:   new THREE.MeshLambertMaterial({ color: 0x3a5c3a }),
+  road:     new THREE.MeshLambertMaterial({ color: 0x2a2a2e }),
+  sidewalk: new THREE.MeshLambertMaterial({ color: 0x3d3d42 }),
+  water:    new THREE.MeshPhongMaterial({ color:0x1a5276, transparent:true, opacity:0.72,
+    specular:0x6699cc, shininess:60, emissive:0x0a1a2a }),
+  glass:    new THREE.MeshPhongMaterial({ color:0x88ccff, specular:0xffffff, shininess:120,
+    transparent:true, opacity:0.85, emissive:0x0a1520 }),
+  concrete: new THREE.MeshLambertMaterial({ color:0x7a7a80 }),
+  concrete2:new THREE.MeshLambertMaterial({ color:0x5a5a60 }),
+  darkGlass:new THREE.MeshPhongMaterial({ color:0x3a5570, specular:0x6699cc, shininess:80,
+    transparent:true, opacity:0.88, emissive:0x0a1520 }),
+  white:    new THREE.MeshLambertMaterial({ color:0xd8d8d8 }),
+  accent:   new THREE.MeshLambertMaterial({ color:0x4fc3f7 }),
+  tree:     new THREE.MeshLambertMaterial({ color:0x2d7a3a }),
+  treeTrunk:new THREE.MeshLambertMaterial({ color:0x5a4030 }),
+  carRed:   new THREE.MeshLambertMaterial({ color:0xcc2222 }),
+  carWhite: new THREE.MeshLambertMaterial({ color:0xdddddd }),
+  carBlack: new THREE.MeshLambertMaterial({ color:0x222222 }),
+  carYellow:new THREE.MeshLambertMaterial({ color:0xddcc22 }),
+  nightWindow:new THREE.MeshLambertMaterial({ color:0xffaa33, emissive:0xff8800 }),
+};
+
+// ============ HELPER: add voxel ============
+const geoVoxel = new THREE.BoxGeometry(VOXEL, VOXEL, VOXEL);
+const _tmpPos = new THREE.Vector3();
+
+function addVoxel(x, y, z, material, sceneRef=scene, receiveShadow=true, castShadow=true) {
+  const mesh = new THREE.Mesh(geoVoxel, material);
+  mesh.position.set(x + VOXEL/2, y + VOXEL/2, z + VOXEL/2);
+  mesh.castShadow = castShadow;
+  mesh.receiveShadow = receiveShadow;
+  sceneRef.add(mesh);
+  return mesh;
+}
+
+function addBox(px, py, pz, sx, sy, sz, material, sceneRef=scene) {
+  const g = new THREE.BoxGeometry(sx, sy, sz);
+  const m = new THREE.Mesh(g, material);
+  m.position.set(px + sx/2, py + sy/2, pz + sz/2);
+  m.castShadow = true;
+  m.receiveShadow = true;
+  sceneRef.add(m);
+  return m;
+}
+
+// ============ GROUND ============
+// Large ground plane
+const geoGround = new THREE.PlaneGeometry(GRID_W, GRID_D);
+const groundMesh = new THREE.Mesh(geoGround, mats.ground);
+groundMesh.rotation.x = -Math.PI/2;
+groundMesh.position.set(GRID_W/2, GROUND_Y, GRID_D/2);
+groundMesh.receiveShadow = true;
+scene.add(groundMesh);
+
+// ============ HUANGPU RIVER (curved water body) ============
+// River curves along the west and north sides
+function createRiver() {
+  // Create a curved river using a series of water blocks
+  const riverBlocks = [];
+  // West side: from south to north
+  for (let z = 0; z < 70; z += 4) {
+    const width = 12 + Math.sin(z*0.05)*3;
+    for (let x = 0; x < width; x += 4) {
+      for (let bz = z; bz < Math.min(z+4, 70); bz += 1) {
+        for (let bx = x; bx < Math.min(x+4, width); bx += 1) {
+          const m = addVoxel(bx, WATER_Y, bz, mats.water);
+          m.material = mats.water.clone();
+          riverBlocks.push(m);
+        }
+      }
+    }
+  }
+  // North curve: from west to east (around y=65-80)
+  for (let x = 0; x < 80; x += 4) {
+    const width = 14 + Math.sin(x*0.04)*2;
+    for (let z = 62; z < 62 + width; z += 1) {
+      const m = addVoxel(x, WATER_Y, z, mats.water);
+      m.material = mats.water.clone();
+      riverBlocks.push(m);
+    }
+  }
+  return riverBlocks;
+}
+const riverBlocks = createRiver();
+
+// ============ ROAD NETWORK ============
+const roads = [];
+// Main roads - grid pattern
+const mainRoadsX = [10, 25, 40, 55, 70, 85, 100, 115, 130, 145];
+const mainRoadsZ = [10, 25, 40, 55, 70, 85, 100, 115];
+
+// Horizontal roads
+for (const z of mainRoadsZ) {
+  for (let x = 0; x < GRID_W; x += 1) {
+    const m = addVoxel(x, ROAD_Y, z, mats.road);
+    m.material = mats.road;
+    roads.push({mesh:m, x, z, dir:'h'});
+  }
+}
+// Vertical roads
+for (const x of mainRoadsX) {
+  for (let z = 0; z < GRID_D; z += 1) {
+    const m = addVoxel(x, ROAD_Y, z, mats.road);
+    m.material = mats.road;
+    roads.push({mesh:m, x, z, dir:'v'});
+  }
+}
+
+// Sidewalks (slightly raised, lighter)
+for (const z of mainRoadsZ) {
+  for (let x = 0; x < GRID_W; x += 1) {
+    if (x % 15 === 0) addVoxel(x, ROAD_Y+0.01, z, mats.sidewalk);
+  }
+}
+for (const x of mainRoadsX) {
+  for (let z = 0; z < GRID_D; z += 1) {
+    if (z % 15 === 0) addVoxel(x, ROAD_Y+0.01, z, mats.sidewalk);
+  }
+}
+
+// ============ BUILDING DATA ============
+// Each building: {x, z, w, d, h, color, type}
+// x,z = center of building in grid units
+const buildingData = [];
+
+// --- THE THREE BUILDINGS (Lujiazui core) ---
+// Shanghai Tower: center-right, 632m = 63 voxels
+buildingData.push({x:82, z:58, w:7, d:7, h:63, type:'shanghai-tower', name:'上海中心大厦'});
+// SWFC: left of Shanghai Tower, 492m = 49 voxels
+buildingData.push({x:68, z:58, w:6, d:6, h:49, type:'swfc', name:'上海环球金融中心'});
+// Jin Mao: right of SWFC, 421m = 42 voxels
+buildingData.push({x:74, z:50, w:5, d:5, h:42, type:'jinmao', name:'金茂大厦'});
+
+// --- SURROUNDING HIGH-RISES ---
+const highRises = [
+  {x:55, z:55, w:5, d:5, h:28},  // HSBC Building
+  {x:95, z:55, w:4, d:4, h:22},  // SWFC area
+  {x:60, z:42, w:4, d:4, h:18},
+  {x:90, z:42, w:5, d:5, h:25},
+  {x:45, z:58, w:4, d:4, h:16},
+  {x:100, z:62, w:4, d:4, h:20},
+  {x:50, z:70, w:4, d:4, h:14},
+  {x:85, z:70, w:5, d:5, h:24},
+  {x:70, z:72, w:4, d:4, h:12},
+  {x:110, z:58, w:4, d:4, h:18},
+  {x:40, z:48, w:3, d:3, h:10},
+  {x:105, z:48, w:4, d:3, h:15},
+  {x:65, z:35, w:3, d:3, h:8},
+  {x:80, z:35, w:4, d:4, h:12},
+  {x:95, z:35, w:3, d:3, h:10},
+  {x:30, z:55, w:4, d:3, h:10},
+  {x:115, z:50, w:3, d:3, h:8},
+  {x:75, z:65, w:3, d:3, h:6},
+  {x:58, z:62, w:3, d:3, h:8},
+  {x:88, z:58, w:3, d:3, h:10},
+];
+for (const b of highRises) {
+  buildingData.push({...b, type:'highrise'});
+}
+
+// --- MID-RISES ---
+const midRises = [
+  {x:35, z:40, w:3, d:3, h:6},
+  {x:42, z:35, w:3, d:3, h:5},
+  {x:55, z:28, w:4, d:3, h:7},
+  {x:70, z:25, w:3, d:3, h:5},
+  {x:85, z:25, w:3, d:3, h:6},
+  {x:100, z:28, w:4, d:3, h:7},
+  {x:115, z:35, w:3, d:3, h:5},
+  {x:120, z:45, w:3, d:3, h:6},
+  {x:110, z:72, w:3, d:3, h:5},
+  {x:40, z:75, w:3, d:3, h:4},
+  {x:50, z:80, w:3, d:3, h:5},
+  {x:65, z:78, w:3, d:3, h:4},
+  {x:80, z:82, w:3, d:3, h:6},
+  {x:95, z:78, w:3, d:3, h:5},
+  {x:108, z:80, w:3, d:3, h:4},
+  {x:20, z:50, w:3, d:3, h:4},
+  {x:15, z:40, w:3, d:3, h:3},
+  {x:125, z:55, w:3, d:3, h:4},
+  {x:130, z:65, w:3, d:3, h:3},
+  {x:10, z:30, w:3, d:3, h:3},
+  {x:120, z:20, w:3, d:3, h:3},
+  {x:135, z:40, w:3, d:3, h:4},
+  {x:130, z:80, w:3, d:3, h:3},
+  {x:110, z:90, w:3, d:3, h:3},
+  {x:70, z:90, w:3, d:3, h:4},
+  {x:30, z:90, w:3, d:3, h:3},
+  {x:5, z:65, w:3, d:3, h:3},
+];
+for (const b of midRises) {
+  buildingData.push({...b, type:'midrise'});
+}
+
+// --- LOW-RISES (outskirts) ---
+for (let i = 0; i < 40; i++) {
+  const x = 5 + Math.random() * 140;
+  const z = 5 + Math.random() * 100;
+  if (x > 25 && x < 100 && z > 25 && z < 80) continue; // skip core
+  buildingData.push({
+    x, z, w: 2+Math.floor(Math.random()*2), d: 2+Math.floor(Math.random()*2),
+    h: 2+Math.floor(Math.random()*4), type:'lowrise'
+  });
+}
+
+// ============ BUILDING CONSTRUCTION ============
+const allBuildingMeshes = [];
+const buildingHeights = new Float32Array(GRID_W * GRID_D).fill(0); // for collision
+
+function setHeight(x, z, h) {
+  const ix = Math.round(x), iz = Math.round(z);
+  if (ix >= 0 && ix < GRID_W && iz >= 0 && iz < GRID_D) {
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dz = -1; dz <= 1; dz++) {
+        const idx = (ix+dx) + (iz+dz)*GRID_W;
+        if (idx >= 0 && idx < GRID_W*GRID_D) {
+          buildingHeights[idx] = Math.max(buildingHeights[idx], h);
+        }
+      }
+    }
+  }
+}
+
+function buildShanghaiTower(cx, cz, h) {
+  const group = new THREE.Group();
+  const baseW = 7;
+  for (let y = 0; y < h; y++) {
+    const t = y / h; // 0..1
+    const twist = Math.sin(t * Math.PI * 0.8) * 1.2;
+    const taper = 1 - t * 0.55;
+    const w = Math.max(1, Math.round(baseW * taper));
+    const d = Math.max(1, Math.round(baseW * taper * 0.9));
+    for (let dx = 0; dx < w; dx++) {
+      for (let dz = 0; dz < d; dz++) {
+        const rx = (dx - w/2) * Math.cos(twist) - (dz - d/2) * Math.sin(twist);
+        const rz = (dx - w/2) * Math.sin(twist) + (dz - d/2) * Math.cos(twist);
+        const bx = Math.round(cx + rx);
+        const bz = Math.round(cz + rz);
+        const mat = (y === 0 || y === h-1 || y % 5 === 0) ? mats.darkGlass : mats.glass;
+        addVoxel(bx, y, bz, mat, group);
+        setHeight(bx, bz, y+1);
+      }
+    }
+  }
+  // Spire
+  for (let y = h; y < h+4; y++) {
+    const s = h+4 - y;
+    for (let dx = 0; dx < s; dx++) {
+      for (let dz = 0; dz < s; dz++) {
+        addVoxel(Math.round(cx + dx - s/2), y, Math.round(cz + dz - s/2), mats.accent, group);
+      }
+    }
+  }
+  scene.add(group);
+  allBuildingMeshes.push(group);
+}
+
+function buildSWFC(cx, cz, h) {
+  const group = new THREE.Group();
+  const w = 6, d = 6;
+  for (let y = 0; y < h; y++) {
+    const t = y / h;
+    // Trapezoidal top cutout
+    let cutoutW = 0, cutoutD = 0;
+    if (t > 0.75) {
+      const ct = (t - 0.75) / 0.25;
+      cutoutW = Math.round(w * ct * 0.5);
+      cutoutD = Math.round(d * ct * 0.5);
+    }
+    for (let dx = 0; dx < w; dx++) {
+      for (let dz = 0; dz < d; dz++) {
+        if (dx >= cutoutW && dx < w - cutoutW && dz >= cutoutD && dz < d - cutoutD) continue;
+        const mat = t > 0.8 ? mats.accent : (y % 4 === 0 ? mats.darkGlass : mats.glass);
+        addVoxel(cx + dx - w/2, y, cz + dz - d/2, mat, group);
+        setHeight(cx + dx - w/2, cz + dz - d/2, y+1);
+      }
+    }
+  }
+  // Top cap
+  for (let dx = 0; dx < w; dx++) {
+    for (let dz = 0; dz < d; dz++) {
+      if (dx > 0 && dx < w-1 && dz > 0 && dz < d-1) continue;
+      addVoxel(cx + dx - w/2, h, cz + dz - d/2, mats.accent, group);
+    }
+  }
+  scene.add(group);
+  allBuildingMeshes.push(group);
+}
+
+function buildJinMao(cx, cz, h) {
+  const group = new THREE.Group();
+  const baseW = 5, baseD = 5;
+  const tiers = 5;
+  const tierH = h / tiers;
+  for (let t = 0; t < tiers; t++) {
+    const scale = 1 - t * 0.15;
+    const w = Math.max(1, Math.round(baseW * scale));
+    const d = Math.max(1, Math.round(baseD * scale));
+    const yStart = t * tierH;
+    const yEnd = (t+1) * tierH;
+    for (let y = yStart; y < yEnd; y++) {
+      for (let dx = 0; dx < w; dx++) {
+        for (let dz = 0; dz < d; dz++) {
+          const isEdge = (dx===0||dx===w-1||dz===0||dz===d-1);
+          const mat = isEdge ? mats.darkGlass : mats.glass;
+          addVoxel(cx + dx - w/2, y, cz + dz - d/2, mat, group);
+          setHeight(cx + dx - w/2, cz + dz - d/2, y+1);
+        }
+      }
+    }
+  }
+  // Spire
+  for (let y = h; y < h+5; y++) {
+    const s = h+5 - y;
+    for (let dx = 0; dx < s; dx++) {
+      for (let dz = 0; dz < s; dz++) {
+        addVoxel(Math.round(cx + dx - s/2), y, Math.round(cz + dz - s/2), mats.accent, group);
+      }
+    }
+  }
+  scene.add(group);
+  allBuildingMeshes.push(group);
+}
+
+function buildGeneric(b) {
+  const group = new THREE.Group();
+  const {x:cx, z:cz, w, d, h} = b;
+  for (let y = 0; y < h; y++) {
+    for (let dx = 0; dx < w; dx++) {
+      for (let dz = 0; dz < d; dz++) {
+        const isEdge = (dx===0||dx===w-1||dz===0||dz===d-1);
+        let mat;
+        if (b.type === 'lowrise') mat = isEdge ? mats.concrete2 : mats.concrete;
+        else if (b.type === 'midrise') mat = isEdge ? mats.darkGlass : mats.glass;
+        else mat = isEdge ? mats.darkGlass : mats.glass;
+        // Add some window variation
+        if (b.type === 'highrise' && y % 3 === 0 && isEdge) mat = mats.white;
+        addVoxel(Math.round(cx + dx - w/2), y, Math.round(cz + dz - d/2), mat, group);
+        setHeight(Math.round(cx + dx - w/2), Math.round(cz + dz - d/2), y+1);
+      }
+    }
+  }
+  // Roof detail
+  if (h > 3) {
+    for (let dx = 0; dx < w; dx++) {
+      for (let dz = 0; dz < d; dz++) {
+        if (dx===0||dx===w-1||dz===0||dz===d-1) {
+          addVoxel(Math.round(cx + dx - w/2), h, Math.round(cz + dz - d/2), mats.accent, group);
+        }
+      }
+    }
+  }
+  scene.add(group);
+  allBuildingMeshes.push(group);
+}
+
+// Build all buildings
+for (const b of buildingData) {
+  if (b.type === 'shanghai-tower') buildShanghaiTower(b.x, b.z, b.h);
+  else if (b.type === 'swfc') buildSWFC(b.x, b.z, b.h);
+  else if (b.type === 'jinmao') buildJinMao(b.x, b.z, b.h);
+  else buildGeneric(b);
+}
+
+// ============ TREES ============
+for (let i = 0; i < 60; i++) {
+  const tx = 5 + Math.random() * 150;
+  const tz = 5 + Math.random() * 100;
+  // Check not on building
+  const idx = Math.round(tx) + Math.round(tz)*GRID_W;
+  if (idx >= 0 && idx < GRID_W*GRID_D && buildingHeights[idx] > 0) continue;
+  // Trunk
+  addVoxel(Math.round(tx), 0, Math.round(tz), mats.treeTrunk);
+  addVoxel(Math.round(tx), 1, Math.round(tz), mats.treeTrunk);
+  // Leaves (3x3x3 cube)
+  for (let ly = 2; ly < 5; ly++) {
+    const r = ly === 2 ? 1 : 0;
+    for (let dx = -r; dx <= r; dx++) {
+      for (let dz = -r; dz <= r; dz++) {
+        addVoxel(Math.round(tx+dx), ly, Math.round(tz+dz), mats.tree);
+      }
+    }
+  }
+}
+
+// ============ CARS (dynamic) ============
+const cars = [];
+const carGeo = new THREE.BoxGeometry(0.6, 0.4, 1.2);
+const carMats = [mats.carRed, mats.carWhite, mats.carBlack, mats.carYellow];
+
+// Place cars on main roads
+for (const r of roads) {
+  if (r.dir === 'h' && r.x % 8 === 0 && Math.random() < 0.15) {
+    const m = new THREE.Mesh(carGeo, carMats[Math.floor(Math.random()*4)]);
+    m.position.set(r.x + 0.3, ROAD_Y + 0.4, r.z + 0.5);
+    m.castShadow = true;
+    scene.add(m);
+    cars.push({mesh:m, x:r.x, z:r.z, dir:'h', speed: 0.03 + Math.random()*0.04, lane: Math.random()<0.5?1:-1});
+  }
+  if (r.dir === 'v' && r.z % 8 === 0 && Math.random() < 0.15) {
+    const m = new THREE.Mesh(carGeo, carMats[Math.floor(Math.random()*4)]);
+    m.position.set(r.x + 0.5, ROAD_Y + 0.4, r.z + 0.3);
+    m.castShadow = true;
+    scene.add(m);
+    cars.push({mesh:m, x:r.x, z:r.z, dir:'v', speed: 0.03 + Math.random()*0.04, lane: Math.random()<0.5?1:-1});
+  }
+}
+
+// ============ CONTROLS ============
+let currentMode = 'god';
+const orbitControls = new OrbitControls(camera, renderer.domElement);
+orbitControls.enableDamping = true;
+orbitControls.dampingFactor = 0.08;
+orbitControls.minDistance = 15;
+orbitControls.maxDistance = 250;
+orbitControls.maxPolarAngle = Math.PI * 0.48;
+orbitControls.target.set(80, 15, 55);
+
+const pointerLockControls = new PointerLockControls(camera, renderer.domElement);
+
+// First-person movement state
+const moveState = { forward:false, backward:false, left:false, right:false, jump:false, speed:0.25 };
+const velocity = new THREE.Vector3();
+const direction = new THREE.Vector3();
+let canJump = true;
+let fpY = 3; // first-person camera height
+let fpX = 80, fpZ = 55; // start position
+
+function setMode(mode) {
+  currentMode = mode;
+  const btnGod = document.getElementById('btn-god');
+  const btnFps = document.getElementById('btn-fps');
+  const modeLabel = document.getElementById('mode-label');
+  const crosshair = document.getElementById('crosshair');
+  const helpText = document.getElementById('help-text');
+
+  if (mode === 'god') {
+    btnGod.classList.add('active');
+    btnFps.classList.remove('active');
+    modeLabel.textContent = 'GOD VIEW · 轨道相机';
+    crosshair.style.display = 'none';
+    orbitControls.enabled = true;
+    pointerLockControls.unlock();
+    helpText.innerHTML = `<kbd>鼠标拖拽</kbd> 旋转 · <kbd>滚轮</kbd> 缩放 · <kbd>右键拖拽</kbd> 平移<br><button class="btn" onclick="setMode('fps')" style="margin-top:6px;padding:4px 10px;font-size:11px;">切换第一人称 →</button>`;
+  } else {
+    btnFps.classList.add('active');
+    btnGod.classList.remove('active');
+    modeLabel.textContent = 'FIRST PERSON · 第一人称漫游';
+    crosshair.style.display = 'block';
+    orbitControls.enabled = false;
+    pointerLockControls.lock();
+    fpX = camera.position.x;
+    fpZ = camera.position.z;
+    fpY = camera.position.y;
+    helpText.innerHTML = `<kbd>W/A/S/D</kbd> 移动 · <kbd>空格</kbd> 跳跃 · <kbd>鼠标</kbd> 视角<br><kbd>ESC</kbd> 退出指针锁定 · <button class="btn" onclick="setMode('god')" style="margin-top:6px;padding:4px 10px;font-size:11px;">切换上帝视角 →</button>`;
+  }
+}
+
+// Expose setMode globally for button onclicks
+window.setMode = setMode;
+window.toggleDayNight = function() {
+  isNight = !isNight;
+  if (isNight) {
+    scene.background.set(0x050810);
+    scene.fog.color.set(0x050810);
+    ambientLight.color.set(0x1a2244);
+    ambientLight.intensity = 0.3;
+    sunLight.color.set(0x446688);
+    sunLight.intensity = 0.4;
+    hemiLight.color.set(0x223355);
+    hemiLight.intensity = 0.15;
+    // Night window lights on buildings
+    for (const g of allBuildingMeshes) {
+      for (const child of g.children) {
+        if (child.material === mats.glass || child.material === mats.darkGlass) {
+          if (Math.random() < 0.3) {
+            child.material = mats.nightWindow;
+          }
+        }
+      }
+    }
+  } else {
+    scene.background.set(0x0a0e1a);
+    scene.fog.color.set(0x0a0e1a);
+    ambientLight.color.set(0x334466);
+    ambientLight.intensity = 0.7;
+    sunLight.color.set(0xfff5e6);
+    sunLight.intensity = 2.2;
+    hemiLight.color.set(0x88aaff);
+    hemiLight.intensity = 0.4;
+    // Restore materials
+    for (const g of allBuildingMeshes) {
+      for (const child of g.children) {
+        if (child.material === mats.nightWindow) {
+          child.material = mats.glass;
+        }
+      }
+    }
+  }
+};
+let isNight = false;
+
+// Pointer lock event
+pointerLockControls.addEventListener('lock', () => {
+  if (currentMode === 'fps') {
+    // already locked
+  }
+});
+pointerLockControls.addEventListener('unlock', () => {
+  if (currentMode === 'fps') {
+    // Switch back to god view on unlock
+    setMode('god');
+  }
+});
+
+// Keyboard events
+document.addEventListener('keydown', (e) => {
+  if (currentMode !== 'fps') return;
+  switch (e.code) {
+    case 'KeyW': moveState.forward = true; break;
+    case 'KeyA': moveState.left = true; break;
+    case 'KeyS': moveState.backward = true; break;
+    case 'KeyD': moveState.right = true; break;
+    case 'Space': if (canJump) { velocity.y = 0.25; canJump = false; } break;
+  }
+});
+document.addEventListener('keyup', (e) => {
+  switch (e.code) {
+    case 'KeyW': moveState.forward = false; break;
+    case 'KeyA': moveState.left = false; break;
+    case 'KeyS': moveState.backward = false; break;
+    case 'KeyD': moveState.right = false; break;
+  }
+});
+
+// ============ COLLISION CHECK ============
+function isWalkable(nx, nz) {
+  const ix = Math.round(nx), iz = Math.round(nz);
+  if (ix < 0 || ix >= GRID_W || iz < 0 || iz >= GRID_D) return false;
+  const idx = ix + iz * GRID_W;
+  if (idx < 0 || idx >= GRID_W*GRID_D) return false;
+  const h = buildingHeights[idx];
+  return h < 2; // can walk if building < 2 voxels
+}
+
+// ============ WATER ANIMATION ============
+let waterPhase = 0;
+
+// ============ ANIMATION LOOP ============
+const clock = new THREE.Clock();
+let frameCount = 0, lastFpsTime = 0, fpsDisplay = 0;
+
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.05);
+  const t = clock.getElapsedTime();
+
+  // --- FPS mode ---
+  if (currentMode === 'fps' && pointerLockControls.isLocked) {
+    // Movement
+    velocity.x -= velocity.x * 8.0 * dt;
+    velocity.z -= velocity.z * 8.0 * dt;
+    direction.z = Number(moveState.forward) - Number(moveState.backward);
+    direction.x = Number(moveState.right) - Number(moveState.left);
+    direction.normalize();
+
+    if (moveState.forward || moveState.backward) {
+      velocity.z -= direction.z * moveState.speed * 60 * dt;
+    }
+    if (moveState.left || moveState.right) {
+      velocity.x -= direction.x * moveState.speed * 60 * dt;
+    }
+
+    // Get camera direction for movement
+    const camDir = new THREE.Vector3();
+    camera.getWorldDirection(camDir);
+    camDir.y = 0;
+    camDir.normalize();
+    const camRight = new THREE.Vector3();
+    camRight.crossVectors(camDir, new THREE.Vector3(0,1,0)).normalize();
+
+    const moveX = -velocity.z * camDir.x + -velocity.x * camRight.x;
+    const moveZ = -velocity.z * camDir.z + -velocity.x * camRight.z;
+
+    const newX = fpX + moveX;
+    const newZ = fpZ + moveZ;
+
+    // Collision
+    if (isWalkable(newX, fpZ)) fpX = newX;
+    if (isWalkable(fpX, newZ)) fpZ = newZ;
+
+    // Gravity
+    velocity.y -= 9.8 * dt;
+    fpY += velocity.y;
+    // Ground collision
+    const groundH = 2; // ground + some offset
+    if (fpY < groundH) {
+      fpY = groundH;
+      velocity.y = 0;
+      canJump = true;
+    }
+
+    camera.position.set(fpX, fpY, fpZ);
+  }
+
+  // --- Water animation ---
+  waterPhase += dt * 0.8;
+  for (const block of riverBlocks) {
+    const baseY = WATER_Y + VOXEL/2;
+    block.position.y = baseY + Math.sin(waterPhase + block.position.x*0.3 + block.position.z*0.2) * 0.04;
+  }
+
+  // --- Car animation ---
+  for (const car of cars) {
+    if (car.dir === 'h') {
+      car.mesh.position.x += car.speed * car.lane;
+      if (car.mesh.position.x > GRID_W) car.mesh.position.x = 0;
+      if (car.mesh.position.x < 0) car.mesh.position.x = GRID_W;
+    } else {
+      car.mesh.position.z += car.speed * car.lane;
+      if (car.mesh.position.z > GRID_D) car.mesh.position.z = 0;
+      if (car.mesh.position.z < 0) car.mesh.position.z = GRID_D;
+    }
+  }
+
+  // --- Orbit controls ---
+  if (currentMode === 'god') {
+    orbitControls.update();
+  }
+
+  // --- Night light flicker ---
+  if (isNight && Math.random() < 0.02) {
+    for (const g of allBuildingMeshes) {
+      for (const child of g.children) {
+        if (child.material === mats.nightWindow) {
+          if (Math.random() < 0.05) {
+            child.material = new THREE.MeshLambertMaterial({
+              color: 0xff4422, emissive: 0xff2200
+            });
+          }
+        }
+      }
+    }
+  }
+
+  // --- FPS counter ---
+  frameCount++;
+  if (t - lastFpsTime >= 1) {
+    fpsDisplay = Math.round(frameCount / (t - lastFpsTime));
+    frameCount = 0;
+    lastFpsTime = t;
+    document.getElementById('fps').textContent = `FPS: ${fpsDisplay}`;
+  }
+
+  renderer.render(scene, camera);
+}
+
+animate();
+
+// ============ RESIZE ============
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// Initial mode set
+setMode('god');
+
+console.log('Voxel Lujiazui ready. 🌆 Three.js voxel scene initialized.');
+console.log('Buildings:', buildingData.length, '| Cars:', cars.length, '| River blocks:', riverBlocks.length);
+</script>
+</body>
+</html>

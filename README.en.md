@@ -1,6 +1,6 @@
 # AI Prompt Test Benchmark Suite
 
-This repository is a standardized evaluation suite containing **44 benchmark projects** (L1–L4) for auditing AI code generation, physics simulations, 3D graphics, and hardware protocols, plus a root-level **[Image/](./Image/)** partition with **6** independent image-generation items. L1–L4 projects are stored in 4 difficulty tiers and catalogued by domain in **[DOMAIN_INDEX.en.md](./DOMAIN_INDEX.en.md)**; image items are listed in **[Image/README.md](./Image/README.md)**.
+This repository is a standardized evaluation suite containing **57 benchmark projects** (L1–L4) for auditing AI code generation, physics simulations, 3D graphics, and hardware protocols, plus a root-level **[Image/](./Image/)** partition with **6** independent image-generation items. L1–L4 projects are stored in 4 difficulty tiers and catalogued by domain in **[DOMAIN_INDEX.en.md](./DOMAIN_INDEX.en.md)**; image items are listed in **[Image/README.md](./Image/README.md)**.
 
 **[中文文档 →](./README.md)** ｜ **[Domain Catalog with Copy-Ready Prompts →](./DOMAIN_INDEX.en.md)** ｜ **[Image Partition →](./Image/README.md)**
 
@@ -10,10 +10,10 @@ This repository is a standardized evaluation suite containing **44 benchmark pro
 
 ```
 benchmark/
-├── L1_Basic/                     # Level 1: Basic tools & scripts (5 projects)
-├── L2_Intermediate/              # Level 2: Web apps, interactive games & text writing (13 projects)
-├── L3_Advanced/                  # Level 3: 3D engines & physics simulation (16 projects)
-├── L4_Expert/                    # Level 4: Native engines & hardware protocols (11 projects)
+├── L1_Basic/                     # Level 1: Basic tools & scripts (8 projects)
+├── L2_Intermediate/              # Level 2: Web apps, interactive games & text writing (15 projects)
+├── L3_Advanced/                  # Level 3: 3D engines & physics simulation (21 projects)
+├── L4_Expert/                    # Level 4: Native engines & hardware protocols (13 projects)
 ├── Image/                        # Image generation & editing (6 independent items)
 ├── DOMAIN_INDEX.en.md            # Domain catalog with embedded copy-ready prompts (English)
 ├── DOMAIN_INDEX.zh.md            # Domain catalog with embedded copy-ready prompts (Chinese)
@@ -180,3 +180,24 @@ Targeting native Python/C++/OpenGL rendering engines, DSP audio synthesis, UDP t
 ## 6. License
 
 This project is licensed under the [MIT License](LICENSE).
+
+<!-- VISUAL-BACKEND:START -->
+
+## Visual Backend Suite
+
+Eight registered tasks, two per level. B01 reuses the existing Bilibili task; seven projects are newly registered. Timing and difficulty are being calibrated in independent CLI sessions.
+
+[Suite and pilot results](./Backend/README.md) · [Machine-readable registry](./Backend/BANK.json)
+
+| ID | Level | Task | Input |
+|---|---|---|---|
+| B01 | L1 | [B 站评论 IP 属地脚本](./L1_Basic/BilibiliUserscript/README.md) | [Prompt](./Backend/dispatch/BilibiliControlled/PROJECT_PROMPT.md) |
+| B02 | L1 | [HTTP 健康探针与可视化报告](./L1_Basic/HttpHealthProbe/README.md) | [Prompt](./L1_Basic/HttpHealthProbe/PROJECT_PROMPT.md) |
+| B03 | L2 | [目录重复文件检测器](./L2_Intermediate/DuplicateFileInspector/README.md) | [Prompt](./L2_Intermediate/DuplicateFileInspector/PROJECT_PROMPT.md) |
+| B04 | L2 | [本地短链接与访问统计台](./L2_Intermediate/LocalShortLinks/README.md) | [Prompt](./L2_Intermediate/LocalShortLinks/PROJECT_PROMPT.md) |
+| B05 | L3 | [乱序订单事件回放与对账报告](./L3_Advanced/OrderEventReplay/README.md) | [Prompt](./L3_Advanced/OrderEventReplay/PROJECT_PROMPT.md) |
+| B06 | L3 | [限流与熔断代理工作台](./L3_Advanced/ResilientGateway/README.md) | [Prompt](./L3_Advanced/ResilientGateway/PROJECT_PROMPT.md) |
+| B07 | L4 | [Raft 在线换节点与无日志读取](./L4_Expert/RaftTxnWorkbench/README.md) | [Prompt](./L4_Expert/RaftTxnWorkbench/PROJECT_PROMPT.md) |
+| B08 | L4 | [检查点恢复与跨进程世代隔离](./L4_Expert/DurableCollab/README.md) | [Prompt](./L4_Expert/DurableCollab/PROJECT_PROMPT.md) |
+
+<!-- VISUAL-BACKEND:END -->

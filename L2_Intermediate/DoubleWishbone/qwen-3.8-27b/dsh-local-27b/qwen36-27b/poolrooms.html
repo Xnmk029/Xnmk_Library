@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Poolrooms</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;overflow:hidden;background:#000}
+canvas{display:block}
+#blocker{position:fixed;inset:0;z-index:100;background:rgba(0,0,0,0.8);display:flex;align-items:center;justify-content:center;flex-direction:column;cursor:pointer;font-family:'Segoe UI',Arial,sans-serif;transition:opacity .5s}
+#blocker h1{color:#8ec8e8;font-size:3em;font-weight:300;letter-spacing:0.3em;text-shadow:0 0 40px rgba(100,180,255,0.4);margin-bottom:20px}
+#blocker p{color:#7a9ab5;font-size:1.1em;letter-spacing:0.1em}
+#crosshair{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:4px;height:4px;background:rgba(255,255,255,0.25);border-radius:50%;z-index:50;pointer-events:none;display:none}
+</style>
+</head>
+<body>
+<div id="blocker"><h1>Poolrooms</h1><p>Click to explore</p></div>
+<div id="crosshair"></div>
+
+<script type="importmap">
+{"imports":{
+"three":"https://cdn.jsdelivr.net/npm/three@0.163.0/build/three.module.js",
+"three/addons/":"https://cdn.jsdelivr.net/npm/three@0.163.0/examples/jsm/"
+}}
+</script>
+
+<script type="module">
+import*as THREE from'three';
+import{PointerLockControls}from'three/addons/controls/PointerLockControls.js';
+import{EffectComposer}from'three/addons/postprocessing/EffectComposer.js';
+import{RenderPass}from'three/addons/postprocessing/RenderPass.js';
+import{UnrealBloomPass}from'three/addons/postprocessing/UnrealBloomPass.js';
+import{SSAOPass}from'three/addons/postprocessing/SSAOPass.js';
+import{OutputPass}from'three/addons/postprocessing/OutputPass.js';
+import{ShaderPass}from'three/addons/postprocessing/ShaderPass.js';
+
+/* ═══════════════════════════════════════════════════════════
+   CONFIG
+   ═══════════════════════════════════════════════════════════ */
+const PH=1.7,SPD=4.5,CS=20;
+const clock=new THREE.Clock();
+let scene,camera,renderer,composer,controls,ssaoPass;
+const chunks=new Map(),waters=[];
+let mF=false,mB=false,mL=false,mR=false;
+const vel=new THREE.Vector3(),dir=new THREE.Vector3();
+let pCX=null,pCZ=null,underwaterFactor=0;
+
+/* ═══════════════════════════════════════════════════════════
+   NOISE
+   ═══════════════════════════════════════════════════════════ */
+class Noise{
+constructor(seed){
+this.p=new Uint8Array(512);const p=new Uint8Array(256);
+for(let i=0;i<256;i++)p[i]=i;
+let s=Math.abs(seed)*2147483647|0;
+for(let i=255;i>0;i--){s=((s*16807)%2147483647)||1;const j=s%(i+1);[p[i],p[j]]=[p[j],p[i]]}
+for(let i=0;i<512;i++)this.p[i]=p[i&255];
+}
+n2D(x,y){
+const F2=.5*(Math.sqrt(3)-1),G2=(3-Math.sqrt(3))/6;
+const s=(x+y)*F2,i=Math.floor(x+s),j=Math.floor(y+s);
+const t=(i+j)*G2,x0=x-(i-t),y0=y-(j-t);
+const[i1,j1]=x0>y0?[1,0]:[0,1];
+const x1=x0-i1+G2,y1=y0-j1+G2,x2=x0-1+2*G2,y2=y0-1+2*G2;
+const ii=i&255,jj=j&255;
+const grad=(h,x,y)=>{const v=h&3;return((v&1)?-x:x)+((v&2)?-y:y)};
+let n0=0,n1=0,n2=0;
+let t0=.5-x0*x0-y0*y0;if(t0>0){t0*=t0;n0=t0*t0*grad(this.p[ii+this.p[jj]],x0,y0)}
+let t1=.5-x1*x1-y1*y1;if(t1>0){t1*=t1;n1=t1*t1*grad(this.p[ii+i1+this.p[jj+j1]],x1,y1)}
+let t2=.5-x2*x2-y2*y2;if(t2>0){t2*=t2;n2=t2*t2*grad(this.p[ii+1+this.p[jj+1]],x2,y2)}
+return 70*(n0+n1+n2);
+}
+fbm(x,y,o=4){let v=0,a=1,f=1,m=0;for(let i=0;i<o;i++){v+=this.n2D(x*f,y*f)*a;m+=a;a*=.5;f*=2}return v/m}
+}
+const R=new Noise(42);
+
+function hash(cx,cz,seed){const h=((cx*374761393+cz*668265263+seed*1274126177)^4170816240)&0x7fffffff;return(h%1000)/1000}
+
+/* ═══════════════════════════════════════════════════════════
+   PROCEDURAL TEXTURES
+   ═══════════════════════════════════════════════════════════ */
+function tileTex(sz,c1,gc){
+const cv=document.createElement('canvas');cv.width=cv.height=sz;const c=cv.getContext('2d');
+const n=4,ts=sz/n,gw=3;
+for(let ty=0;ty<n;ty++)for(let tx=0;tx<n;tx++){
+const r=parseInt(c1.slice(1,3),16),g=parseInt(c1.slice(3,5),16),b=parseInt(c1.slice(5,7),16);
+const v=((tx+ty*7)*13)%20-10;
+c.fillStyle=`rgb(${Math.max(0,Math.min(255,r+v))},${Math.max(0,Math.min(255,g+v))},${Math.max(0,Math.min(255,b+v))})`;
+c.fillRect(tx*ts+gw,ty*ts+gw,ts-gw*2,ts-gw*2);
+for(let i=0;i<60;i++){
+const px=tx*ts+gw+Math.random()*(ts-gw*2),py=ty*ts+gw+Math.random()*(ts-gw*2);
+c.fillStyle=`rgba(255,255,255,${Math.random()*0.05})`;c.fillRect(px,py,Math.random()*3+1,Math.random()*3+1);
+}}
+c.strokeStyle=gc;c.lineWidth=gw;c.beginPath();
+for(let i=0;i<=n;i++){c.moveTo(i*ts,0);c.lineTo(i*ts,sz);c.moveTo(0,i*ts);c.lineTo(sz,i*ts)}c.stroke();
+const t=new THREE.CanvasTexture(cv);t.wrapS=t.wrapT=THREE.RepeatWrapping;t.anisotropy=8;return t;
+}
+function tileNorm(sz){
+const cv=document.createElement('canvas');cv.width=cv.height=sz;const c=cv.getContext('2d');
+c.fillStyle='rgb(128,128,255)';c.fillRect(0,0,sz,sz);
+const n=4,ts=sz/n,gw=3;
+for(let ty=0;ty<n;ty++)for(let tx=0;tx<n;tx++){
+for(let i=0;i<80;i++){const px=tx*ts+gw+Math.random()*(ts-gw*2),py=ty*ts+gw+Math.random()*(ts-gw*2);const v=(128+Math.random()*16-8)|0;c.fillStyle=`rgb(${v},${v},255)`;c.fillRect(px,py,2,2)}}
+c.strokeStyle='rgb(128,128,185)';c.lineWidth=gw;c.beginPath();
+for(let i=0;i<=n;i++){c.moveTo(i*ts,0);c.lineTo(i*ts,sz);c.moveTo(0,i*ts);c.lineTo(sz,i*ts)}c.stroke();
+const t=new THREE.CanvasTexture(cv);t.wrapS=t.wrapT=THREE.RepeatWrapping;return t;
+}
+function concreteTex(sz){
+const cv=document.createElement('canvas');cv.width=cv.height=sz;const c=cv.getContext('2d');
+c.fillStyle='#8a8a85';c.fillRect(0,0,sz,sz);
+for(let i=0;i<8000;i++){const px=Math.random()*sz,py=Math.random()*sz;const v=(110+Math.random()*50)|0;c.fillStyle=`rgba(${v},${v},${(v-3)|0},${Math.random()*0.25})`;c.fillRect(px,py,Math.random()*4+1,Math.random()*4+1)}
+for(let i=0;i<20;i++){c.strokeStyle=`rgba(80,80,75,${Math.random()*0.12})`;c.lineWidth=Math.random()*2+.5;c.beginPath();c.moveTo(Math.random()*sz,Math.random()*sz);c.bezierCurveTo(Math.random()*sz,Math.random()*sz,Math.random()*sz,Math.random()*sz,Math.random()*sz,Math.random()*sz);c.stroke()}
+const t=new THREE.CanvasTexture(cv);t.wrapS=t.wrapT=THREE.RepeatWrapping;t.anisotropy=8;return t;
+}
+function aoTex(sz){
+const cv=document.createElement('canvas');cv.width=cv.height=sz;const c=cv.getContext('2d');
+c.fillStyle='#ddd';c.fillRect(0,0,sz,sz);
+const n=4,ts=sz/n;c.fillStyle='#999';
+for(let i=0;i<=n;i++){c.fillRect(i*ts-2,0,4,sz);c.fillRect(0,i*ts-2,sz,4)}
+const t=new THREE.CanvasTexture(cv);t.wrapS=t.wrapT=THREE.RepeatWrapping;return t;
+}
+function bumpTex(sz){
+const cv=document.createElement('canvas');cv.width=cv.height=sz;const c=cv.getContext('2d');
+c.fillStyle='#808080';c.fillRect(0,0,sz,sz);
+for(let i=0;i<5000;i++){const v=(128+Math.random()*24-12)|0;c.fillStyle=`rgb(${v},${v},${v})`;c.fillRect(Math.random()*sz,Math.random()*sz,2,2)}
+const t=new THREE.CanvasTexture(cv);t.wrapS=t.wrapT=THREE.RepeatWrapping;return t;
+}
+function roughTex(sz,b){
+const cv=document.createElement('canvas');cv.width=cv.height=sz;const c=cv.getContext('2d');
+const v=(b*255)|0;c.fillStyle=`rgb(${v},${v},${v})`;c.fillRect(0,0,sz,sz);
+for(let i=0;i<3000;i++){const nv=Math.max(0,Math.min(255,(b*255+Math.random()*40-20)|0));c.fillStyle=`rgb(${nv},${nv},${nv})`;c.fillRect(Math.random()*sz,Math.random()*sz,3,3)}
+const t=new THREE.CanvasTexture(cv);t.wrapS=t.wrapT=THREE.RepeatWrapping;return t;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   MATERIALS
+   ═══════════════════════════════════════════════════════════ */
+const matPool=new THREE.MeshStandardMaterial({map:tileTex(512,'#c8dce8','#5a7a8a'),normalMap:tileNorm(512),normalScale:new THREE.Vector2(.3,.3),roughnessMap:roughTex(256,.12),roughness:.15,metalness:.02,aoMap:aoTex(512),aoMapIntensity:.5});
+const matWall=new THREE.MeshStandardMaterial({map:tileTex(512,'#d8e8f0','#4a6a7a'),normalMap:tileNorm(512),normalScale:new THREE.Vector2(.2,.2),roughnessMap:roughTex(256,.18),roughness:.2,metalness:.02,aoMap:aoTex(512),aoMapIntensity:.6});
+const matCeil=new THREE.MeshStandardMaterial({map:tileTex(512,'#e0ecf2','#5a7a8a'),normalMap:tileNorm(512),normalScale:new THREE.Vector2(.15,.15),roughness:.3,metalness:0,aoMap:aoTex(512),aoMapIntensity:.3});
+const matConc=new THREE.MeshStandardMaterial({map:concreteTex(512),normalMap:bumpTex(256),normalScale:new THREE.Vector2(.4,.4),roughnessMap:roughTex(256,.8),roughness:.85,metalness:0,aoMap:aoTex(256),aoMapIntensity:.3});
+const matDark=new THREE.MeshStandardMaterial({map:tileTex(512,'#6a8a9a','#2a4a5a'),normalMap:tileNorm(512),normalScale:new THREE.Vector2(.3,.3),roughnessMap:roughTex(256,.1),roughness:.1,metalness:.05,aoMap:aoTex(512),aoMapIntensity:.5});
+
+/* ═══════════════════════════════════════════════════════════
+   WATER SHADER
+   ═══════════════════════════════════════════════════════════ */
+const WVert=`
+uniform float uTime;
+varying vec3 vWP;varying vec3 vN;varying vec2 vUv;
+void main(){
+vUv=uv;vec3 p=position;
+float w=sin(p.x*1.5+uTime*.8)*cos(p.y*1.2+uTime*.6)*.025
+      +sin(p.x*3.+p.y*2.5+uTime*1.2)*.008
+      +sin(p.x*.5+uTime*.3)*sin(p.y*.7+uTime*.4)*.018
+      +sin(p.x*5.+uTime*2.)*cos(p.y*4.-uTime*1.5)*.004;
+p.z+=w;
+float dx=cos(p.x*1.5+uTime*.8)*1.5*cos(p.y*1.2+uTime*.6)*.025
+        +cos(p.x*3.+p.y*2.5+uTime*1.2)*3.*.008
+        +cos(p.x*.5+uTime*.3)*.5*sin(p.y*.7+uTime*.4)*.018
+        +cos(p.x*5.+uTime*2.)*5.*cos(p.y*4.-uTime*1.5)*.004;
+float dy=-sin(p.x*1.5+uTime*.8)*sin(p.y*1.2+uTime*.6)*1.2*.025
+        +cos(p.x*3.+p.y*2.5+uTime*1.2)*2.5*.008
+        +sin(p.x*.5+uTime*.3)*cos(p.y*.7+uTime*.4)*.7*.018
+        -sin(p.x*5.+uTime*2.)*cos(p.y*4.-uTime*1.5)*4.*.004;
+vN=normalize(vec3(-dx,-dy,1.));
+vec4 wp=modelMatrix*vec4(p,1.);vWP=wp.xyz;
+gl_Position=projectionMatrix*viewMatrix*wp;
+}`;
+
+const WFrag=`
+uniform vec3 uDeep,uShallow,uFog,uCam;
+uniform float uTime;
+varying vec3 vWP,vN;varying vec2 vUv;
+float caustic(vec2 uv,float t){
+vec2 p=uv*6.+t*.08;float c=0.;
+for(int i=0;i<4;i++){
+vec2 q=p*float(i+1);
+c+=sin(q.x*6.28+sin(q.y*3.14+t*float(i)))*cos(q.y*6.28+cos(q.x*2.71+t*float(i+1)));
+}return pow(max(c/4.+0.5,0.),3.);
+}
+void main(){
+vec3 N=normalize(vN),V=normalize(uCam-vWP);
+float fr=pow(1.-max(dot(N,V),0.),4.);
+// Pseudo-depth: distance from pool center (flat plane -> use local uv distance to center)
+float dcen=distance(vUv,vec2(.5));
+float depth=smoothstep(.0,.45,dcen);
+vec3 wc=mix(uShallow,uDeep,depth);
+// Caustics stronger near edges, weaker deep
+float cau=caustic(vWP.xy*.4,uTime);
+wc+=vec3(.85,.95,.9)*cau*.2*(1.-depth*.3);
+// Reflection
+vec3 R=reflect(-V,N);
+float rf=smoothstep(-.3,.3,R.y);
+vec3 rc=mix(vec3(.2,.3,.4),vec3(.45,.55,.65),rf);
+wc=mix(wc,rc,fr*.7);
+// Specular (sun glint)
+vec3 L=normalize(vec3(.5,1.,.3)),H=normalize(L+V);
+float sp=pow(max(dot(N,H),0.),512.);
+wc+=vec3(1.,.97,.93)*sp*.7;
+// Fake refraction toward bottom color (darkens deep water)
+wc*=mix(1.,.7,depth*fr);
+// Distance fog
+float dist=length(vWP-uCam);
+wc=mix(wc,uFog,1.-exp(-dist*.012));
+float a=mix(.78,.96,fr);
+gl_FragColor=vec4(wc,a);
+}`;
+
+function makeWater(deep,shallow){
+return new THREE.ShaderMaterial({
+vertexShader:WVert,fragmentShader:WFrag,
+uniforms:{uDeep:{value:new THREE.Color(deep)},uShallow:{value:new THREE.Color(shallow)},uFog:{value:new THREE.Color(0x1a2a35)},uTime:{value:0},uCam:{value:new THREE.Vector3()}},
+transparent:true,side:THREE.DoubleSide,depthWrite:false
+});
+}
+
+/* ═══════════════════════════════════════════════════════════
+   SCENE SETUP
+   ═══════════════════════════════════════════════════════════ */
+scene=new THREE.Scene();
+scene.background=new THREE.Color(0x1a2a35);
+scene.fog=new THREE.FogExp2(0x1a2a35,.01);
+
+camera=new THREE.PerspectiveCamera(72,innerWidth/innerHeight,.1,250);
+camera.position.set(0,PH,0);
+
+renderer=new THREE.WebGLRenderer({antialias:true,powerPreference:'high-performance'});
+renderer.setSize(innerWidth,innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+renderer.toneMapping=THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure=.85;
+renderer.shadowMap.enabled=true;
+renderer.shadowMap.type=THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+// Environment map
+const pmrem=new THREE.PMREMGenerator(renderer);
+const eS=new THREE.Scene();eS.background=new THREE.Color(0x3a5568);
+eS.add(Object.assign(new THREE.Mesh(new THREE.SphereGeometry(50,32,32),new THREE.MeshBasicMaterial({color:0x4a6a8a,side:THREE.BackSide}))));
+const l1=new THREE.PointLight(0xaaccff,3,100);l1.position.set(10,15,10);eS.add(l1);
+const l2=new THREE.PointLight(0x88aacc,2,100);l2.position.set(-10,10,-5);eS.add(l2);
+const envMap=pmrem.fromScene(eS).texture;pmrem.dispose();
+scene.environment=envMap;
+matPool.envMap=envMap;matWall.envMap=envMap;matDark.envMap=envMap;matConc.envMap=envMap;matCeil.envMap=envMap;
+
+/* ═══════════════════════════════════════════════════════════
+   POST-PROCESSING
+   ═══════════════════════════════════════════════════════════ */
+composer=new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene,camera));
+ssaoPass=new SSAOPass(scene,camera,innerWidth,innerHeight);
+ssaoPass.kernelRadius=12;ssaoPass.minDistance=.003;ssaoPass.maxDistance=.15;
+composer.addPass(ssaoPass);
+composer.addPass(new UnrealBloomPass(new THREE.Vector2(innerWidth,innerHeight),.12,.5,.82));
+composer.addPass(new OutputPass());
+composer.addPass(new ShaderPass({
+uniforms:{tDiffuse:{value:null}},
+vertexShader:`varying vec2 vUv;void main(){vUv=uv;gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.);}`,
+fragmentShader:`uniform sampler2D tDiffuse;varying vec2 vUv;void main(){vec4 c=texture2D(tDiffuse,vUv);vec2 u=(vUv-.5)*2.;c.rgb*=1.-dot(u,u)*.2;c.rgb*=vec3(.97,.99,1.03);gl_FragColor=c;}`
+}));
+
+/* ═══════════════════════════════════════════════════════════
+   LIGHTING
+   ═══════════════════════════════════════════════════════════ */
+scene.add(new THREE.AmbientLight(0x2a3a4a,.35));
+scene.add(new THREE.HemisphereLight(0x8ab8d8,0x3a4a3a,.55));
+const sun=new THREE.DirectionalLight(0xc8ddf0,1.1);
+sun.position.set(10,20,5);sun.castShadow=true;
+sun.shadow.mapSize.set(2048,2048);
+const sc=28;sun.shadow.camera.left=-sc;sun.shadow.camera.right=sc;sun.shadow.camera.top=sc;sun.shadow.camera.bottom=-sc;sun.shadow.camera.near=1;sun.shadow.camera.far=70;
+sun.shadow.bias=-.0005;scene.add(sun);scene.add(sun.target);
+const pl=new THREE.PointLight(0x4488aa,.6,20);scene.add(pl);
+
+/* ═══════════════════════════════════════════════════════════
+   CONTROLS
+   ═══════════════════════════════════════════════════════════ */
+controls=new PointerLockControls(camera,document.body);
+const blocker=document.getElementById('blocker'),crosshair=document.getElementById('crosshair');
+blocker.onclick=()=>controls.lock();
+controls.addEventListener('lock',()=>{blocker.style.display='none';crosshair.style.display='block'});
+controls.addEventListener('unlock',()=>{blocker.style.display='flex';crosshair.style.display='none'});
+document.addEventListener('keydown',e=>{switch(e.code){case'KeyW':mF=true;break;case'KeyS':mB=true;break;case'KeyA':mL=true;break;case'KeyD':mR=true;break;}});
+document.addEventListener('keyup',e=>{switch(e.code){case'KeyW':mF=false;break;case'KeyS':mB=false;break;case'KeyA':mL=false;break;case'KeyD':mR=false;break;}});
+
+/* ═══════════════════════════════════════════════════════════
+   HELPERS
+   ═══════════════════════════════════════════════════════════ */
+function bx(w,h,d,mat,px,py,pz){const m=new THREE.Mesh(new THREE.BoxGeometry(w,h,d),mat);m.position.set(px,py,pz);m.castShadow=true;m.receiveShadow=true;scene.add(m);return m}
+function fl(w,d,mat,px,py,pz){const m=new THREE.Mesh(new THREE.PlaneGeometry(w,d),mat);m.rotation.x=-Math.PI/2;m.position.set(px,py,pz);m.receiveShadow=true;scene.add(m);return m}
+function ce(w,d,mat,px,py,pz){const m=new THREE.Mesh(new THREE.PlaneGeometry(w,d),mat);m.rotation.x=Math.PI/2;m.position.set(px,py,pz);m.receiveShadow=true;scene.add(m);return m}
+function aw(w,d,deep,shallow,px,py,pz,seg=48){const wm=makeWater(deep,shallow);const m=new THREE.Mesh(new THREE.PlaneGeometry(w,d,seg,seg),wm);m.rotation.x=-Math.PI/2;m.position.set(px,py,pz);scene.add(m);waters.push(m);return m}
+
+/* ═══════════════════════════════════════════════════════════
+   WALL BUILDER (with door openings)
+   ═══════════════════════════════════════════════════════════ */
+// Builds walls for a room at (ox,oz) size CS×CS, with optional door openings
+// doors: array of {axis:'x'|'z', pos: coordinate, width: door width}
+function buildRoomWalls(ox,oz,wh,mat,doors=[]){
+const objs=[];
+// Wall at z=oz (far), z=oz+CS (near), x=ox (left), x=ox+CS (right)
+const wallDefs=[
+{axis:'z',coord:oz,w:CS,h:wh,d:.2,px:ox+CS/2,pz:oz,py:wh/2},
+{axis:'z',coord:oz+CS,w:CS,h:wh,d:.2,px:ox+CS/2,pz:oz+CS,py:wh/2},
+{axis:'x',coord:ox,w:CS,h:wh,d:.2,px:ox,py:wh/2,pz:oz+CS/2,rotY:true},
+{axis:'x',coord:ox+CS,w:CS,h:wh,d:.2,px:ox+CS,py:wh/2,pz:oz+CS/2,rotY:true},
+];
+for(const wd of wallDefs){
+const relevantDoors=doors.filter(d=>d.axis===wd.axis&&d.coord===wd.coord);
+if(relevantDoors.length===0){
+const m=new THREE.Mesh(new THREE.BoxGeometry(wd.w,wd.h,wd.d),mat);
+m.position.set(wd.px,wd.py,wd.pz);if(wd.rotY)m.rotation.y=Math.PI/2;
+m.castShadow=true;m.receiveShadow=true;scene.add(m);objs.push(m);
+}else{
+// Build wall segments around doors
+// pos is a local offset from the wall's start (CS/2 = center of chunk)
+const segs=[];let start=0;const end=CS;
+for(const d of relevantDoors){
+const dl=d.pos-d.width/2,dr=d.pos+d.width/2;
+if(dl>start)segs.push({s:start,e:Math.min(dl,end)});
+start=Math.max(start,dr);
+}
+if(start<end)segs.push({s:start,e:end});
+for(const sg of segs){
+const len=sg.e-sg.s;const mid=sg.s+(sg.e-sg.s)/2;
+const m=new THREE.Mesh(new THREE.BoxGeometry(len,wd.h,wd.d),mat);
+if(wd.axis==='z'){m.position.set(ox+mid,wd.py,wd.pz)}
+else{m.position.set(wd.px,wd.py,oz+mid);m.rotation.y=Math.PI/2}
+m.castShadow=true;m.receiveShadow=true;scene.add(m);objs.push(m);
+}
+}
+}
+return objs;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   CHUNK GENERATION
+   ═══════════════════════════════════════════════════════════ */
+function generateChunk(cx,cz){
+const key=`${cx},${cz}`;
+if(chunks.has(key))return;
+const ox=cx*CS,oz=cz*CS;
+const h=hash(cx,cz,0);
+const h2=hash(cx,cz,1);
+const h3=hash(cx,cz,2);
+const objs=[];
+
+// Determine which sides connect to neighbors
+// Use a consistent rule: even chunks have opening on +z side, odd on -z side
+// Even cx have opening on +x side, odd on -x side
+const doors=[];
+// Each chunk has one door on +z side (for even cz) or -z side (for odd cz)
+// and one door on +x side (for even cx) or -x side (for odd cx)
+// For z-axis doors, the pos is an x-coordinate (along the z-wall)
+// For x-axis doors, the pos is a z-coordinate (along the x-wall)
+if(cz%2===0)doors.push({axis:'z',coord:oz+CS,pos:CS/2,width:2.5});
+else doors.push({axis:'z',coord:oz,pos:CS/2,width:2.5});
+if(cx%2===0)doors.push({axis:'x',coord:ox+CS,pos:CS/2,width:2.5});
+else doors.push({axis:'x',coord:ox,pos:CS/2,width:2.5});
+
+if(h<.30){
+// Classic pool room
+const wh=3.0;
+objs.push(fl(CS,CS,matPool,ox+CS/2,0,oz+CS/2));
+objs.push(...buildRoomWalls(ox,oz,wh,matWall,doors));
+objs.push(ce(CS-1,CS-1,matCeil,ox+CS/2,wh-.05,oz+CS/2));
+aw(CS-.6,CS-.6,0x0a4a5a,0x3a9aba,ox+CS/2,.03,oz+CS/2,64);
+if(h2>.3)for(let i=1;i<3;i++)for(let j=1;j<3;j++){const col=new THREE.Mesh(new THREE.CylinderGeometry(.18,.22,wh,12),matConc);col.position.set(ox+CS/4*i,wh/2,oz+CS/4*j);col.castShadow=true;scene.add(col);objs.push(col)}
+if(h3>.6){const pt=new THREE.PointLight(0xaaccdd,.3,15);pt.position.set(ox+CS/2,2.5,oz+CS/2);scene.add(pt);objs.push(pt)}
+}else if(h<.50){
+// Corridor — narrow passage through room
+const dir=h2>.5?0:1;
+const cw=3+h2*1.5;
+const wh=2.8+h2;
+// Full floor
+objs.push(fl(CS,CS,matPool,ox+CS/2,0,oz+CS/2));
+// Boundary walls with doors
+objs.push(...buildRoomWalls(ox,oz,wh,matWall,doors));
+// Side walls creating narrow passage
+if(dir===0){
+objs.push(bx(.2,wh,CS,matWall,ox+cw*.15,wh/2,oz+CS/2));
+objs.push(bx(.2,wh,CS,matWall,ox+cw*.85,wh/2,oz+CS/2));
+}else{
+objs.push(bx(CS,wh,.2,matWall,ox+CS/2,wh/2,oz+cw*.15));
+objs.push(bx(CS,wh,.2,matWall,ox+CS/2,wh/2,oz+cw*.85));
+}
+objs.push(ce(CS-1,CS-1,matCeil,ox+CS/2,wh-.02,oz+CS/2));
+// Shallow water in corridor center
+if(dir===0)aw(cw-.6,.4,0x0a4a5a,0x4aaaba,ox+cw/2,.02,oz+CS/2,20);
+else aw(.4,cw-.6,0x0a4a5a,0x4aaaba,ox+CS/2,.02,oz+cw/2,20);
+}else if(h<.65){
+// Platform room
+const pw=CS*.5,pd=CS*.5;
+const py=ox+(CS-pw)/2,pz=oz+(CS-pd)/2;
+const wh=3.2;
+objs.push(fl(CS,CS,matPool,ox+CS/2,-.3,oz+CS/2));
+const plat=new THREE.Mesh(new THREE.BoxGeometry(pw,.35,pd),matConc);plat.position.set(py+pw/2,.175,pz+pd/2);plat.castShadow=true;plat.receiveShadow=true;scene.add(plat);objs.push(plat);
+const pt=new THREE.Mesh(new THREE.PlaneGeometry(pw-.2,pd-.2),matDark);pt.rotation.x=-Math.PI/2;pt.position.set(py+pw/2,.36,pz+pd/2);pt.receiveShadow=true;scene.add(pt);objs.push(pt);
+objs.push(...buildRoomWalls(ox,oz,wh,matWall,doors));
+aw(CS-.5,CS-.5,0x0a3a4a,0x3a8a9a,ox+CS/2,.05,oz+CS/2,48);
+}else if(h<.78){
+// Staircase room
+const wh=3.5,steps=5,sh=.35,sd=.7;
+objs.push(fl(CS,CS,matPool,ox+CS/2,0,oz+CS/2));
+objs.push(...buildRoomWalls(ox,oz,wh,matWall,doors));
+for(let i=0;i<steps;i++)objs.push(bx(4,sh,sd,matConc,ox+CS/2,i*sh+sh/2,oz+1+i*sd));
+const topY=steps*sh;
+const poolF=new THREE.Mesh(new THREE.PlaneGeometry(6,CS-steps*sd-1),matPool);poolF.rotation.x=-Math.PI/2;poolF.position.set(ox+CS/2,topY,oz+steps*sd+(CS-steps*sd-1)/2);poolF.receiveShadow=true;scene.add(poolF);objs.push(poolF);
+aw(5.5,CS-steps*sd-2,0x0a3a4a,0x4aaaba,ox+CS/2,topY+.03,oz+steps*sd+(CS-steps*sd-1)/2,32);
+for(let i=0;i<steps;i++){const rail=new THREE.Mesh(new THREE.CylinderGeometry(.03,.03,1,6),matConc);rail.position.set(ox+CS/2-2.2,.5+i*sh,oz+1+i*sd);scene.add(rail);objs.push(rail)}
+const railH=new THREE.Mesh(new THREE.BoxGeometry(4.4,.05,.05),matConc);railH.position.set(ox+CS/2-2.2,.5+steps*sh,oz+1+(steps-1)*sd/2);scene.add(railH);objs.push(railH);
+}else if(h<.90){
+// Deep pool
+const wh=4.0;
+objs.push(fl(CS,CS,matDark,ox+CS/2,-2,oz+CS/2));
+objs.push(...buildRoomWalls(ox,oz,wh,matWall,doors));
+const ws=1.2,wt=.15,wp=ws/2+.3; // walkway size, thickness, offset from wall
+objs.push(bx(CS-ws*2,wt,ws,matConc,ox+CS/2,wt/2,oz+wp));
+objs.push(bx(ws,wt,CS-ws*2,matConc,ox+wp,wt/2,oz+CS/2));
+objs.push(bx(ws,wt,CS-ws*2,matConc,ox+CS-wp,wt/2,oz+CS/2));
+aw(CS-1.5,CS-1.5,0x051520,0x1a4a5a,ox+CS/2,-.3,oz+CS/2,64);
+const dl=new THREE.PointLight(0x223355,.4,15);dl.position.set(ox+CS/2,-.5,oz+CS/2);scene.add(dl);objs.push(dl);
+}else{
+// Mixed room
+const half=CS/2;
+objs.push(fl(CS,CS,matPool,ox+CS/2,0,oz+CS/2));
+objs.push(fl(half-.5,half-.5,matDark,ox+half/2,.01,oz+half/2));
+const wh=3.0;
+objs.push(...buildRoomWalls(ox,oz,wh,matWall,doors));
+aw(half-.5,half-.5,0x0a3a4a,0x3a8a9a,ox+half+half/2,.03,oz+half+half/2,40);
+for(let i=0;i<2;i++)for(let j=0;j<2;j++){const col=new THREE.Mesh(new THREE.CylinderGeometry(.2,.25,wh,10),matConc);col.position.set(ox+half/2+i*half,wh/2,oz+CS/4+j*CS/2);col.castShadow=true;scene.add(col);objs.push(col)}
+}
+
+chunks.set(key,objs);
+}
+
+/* ═══════════════════════════════════════════════════════════
+   CHUNK MANAGEMENT
+   ═══════════════════════════════════════════════════════════ */
+function updateChunks(){
+const px=camera.position.x,pz=camera.position.z;
+const cx=Math.floor(px/CS),cz=Math.floor(pz/CS);
+if(cx===pCX&&cz===pCZ)return;
+pCX=cx;pCZ=cz;
+for(let dx=-2;dx<=2;dx++)for(let dz=-2;dz<=2;dz++)generateChunk(cx+dx,cz+dz);
+for(const[key,objs]of chunks){
+const[rx,rz]=key.split(',').map(Number);
+if(Math.abs(rx-cx)>3||Math.abs(rz-cz)>3){
+for(const o of objs){scene.remove(o);if(o.geometry)o.geometry.dispose();if(o.material&&o.material.dispose)o.material.dispose()}
+const wi=waters.findIndex(w=>objs.includes(w));if(wi>=0)waters.splice(wi,1);
+chunks.delete(key);
+}
+}
+}
+
+// Chunk-relative wall collision
+// Door on +z wall when cz even, -z wall when cz odd; same for x.
+// Door always centered at chunk center (CS/2 local) with half-width HALF_DOOR.
+const DOOR_W=2.5, HALF_DOOR=DOOR_W/2;
+function wallHasDoorZ(chunkZ){return chunkZ%2===0}
+function wallHasDoorX(chunkX){return chunkX%2===0}
+function collideWalls(pos, radius){
+const px=pos.x,pz=pos.z;
+const chunkX=Math.floor(px/CS), chunkZ=Math.floor(pz/CS);
+// z walls
+for(const [wz, isPos] of [[chunkZ*CS,false],[(chunkZ+1)*CS,true]]){
+const wIdx=isPos?chunkZ+1:chunkZ; // the chunk that owns this boundary's door
+if(Math.abs(pz-wz)<radius){
+const localX=px-chunkX*CS;
+// door present on this wall only if the owning chunk's parity says so
+const hasDoor=wallHasDoorZ(wIdx);
+if(hasDoor && Math.abs(localX-CS/2)<HALF_DOOR){
+// inside door opening - no collision
+}else{
+if(pz<wz)pos.z=wz-radius;else pos.z=wz+radius;
+}
+}
+}
+// x walls
+for(const [wx, isPos] of [[chunkX*CS,false],[(chunkX+1)*CS,true]]){
+const wIdx=isPos?chunkX+1:chunkX;
+if(Math.abs(px-wx)<radius){
+const localZ=pz-chunkZ*CS;
+const hasDoor=wallHasDoorX(wIdx);
+if(hasDoor && Math.abs(localZ-CS/2)<HALF_DOOR){
+}else{
+if(px<wx)pos.x=wx-radius;else pos.x=wx+radius;
+}
+}
+}
+}
+function getGroundY(x,z){return R.fbm(x*.08,z*.08,2)*.15-.1}
+function getWaterLevel(x,z){return .05+R.fbm(x*.05,z*.05,2)*.08}
+
+/* ═══════════════════════════════════════════════════════════
+   ANIMATION
+   ═══════════════════════════════════════════════════════════ */
+function animate(){
+requestAnimationFrame(animate);
+const dt=Math.min(clock.getDelta(),.05),t=clock.getElapsedTime();
+
+if(controls.isLocked){
+vel.x-=vel.x*8*dt;vel.z-=vel.z*8*dt;
+dir.z=Number(mF)-Number(mB);dir.x=Number(mR)-Number(mL);
+const len=dir.length();if(len>0)dir.normalize();
+const sp=SPD*(underwaterFactor>.5?.45:1);
+if(mF||mB)vel.z-=dir.z*sp*8*dt;
+if(mL||mR)vel.x-=dir.x*sp*8*dt;
+controls.moveRight(-vel.x*dt);controls.moveForward(-vel.z*dt);
+
+// Wall collision
+collideWalls(camera.position,.45);
+
+const gx=camera.position.x,gz=camera.position.z;
+const gy=getGroundY(gx,gz);
+const wl=getWaterLevel(gx,gz);
+const targetY=Math.max(gy,wl-.15)+PH;
+camera.position.y+=(targetY-camera.position.y)*.12;
+
+if(camera.position.y<wl+.2){underwaterFactor=Math.min(1,underwaterFactor+dt*2)}
+else{underwaterFactor=Math.max(0,underwaterFactor-dt*3)}
+renderer.toneMappingExposure=.85-underwaterFactor*.25;
+scene.fog.density=.01+underwaterFactor*.025;
+scene.background.lerpColors(new THREE.Color(0x1a2a35),new THREE.Color(0x0a1520),underwaterFactor*.5);
+}
+
+for(const w of waters){w.material.uniforms.uTime.value=t;w.material.uniforms.uCam.value.copy(camera.position)}
+sun.position.copy(camera.position).add(new THREE.Vector3(10,20,5));
+sun.target.position.copy(camera.position);
+pl.position.copy(camera.position);pl.position.y=2;
+
+updateChunks();
+composer.render();
+}
+
+/* ═══════════════════════════════════════════════════════════
+   RESIZE
+   ═══════════════════════════════════════════════════════════ */
+window.addEventListener('resize',()=>{
+camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();
+renderer.setSize(innerWidth,innerHeight);composer.setSize(innerWidth,innerHeight);
+ssaoPass.setSize(innerWidth,innerHeight);
+});
+
+/* ═══════════════════════════════════════════════════════════
+   INIT
+   ═══════════════════════════════════════════════════════════ */
+for(let dx=-2;dx<=2;dx++)for(let dz=-2;dz<=2;dz++)generateChunk(dx,dz);
+animate();
+
+</script>
+</body>
+</html>

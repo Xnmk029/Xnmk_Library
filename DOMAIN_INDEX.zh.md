@@ -2,7 +2,7 @@
 
 **[English Index →](./DOMAIN_INDEX.en.md)** ｜ **[返回主 README →](./README.md)**
 
-全部 43 个测试项目按 **7 大技术领域** 归类，不再按 L1–L4 难度划分。每个项目的提示词全文已内嵌在下方 —— 展开即复制，无需跳转页面。
+测试项目按技术领域归类，另含已登记的脚本与可视化后端题组。提示词全文内嵌在下方，或链接到各自版本的派发输入。
 
 ---
 
@@ -23,12 +23,13 @@
 | 领域 | 项目数 | 项目 |
 |---|:-:|---|
 | [🎮 Web 游戏与交互逻辑](#web) | 8 | 2048 · Balatro · FPSlab · GoBoard · MoTa · Musicgames · Sokoban · LitRPGNovel |
-| [🧊 3D 图形、物理仿真与 Shaders](#graphics) | 20 | DoubleWishbone · PenroseStairs · Bicycle3D · BicycleDrivetrain · EscapeFromDuckov · FPV · IndustrialDigitalTwin · MinecraftVOxy · Poolrooms3D · RTX · RainWorld · USP · cloth · teardown · CFD · Minecraft · TimberPavilion · VT4 · VoxelVictoriaHarbour · VN1 |
+| [🧊 3D 图形、物理仿真与 Shaders](#graphics) | 21 | DoubleWishbone · PenroseStairs · Bicycle3D · BicycleDrivetrain · EscapeFromDuckov · FPV · IndustrialDigitalTwin · MinecraftVOxy · Poolrooms3D · RTX · RainWorld · USP · cloth · teardown · CFD · Minecraft · TimberPavilion · VT4 · VoxelVictoriaHarbour · VN1 · VoxelMarinaBay |
 | [🎨 视觉艺术与现代 UI 组件](#ui) | 3 | SVG · AMLL · FrontendShowcase |
 | [🐍 Python 工具与原生引擎](#python) | 5 | PyFlowingLight · EngineSIM · Telemetry · UnifiedInputManager · osuMania |
 | [🔌 系统集成与 MCP 协议](#system) | 8 | Archive · BilibiliUserscript · BilibiliIpAcceptance · WeChatCheckinExcel · BEAMhard · DeepSWE · PSMCP · SketchUpMCP |
 | [⌚ 嵌入式系统与产品设计](#embedded) | 1 | BikeComputer |
 | [📝 文本写作与内容安全](#writing) | 1 | YuriEdgeLadder |
+| [脚本与可视化后端](#backend) | 8 | BilibiliUserscript · HttpHealthProbe · DuplicateFileInspector · LocalShortLinks · OrderEventReplay · ResilientGateway · RaftTxnWorkbench · DurableCollab |
 
 
 ---
@@ -1972,6 +1973,62 @@ C 级结构必须使用中性灰色、半透明材料或“示意结构”标签
 </details>
 
 
+### 53 · 体素滨海湾：新加坡滨海湾与市中心数字沙盘
+*Voxel Marina Bay: Singapore Marina Bay & Downtown Core Diorama*
+
+📁 `L3_Advanced/VoxelMarinaBay/PROJECT_PROMPT.md` ｜ [源文件](./L3_Advanced/VoxelMarinaBay/PROJECT_PROMPT.md) ｜ [评分标准](./L3_Advanced/VoxelMarinaBay/README.md)
+
+> 与「体素陆家嘴」「体素维港」为并列同构题：同一考核维度、不同城市实体。题面为用户提供的英文原文，未翻译。
+
+<details>
+<summary>📋 提示词全文 — 点击展开，用代码块右上角按钮一键复制</summary>
+
+```markdown
+# Task Background
+
+Create a voxel-style digital scale model of Singapore's Marina Bay and Downtown Core district. The core purpose of this project is to assess the model's combined ability to recreate a city at voxel scale, make landmark buildings recognizable, support both bird's-eye and first-person exploration, and create convincing lighting and atmosphere.
+
+# Scope of Requirements
+
+## City and Spatial Reconstruction
+
+- Recreate Singapore's real Marina Bay and CBD cityscape using **extremely detailed voxels**, including but not limited to:
+  - The Marina Bay waterfront (waterfront promenades, boardwalks, the Singapore River mouth, and the bay basin)
+  - The texture of dense urban blocks, integrated garden greenery, and the surrounding road network
+  - The central financial district (Raffles Place / Downtown Core) skyscraper cluster
+  - Iconic landmark structures (Marina Bay Sands with its tri-tower base and SkyPark cantilever, the ArtScience Museum, the Merlion Park waterfront, and key CBD towers such as UOB Plaza, One Raffles Place, and Guoco Tower)
+  - The road and bridge network (Marina Boulevard, Collyer Quay, surrounding pedestrian and vehicular bridges like the Helix Bridge or Sheares Bridge, and moving traffic; vehicle motion can be simple but must be present)
+  - Singapore's highly recognizable Marina Bay skyline silhouette
+
+## Camera Modes and Interaction
+
+- **Bird's-eye view**: Show the grand scale of Marina Bay and the Downtown Core waterfront in full, with zooming and orbiting (an orbit camera or equivalent controls).
+- **Immersive first-person view**: Let the player enter the voxel world and move freely through city streets, waterfront promenades, plazas, and between towers, conveying realistic scale and a bustling atmosphere.
+- The two modes must be switchable, with clear control instructions.
+
+## Lighting, Materials, and Environment
+
+- Aim for cinematic lighting: sensible day/night conditions or a primary light direction, shadows, and ambient light; avoid a uniformly flat, plastic look.
+- Give materials a realistic feel within the voxel style: distinguish reflective glass curtain walls, concrete, bay water, asphalt roads, lush equatorial greenery, and boardwalk timber.
+- Include at least one dynamic environmental effect: moving bay water reflections, traffic flows, clouds/atmospheric haze, skyline night illumination, a day/night cycle, or similar.
+
+## Style
+
+- Combine voxel art with a digital-twin/open-world experience; aim for an art-quality, game-quality voxel world of Marina Bay.
+- Demonstrate spatial understanding, architectural reconstruction, visual design, and an immersive experience to the greatest extent possible.
+
+# Delivery Constraints
+
+- Prefer a **single HTML file** (engines such as Three.js may be loaded from a reliable CDN) that runs when double-clicked.
+- Build the buildings and city layout primarily with **procedural voxels**; do not make externally downloaded 3D model files the main content (CDN-hosted engine libraries are an exception).
+- Do not copy projects from outside the workspace; do not pass off a single texture or video as an interactive scale model.
+- Do not include TODOs or unfinished placeholders.
+- Explain the controls and how to switch modes in the interface or in a README/log.
+```
+
+</details>
+
+
 ---
 
 <a id="ui"></a>
@@ -3171,3 +3228,292 @@ BikeComputer/
 ---
 
 *提示词内容与各项目 `PROJECT_PROMPT.md` 源文件逐字一致；如源文件更新，请重新生成本索引或直接在展开区复制后核对源文件。*
+
+<!-- VISUAL-BACKEND:START -->
+
+<a id="backend"></a>
+
+## 脚本与可视化后端
+
+跨领域题组：8 个有效题目，B01 复用既有项目，不重复增加项目数。 [登记与时间校准](./Backend/README.md)。
+
+| ID | Level | 题面 |
+|---|---|---|
+| B01 | L1 | [B 站评论 IP 属地脚本](./Backend/dispatch/BilibiliControlled/PROJECT_PROMPT.md) |
+| B02 | L1 | [HTTP 健康探针与可视化报告](./L1_Basic/HttpHealthProbe/PROJECT_PROMPT.md) |
+| B03 | L2 | [目录重复文件检测器](./L2_Intermediate/DuplicateFileInspector/PROJECT_PROMPT.md) |
+| B04 | L2 | [本地短链接与访问统计台](./L2_Intermediate/LocalShortLinks/PROJECT_PROMPT.md) |
+| B05 | L3 | [乱序订单事件回放与对账报告](./L3_Advanced/OrderEventReplay/PROJECT_PROMPT.md) |
+| B06 | L3 | [限流与熔断代理工作台](./L3_Advanced/ResilientGateway/PROJECT_PROMPT.md) |
+| B07 | L4 | [Raft 在线换节点与无日志读取](./L4_Expert/RaftTxnWorkbench/PROJECT_PROMPT.md) |
+| B08 | L4 | [检查点恢复与跨进程世代隔离](./L4_Expert/DurableCollab/PROJECT_PROMPT.md) |
+
+### B02 · HTTP 健康探针与可视化报告
+
+[源题面](./L1_Basic/HttpHealthProbe/PROJECT_PROMPT.md)
+
+<details>
+<summary>📋 提示词全文</summary>
+
+```text
+# HTTP 健康探针与可视化报告
+
+编写 Node.js 24 命令行健康探针。用户提供 JSON 文件，根结构为 [{id:string,url:string},...]，访问本地 HTTP 目标，输出 JSON 结果和可直接打开的 HTML 报告。HTML 用表格和原生 details 展示绿/红状态、HTTP 状态与错误，使用简洁默认样式即可。
+
+命令 node probe.js --config <JSON路径> --out <HTML路径> --timeout-ms 150 --concurrency 2。JSON 产物与 HTML 同路径但扩展名为 .json，结构 {results:[{id,url,status,ok,error}],summary:{total,healthy,failed}}。results 严格保留输入顺序。HTTP 2xx 为 ok:true、error:null；非 2xx 为失败且保留真实 status；连接失败或超时的 status:null，error 为非空字符串。每个目标独立超时，失败不影响其他目标；最多 concurrency 个请求同时在途。重定向不跟随，3xx 也视为失败。
+
+本题只允许 http://127.0.0.1:<端口>/... 目标，拒绝含用户名/密码、其他主机或其他协议的 URL；id 必须是非空字符串，URL 不合法或配置 JSON 错误时退出 2，并保持已有输出文件不变。输入合法时完成全部检查并写报告；全健康退出 0，有失败退出 1。HTML 中的 id、URL 和错误必须按纯文本展示，不能执行输入携带的标记。交付 probe.js 和 README.md，全部使用原生模块，报告由程序运行生成；README 给出配置与命令示例。
+```
+
+</details>
+
+### B03 · 目录重复文件检测器
+
+[源题面](./L2_Intermediate/DuplicateFileInspector/PROJECT_PROMPT.md)
+
+<details>
+<summary>📋 提示词全文</summary>
+
+```text
+# 目录重复文件检测器
+
+实现只读重复文件检测器，额外参数 --root <工作目录>。网页可启动扫描、查看进度、展开重复文件分组和查看上次结果；不做删除、移动或自动清理。只扫描根目录内普通文件，不跟随符号链接和 junction。
+
+POST /api/scan 启动扫描并等待完成，返回 {groups:[{sha256,size,paths}],scanned,skipped}；paths 是相对根目录路径数组，按字符串字典序排序，groups 按首个路径排序；只有字节完全相同且至少两份的文件才归为一组。scanned 为成功读取的文件数，skipped 为无法读取或超限的文件数，单文件上限 8 MiB。零字节文件也可重复，不能仅凭文件大小或文件名判重复。GET /api/result 返回最近一次完整扫描结果，服务重启后保留。并发扫描请求合并到同一运行或返回 409，不能发布半份结果。根外路径不可读取。
+
+演示时用同名不同内容、不同名相同内容、空文件和中文文件名。扫描结果显示真实 SHA-256，用户修改文件后再次扫描结果更新。
+
+## 运行与交付
+
+只使用 Node.js 24 原生模块，无第三方依赖。交付 server.js、原生网页和简短 README。启动 node server.js --port <端口> --data <数据目录>，只监听 127.0.0.1；GET /health 返回 {"ok":true}，GET / 提供操作界面。界面只需实用的表单、列表和状态，用户数据按纯文本展示。所有展示来自真实 API。错误返回非 2xx 与 {"error":"原因"}。数据目录不存在则创建，重启时复用；不能以浏览器缓存代替服务端状态。无需账号、外部服务或依赖安装。
+```
+
+</details>
+
+### B04 · 本地短链接与访问统计台
+
+[源题面](./L2_Intermediate/LocalShortLinks/PROJECT_PROMPT.md)
+
+<details>
+<summary>📋 提示词全文</summary>
+
+```text
+# 本地短链接与访问统计台
+
+实现一个单机短链接服务，交付 server.js 和简短 README。页面由服务端直接生成默认 HTML 表单和链接表格，用户可以创建短链接、点击跳转、刷新查看访问次数；只覆盖创建、跳转、计数和重启保持。
+
+POST /api/links 接收 {url,slug?}，url 仅允许 http://127.0.0.1:<端口>/...，拒绝用户名/密码或其他主机/协议，按 new URL(url).href 保存。slug 如提供，必须匹配 [A-Za-z0-9_-]{3,24} 且区分大小写；未提供则生成独立唯一 slug。新建 201 返回 {slug,url,visits:0}；已有相同 slug 和相同 URL 返回 200 与当前记录；同 slug 不同 URL 返回 409，不覆盖原记录；非法 URL/slug 返回 422。不同 slug 可以指向同一 URL。
+
+GET /s/<slug> 返回 302，Location 为已保存 URL，并将该链接 visits 原子增加 1；服务本身不请求目标。HEAD /s/<slug> 返回相同跳转头但不计访问；未知 slug 返回 404。并发 20 次 GET 不能丢计数。GET /api/links 返回 {links:[{slug,url,visits}]}，按 slug 字典序排列。
+
+创建记录和访问计数须在响应前持久化，重启保持。根页面使用原生表单提交创建，可增加 POST /create 处理 URL 编码表单并跳回根页面；API 与页面共享真实状态。以本地测试接收页作为跳转目标演示，不访问外部网站。
+
+## 运行与交付
+
+只使用 Node.js 24 原生模块，无第三方依赖。交付 server.js、原生网页和简短 README。启动 node server.js --port <端口> --data <数据目录>，只监听 127.0.0.1；GET /health 返回 {"ok":true}，GET / 提供操作界面。界面只需实用的表单、列表和状态，用户数据按纯文本展示。所有展示来自真实 API。错误返回非 2xx 与 {"error":"原因"}。数据目录不存在则创建，重启时复用；不能以浏览器缓存代替服务端状态。无需账号、外部服务或依赖安装。
+```
+
+</details>
+
+### B05 · 乱序订单事件回放与对账报告
+
+[源题面](./L3_Advanced/OrderEventReplay/PROJECT_PROMPT.md)
+
+<details>
+<summary>📋 提示词全文</summary>
+
+```text
+# 乱序订单事件回放与对账报告
+
+实现 Node.js 24 原生命令行订单事件回放器，交付 replay.js 和简短 README。输入最多 10,000 行、1 MiB 的 UTF-8 JSONL；空行忽略。全部按完整批次重放，输出确定性的订单状态、逐事件回执和 HTML 对账报告，使用简单原生表格。
+
+命令 node replay.js --input <JSONL文件> --out <HTML文件>。JSON 产物与 HTML 同路径但扩展名为 .json，且只包含 {orders,receipts,summary}；stdout 只输出 summary JSON。合法批次退出 0，即使存在业务拒绝或版本缺口；输入结构错误或事件冲突退出 2，并保持已有 HTML/JSON 产物不变。
+
+每条事件为 {eventId,orderId,version,type,payload}：ID 为非空字符串，必须完整保留超出安全整数范围的数字形字符串；version 为正的安全整数；type 仅 CREATE/PAY/CANCEL/REFUND。CREATE 的 payload 为 {amount}，amount 是正的安全整数，单位为分；其他类型的 payload 必须为 {}。不接受额外字段。结构化字段相同的同 eventId 重复只保留一条，summary.duplicates 增加；同 eventId 不同内容或同 (orderId,version) 对应不同 eventId 是批次冲突，退出 2。对象字段的输入顺序不影响重复判断。
+
+按 orderId 的 Unicode 码点字典序分组，组内按 version 升序；每个订单从 version 1 开始消费。遇到缺口后，该事件及该订单后续事件都记 PENDING_GAP，不应用。补齐缺口后重新完整重放，后续事件可正常生效。
+
+状态初始 ABSENT、amount=0、lastVersion=0。CREATE 仅在 version=1 且 ABSENT 时成功，进入 PENDING 并设置 amount；PAY 仅 PENDING→PAID；CANCEL 仅 PENDING→CANCELLED；REFUND 仅 PAID→REFUNDED。合法转移记 APPLIED。错误状态上的合法类型记 REJECTED_TRANSITION，状态和金额保持，但该 version 仍被消费，lastVersion 前进。缺口事件不推进 lastVersion。
+
+orders 为 [{orderId,status,amount,lastVersion}]，包含所有订单（包括 ABSENT）；receipts 为每条唯一事件的 [{eventId,orderId,version,result}]，按 orderId、version 排序。summary 为 {orders,statusCounts,paidAmount,refundedAmount,applied,rejected,pending,duplicates}：orders 为订单数；statusCounts 包含五种状态的计数；paidAmount/refundedAmount 分别是当前 PAID/REFUNDED 订单金额之和；applied/rejected/pending 为回执分类数。相同事件集合的任意输入乱序须生成语义相同的 JSON，不加入时间戳或其他字段。
+
+HTML 分别用表格显示订单状态和事件回执，清楚显示拒绝和缺口；所有输入文本按纯文本处理，不加载外部资源。演示先回放缺 CREATE 的 PAY，再补 CREATE 重放，对比状态；同时演示重复事件、已取消订单再次支付被拒绝。
+```
+
+</details>
+
+### B06 · 限流与熔断代理工作台
+
+[源题面](./L3_Advanced/ResilientGateway/PROJECT_PROMPT.md)
+
+<details>
+<summary>📋 提示词全文</summary>
+
+```text
+# 限流与熔断代理工作台
+
+实现本地 HTTP 代理与状态界面，展示请求次数、真正的上游调用数、限流拒绝、熔断状态和请求结果。额外启动参数 --upstream <本地HTTP地址> --limit 3 --window-ms 1000 --timeout-ms 150 --failure-threshold 2 --open-ms 500。本题只代理 GET，不做任务队列、持久化租约或多进程调度。
+
+GET /relay?path=<以/开头的路径> 将请求实际发送到固定 upstream 的该路径，返回上游真实状态码和原始字节；拒绝绝对 URL、//host 与协议变换，不能让调用者换掉目标主机。单次上游超过 timeout-ms 返回 504。
+
+所有 relay 请求先执行固定窗口限流：窗口从该服务收到首个 relay 请求起算，每 window-ms 重置，最多放行 limit 个，超限 429，不能访问上游。通过限流后再检查熔断。连续 failure-threshold 次网络失败、超时或 HTTP 5xx 使 CLOSED 转 OPEN；HTTP 4xx 不算故障，成功 2xx/3xx 重置连续故障计数。OPEN 内请求返回 503，不能访问上游；open-ms 后进入 HALF_OPEN，只允许一个探测，其余并发请求 503。探测成功回 CLOSED，失败重新 OPEN 并重计等待时间。
+
+GET /api/stats 返回 {state,requests,upstreamCalls,rateRejected,circuitRejected}；requests 计所有 relay 请求，upstreamCalls 仅计真实发出的请求，其余字段计相应拒绝。重启清零计数与状态，必须在 README 明示；无持久化要求。网页可输入路径发送真实请求、显示返回内容并刷新 stats。
+
+## 运行与交付
+
+只使用 Node.js 24 原生模块，无第三方依赖。交付 server.js、原生网页和简短 README。启动 node server.js --port <端口> --data <数据目录>，只监听 127.0.0.1；GET /health 返回 {"ok":true}，GET / 提供操作界面。界面只需实用的表单、列表和状态，用户数据按纯文本展示。所有展示来自真实 API。错误返回非 2xx 与 {"error":"原因"}。数据目录不存在则创建，重启时复用；不能以浏览器缓存代替服务端状态。无需账号、外部服务或依赖安装。
+```
+
+</details>
+
+### B07 · Raft 在线换节点与无日志读取
+
+[源题面](./L4_Expert/RaftTxnWorkbench/PROJECT_PROMPT.md)
+
+<details>
+<summary>📋 提示词全文</summary>
+
+```text
+# Raft 在线换节点、无日志读取与条件事务 · v2
+
+把随题 `starter.tar` 中的 etcd `contrib/raftexample` 改造成可用的三节点条件事务服务。先在当前目录执行 `tar -xf starter.tar`，在解出的 `repo/` 中继续开发。源码来自 etcd v3.5.17，commit `507c0de87bd5034e3de4ab76ebf96b54dae0cd52`，Apache-2.0；`UPSTREAM.json` 给出出处和原文件哈希。已将原 monorepo 的模块依赖改为独立 go.mod/go.sum，原业务源码和测试未修改。
+
+这是现有仓库的演进任务。沿用 etcd Raft、rafthttp、WAL 和快照路径，修改状态机、HTTP 与必要的 Raft 集成。禁止以单机数据库、共享状态文件、固定主节点或请求转发器替代共识；不得修改依赖里的 Raft 算法。保留原示例 API 的可用性与原测试；旧 PUT 也必须在提交并应用后才返回成功。
+
+## 启动与持久化
+
+在 `repo/` 中 `go build -o rafttxn .`。保留 `--id`、`--cluster`、`--port`、`--join`，新增 `--data-dir`（每节点独占）、`--snap-count`（默认 10000，可设为 8）、`--request-timeout`（默认 1500ms）。先运行三个独立 voter 进程，再在线加入第四个 learner；peer URL 和 HTTP 端口各不相同，重启复用原 data-dir。初次集群的 CSV URL 按顺序对应 ID 1、2、3；新节点 4 使用 `--join=true --cluster=<四个URL>`，不得凭该 CSV 自行成为 voter。已有 WAL/快照时以持久配置为准。所有整数限制在 JSON 精确整数范围。
+
+## 条件事务契约
+
+`POST /v1/txn` 接受：
+
+```json
+{"requestId":"r1","compare":[{"key":"a","modRevision":0}],"success":[{"op":"put","key":"a","value":"one"},{"op":"delete","key":"b"}]}
+```
+
+key/requestId 为非空字符串，每个数组内不得重复 key；compare 可为空，success 必须含 1–16 个操作；只允许 put/delete，put 的 value 必须为字符串。非法请求 400，不提出日志。JSON 对象字段顺序和空白不影响请求身份；数组顺序属于请求内容。
+
+每个 key 初始 `value=null, modRevision=0`。在**同一条已提交日志的确定性状态机应用**中，先检查所有 compare，再全部执行或全部不执行。全局 `revision` 从 0 开始，仅成功事务加 1；该事务写入和删除的 key 均使用这个新 modRevision。删除保留墓碑和 modRevision，删除不存在的 key 也写墓碑；不能因删除后重建出现 ABA。比较失败不改变 revision 或任何 key。
+
+200 返回：
+
+```json
+{"requestId":"r1","succeeded":true,"revision":1,"results":[{"key":"a","value":"one","modRevision":1},{"key":"b","value":null,"modRevision":1}]}
+```
+
+results 按 success 数组顺序给出事务执行后各 key 的状态；比较失败则 `succeeded=false, results=[]`，revision 为该日志应用时的全局 revision。HTTP 200 只能在相应命令已由多数派提交且本节点应用后返回。
+
+requestId 是整个集群永久幂等键，成功和比较失败的原始结果均须持久化。相同 ID、相同逻辑请求返回完全相同的原始 JSON 结果；相同 ID、不同内容返回 409，不能改变状态。并发重复提交、换节点重试、leader 切换、WAL 重放和快照安装后均成立。幂等判定与事务必须在同一状态机中，不能只查当前 HTTP 进程的内存表。超时 503/504 只代表结果未知，允许该命令稍后提交。
+
+## 读取、故障和观察
+
+`GET /v1/kv?key=a` 返回 `{"key":"a","value":"one","modRevision":1,"revision":1}`，缺失/墓碑也返回 200。所有成功读取必须线性一致：**必须使用 ReadIndex 的 quorum 确认，并等到本地状态机应用至对应 index**。本版不再接受每次 GET 追加日志屏障、隐藏写入或定期无业务写入来完成读取。允许新 term 的 Raft 正常 no-op，但 leader/term 稳定且没有业务/配置写入时，连续和并发 GET 不得推进 appliedIndex。不得以缓存 leader 身份、固定租约或“最近刚写过”代替 quorum 确认。
+
+每次屏障使用唯一请求上下文，正确处理并发 ReadState、取消、leader 更替和晚到响应；不能用一条已确认的旧 ReadState 放行之后开始的读取。健康多数派上的任意节点应可在 5 秒内完成操作；落后节点可以短暂拒绝服务。无多数派、孤立旧 leader 上的读写必须在配置超时加 1 秒内返回 503/504，不得返回过期成功。读取取消后须回收等待者，不得让网络事件循环被慢客户端阻塞。
+
+`GET /v1/status` 为允许陈旧的诊断接口，至少返回 `id, leaderId, term, appliedIndex, snapshotIndex, revision, configIndex, voterIds, learnerIds`；ID 数组升序。appliedIndex 必须代表状态机已应用的位置。快照应同时包含 KV、墓碑、revision、完整幂等结果和有效成员配置；快照边界、apply 通知、ConfState 和恢复顺序必须一致。进程被强制结束后，已确认数据和幂等结果不能丢失。落后节点在日志压缩后仍能通过真实快照传输追平。
+
+增加仅用于本地演练的 `POST /v1/debug/partition`，请求 `{"blockedPeerIds":[2,3]}` 全量替换本节点阻断列表；空数组恢复。阻断必须作用于真实 Raft peer 网络收发（含已建立的流），不能只影响业务 HTTP 或诊断状态。验收会在各侧同时配置，以隔离原 leader；客户端 HTTP 始终可访问。
+
+## 在线成员变更：不能靠停服重建集群
+
+`GET /v1/members` 返回 `{"configIndex":3,"members":[{"id":1,"peerUrl":"http://127.0.0.1:9021","learner":false}]}`；示例仅展示一项，实际返回当前完整列表，按 ID 升序。它是线性一致读取，也必须通过 ReadIndex。configIndex 为最后一次已应用配置日志的位置，初始配置由原集群的已应用配置日志确定；配置变化不能改变业务 revision。
+
+`POST /v1/members` 接受以下三种请求，均使用同一集群的永久 requestId 命名空间（与 /v1/txn 共用）：
+
+```json
+{"requestId":"add-4","op":"addLearner","id":4,"peerUrl":"http://127.0.0.1:4921"}
+{"requestId":"promote-4","op":"promote","id":4}
+{"requestId":"remove-3","op":"remove","id":3}
+```
+
+200 返回 `{"requestId":"add-4","configIndex":42,"members":[...]}`，members 格式同上，表示该配置已由 Raft 提交并在本节点应用。相同 ID 相同逻辑请求永久返回原始结果，不能因为当前配置已经不同而重新执行；相同 ID 异内容或跨事务/成员操作复用返回 409。仅缓存于收到 HTTP 的进程不成立。非法输入 400；不存在/不适用的成员操作 409；暂时不可完成的变更 503/504，不能以 200 返回“已排队”。
+
+通过 etcd Raft 的配置变更机制实际添加 learner、晋升 voter 和移除 voter，不得只改诊断 JSON、HTTP 路由或启动参数。变更串行化，一次至多一个未完成配置提议，使用库的安全配置语义，不自行改写共识算法。必须满足：
+
+1. learner 能接收日志和快照，但不能投票、参与 quorum 或使没有多数 voter 的分区恢复读写可用。
+2. 晋升前取得当前已提交屏障，并确认目标 learner 已追平该边界；离线或落后的 learner 必须在请求预算内返回 503/504，不能提前提交晋升。追平后可用相同请求重试。
+3. 成功晋升 4、移除 3 后，voter 为 1、2、4；即使随后停掉 1 和 3，2 与 4 仍须形成多数派完成事务。不得继续按最初三个 ID 计算多数派。
+4. 节点 3 一旦应用移除，停止业务服务或返回 410；尚未获知移除的旧副本也必须经 quorum 屏障，不能继续返回陈旧 200。重启不能把已移除节点按旧 CSV 重新加入。
+5. 快照传输和整群重启后，成员、learner 身份、configIndex、业务状态和跨类型幂等结果均保持；旧 add/promote/remove 请求重试返回当时结果，不改变当前成员集合。无需实现自动扩容控制器。
+
+## 演示与交付
+
+交付完整 `repo/`、锁定依赖、README、自动化回归测试和 `demo` 启动入口。提供浏览器可打开的工作台或由真实历史生成的 HTML 报告：显示四进程 term/leader/applied/snapshot、voter/learner、配置日志、事务返回和分区恢复时间线。真实演示并发 CAS、旧 leader 隔离、无日志读取、learner 追平/晋升/替换旧 voter、按新 quorum 提交及快照恢复。界面不能自行生成一致性结论。
+
+保留原版所有事务/故障测试，并补充：稳定 term 下至少 64 次读不增加日志；learner 不能补足 quorum；离线 learner 拒绝晋升；在线换节点后按新 quorum 读写；旧配置节点重启不会复活；成员请求跨进程、跨快照重放；ReadIndex 等待中取消和换主不能泄漏或错误复用屏障。说明锁顺序、配置与业务应用的共同边界、取消后的晚到事件及快照版本。测试必须实际运行，不能把库本身正确当作集成已经正确。
+```
+
+</details>
+
+### B08 · 检查点恢复与跨进程世代隔离
+
+[源题面](./L4_Expert/DurableCollab/PROJECT_PROMPT.md)
+
+<details>
+<summary>📋 提示词全文</summary>
+
+```text
+# y-websocket 检查点恢复、旧客户端隔离与并发压缩 · v2
+
+在随题 `starter.tar` 的真实 y-websocket 仓库上实现可恢复的协同后端。先执行 `tar -xf starter.tar`，在 `repo/` 内开发。基线为 yjs/y-websocket v2.1.0，commit `7c3408a33fc52bd5001d2ff80b38624961402614`，MIT。上游业务源码未改，工具链固定 lib0=0.2.99、TypeScript=4.9.5，出处及差异见 UPSTREAM.json。Node.js 24 可用；可使用原生 `node:sqlite`、Yjs 和 SQLite 事务，不需要 Redis/Docker。可更新依赖，但必须提交锁文件。首次安装可用 `npm ci --ignore-scripts`；不再使用原可选 LevelDB 存储。
+
+沿用并实际修改现有 `bin/server.cjs` / `bin/utils.cjs` 的文档生命周期、同步和持久化路径，保留标准 y-websocket 二进制协议、`src/y-websocket.js` 客户端和公开 exports 的兼容性。不能另写一个完全绕过原服务的 REST 演示，也不能把 Y.Text 改为整段字符串最后写入覆盖。CRDT 合并使用 Yjs，不要求自行实现算法。
+
+## 双进程与协议
+
+启动 `node bin/server.cjs`，环境变量 `HOST=127.0.0.1`、`PORT`、`DB_PATH`、`ROOM_IDLE_MS`（默认 1000）。两个独立服务进程使用同一个本机 SQLite 文件、不同端口，客户端连接 `ws://host:port/<room>?epoch=1`。新 room 的 epoch 为 1，是持久化的文档世代号；下面定义恢复操作时的变化。进程各自有独立 Y.Doc 缓存。通过持久日志增量追赶，健康时远端提交在 2 秒内可见；不能共享 JS 内存，不能依赖浏览器 BroadcastChannel 达成跨服务同步。所有 room 为 1–64 位 ASCII 字母/数字/下划线/连字符，非法 room 返回 400/拒绝升级。双进程同时启动、WAL 恢复或迁移时须正确等待/重试 SQLite 锁，不能在设置 busy handling 前读取版本而随机退出。
+
+支持标准同步 step1/step2/update。服务在广播更新前先持久提交；加载初始状态完成前不能向新连接发出空文档“已同步”的结果。awareness 只要求单进程内兼容和断开清理，不要求跨进程持久化。
+
+增加以下 HTTP API（body 为 JSON）：
+
+* `POST /v1/rooms/<room>/updates`：`{"epoch":1,"updateId":"u1","update":"<base64 Yjs V1 update>"}`。200 返回 `{"epoch":1,"updateId":"u1","seq":1}`，表示原始更新字节已持久提交，进程立即被 kill 后仍可恢复。幂等范围为 `(room,epoch,updateId)`；相同 ID 相同字节返回原 seq，不同字节 409。base64 必须规范、update 必须为有效的 Yjs V1 update；非法输入 400，不能改变日志、seq 或缓存文档。
+* `GET /v1/rooms/<room>/state`：返回 `{"epoch":1,"update":"<合并后的V1更新>","text":"<Y.Text('text')>","lastSeq":1,"snapshotSeq":0,"totalUpdates":1}`。来自同一已提交边界；update 必须完整保留未满足依赖的结构和删除集，不能只导出当前可见 text。空 room 返回 epoch=1、合法空更新和零计数。
+* `POST /v1/rooms/<room>/compact`：`{"epoch":1}`，200 返回 `{"epoch":1,"snapshotSeq":1}`。snapshotSeq 为这次已持久快照包含的日志上界；不得包含尚未进入快照的更新、跨 room/epoch 删除、删除上界之后的并发更新或删除幂等凭据。空 room 可返回 snapshotSeq=0。
+* `GET /v1/rooms/<room>/stats`：`{"epoch":1,"lastSeq":1,"snapshotSeq":1,"totalUpdates":1,"logRows":0,"dedupRows":1}`，均为当前 epoch 的计数，源自数据库。成功压缩在无并发更新时须清除快照已覆盖的原始日志，不能只设置数字，不能永久积累全部原始 payload 冒充压缩。
+* `GET /v1/health`：200 JSON 存活检查。
+
+seq 在每个 `(room,epoch)` 内严格递增连续。每次**唯一 HTTP 更新**增加一次 totalUpdates 和 seq；重复 HTTP 更新不增加。标准 WS 携带的有实际内容的更新也记入同一日志/序号，跨进程 tail 不能重新入库。HTTP updateId 相等才视为重复，不同 ID 即便字节相同也分配新 seq。WS 的重复/无效内容允许无副作用地略过。必须区分远端日志应用与本地输入的 origin，避免同步回环。
+
+所有 updates/compact 的 epoch 必填，缺失、非正整数或超出 JSON 精确整数范围返回 400。旧/未来 epoch 返回 409 `{"error":"EPOCH_MISMATCH","epoch":<当前值>}`，在查旧幂等结果或操作缓存前拦截；不得因旧请求曾成功而绕过隔离。WS 的二进制同步协议不变，标准 WebsocketProvider 只增加 URL params；升级时缺失/非法 epoch 返回 HTTP 400，epoch 不匹配返回 HTTP 409。
+
+## 持久检查点、恢复与隔离旧客户端
+
+`POST /v1/rooms/<room>/checkpoints` 接受 `{"epoch":1,"checkpointId":"cp1"}`，在一个已提交边界捕获完整合并更新（包括 pending 内容），200 返回 `{"checkpointId":"cp1","epoch":1,"seq":12}`。checkpointId 为 room 内 1–64 位 ASCII 字母/数字/下划线/连字符，永久指向不可变的内容与元数据；相同 ID 重试返回原结果，不捕获后来状态；此重试仍须通过当前 epoch 检查。检查点跨 epoch、进程和重启保留，不受日志压缩影响。
+
+`POST /v1/rooms/<room>/restore` 接受 `{"requestId":"restore-1","expectedEpoch":1,"checkpointId":"cp1"}`。在同一事务内验证 expectedEpoch、安装该检查点、将 epoch 增加 1、将新 epoch 的 lastSeq/snapshotSeq/totalUpdates 置零、保存恢复幂等结果。200 返回 `{"requestId":"restore-1","epoch":2,"restoredCheckpointId":"cp1","seq":0}`。检查点中的更新成为新 epoch 的初始内容，后续唯一更新从 seq=1 开始；恢复不是普通 CRDT 合并，允许有意撤销检查点之后的修改。
+
+restore requestId 在 room 内跨 epoch 永久幂等。对已成功的 ID，先核对请求内容再返回原始结果，不能因 expectedEpoch 已过期而再次恢复或拒绝合法重试；异内容 409 `{"error":"REQUEST_CONFLICT"}`。未知 ID 的 expectedEpoch 不匹配返回 409 EPOCH_MISMATCH，检查点不存在 404，非法输入 400，均不改变状态。临时失败不占用 requestId。两个不同 ID 同时以同一个 expectedEpoch 恢复，必须恰好一个成功，另一个 EPOCH_MISMATCH；不能各自读旧值后连续推进两个 epoch。
+
+恢复提交后还必须满足：
+
+1. 所有旧 epoch HTTP 更新立即被拒绝；来自另一进程的旧 WS 连接在 2 秒内以 close code **4009** 关闭并清理 awareness。每次 WS 写入必须在提交事务内复核连接 epoch，不能仅在升级时检查。
+2. 旧离线客户端重连不能把被撤销的修改自动合并回新 epoch；旧 URL 拒绝升级。演示客户端发现恢复后应明确提示，并使用**全新 Y.Doc** 连接新 epoch；不能把旧 doc 清空后当普通删除操作上传。
+3. 远端 tail、缓存刷新、初始化、room 回收、压缩都要携带 epoch。旧加载/回收/压缩任务晚到不能覆盖新 doc、清掉新日志或使 epoch 倒退。所有读响应的内容、水位和 epoch 必须来自同一数据库边界。
+4. 同一 updateId 可在新 epoch 重新使用并获得新 seq；旧 epoch 的去重凭据不能误伤新请求。恢复 requestId 和检查点本身必须跨 epoch 保留。
+
+## 恢复与并发边界
+
+压缩、写入、远端追赶、room 淘汰都可能并发；两个进程可同时压缩同一个 room。单调水位和快照发布须有事务或等价并发控制。压缩后的重启必须恢复全部已确认更新及去重凭据。room 最后连接断开 ROOM_IDLE_MS 后应释放文档缓存与相关定时器；HTTP 操作不能复用正在销毁的文档，新连接与旧回收任务竞态不能销毁新的 room。加载失败不得用空状态覆盖原数据。
+
+必须正确处理：同一离线客户端连续生成更新 U1、U2，服务先收到 U2，在 U1 尚未到达时压缩或创建检查点，终止重启或恢复到该检查点，之后在当前 epoch 收到 U1，最终结果与独立 Yjs 合并真值相同；delete set 先于其目标结构到达也如此。合法 Yjs 编码 API 可以使用，判据是原始依赖内容是否完整保留。
+
+实现三个确定性故障点，默认关闭：环境变量 `BENCH_FAILPOINT` 为 `update-before-commit`、`update-after-commit` 或 `compact-before-commit`，`BENCH_MARKER` 为文件路径。仅对 HTTP 更新/压缩触发；到达对应边界后写入 marker 并暂停当前操作，直到进程被终止（不要继续响应）。before-commit 必须在数据真正提交前，after-commit 必须在数据提交后但 HTTP 返回前，compact-before-commit 必须在新快照和日志删除的事务提交前。其他进程仍可运行；不得为测试预写成功结果。验收将 kill 该进程后，借另一进程或重启检查提交边界。
+
+本版新增 `restore-before-commit`、`restore-after-commit`，同样写 marker 后暂停并等待 kill，分别验证整个恢复事务回滚及“提交成功但响应未知”的永久重试。
+
+另新增可释放的 `compact-after-read`：压缩器读完 `(epoch,seq,完整输入)` 后、发布快照前写 marker，异步等待 `BENCH_RELEASE` 指定文件出现，不能持有阻止另一进程恢复的写事务。等待期间另一进程恢复使 epoch 改变，释放后该压缩请求必须返回 409 EPOCH_MISMATCH，丢弃旧快照，不得删除任何新 epoch 日志。故障点只能控制时序，不能绕过正常数据库逻辑。
+
+## 演示与交付
+
+交付完整修改仓库、依赖 lockfile、迁移/启动说明、自动化测试和浏览器演示入口。演示两个不同服务端口的编辑窗口，显示实际 text、epoch、seq/snapshot 水位及时间线；先演示正常离线收敛，再创建检查点、继续编辑并恢复，展示旧连接被关闭、旧离线修改被拒绝、新 doc 读取恢复结果。提供压缩竞态、恢复响应丢失和重启检查脚本。页面状态必须来自真实客户端与 API。
+
+保留原有同步/压缩/故障测试并按 epoch 契约升级，新增：并发恢复只有一个赢家；相同恢复 ID 在新 epoch 仍返回原结果；旧 socket 和离线 doc 不能复活撤销内容；旧压缩器在新 epoch 写入之后才释放；含 pending structs/delete sets 的检查点恢复；恢复提交前后强杀；新 epoch 重用 updateId；反复同时重启和初始化失败保护。README 解释恢复的线性化点、epoch 事务检查、缓存/连接隔离及旧任务取消。用标准客户端和独立 Yjs 实例验证，不把接口返回 200 当作内容正确的证明。
+```
+
+</details>
+
+<!-- VISUAL-BACKEND:END -->

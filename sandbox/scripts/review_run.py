@@ -43,6 +43,7 @@ from sandbox_lib import (  # noqa: E402
     now_iso,
     primary_html,
     primary_svg,
+    prompt_input_names,
     scan_forbidden_imports,
     scan_transcript,
     sha256_file,
@@ -62,7 +63,7 @@ def find_latest_run(model: str) -> Path:
 
 
 def observed_integrity_checks(meta: dict, workdir: Path,
-                              harness_dir: Path, transcript: str | None
+                              harness_dir: Path, transcript: str | None, snapshotter=None
                               ) -> list[tuple[str, str, str]]:
     """H-series: environment evidence, replacing self-reported integrity."""
     rows = []
@@ -83,7 +84,7 @@ def observed_integrity_checks(meta: dict, workdir: Path,
         rows.append(("H2", "FAIL", "缺少 prepare 期快照，无法验证目录未被污染"))
     else:
         before = load_json(snap_path)
-        after = snapshot_dir(workdir)
+        after = (snapshotter or snapshot_dir)(workdir)
         diff = diff_snapshot(before, after)
         problems = []
         if PROMPT_FILE in diff["modified"] or PROMPT_FILE in diff["removed"]:
@@ -307,7 +308,7 @@ def render_review(meta: dict, rows: list[tuple[str, str, str]],
 
 
 def review(harness_dir: Path, strict: bool = False,
-           transcript_path: Path | None = None) -> int:
+           transcript_path: Path | None = None, *, inventory_fn=None, deliverable_fn=None) -> int:
     harness_dir = harness_dir.resolve()
     meta = load_meta(harness_dir)
     if meta.get("protocol_version") != "2.0":
@@ -324,6 +325,9 @@ def review(harness_dir: Path, strict: bool = False,
     if meta.get("profile") == "native-godot-v1":
         from godot_profile import review as godot_review
         return godot_review(harness_dir, strict, transcript_path)
+    if meta.get("profile") == "native-blender-v1":
+        from blender_profile import review as blender_review
+        return blender_review(harness_dir, strict, transcript_path)
 
     workdir = workdir_of(meta)
     prompt_path = workdir / PROMPT_FILE
@@ -339,12 +343,12 @@ def review(harness_dir: Path, strict: bool = False,
 
     prompt_text = prompt_path.read_text(encoding="utf-8")
     req = extract_requirements(prompt_text)
-    names = list_deliverables(workdir)
+    names = (deliverable_fn or list_deliverables)(workdir, prompt_input_names(meta))
     html_path = primary_html(workdir, names)
 
     rows: list[tuple[str, str, str]] = []
     rows.append(("P1", "PASS", f"题面载入 {len(prompt_text)} chars"))
-    rows.extend(observed_integrity_checks(meta, workdir, harness_dir, transcript))
+    rows.extend(observed_integrity_checks(meta, workdir, harness_dir, transcript, inventory_fn))
     rows.extend(leakage_check(workdir))
     rows.extend(static_delivery_checks(workdir, names, html_path, prompt_text))
 

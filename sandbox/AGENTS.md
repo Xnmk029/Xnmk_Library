@@ -162,10 +162,22 @@ OS 级隔离仍为 unverified。协议只作专项扩展，不改变既有冻结
 
 ## 13. 原生 Godot profile：native-godot-v1
 
-登记文件为项目根的 BENCH_PROFILE.json，当前项目 NativeWorkflowBench/GodotShader。受测目录仍只复制原始题面；Godot 项目发现、审阅和收卷使用既有 prepare/review/collect 入口。操作见 GODOT_RUNS.md。
+登记文件为项目根的 BENCH_PROFILE.json，当前项目 NativeWorkflowBench/GodotShader 与 NativeWorkflowBench/GodotGameDemo。默认 prompt_only 仍只复制原始题面；续作题可登记 prompt_and_locked_archives，由 PROMPT_REGISTRY.json 列出输入 ZIP，再由 BENCH_PROFILE.json 的 locked_inputs 锁定 basename、SHA-256 与字节数。prepare、review、collect 必须核对输入；ZIP 原样保留，解压后的源码可编辑。禁止把旧提示词、评审、分数、金标、录像或缓存作为续作输入。Godot 项目发现、审阅和收卷使用既有 prepare/review/collect 入口。操作见 GODOT_RUNS.md。
 
 机器模块 godot_profile.py 获本 profile 的最小运行权限：读取登记、题面、交付与快照，在 harness 的独立副本上调用固定 Godot 导入/GPU 启动/截图，不读取参考解或其他模型答案。原始提交不修改；每次验收有唯一 user://、TEMP/TMP 和进程，缓存不进入交付归档。
 
 收卷保留完整工程的相对路径与全部普通/二进制依赖，归档前核对已审阅快照与运行证据。完整性有效但运行失败的样本可保留 FAIL 归档，以避免只保留成功样本；此为本 profile 的专门例外。INVALID、陈旧证据和改动过的题面/交付拒收，force 不可绕过。原生工程不会被重命名或压平为 answer 文件。
 
 运行检查与视觉评分分开：GPU 启动不验证六模式、交互、像素稳定性或风格质量，视觉评分始终待人工；工程 fixtures 不属于模型成绩。宿主/Agent/MCP 的读取边界未经验证时，isolation_verification 必须保持 unverified，不因目录、哈希或运行检查通过而升级。
+
+## 14. 原生 Blender profile：native-blender-v1
+
+登记文件为项目根的 BENCH_PROFILE.json，首题 NativeWorkflowBench/BlenderMXMaster3S。prepare 仅复制原题面和登记的 references/** 文件白名单，不复制项目说明、环境探针、模型答案或 harness 状态。白名单内容、正式题面与登记均冻结 SHA-256；参考图和公开尺寸资料属于本题输入。纯文字变体可明确登记 input_payload=prompt_only 且 input_files={}，此时 prepare 只复制原题面，仍执行完整的快照、原生验收与收卷检查；与带图条件分列记录。
+
+机器模块 blender_profile.py 获最小原生验收权限：只检查当前提交及输入完整性，在 harness 的独立副本和独立用户配置/TEMP 上，用登记 Blender 版本/build 打开 .blend 并生成受控 GPU 预览与结构/尺寸报告。自动执行嵌入脚本关闭，原始提交不修改。运行检查不能代替曲面、材质、拓扑与连续证据的人工评分。
+
+原生 Blender 登记可提供 expected_dimensions_xyz_mm 和 liquid_volume（对象名、目标 mL、容差）。验收从冻结登记读取工程尺寸与可选闭合液体网格体积条件；原鼠标题未登记时保留原 84.3×124.9×51 mm 检查，不将鼠标尺寸用于瓶类新题。液体体积检查考虑求值网格、世界变换和场景单位，几何闭合与容积符合不替代材质/形体视觉评分。
+
+review/collect 走现有入口。完整工程、二进制资源和相对路径保留；完整性有效的运行失败样本可保留 FAIL 归档。INVALID、题面/参考图变更、陈旧或被改动的运行证据均拒收，force 不可绕过，已有归档不覆盖。工程 fixtures 标注 engineering_fixture，不调用模型、不形成模型成绩。
+
+每个 Agent/MCP run 需绑定独立 Blender 文件、进程、用户配置和端口；图像输入注册与原生副本验收不证明 OS 或 MCP Python 文件读取边界有效，isolation_verification 仍为 unverified。实际模型、接入方式、会话日志和 usage 由派发宿主保存；未知值不从模型自述补全。

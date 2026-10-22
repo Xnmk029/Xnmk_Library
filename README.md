@@ -1,8 +1,9 @@
 # AI 大语言模型 Benchmark 测试套件
 
-本仓库为一个标准化的 AI 代码生成与系统架构评测套件，共包含 **44 个独立测试项目**（L1–L4），另含根目录 **[Image/](./Image/)** 图像生成分区（**6** 个独立测试项）。L1–L4 按难度阶梯归类，并按技术领域整理在 **[DOMAIN_INDEX.zh.md](./DOMAIN_INDEX.zh.md)** 全景索引中；图像项见 **[Image/README.md](./Image/README.md)**。
+本仓库为一个标准化的 AI 代码生成与系统架构评测套件，共包含 **57 个独立测试项目**（L1–L4），另含根目录 **[Image/](./Image/)** 图像生成分区（**6** 个独立测试项）。L1–L4 按难度阶梯归类，并按技术领域整理在 **[DOMAIN_INDEX.zh.md](./DOMAIN_INDEX.zh.md)** 全景索引中；图像项见 **[Image/README.md](./Image/README.md)**。
 
 **[English Documentation →](./README.en.md)** ｜ **[按领域分类的提示词索引（一键复制）→](./DOMAIN_INDEX.zh.md)** ｜ **[图像生成分区 →](./Image/README.md)**
+
 
 ---
 
@@ -10,10 +11,10 @@
 
 ```
 benchmark/
-├── L1_Basic/                     # Level 1: 基础工具与脚本类（5 个项目）
-├── L2_Intermediate/              # Level 2: 中级 Web 应用、交互游戏与文本写作类（13 个项目）
-├── L3_Advanced/                  # Level 3: 高级 3D 引擎与物理仿真类（16 个项目）
-├── L4_Expert/                    # Level 4: 专家级原生引擎与硬件协议类（11 个项目）
+├── L1_Basic/                     # Level 1: 基础工具与脚本类（8 个项目）
+├── L2_Intermediate/              # Level 2: 中级 Web 应用、交互游戏与文本写作类（15 个项目）
+├── L3_Advanced/                  # Level 3: 高级 3D 引擎与物理仿真类（21 个项目）
+├── L4_Expert/                    # Level 4: 专家级原生引擎与硬件协议类（13 个项目）
 ├── Image/                        # 图像生成与编辑（6 个独立测试项，与 L1–L4 并列）
 ├── DOMAIN_INDEX.en.md            # 按领域分类的提示词全景索引·英文版（内嵌全文，一键复制）
 ├── DOMAIN_INDEX.zh.md            # 按领域分类的提示词全景索引·中文版（内嵌全文，一键复制）
@@ -93,6 +94,7 @@ benchmark/
 | 50 | [`YuriEdgeLadder`](./L2_Intermediate/YuriEdgeLadder) | **百合贴线写作：NSFW 边界与语言张力** | 文本写作与内容安全 | `L2` | [提示词](./L2_Intermediate/YuriEdgeLadder/PROJECT_PROMPT.md) \| [评分标准](./L2_Intermediate/YuriEdgeLadder/README.md) |
 | 51 | [`VoxelVictoriaHarbour`](./L3_Advanced/VoxelVictoriaHarbour) | **体素维港：香港维多利亚港数字沙盘** | 3D 图形、物理仿真与 Shaders | `L3` | [提示词](./L3_Advanced/VoxelVictoriaHarbour/PROJECT_PROMPT.md) \| [评分标准](./L3_Advanced/VoxelVictoriaHarbour/README.md) |
 | 52 | [`VN1`](./L3_Advanced/VN1) | **VN1：8×8 轮式步兵战车家族程序化建模与 WebGPU 工作室** | 3D 图形、物理仿真与 Shaders | `L3` | [提示词](./L3_Advanced/VN1/PROJECT_PROMPT.md) \| [评分标准](./L3_Advanced/VN1/README.md) |
+| 53 | [`VoxelMarinaBay`](./L3_Advanced/VoxelMarinaBay) | **体素滨海湾：新加坡滨海湾与市中心数字沙盘**（并列题：陆家嘴 / 维港） | 3D 图形、物理仿真与 Shaders | `L3` | [提示词](./L3_Advanced/VoxelMarinaBay/PROJECT_PROMPT.md) \| [评分标准](./L3_Advanced/VoxelMarinaBay/README.md) |
 
 > 图像分区总览与评测流程见 **[Image/README.md](./Image/README.md)**。
 
@@ -149,6 +151,7 @@ benchmark/
 - [`TimberPavilion`](./L3_Advanced/TimberPavilion): 攒尖亭：四角亭木构营造与朝代演变
 - [`VT4`](./L3_Advanced/VT4): VT-4：主战坦克家族程序化建模与 WebGPU 工作室
 - [`VN1`](./L3_Advanced/VN1): VN1：8×8 轮式步兵战车家族程序化建模与 WebGPU 工作室
+- [`VoxelMarinaBay`](./L3_Advanced/VoxelMarinaBay): 体素滨海湾：新加坡滨海湾与市中心数字沙盘
 
 ### Level 4: 专家级原生引擎与硬件协议类 (L4_Expert)
 
@@ -180,3 +183,24 @@ benchmark/
 ## 6. 开源协议
 
 本项目基于 [MIT 许可证](LICENSE) 开源。
+
+<!-- VISUAL-BACKEND:START -->
+
+## 脚本与可视化后端题库
+
+已登记 8 题，L1–L4 各 2 题；B01 沿用现有 B 站项目，其余 7 个项目新增入库。基础测试、完成时间及替换记录见题库报告。
+
+[题库、试测结果与耗时](./Backend/README.md) · [机读登记](./Backend/BANK.json)
+
+| ID | Level | 题目 | 派发输入 |
+|---|---|---|---|
+| B01 | L1 | [B 站评论 IP 属地脚本](./L1_Basic/BilibiliUserscript/README.md) | [题面](./Backend/dispatch/BilibiliControlled/PROJECT_PROMPT.md) |
+| B02 | L1 | [HTTP 健康探针与可视化报告](./L1_Basic/HttpHealthProbe/README.md) | [题面](./L1_Basic/HttpHealthProbe/PROJECT_PROMPT.md) |
+| B03 | L2 | [目录重复文件检测器](./L2_Intermediate/DuplicateFileInspector/README.md) | [题面](./L2_Intermediate/DuplicateFileInspector/PROJECT_PROMPT.md) |
+| B04 | L2 | [本地短链接与访问统计台](./L2_Intermediate/LocalShortLinks/README.md) | [题面](./L2_Intermediate/LocalShortLinks/PROJECT_PROMPT.md) |
+| B05 | L3 | [乱序订单事件回放与对账报告](./L3_Advanced/OrderEventReplay/README.md) | [题面](./L3_Advanced/OrderEventReplay/PROJECT_PROMPT.md) |
+| B06 | L3 | [限流与熔断代理工作台](./L3_Advanced/ResilientGateway/README.md) | [题面](./L3_Advanced/ResilientGateway/PROJECT_PROMPT.md) |
+| B07 | L4 | [Raft 在线换节点与无日志读取](./L4_Expert/RaftTxnWorkbench/README.md) | [题面](./L4_Expert/RaftTxnWorkbench/PROJECT_PROMPT.md) |
+| B08 | L4 | [检查点恢复与跨进程世代隔离](./L4_Expert/DurableCollab/README.md) | [题面](./L4_Expert/DurableCollab/PROJECT_PROMPT.md) |
+
+<!-- VISUAL-BACKEND:END -->

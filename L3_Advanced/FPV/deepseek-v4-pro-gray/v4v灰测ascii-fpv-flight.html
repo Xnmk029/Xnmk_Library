@@ -1,0 +1,713 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ASCII FPV CITY FLIGHT / 字符飞行</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;background:#000;overflow:hidden;}
+  #screen{
+    position:absolute; margin:0; padding:0;
+    font-family:"Cascadia Mono","Consolas","DejaVu Sans Mono","Liberation Mono","Courier New",monospace;
+    white-space:pre; letter-spacing:0; font-variant-ligatures:none;
+    -webkit-font-smoothing:antialiased;
+    color:#8a8a8a; background:#000; user-select:none; text-align:left;
+  }
+  #hint{
+    position:fixed; left:0; right:0; bottom:4px; text-align:center; pointer-events:none;
+    font-family:"Microsoft YaHei","PingFang SC",sans-serif; font-size:13px; color:#7fd6ff; opacity:.72;
+    text-shadow:0 0 6px #000,0 0 3px #000;
+  }
+</style>
+</head>
+<body>
+<pre id="screen"></pre>
+<div id="hint">W/S 俯仰(±45°) · A/D 滚转速率(±45°，45°滚转=90°/s 协调转弯) · Z/X 加速/减速(10~50m/s) · P 暂停 · R 重开 · H 隐藏提示</div>
+<script>
+(function(){
+'use strict';
+
+/* ============================================================
+   ASCII FPV CITY FLIGHT
+   全部 3D 画面由彩色 ASCII 字符网格排列而成（每个字符格 = 一条光线）
+   ============================================================ */
+
+var DEG = Math.PI/180, TAU = Math.PI*2;
+function clamp(v,a,b){ return v<a?a:(v>b?b:v); }
+function fmod(a,b){ return a - Math.floor(a/b)*b; }
+
+/* 整数哈希：用于程序化生成无限城市 */
+function hash2(i,j){
+  var h = Math.imul(i|0,374761393) ^ Math.imul(j|0,668265263);
+  h = Math.imul(h ^ (h>>>13), 1274126177);
+  h = h ^ (h>>>16);
+  return (h>>>0)/4294967296;
+}
+
+/* ===================== 配色（材质 x 亮度级） ===================== */
+var MAT = [
+  [  0,  0,  0], /* 0  天空/空白 */
+  [196,193,186], /* 1  混凝土墙 */
+  [116,172,224], /* 2  玻璃幕墙 */
+  [206,126, 88], /* 3  砖墙     */
+  [152,155,164], /* 4  屋顶     */
+  [255,222,130], /* 5  亮灯窗口 */
+  [104,108,120], /* 6  沥青路面 */
+  [240,214, 84], /* 7  车道分隔线 */
+  [ 86,170, 84], /* 8  草地     */
+  [172,170,156], /* 9  人行道   */
+  [ 92,206,104], /* 10 树冠亮面 */
+  [ 44,138, 72], /* 11 树冠暗面 */
+  [140, 96, 56], /* 12 树干     */
+  [ 90,255,170], /* 13 HUD 主色 */
+  [ 42,148,110], /* 14 HUD 暗色 */
+  [255, 96, 80], /* 15 警告红   */
+  [235,240,255], /* 16 白       */
+  [ 96,112,140]  /* 17 暗玻璃(未亮窗) */
+];
+var M_SKY=0,M_CONC=1,M_GLASS=2,M_BRICK=3,M_ROOF=4,M_WIN=5,M_ROAD=6,M_LANE=7,
+    M_GRASS=8,M_WALK=9,M_LEAF=10,M_LEAF2=11,M_TRUNK=12,M_HUD=13,M_HUD2=14,
+    M_WARN=15,M_WHITE=16,M_DGLASS=17;
+var LEVELS = 8;
+var CL_HUD  = M_HUD*LEVELS+7,   CL_HUD2 = M_HUD2*LEVELS+7;
+var CL_WARN = M_WARN*LEVELS+7,  CL_WHITE= M_WHITE*LEVELS+7;
+
+(function buildPalette(){
+  var css = '#screen span{display:inline}';
+  for(var m=0;m<MAT.length;m++){
+    for(var l=0;l<LEVELS;l++){
+      var f = Math.pow((l+1)/LEVELS, 1.25);
+      var c = MAT[m];
+      css += '.c'+(m*LEVELS+l)+'{color:rgb('+
+        Math.round(c[0]*f)+','+Math.round(c[1]*f)+','+Math.round(c[2]*f)+')}';
+    }
+  }
+  if(typeof document!=='undefined' && document.createElement){
+    var st=document.createElement('style'); st.textContent=css;
+    (document.head||document.body||{appendChild:function(){}}).appendChild(st);
+  }
+})();
+
+/* ===================== 世界参数 ===================== */
+var CELL = 16;        /* 每个城市网格 16m */
+var PER  = 6;         /* 6x6 格 = 一个街区周期 */
+var ROADW= 2;         /* 其中 2 格为马路 => 32m 宽街道，可以从楼间穿过 */
+var FAR  = 300;       /* 最远视距 */
+var FOG  = 120;       /* 雾衰减距离 */
+var MAXSTEPS = 56;    /* DDA 最大步进 */
+var VFOV = 60*DEG;
+
+/* 飞行参数 */
+var PITCH_RATE = 38*DEG;   /* W/S 俯仰角速率 */
+var ROLL_RATE  = 95*DEG;   /* A/D 滚转角速率（速率模式） */
+var MAX_PITCH  = 45*DEG;
+var MAX_ROLL   = 45*DEG;
+var YAW_AT_MAX = 90*DEG;   /* 滚转45°时偏航角速度 90°/s，线性协调转弯 */
+var ACCEL = 9, VMIN = 10, VMAX = 50;
+
+/* ===================== 城市单元查询 ===================== */
+var K_ROAD=0, K_BUILD=1, K_GREEN=2;
+var cKind=0, cH=0, cMat=M_CONC, cLit=0;
+var cTree=0, cTx=0, cTz=0, cTy=0, cTr=0;
+
+function setTree(i,j,t){
+  var jx=hash2(i+31,j+17), jz=hash2(i-13,j+53);
+  cTree=1;
+  cTr = 2.0 + t*1.3;                       /* 树冠半径（保证不越出本格） */
+  cTx = i*CELL + CELL*(0.32+0.36*jx);
+  cTz = j*CELL + CELL*(0.32+0.36*jz);
+  cTy = 4.2 + t*3.0 + cTr;
+}
+
+function cellAt(i,j){
+  var ri=((i%PER)+PER)%PER, rj=((j%PER)+PER)%PER;
+  var roadI = ri<ROADW, roadJ = rj<ROADW;
+  cTree=0;
+  if(roadI||roadJ){                        /* 街道 */
+    cKind=K_ROAD; cH=0;
+    if(!(roadI&&roadJ)){                   /* 路口不种树 */
+      var t=hash2(i*3+11,j*7+5);
+      if(t>0.42){                          /* 沿人行道成排的行道树 */
+        cTree=1; cTr=2.0+t*0.9; cTy=4.8+t*2.4+cTr;
+        if(roadI){ cTx=i*CELL+(ri===0?4.2:CELL-4.2); cTz=j*CELL+CELL*0.5; }
+        else     { cTz=j*CELL+(rj===0?4.2:CELL-4.2); cTx=i*CELL+CELL*0.5; }
+      }
+    }
+    return;
+  }
+  var bi=Math.floor(i/PER), bj=Math.floor(j/PER);
+  var bh=hash2(bi+9137,bj-4211);
+  if(bh<0.14){                             /* 公园街区 */
+    cKind=K_GREEN; cH=0;
+    var tp=hash2(i*5+3,j*9+7);
+    if(tp>0.28) setTree(i,j,tp);
+    return;
+  }
+  var q=hash2(i,j);
+  if(q<0.12){                              /* 空地/广场（楼群间的缝隙） */
+    cKind=K_GREEN; cH=0;
+    if(q<0.04) setTree(i,j,0.5+q);
+    return;
+  }
+  cKind=K_BUILD;
+  var hq=hash2(i+7919,j+104729);
+  var base = 10 + hq*hq*58;
+  if(bh>0.76) base *= 2.2;                 /* 市中心高楼群 */
+  cH = Math.min(170, Math.round(base/3)*3 + 6);
+  var mv=hash2(i-5,j+9);
+  cMat = mv<0.40 ? M_CONC : (mv<0.78 ? M_GLASS : M_BRICK);
+  cLit = hash2(i+601,j-337);
+  return;
+}
+
+function heightAt(x,z){
+  cellAt(Math.floor(x/CELL),Math.floor(z/CELL));
+  return cKind===K_BUILD ? cH : 0;
+}
+
+/* ===================== 光线求交输出 ===================== */
+var outChar=32, outCls=0;
+var RAMP = ".-=+*x#%@";     /* 远景楼面由暗到亮的密度梯度（避开草地/路面用字） */
+
+function put(mat,bright,ch){
+  var l=(bright*LEVELS)|0; if(l>LEVELS-1)l=LEVELS-1; if(l<0)l=0;
+  outCls = mat*LEVELS+l; outChar = ch;
+}
+function rampCode(b){
+  var i=(b*RAMP.length)|0; if(i>=RAMP.length)i=RAMP.length-1; if(i<0)i=0;
+  return RAMP.charCodeAt(i);
+}
+function fogAt(t){ return Math.exp(-t/FOG); }
+
+/* ---- 楼房立面 ---- */
+function wallOut(hx,hy,hz,t,axis,pos,i,j,h){
+  var fog=fogAt(t);
+  /* 四个朝向给四档明暗，立体感才出得来（假想光来自 -z / -x 方向） */
+  var face = axis===0 ? (pos?0.40:0.66) : (pos?1.00:0.54);
+  var u = axis===0 ? hz : hx;
+  var v = hy;
+  var mat=cMat, br=fog*face;
+
+  if(t<150){
+    if(Math.abs(fmod(u,CELL)-CELL*0.5) > CELL*0.5-0.40){   /* 楼体竖直棱线 */
+      put(mat, Math.min(1,br*1.55), 124 /* '|' */); return;
+    }
+    var wv=fmod(v,4.8);
+    if(v<3.4 || wv<1.30 || (h-v)<2.2){                     /* 楼板横线 / 底层 / 女儿墙 */
+      put(mat, Math.min(1,br*1.32), 45 /* '-' */); return;
+    }
+    var wu=fmod(u,4.4);
+    if(wu>0.85 && wu<3.55){                                /* 窗户 */
+      var wk=hash2(Math.floor(u/4.4)*17+i, Math.floor(v/4.8)*13+j);
+      if(wk < 0.26+cLit*0.44){ put(M_WIN, fog*(0.70+0.30*wk), 48 /* '0' */); return; }
+      put(M_DGLASS, br*1.05, 111 /* 'o' */); return;
+    }
+    put(mat, br, 58 /* ':' 窗间柱 */); return;             /* 竖向窗间墙 */
+  }
+  put(mat, br, rampCode(br));                              /* 远景只留密度梯度 */
+}
+
+/* ---- 屋顶 ---- */
+function roofOut(hx,hz,t,i,j){
+  var fog=fogAt(t);
+  var lx=fmod(hx,CELL), lz=fmod(hz,CELL);
+  var edge=Math.min(lx,CELL-lx,lz,CELL-lz);
+  if(edge<0.6){ put(M_ROOF, Math.min(1,fog*1.25), 35 /* '#' */); return; }
+  var n=hash2(Math.floor(hx*1.2),Math.floor(hz*1.2));
+  var ch = n<0.68 ? 61 /* '=' */ : (n<0.90 ? 45 /* '-' */ : (n<0.975 ? 43 /* '+' */ : 35));
+  put(M_ROOF, fog*0.95, ch);
+}
+
+/* ---- 地面：道路 / 车道线 / 人行道 / 草地 ---- */
+function groundOut(hx,hz,t){
+  var fog=fogAt(t);
+  var PZ=PER*CELL, RW=ROADW*CELL;                 /* 96m 周期，32m 路宽 */
+  var ux=fmod(hx,PZ), uz=fmod(hz,PZ);
+  var roadX=(ux<RW), roadZ=(uz<RW);
+  var n=hash2(Math.floor(hx*1.6),Math.floor(hz*1.6));
+
+  if(roadX||roadZ){
+    /* 人行道（贴着楼根） */
+    if(roadX&&!roadZ&&(ux<3.4||ux>RW-3.4)){ put(M_WALK,fog*(0.50+0.30*n),46); return; }
+    if(roadZ&&!roadX&&(uz<3.4||uz>RW-3.4)){ put(M_WALK,fog*(0.50+0.30*n),46); return; }
+    if(!(roadX&&roadZ)){                          /* 路口不画标线 */
+      if(roadX && Math.abs(ux-RW*0.5)<0.85 && fmod(hz,11)<6.0){ put(M_LANE,fog,124); return; }
+      if(roadZ && Math.abs(uz-RW*0.5)<0.85 && fmod(hx,11)<6.0){ put(M_LANE,fog,45); return; }
+    }
+    var rc = n<0.55?46 : (n<0.86?45:58);          /* '.' '-' ':' 沥青颗粒 */
+    put(M_ROAD, fog*(0.42+0.48*n), rc);
+    return;
+  }
+  var gc = n<0.40?34 : (n<0.72?44 : (n<0.92?39:59));  /* '"' ',' "'" ';' 草地 */
+  put(M_GRASS, fog*(0.50+0.50*n), gc);
+}
+
+/* ---- 树：球形树冠 + 圆柱树干 ---- */
+function traceTree(ox,oy,oz,dx,dy,dz,tmin,tmax){
+  var ex=ox-cTx, ey=oy-cTy, ez=oz-cTz;
+  var b=ex*dx+ey*dy+ez*dz;
+  var c=ex*ex+ey*ey+ez*ez-cTr*cTr;
+  var disc=b*b-c, t, sq;
+  if(disc>0){
+    sq=Math.sqrt(disc); t=-b-sq;
+    if(t<tmin) t=-b+sq;
+    if(t>=tmin&&t<=tmax){
+      var hx=ox+dx*t, hy=oy+dy*t, hz=oz+dz*t;
+      var nx=(hx-cTx)/cTr, ny=(hy-cTy)/cTr, nz=(hz-cTz)/cTr;
+      var lam=clamp(0.30+0.70*(ny*0.55+nx*0.42+nz*0.30+0.35),0,1);
+      var fog=fogAt(t);
+      var nz2=hash2(Math.floor(hx*2.2),Math.floor(hz*2.2+hy*3.1));
+      var mat = lam>0.62?M_LEAF:M_LEAF2;
+      var ch = nz2<0.30?42 : (nz2<0.62?111 : (nz2<0.86?37:35)); /* '*' 'o' '%' '#' */
+      put(mat, fog*(0.35+0.65*lam), ch);
+      return t;
+    }
+  }
+  var A=dx*dx+dz*dz;
+  if(A>1e-9){
+    var B=ex*dx+ez*dz, C=ex*ex+ez*ez-0.2025;
+    var d2=B*B-A*C;
+    if(d2>0){
+      sq=Math.sqrt(d2); t=(-B-sq)/A;
+      if(t<tmin) t=(-B+sq)/A;
+      if(t>=tmin&&t<=tmax){
+        var yy=oy+dy*t;
+        if(yy>0 && yy<cTy-cTr*0.45){ put(M_TRUNK, fogAt(t)*0.85, 124); return t; }
+      }
+    }
+  }
+  return -1;
+}
+
+/* ===================== 主光线步进（DDA 网格行进） ===================== */
+function trace(ox,oy,oz,dx,dy,dz){
+  var tGround = Infinity;
+  if(dy<-1e-8) tGround = -oy/dy;
+  var maxT = tGround<FAR ? tGround : FAR;
+
+  var i=Math.floor(ox/CELL), j=Math.floor(oz/CELL);
+  var stepI = dx>0?1:(dx<0?-1:0), stepJ = dz>0?1:(dz<0?-1:0);
+  var tdx = stepI!==0 ? Math.abs(CELL/dx) : Infinity;
+  var tdz = stepJ!==0 ? Math.abs(CELL/dz) : Infinity;
+  var tMaxX = stepI>0 ? ((i+1)*CELL-ox)/dx : (stepI<0 ? (i*CELL-ox)/dx : Infinity);
+  var tMaxZ = stepJ>0 ? ((j+1)*CELL-oz)/dz : (stepJ<0 ? (j*CELL-oz)/dz : Infinity);
+
+  var tEnter=0, axis=1;
+  for(var s=0;s<MAXSTEPS;s++){
+    if(tEnter>maxT) break;
+    var tExit = tMaxX<tMaxZ ? tMaxX : tMaxZ;
+    var tX = tExit<maxT ? tExit : maxT;
+    cellAt(i,j);
+    if(cKind===K_BUILD){
+      var h=cH;
+      var yE=oy+dy*tEnter;
+      if(yE<h){
+        wallOut(ox+dx*tEnter, yE, oz+dz*tEnter, tEnter, axis, (axis===0?dx>0:dz>0), i, j, h);
+        return;
+      } else if(dy<0){
+        var tr=(h-oy)/dy;
+        if(tr>=tEnter && tr<=tX){ roofOut(ox+dx*tr, oz+dz*tr, tr, i, j); return; }
+      }
+    } else if(cTree===1){
+      if(traceTree(ox,oy,oz,dx,dy,dz,tEnter,tX)>=0) return;
+    }
+    if(tExit>=maxT) break;
+    if(tMaxX<tMaxZ){ tEnter=tMaxX; i+=stepI; tMaxX+=tdx; axis=0; }
+    else           { tEnter=tMaxZ; j+=stepJ; tMaxZ+=tdz; axis=1; }
+  }
+  if(dy<0 && tGround<=FAR){ groundOut(ox+dx*tGround, oz+dz*tGround, tGround); return; }
+  outChar=32; outCls=0;   /* 天空：纯黑底 */
+}
+
+/* ===================== 字符画屏幕 ===================== */
+var screenEl = (typeof document!=='undefined') ? document.getElementById('screen') : null;
+var W=0,H=0,cellW=8,cellH=14,aspect=1.8;
+var gchar=null, gcls=null;
+
+function measureCharW(fs){
+  if(typeof document==='undefined'||!document.createElement) return fs*0.6;
+  var sp=document.createElement('span');
+  sp.style.cssText='position:absolute;visibility:hidden;white-space:pre;'+
+    'font-family:'+(screenEl&&screenEl.style?getComputedStyleFont():'monospace')+';font-size:'+fs+'px';
+  sp.textContent='MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM';
+  (document.body||{appendChild:function(){},removeChild:function(){}}).appendChild(sp);
+  var w=0;
+  try{ w=sp.getBoundingClientRect().width/40; }catch(e){ w=0; }
+  try{ document.body.removeChild(sp); }catch(e){}
+  return w>0.5 ? w : fs*0.6;
+}
+function getComputedStyleFont(){
+  try{ return window.getComputedStyle(screenEl).fontFamily || 'monospace'; }
+  catch(e){ return 'monospace'; }
+}
+
+function fit(){
+  var sw = (typeof window!=='undefined'&&window.innerWidth) ? window.innerWidth : 1600;
+  var sh = (typeof window!=='undefined'&&window.innerHeight)? window.innerHeight: 900;
+  var fs = clamp(Math.round(sw/162/0.6), 9, 26);
+  var cw, chh, cols, rows, guard=0;
+  do{
+    cw  = measureCharW(fs);
+    chh = Math.max(6, Math.round(fs*1.02));
+    cols= Math.max(40, Math.floor(sw/cw));
+    rows= Math.max(20, Math.floor(sh/chh));
+    if(cols*rows<=16000) break;
+    fs++;
+  }while(guard++<20 && fs<40);
+
+  W=cols; H=rows; cellW=cw; cellH=chh;
+  aspect=(W*cellW)/(H*cellH);
+  gchar=new Uint16Array(W*H); gcls=new Uint16Array(W*H);
+  if(screenEl&&screenEl.style){
+    screenEl.style.fontSize=fs+'px';
+    screenEl.style.lineHeight=chh+'px';
+    screenEl.style.left=Math.max(0,Math.floor((sw-cols*cw)/2))+'px';
+    screenEl.style.top =Math.max(0,Math.floor((sh-rows*chh)/2))+'px';
+  }
+}
+
+function drawText(x,y,str,cls){
+  if(y<0||y>=H) return;
+  for(var k=0;k<str.length;k++){
+    var xx=x+k; if(xx<0||xx>=W) continue;
+    var idx=y*W+xx; gchar[idx]=str.charCodeAt(k); gcls[idx]=cls;
+  }
+}
+function setCell(x,y,code,cls){
+  if(x<0||x>=W||y<0||y>=H) return;
+  var idx=y*W+x; gchar[idx]=code; gcls[idx]=cls;
+}
+
+var ESC=/[&<>]/;
+function flush(){
+  if(!screenEl) return;
+  var parts=[],y,x,base,c,e,txt;
+  for(y=0;y<H;y++){
+    base=y*W; x=0;
+    while(x<W){
+      c=gcls[base+x]; e=x+1;
+      while(e<W && gcls[base+e]===c) e++;
+      txt=String.fromCharCode.apply(null, gchar.subarray(base+x,base+e));
+      if(ESC.test(txt)) txt=txt.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      parts.push(c===0 ? txt : '<span class="c'+c+'">'+txt+'</span>');
+      x=e;
+    }
+    parts.push('\n');
+  }
+  screenEl.innerHTML=parts.join('');
+}
+
+/* ===================== 飞行状态 ===================== */
+var px=7, py=32, pz=7, yaw=0, pitch=0, roll=0, speed=28;
+var dist=0, tflight=0, best=0, fps=0;
+var mode='title', crashMsg='';
+var keys={};
+
+try{ best=parseFloat(localStorage.getItem('asciifpv_best')||'0')||0; }catch(e){ best=0; }
+
+function respawn(){
+  px=CELL*1.0; py=45; pz=CELL*1.0;      /* 街道正中，机头朝北 */
+  yaw=0; pitch=0; roll=0; speed=28; dist=0; tflight=0;
+  crashMsg='';
+}
+
+function crash(reason){
+  mode='crash'; crashMsg=reason;
+  if(dist>best){
+    best=dist;
+    try{ localStorage.setItem('asciifpv_best', String(Math.round(best))); }catch(e){}
+  }
+}
+
+function hitTest(){
+  if(py<1.5) return 'GROUND IMPACT';
+  var off=[[0,0],[1.8,0],[-1.8,0],[0,1.8],[0,-1.8]];
+  for(var k=0;k<off.length;k++){
+    var x=px+off[k][0], z=pz+off[k][1];
+    cellAt(Math.floor(x/CELL),Math.floor(z/CELL));
+    if(cKind===K_BUILD && py<cH+1.0) return 'HIT BUILDING';
+    if(cTree===1){
+      var dx=px-cTx, dy=py-cTy, dz=pz-cTz;
+      if(dx*dx+dy*dy+dz*dz < (cTr+1.0)*(cTr+1.0)) return 'HIT TREE';
+    }
+  }
+  return null;
+}
+
+function update(dt){
+  /* 滚转：角速率模式，松手保持姿态，限幅 ±45° */
+  var rr=0;
+  if(keys.a) rr-=ROLL_RATE;
+  if(keys.d) rr+=ROLL_RATE;
+  roll=clamp(roll+rr*dt,-MAX_ROLL,MAX_ROLL);
+
+  /* 俯仰：W 减小俯仰(压机头) S 增加俯仰(拉机头)，限幅 ±45° */
+  var pr=0;
+  if(keys.w) pr-=PITCH_RATE;
+  if(keys.s) pr+=PITCH_RATE;
+  pitch=clamp(pitch+pr*dt,-MAX_PITCH,MAX_PITCH);
+
+  /* 协调转弯：偏航角速度与滚转角线性相关，45°→90°/s */
+  yaw=fmod(yaw+(roll/MAX_ROLL)*YAW_AT_MAX*dt, TAU);
+
+  /* 油门 */
+  if(keys.z) speed+=ACCEL*dt;
+  if(keys.x) speed-=ACCEL*dt;
+  speed=clamp(speed,VMIN,VMAX);
+
+  var cp=Math.cos(pitch), sp=Math.sin(pitch);
+  px+=speed*cp*Math.sin(yaw)*dt;
+  pz+=speed*cp*Math.cos(yaw)*dt;
+  py+=speed*sp*dt;
+  if(py>320){ py=320; if(pitch>0) pitch=0; }
+  dist+=speed*dt; tflight+=dt;
+
+  var hit=hitTest();
+  if(hit) crash(hit);
+}
+
+/* ===================== 世界渲染 ===================== */
+var vcr=1,vsr=0,vtanH=1,vtanV=1;   /* 供 HUD 反投影使用 */
+
+function renderWorld(){
+  var cp=Math.cos(pitch), sp=Math.sin(pitch), cy=Math.cos(yaw), sy=Math.sin(yaw);
+  var fx=cp*sy, fy=sp, fz=cp*cy;
+  var rx0=cy,     ry0=0,  rz0=-sy;
+  var ux0=-sp*sy, uy0=cp, uz0=-sp*cy;
+  var cr=Math.cos(roll), sr=Math.sin(roll);
+  var rx=rx0*cr-ux0*sr, ry=ry0*cr-uy0*sr, rz=rz0*cr-uz0*sr;
+  var ux=ux0*cr+rx0*sr, uy=uy0*cr+ry0*sr, uz=uz0*cr+rz0*sr;
+  var tanV=Math.tan(VFOV/2), tanH=tanV*aspect;
+  vcr=cr; vsr=sr; vtanH=tanH; vtanV=tanV;
+
+  for(var y=0;y<H;y++){
+    var b=(1-2*(y+0.5)/H)*tanV;
+    var bux=b*ux, buy=b*uy, buz=b*uz;
+    var row=y*W;
+    for(var x=0;x<W;x++){
+      var a=(2*(x+0.5)/W-1)*tanH;
+      var dx=fx+a*rx+bux, dy=fy+a*ry+buy, dz=fz+a*rz+buz;
+      var inv=1/Math.sqrt(dx*dx+dy*dy+dz*dz);
+      trace(px,py,pz,dx*inv,dy*inv,dz*inv);
+      gchar[row+x]=outChar; gcls[row+x]=outCls;
+    }
+  }
+}
+
+/* ===================== HUD ===================== */
+function bodyX(A,B){ return Math.round(((A*vcr-B*vsr)/vtanH+1)*0.5*W-0.5); }
+function bodyY(A,B){ return Math.round((1-(A*vsr+B*vcr)/vtanV)*0.5*H-0.5); }
+
+function pad(s,n,right){
+  s=String(s);
+  while(s.length<n) s = right ? (' '+s) : (s+' ');
+  return s;
+}
+
+function drawLadder(){
+  var cx=W>>1, cy=H>>1;
+  /* 地平线 */
+  var Bh=-Math.tan(pitch);
+  var stepA=vtanH*2/W, A;
+  for(A=-vtanH*1.7; A<=vtanH*1.7; A+=stepA*0.5){
+    var sx=bodyX(A,Bh), sy=bodyY(A,Bh);
+    if(sx<0||sx>=W||sy<0||sy>=H) continue;
+    if(Math.abs(sx-cx)<5 && Math.abs(sy-cy)<2) continue;
+    setCell(sx,sy,45,CL_HUD2);
+  }
+  /* 俯仰刻度梯 */
+  var lad=[-40,-30,-20,-10,10,20,30,40];
+  for(var k=0;k<lad.length;k++){
+    var th=lad[k]*DEG, rel=th-pitch;
+    if(Math.abs(rel)>75*DEG) continue;
+    var B=Math.tan(rel);
+    var code = lad[k]>0?45:46;               /* 上方实线 '-'，下方虚线 '.' */
+    for(var side=-1;side<=1;side+=2){
+      for(A=0.10*vtanH; A<=0.30*vtanH; A+=stepA*0.7){
+        var xx=bodyX(side*A,B), yy=bodyY(side*A,B);
+        setCell(xx,yy,code,CL_HUD2);
+      }
+    }
+    var lx=bodyX(0.335*vtanH,B), ly=bodyY(0.335*vtanH,B);
+    drawText(lx,ly,pad(Math.abs(lad[k]),2,true),CL_HUD2);
+  }
+  /* 机头准星 */
+  drawText(cx-3,cy,"--",CL_HUD); drawText(cx+2,cy,"--",CL_HUD);
+  setCell(cx-1,cy,91,CL_HUD); setCell(cx,cy,43,CL_HUD); setCell(cx+1,cy,93,CL_HUD);
+}
+
+function drawHUD(){
+  var cx=W>>1;
+  /* 滚转刻度尺（顶部，41格 = ±45°） */
+  var scale=' ', i;
+  for(i=0;i<41;i++) scale += (i%10===0) ? '|' : '.';
+  scale+=' ';
+  drawText(cx-21,0,scale,CL_HUD2);
+  drawText(cx-21,1,"                                           ",CL_HUD2);
+  var mk=clamp(Math.round(roll/MAX_ROLL*20)+20,0,40);
+  setCell(cx-20+mk,1,94,Math.abs(roll)>44*DEG?CL_WARN:CL_HUD);   /* '^' */
+  drawText(cx-5,2," ROLL ",CL_HUD2);
+
+  var vs=speed*Math.sin(pitch);
+  var hdg=Math.round(fmod(yaw/DEG,360));
+
+  var bar=Math.round((speed-VMIN)/(VMAX-VMIN)*12), tb="";
+  for(i=0;i<12;i++) tb += i<bar ? '#' : '-';
+  var L=1, R=W-19;
+  drawText(L,1,"                  ",CL_HUD2);
+  drawText(L,2," SPD "+pad(speed.toFixed(0),2,true)+" m/s       ",CL_HUD);
+  drawText(L,3," THR ["+tb+"]  ",CL_HUD2);
+  drawText(L,4," DST "+pad(Math.round(dist),5,true)+" m       ",CL_HUD2);
+  drawText(L,5," BST "+pad(Math.round(best),5,true)+" m       ",CL_HUD2);
+  drawText(L,6,"                  ",CL_HUD2);
+
+  var alt=py, low=(alt<15);
+  drawText(R,1,"                  ",CL_HUD2);
+  drawText(R,2,"      ALT "+pad(Math.round(alt),4,true)+" m ",low?CL_WARN:CL_HUD);
+  drawText(R,3,"      V/S "+pad((vs>=0?'+':'')+vs.toFixed(0),4,true)+"   ",CL_HUD2);
+  drawText(R,4,"      HDG "+pad(hdg,4,true)+" d ",CL_HUD2);
+  drawText(R,5,"      FPS "+pad(Math.round(fps),4,true)+"   ",CL_HUD2);
+  drawText(R,6,"                  ",CL_HUD2);
+
+  drawText(L,H-5,"                                                                 ",CL_HUD2);
+  drawText(L,H-4," PIT "+pad((pitch/DEG>=0?'+':'')+(pitch/DEG).toFixed(0),3,true)+
+                 "   ROL "+pad((roll/DEG>=0?'+':'')+(roll/DEG).toFixed(0),3,true)+
+                 "   TRN "+pad((roll/MAX_ROLL*90).toFixed(0),3,true)+" d/s   TIME "+
+                 pad(tflight.toFixed(1),5,true)+" s ",CL_HUD2);
+  drawText(L,H-3,"                                                                 ",CL_HUD2);
+  drawText(L,H-2," W/S PITCH   A/D ROLL   Z/X SPEED   P PAUSE   R RESET   H HELP ",CL_HUD2);
+  drawText(L,H-1,"                                                                 ",CL_HUD2);
+}
+
+function drawPanel(lines,cls){
+  var w=0,i;
+  for(i=0;i<lines.length;i++) w=Math.max(w,lines[i].length);
+  w+=6; var h=lines.length+2;
+  var x0=Math.floor((W-w)/2), y0=Math.floor((H-h)/2);
+  var top='+'; for(i=0;i<w-2;i++) top+='-'; top+='+';
+  drawText(x0,y0,top,cls);
+  for(i=0;i<lines.length;i++){
+    var t=lines[i], p=w-4-t.length, lp=Math.floor(p/2), s='| ',k;
+    for(k=0;k<lp;k++) s+=' ';
+    s+=t;
+    for(k=0;k<p-lp;k++) s+=' ';
+    s+=' |';
+    drawText(x0,y0+1+i,s,cls);
+  }
+  drawText(x0,y0+h-1,top,cls);
+}
+
+function drawOverlay(){
+  if(mode==='title'){
+    drawPanel([
+      "A S C I I   F P V   C I T Y   F L I G H T",
+      "",
+      "W / S ....  PITCH DOWN / UP     (limit +-45 deg)",
+      "A / D ....  ROLL RATE L / R     (limit +-45 deg)",
+      "Z / X ....  FASTER / SLOWER     (10 - 50 m/s)",
+      "P / R / H   PAUSE / RESET / HELP",
+      "",
+      "BANK 45 deg  ==  COORDINATED TURN AT 90 deg/s",
+      "FLY BETWEEN THE TOWERS. DO NOT TOUCH ANYTHING.",
+      "",
+      "PRESS  SPACE  TO LAUNCH"
+    ],CL_HUD);
+  } else if(mode==='crash'){
+    drawPanel([
+      "*  C R A S H E D  *",
+      crashMsg,
+      "",
+      "DISTANCE "+Math.round(dist)+" m    TIME "+tflight.toFixed(1)+" s",
+      "BEST     "+Math.round(best)+" m",
+      "",
+      "PRESS  R  TO FLY AGAIN"
+    ],CL_WARN);
+  } else if(mode==='pause'){
+    drawPanel(["P A U S E D","","PRESS  P  TO RESUME"],CL_HUD);
+  }
+}
+
+/* ===================== 主循环 ===================== */
+function frame(dt){
+  if(mode==='fly') update(dt);
+  renderWorld();
+  drawLadder();
+  drawHUD();
+  drawOverlay();
+  flush();
+}
+
+var lastT=0;
+function loop(ts){
+  if(!lastT) lastT=ts;
+  var dt=(ts-lastT)/1000; lastT=ts;
+  if(dt>0.06) dt=0.06;
+  if(dt>0) fps = fps*0.9 + (1/dt)*0.1;
+  frame(dt);
+  if(typeof requestAnimationFrame!=='undefined') requestAnimationFrame(loop);
+}
+
+/* ===================== 输入 ===================== */
+var KEYMAP={KeyW:'w',KeyA:'a',KeyS:'s',KeyD:'d',KeyZ:'z',KeyX:'x'};
+function onKey(e,down){
+  var code=e.code||'', k=(e.key||'').toLowerCase();
+  var m=KEYMAP[code] || (('wasdzx'.indexOf(k)>=0 && k.length===1) ? k : null);
+  if(m){ keys[m]=down; e.preventDefault(); return; }
+  if(!down) return;
+  if(code==='Space'||k===' '){
+    e.preventDefault();
+    if(mode==='title'){ respawn(); mode='fly'; }
+    else if(mode==='crash'){ respawn(); mode='fly'; }
+    return;
+  }
+  if(k==='r'){ respawn(); mode='fly'; e.preventDefault(); return; }
+  if(k==='p'){ if(mode==='fly') mode='pause'; else if(mode==='pause') mode='fly'; e.preventDefault(); return; }
+  if(k==='h'){
+    var el=document.getElementById('hint');
+    if(el) el.style.display = (el.style.display==='none') ? '' : 'none';
+    e.preventDefault(); return;
+  }
+}
+
+if(typeof window!=='undefined' && window.addEventListener){
+  window.addEventListener('keydown',function(e){onKey(e,true);},false);
+  window.addEventListener('keyup',  function(e){onKey(e,false);},false);
+  window.addEventListener('blur',   function(){ keys={}; },false);
+  window.addEventListener('resize', function(){ fit(); },false);
+}
+
+fit();
+respawn();
+if(typeof requestAnimationFrame!=='undefined') requestAnimationFrame(loop);
+else frame(0);
+
+/* 供离线测试使用 */
+if(typeof globalThis!=='undefined'){
+  globalThis.__FPV={
+    frame:frame,
+    fit:fit,
+    setPose:function(o){
+      if('x' in o)px=o.x; if('y' in o)py=o.y; if('z' in o)pz=o.z;
+      if('yaw' in o)yaw=o.yaw; if('pitch' in o)pitch=o.pitch;
+      if('roll' in o)roll=o.roll; if('speed' in o)speed=o.speed;
+      if('mode' in o)mode=o.mode;
+    },
+    state:function(){ return {x:px,y:py,z:pz,yaw:yaw,pitch:pitch,roll:roll,speed:speed,mode:mode,dist:dist}; },
+    dump:function(){
+      var rows=[],y,x,s;
+      for(y=0;y<H;y++){ s=''; for(x=0;x<W;x++) s+=String.fromCharCode(gchar[y*W+x]); rows.push(s); }
+      return rows.join('\n');
+    },
+    dumpMat:function(){
+      var rows=[],y,x,s,c;
+      for(y=0;y<H;y++){ s=''; for(x=0;x<W;x++){ c=gcls[y*W+x]; s+= c===0?' ':'0123456789abcdefgh'.charAt((c/8)|0); } rows.push(s); }
+      return rows.join('\n');
+    },
+    size:function(){ return {W:W,H:H,aspect:aspect}; },
+    update:update, keys:keys
+  };
+}
+})();
+</script>
+</body>
+</html>

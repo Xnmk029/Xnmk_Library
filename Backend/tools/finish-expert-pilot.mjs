@@ -1,0 +1,45 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import {createHash} from 'node:crypto';
+const root=path.resolve(import.meta.dirname,'../..'),label='backend-expert-open-20261016';
+const suite=JSON.parse(fs.readFileSync(path.join(root,'sandbox/runs',label,'suite-'+label+'.json')));
+const bankFile=path.join(root,'Backend/BANK.json'),bank=JSON.parse(fs.readFileSync(bankFile));
+if(bank.tasks.some(t=>t.level==='L4'&&t.track!=='repository-expert-v1'))throw Error('Expert v1 results are frozen. Never attach old timing or checks to the active v2 prompts.');
+const rel=f=>path.relative(root,f).split(path.sep).join('/');
+const hash=f=>createHash('sha256').update(fs.readFileSync(f)).digest('hex');
+const records=[];
+for(const run of suite.runs){
+ const task=bank.tasks.find(t=>t.name===run.project),h=run.harness;
+ const e=JSON.parse(fs.readFileSync(path.join(h,'execution.json'))),m=JSON.parse(fs.readFileSync(path.join(h,'meta.json')));
+ const initialReport=path.join(root,'Backend/pilots/20261016',run.project,'CHECKS.json');
+ const isolatedReport=path.join(root,'Backend/pilots/20261016',run.project+'-isolated-checks','CHECKS.json');
+ const report=run.project==='DurableCollab'&&fs.existsSync(isolatedReport)?isolatedReport:initialReport;
+ const checks=JSON.parse(fs.readFileSync(report));
+ const providerFile=path.join(h,'provider_evidence.json'),provider=fs.existsSync(providerFile)?JSON.parse(fs.readFileSync(providerFile)):null;
+ const bundle='Backend/pilots/20261016/submissions/'+run.project;
+ if(!fs.existsSync(path.join(root,bundle,'SNAPSHOT.json')))throw Error('Missing reviewed source archive');
+ const sourceManifestFile=path.join(root,bundle,'SNAPSHOT.json'),sourceManifest=JSON.parse(fs.readFileSync(sourceManifestFile));
+ sourceManifest.functionalEvidence=rel(report);sourceManifest.initialFunctionalEvidence=rel(initialReport);
+ fs.writeFileSync(sourceManifestFile,JSON.stringify(sourceManifest,null,2)+'\n');
+ if(hash(path.join(run.workdir,'PROMPT.md'))!==task.promptSha256)throw Error('Prompt changed');
+ if(hash(path.join(run.workdir,'starter.tar'))!==task.input.sha256)throw Error('Input changed');
+ const valid=['PASS','PASS_WITH_WARNINGS'].includes(m.verdict),passed=checks.checks.filter(c=>c.pass).length,total=checks.checks.length;
+ const complete=valid&&e.status==='completed'&&passed===total;
+ const status=complete?'independent-pilot-complete':valid?'independent-pilot-partial':'integrity-review-failed';
+ task.pilot={status,generationSeconds:e.elapsed_seconds,generationStatus:e.status,hardBudgetSeconds:e.wall_seconds,passed,total,sourceBundle:bundle,sourceReadme:bundle+'/repo/README.md',evidence:rel(report),initialEvidence:rel(initialReport),providerEvidence:providerFile?rel(providerFile):null,reviewVerdict:m.verdict,isolationVerification:'unverified'};
+ task.validation={...task.validation,status:complete?'single-model-engineering-pass':'single-model-observed-failures'};
+ const priorReports=[];
+ for(const suffix of ['','-recheck','-recheck2']){const f=path.join(root,'Backend/pilots/20261016',run.project+suffix,'CHECKS.json');if(fs.existsSync(f)&&f!==report){const previous=JSON.parse(fs.readFileSync(f));priorReports.push({file:rel(f),sha256:hash(f),passed:previous.passed,total:previous.total,note:suffix==='-recheck2'?'Aborted infrastructure recheck after dependency installation timeout; not a functional score.':suffix==='-recheck'?'Incomplete diagnostic recheck; not a functional score.':'Original independent report retained, includes cascading failures after a process exited.'});}}
+ records.push({taskId:task.id,task:run.project,promptSha256:task.promptSha256,inputSha256:task.input.sha256,runId:run.run_id,execution:e,provider,reviewVerdict:m.verdict,independentChecks:{passed,total,sha256:hash(report),file:rel(report)},priorReports,complete,sourceBundle:bundle,failedChecks:checks.checks.filter(c=>!c.pass).map(c=>({name:c.name,error:c.error})),isolationVerification:'unverified'});
+}
+bank.status='expert-engineering-pilot-recorded';
+fs.writeFileSync(bankFile,JSON.stringify(bank,null,2)+'\n');
+const result={schemaVersion:1,createdAt:new Date().toISOString(),label,hardBudgetSeconds:1800,concurrency:2,scope:'single-model engineering pilot, not an isolated cross-model ranking',records};
+fs.writeFileSync(path.join(root,'Backend/pilots/20261016/results.json'),JSON.stringify(result,null,2)+'\n');
+const mm=s=>`${Math.floor(s/60)}:${String(Math.round(s%60)).padStart(2,'0')}`;
+const rows=records.map(r=>`| ${r.taskId} | ${r.task} | ${mm(r.execution.elapsed_seconds)} | ${r.execution.status} | ${r.independentChecks.passed}/${r.independentChecks.total} | ${r.complete?'独立工程检查通过':'未达到全部完成'} | [检查](${r.independentChecks.file.replace('Backend/','')}) · [源码](${r.sourceBundle.replace('Backend/','')}/repo/README.md) · [补丁](${r.sourceBundle.replace('Backend/','')}/changes.patch) |`).join('\n');
+const findings=records.flatMap(r=>r.failedChecks.map(c=>`- ${r.taskId}：${c.name}。具体断言与原始响应见该题 CHECKS.json。`)).join('\n')||'本轮所有已执行独立检查通过；仍不等同穷尽式正确性证明或跨模型 L4 校准。';
+const models=[...new Set(records.map(r=>r.provider?.actual_model??'unknown'))].join(', ');
+const content=`<!-- EXPERT-PILOT:START -->\n\n实际模型（运行时证据）：${models}。完成时间包含模型安装、自测和工具等待，不含环境预检和独立评分。\n\n| ID | 题目 | 生成会话耗时 | 会话状态 | 独立检查 | 完成判定 | 证据 |\n|---|---|---:|---|---:|---|---|\n${rows}\n\n${findings}\n\n[机读结果](pilots/20261016/results.json)。源码为原始试测提交的归档，未人工补齐功能，不能当作参考解；生成会话结束不等于通过。报告与源码哈希、模型 usage、退出原因见机读结果。\n\n<!-- EXPERT-PILOT:END -->`;
+const file=path.join(root,'Backend/EXPERT_UPGRADE_REPORT.md');let report=fs.readFileSync(file,'utf8');report=report.replace(/<!-- EXPERT-PILOT:START -->[\s\S]*?<!-- EXPERT-PILOT:END -->/,content);fs.writeFileSync(file,report);
+console.log(JSON.stringify(records.map(r=>({task:r.task,seconds:r.execution.elapsed_seconds,passed:r.independentChecks.passed,total:r.independentChecks.total,complete:r.complete}))));

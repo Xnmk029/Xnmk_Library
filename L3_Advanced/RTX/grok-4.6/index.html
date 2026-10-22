@@ -1,0 +1,1140 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GPU Path Tracing Room Benchmark</title>
+<!--
+PLAN
+1. WebGL2 fragment-shader Monte Carlo path tracing (fixed Cornell-box room, NEE).
+2. HDR float FBO ping-pong accumulation; HUD shows sample count / frame time / FPS.
+3. Three locked workloads: resolution, bounces, spp/frame, denoise.
+4. Start / Pause / Reset / Run Benchmark; warmup 1000ms + measure 3000ms; 3 repeats each.
+5. Software rasterizers are detected and excluded; GPU stats never mixed with CPU/software.
+6. Capture shader compile/link, context lost/restored, resource-load errors; pause on hidden tab.
+7. Export JSON (env, workload, mean/P50/P95/valid n) and PNG of the tone-mapped GPU frame.
+-->
+<style>
+  :root {
+    --bg: #0b0d10;
+    --panel: #14181e;
+    --line: #2a3140;
+    --text: #e8edf5;
+    --muted: #8b95a8;
+    --accent: #3ee0c5;
+    --warn: #f0b429;
+    --err: #ff6b6b;
+    --ok: #5bd67a;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg); color: var(--text);
+    font: 13px/1.45 "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  h1 { font-size: 16px; font-weight: 650; margin: 0 0 4px; }
+  h2 { font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin: 0 0 8px; }
+  header {
+    padding: 14px 18px 10px;
+    border-bottom: 1px solid var(--line);
+    display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap;
+  }
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 999px;
+    border: 1px solid var(--accent); color: var(--accent); font-size: 11px;
+  }
+  .badge.bad { border-color: var(--err); color: var(--err); }
+  .wrap { display: grid; grid-template-columns: minmax(320px, 1fr) 360px; gap: 16px; padding: 16px 18px 24px; }
+  @media (max-width: 960px) { .wrap { grid-template-columns: 1fr; } }
+  canvas {
+    width: min(100%, 640px); height: auto; aspect-ratio: 1 / 1;
+    background: #000; display: block; border: 1px solid var(--line); border-radius: 6px;
+    image-rendering: pixelated;
+  }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin-bottom: 12px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
+  button, select {
+    background: #1e2530; color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 7px 12px; cursor: pointer; font: inherit;
+  }
+  button.primary { background: #12352f; border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .kv { display: grid; grid-template-columns: 120px 1fr; gap: 4px 8px; }
+  .kv span { color: var(--muted); }
+  .mono { font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px; }
+  textarea {
+    width: 100%; min-height: 180px; background: #0b0d10; color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px; padding: 8px; font: 11px/1.4 Consolas, monospace;
+  }
+  #log {
+    max-height: 140px; overflow: auto; background: #0b0d10; border: 1px solid var(--line);
+    border-radius: 6px; padding: 8px; color: var(--muted);
+  }
+  #log .e { color: var(--err); }
+  #log .w { color: var(--warn); }
+  #log .o { color: var(--ok); }
+  .bar { height: 6px; background: #1e2530; border-radius: 99px; overflow: hidden; margin-top: 8px; }
+  .bar > i { display: block; height: 100%; width: 0; background: var(--accent); }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 500; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>小房间 GPU 路径追踪 Benchmark</h1>
+    <div id="backendBadge" class="badge">WebGL2 GPU fragment path tracer</div>
+  </div>
+  <div class="mono" id="gpuLine">GPU: —</div>
+</header>
+<div class="wrap">
+  <div>
+    <canvas id="view" width="768" height="768"></canvas>
+    <div class="panel" style="margin-top:12px">
+      <h2>HUD</h2>
+      <div class="kv mono">
+        <span>Sample count</span><div id="hudSamples">0</div>
+        <span>Frame</span><div id="hudFrame">—</div>
+        <span>FPS</span><div id="hudFps">—</div>
+        <span>Workload</span><div id="hudWl">—</div>
+        <span>Visibility</span><div id="hudVis">visible</div>
+      </div>
+    </div>
+  </div>
+  <div>
+    <div class="panel">
+      <h2>Controls</h2>
+      <div class="row">
+        <button id="btnStart" class="primary" type="button">开始</button>
+        <button id="btnPause" type="button">暂停</button>
+        <button id="btnReset" type="button">重置</button>
+        <button id="btnBench" class="primary" type="button">运行 Benchmark</button>
+      </div>
+      <label>档位
+        <select id="selWl"></select>
+      </label>
+      <div class="bar" aria-hidden="true"><i id="prog"></i></div>
+      <div class="mono" id="benchPhase">idle</div>
+    </div>
+    <div class="panel">
+      <h2>Environment (locked for report)</h2>
+      <div class="kv mono" id="envKv"></div>
+    </div>
+    <div class="panel">
+      <h2>Workload 定义</h2>
+      <table>
+        <thead><tr><th>档</th><th>分辨率</th><th>反弹</th><th>SPP/帧</th><th>降噪</th></tr></thead>
+        <tbody id="wlBody"></tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <h2>Export</h2>
+      <div class="row">
+        <button id="btnJson" type="button">导出 JSON</button>
+        <button id="btnPng" type="button">保存 PNG</button>
+      </div>
+      <textarea id="jsonOut" readonly placeholder="运行 Benchmark 后在此生成报告"></textarea>
+    </div>
+    <div class="panel">
+      <h2>Errors / log</h2>
+      <div id="log" class="mono"></div>
+    </div>
+  </div>
+</div>
+<script>
+(function () {
+  "use strict";
+
+  var WARMUP_MS = 1000;
+  var MEASURE_MS = 3000;
+  var REPEATS = 3;
+  var MAX_BOUNCES = 16;
+  var MAX_SPP = 4;
+
+  var WORKLOADS = [
+    { id: "light", name: "Light", width: 512, height: 512, bounces: 2, spp: 1, denoise: false, denoiseMethod: "none" },
+    { id: "medium", name: "Medium", width: 768, height: 768, bounces: 4, spp: 1, denoise: false, denoiseMethod: "none" },
+    { id: "heavy", name: "Heavy", width: 1024, height: 1024, bounces: 8, spp: 2, denoise: true, denoiseMethod: "atrous-edge-aware" }
+  ];
+
+  var canvas = document.getElementById("view");
+  var logEl = document.getElementById("log");
+  var jsonOut = document.getElementById("jsonOut");
+  var selWl = document.getElementById("selWl");
+  var progEl = document.getElementById("prog");
+
+  var errors = [];
+  var gl = null;
+  var backend = {
+    api: "WebGL2",
+    method: "GPU fragment-shader Monte Carlo path tracing",
+    softwareRenderer: false,
+    mixedWithSoftware: false,
+    colorFormat: "",
+    caveatContext: false
+  };
+  var gpuInfo = { vendor: "", renderer: "", unmaskedVendor: "", unmaskedRenderer: "" };
+  var colorFmt = null;
+  var programs = {};
+  var vao = null;
+  var targets = null;
+  var ping = 0;
+  var sampleCount = 0;
+  var frameIndex = 0;
+  var paused = false;
+  var rafId = 0;
+  var lastT = 0;
+  var fpsEma = 0;
+  var lastDt = 0;
+  var currentWl = WORKLOADS[1];
+  var lastReport = null;
+  var resourceLoadsAttempted = 0;
+  var resourceLoadErrors = 0;
+
+  var verify = {
+    increasedWhileRunning: true,
+    resetReturnsToZero: true,
+    lastSampleCount: 0,
+    events: []
+  };
+
+  var bench = {
+    active: false,
+    phase: "idle",
+    wlIndex: 0,
+    repeatIndex: 0,
+    phaseStart: 0,
+    frames: [],
+    hiddenInvalid: false,
+    results: []
+  };
+
+  function nowIso() {
+    return new Date().toISOString();
+  }
+
+  function log(kind, type, msg) {
+    var rec = { time: nowIso(), type: type, message: String(msg) };
+    if (kind === "e" || kind === "w") errors.push(rec);
+    var div = document.createElement("div");
+    div.className = kind;
+    div.textContent = rec.time.slice(11, 23) + " [" + type + "] " + rec.message;
+    logEl.appendChild(div);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  window.addEventListener("error", function (e) {
+    var t = e.target;
+    if (t && t !== window && (t.src || t.href)) {
+      resourceLoadErrors += 1;
+      log("e", "resource_load", (t.tagName || "resource") + " failed: " + (t.src || t.href));
+    } else if (e.message) {
+      log("e", "script", e.message + (e.filename ? " @" + e.filename + ":" + e.lineno : ""));
+    }
+  }, true);
+
+  window.addEventListener("unhandledrejection", function (e) {
+    log("e", "unhandledrejection", e.reason && e.reason.message ? e.reason.message : String(e.reason));
+  });
+
+  document.addEventListener("visibilitychange", function () {
+    document.getElementById("hudVis").textContent = document.visibilityState;
+    if (document.hidden) {
+      log("w", "background_throttle", "Tab hidden: rendering paused; in-flight benchmark run marked invalid");
+      if (bench.active) bench.hiddenInvalid = true;
+    }
+  });
+
+  function isSoftwareRenderer(vendor, renderer) {
+    var s = (vendor + " " + renderer).toLowerCase();
+    return /swiftshader|llvmpipe|softpipe|microsoft basic render|mesa offscreen|software rasterizer|cpu rasterizer/.test(s);
+  }
+
+  function parseBrowser(ua) {
+    var m;
+    if ((m = ua.match(/Edg\/([\d.]+)/))) return { name: "Microsoft Edge", version: m[1] };
+    if ((m = ua.match(/Chrome\/([\d.]+)/))) return { name: "Google Chrome", version: m[1] };
+    if ((m = ua.match(/Firefox\/([\d.]+)/))) return { name: "Mozilla Firefox", version: m[1] };
+    if ((m = ua.match(/Version\/([\d.]+).*Safari/))) return { name: "Safari", version: m[1] };
+    return { name: "Unknown", version: "" };
+  }
+
+  var VS = "#version 300 es\nin vec2 aPos;\nout vec2 vUv;\nvoid main(){vUv=aPos*0.5+0.5;gl_Position=vec4(aPos,0.0,1.0);}";
+
+  var FS_TRACE = [
+    "#version 300 es",
+    "precision highp float;",
+    "precision highp int;",
+    "in vec2 vUv;",
+    "out vec4 fragColor;",
+    "uniform vec2 uResolution;",
+    "uniform int uSampleCount;",
+    "uniform int uSpp;",
+    "uniform int uBounces;",
+    "uniform int uFrameSeed;",
+    "uniform sampler2D uAccum;",
+    "const float PI = 3.141592653589793;",
+    "const int MAX_BOUNCES = 16;",
+    "const int MAX_SPP = 4;",
+    "uint pcg(inout uint s){",
+    "  s = s * 747796405u + 2891336453u;",
+    "  uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;",
+    "  return (w >> 22u) ^ w;",
+    "}",
+    "float rand(inout uint s){ return float(pcg(s)) * (1.0 / 4294967296.0); }",
+    "struct Ray { vec3 o; vec3 d; };",
+    "struct Hit { float t; vec3 p; vec3 n; vec3 albedo; vec3 emission; bool light; bool ok; };",
+    "void onb(vec3 n, out vec3 t, out vec3 b){",
+    "  vec3 up = abs(n.y) < 0.999 ? vec3(0.0,1.0,0.0) : vec3(1.0,0.0,0.0);",
+    "  t = normalize(cross(up, n));",
+    "  b = cross(n, t);",
+    "}",
+    "vec3 cosineHemisphere(vec3 n, inout uint rng){",
+    "  float u1 = rand(rng);",
+    "  float u2 = rand(rng);",
+    "  float r = sqrt(u1);",
+    "  float phi = 6.28318530718 * u2;",
+    "  vec3 t, b; onb(n, t, b);",
+    "  return normalize(t * (r * cos(phi)) + b * (r * sin(phi)) + n * sqrt(max(1.0 - u1, 0.0)));",
+    "}",
+    "bool hitRect(Ray r, vec3 n, vec3 c, vec3 ax, vec3 ay, float hx, float hy, float tMin, float tMax, out float t, out vec3 p){",
+    "  float denom = dot(r.d, n);",
+    "  if (abs(denom) < 1e-6) return false;",
+    "  t = dot(c - r.o, n) / denom;",
+    "  if (t < tMin || t > tMax) return false;",
+    "  p = r.o + r.d * t;",
+    "  vec3 rel = p - c;",
+    "  float u = dot(rel, ax);",
+    "  float v = dot(rel, ay);",
+    "  return abs(u) <= hx && abs(v) <= hy;",
+    "}",
+    "bool hitAABB(Ray r, vec3 bmin, vec3 bmax, float tMin, float tMax, out float tHit, out vec3 n){",
+    "  vec3 invd = 1.0 / r.d;",
+    "  vec3 t0 = (bmin - r.o) * invd;",
+    "  vec3 t1 = (bmax - r.o) * invd;",
+    "  vec3 tsm = min(t0, t1);",
+    "  vec3 tlg = max(t0, t1);",
+    "  float tn = max(max(tsm.x, tsm.y), tsm.z);",
+    "  float tf = min(min(tlg.x, tlg.y), tlg.z);",
+    "  if (tn > tf || tf < tMin || tn > tMax) return false;",
+    "  tHit = tn >= tMin ? tn : tf;",
+    "  if (tHit < tMin || tHit > tMax) return false;",
+    "  vec3 p = r.o + r.d * tHit;",
+    "  vec3 c = (bmin + bmax) * 0.5;",
+    "  vec3 e = (bmax - bmin) * 0.5;",
+    "  vec3 l = (p - c) / (e + vec3(1e-6));",
+    "  vec3 al = abs(l);",
+    "  if (al.x > al.y && al.x > al.z) n = vec3(sign(l.x), 0.0, 0.0);",
+    "  else if (al.y > al.z) n = vec3(0.0, sign(l.y), 0.0);",
+    "  else n = vec3(0.0, 0.0, sign(l.z));",
+    "  return true;",
+    "}",
+    "const vec3 LIGHT_C = vec3(0.0, 0.999, 0.0);",
+    "const vec3 LIGHT_N = vec3(0.0, -1.0, 0.0);",
+    "const float LIGHT_HX = 0.3;",
+    "const float LIGHT_HZ = 0.3;",
+    "const float LIGHT_AREA = 0.36;",
+    "const vec3 LIGHT_E = vec3(18.0, 16.5, 14.0);",
+    "void consider(inout Hit h, float t, vec3 p, vec3 n, vec3 albedo, vec3 emission, bool light){",
+    "  if (t < h.t) { h.t=t; h.p=p; h.n=n; h.albedo=albedo; h.emission=emission; h.light=light; h.ok=true; }",
+    "}",
+    "Hit intersect(Ray r, float tMin, float tMax, bool skipLight){",
+    "  Hit h; h.t=tMax; h.ok=false; h.light=false; h.emission=vec3(0.0); h.albedo=vec3(0.0); h.n=vec3(0.0); h.p=vec3(0.0);",
+    "  float t; vec3 p; vec3 n;",
+    "  if (!skipLight && hitRect(r, LIGHT_N, LIGHT_C, vec3(1.0,0.0,0.0), vec3(0.0,0.0,1.0), LIGHT_HX, LIGHT_HZ, tMin, h.t, t, p)) {",
+    "    consider(h, t, p, LIGHT_N, vec3(0.0), LIGHT_E, true);",
+    "  }",
+    "  if (hitRect(r, vec3(0.0,1.0,0.0), vec3(0.0,-1.0,0.0), vec3(1.0,0.0,0.0), vec3(0.0,0.0,1.0), 1.0, 1.0, tMin, h.t, t, p))",
+    "    consider(h, t, p, vec3(0.0,1.0,0.0), vec3(0.73,0.73,0.73), vec3(0.0), false);",
+    "  if (hitRect(r, vec3(0.0,-1.0,0.0), vec3(0.0,1.0,0.0), vec3(1.0,0.0,0.0), vec3(0.0,0.0,1.0), 1.0, 1.0, tMin, h.t, t, p))",
+    "    consider(h, t, p, vec3(0.0,-1.0,0.0), vec3(0.73,0.73,0.73), vec3(0.0), false);",
+    "  if (hitRect(r, vec3(1.0,0.0,0.0), vec3(-1.0,0.0,0.0), vec3(0.0,1.0,0.0), vec3(0.0,0.0,1.0), 1.0, 1.0, tMin, h.t, t, p))",
+    "    consider(h, t, p, vec3(1.0,0.0,0.0), vec3(0.63,0.06,0.04), vec3(0.0), false);",
+    "  if (hitRect(r, vec3(-1.0,0.0,0.0), vec3(1.0,0.0,0.0), vec3(0.0,1.0,0.0), vec3(0.0,0.0,1.0), 1.0, 1.0, tMin, h.t, t, p))",
+    "    consider(h, t, p, vec3(-1.0,0.0,0.0), vec3(0.14,0.45,0.09), vec3(0.0), false);",
+    "  if (hitRect(r, vec3(0.0,0.0,1.0), vec3(0.0,0.0,-1.0), vec3(1.0,0.0,0.0), vec3(0.0,1.0,0.0), 1.0, 1.0, tMin, h.t, t, p))",
+    "    consider(h, t, p, vec3(0.0,0.0,1.0), vec3(0.73,0.73,0.73), vec3(0.0), false);",
+    "  if (hitAABB(r, vec3(-0.70,-1.0,-0.78), vec3(-0.18,0.20,-0.22), tMin, h.t, t, n))",
+    "    consider(h, t, r.o+r.d*t, n, vec3(0.73,0.73,0.73), vec3(0.0), false);",
+    "  if (hitAABB(r, vec3(0.14,-1.0,-0.08), vec3(0.70,-0.42,0.50), tMin, h.t, t, n))",
+    "    consider(h, t, r.o+r.d*t, n, vec3(0.73,0.73,0.73), vec3(0.0), false);",
+    "  if (h.ok && dot(h.n, -r.d) < 0.0) h.n = -h.n;",
+    "  return h;",
+    "}",
+    "bool occluded(vec3 from, vec3 to){",
+    "  vec3 dir = to - from;",
+    "  float dist = length(dir);",
+    "  Ray r; r.o = from; r.d = dir / dist;",
+    "  Hit h = intersect(r, 0.001, dist - 0.002, true);",
+    "  return h.ok;",
+    "}",
+    "vec3 pathTrace(Ray ray, inout uint rng, int bounces){",
+    "  vec3 col = vec3(0.0);",
+    "  vec3 tp = vec3(1.0);",
+    "  for (int bounce = 0; bounce < MAX_BOUNCES; bounce++){",
+    "    if (bounce >= bounces) break;",
+    "    Hit h = intersect(ray, 0.001, 1e5, false);",
+    "    if (!h.ok) break;",
+    "    if (h.light) { if (bounce == 0) col += tp * h.emission; break; }",
+    "    vec2 ru = vec2(rand(rng), rand(rng));",
+    "    vec3 lp = LIGHT_C + vec3((ru.x * 2.0 - 1.0) * LIGHT_HX, 0.0, (ru.y * 2.0 - 1.0) * LIGHT_HZ);",
+    "    vec3 toL = lp - h.p;",
+    "    float dist2 = dot(toL, toL);",
+    "    vec3 ldir = toL * inversesqrt(dist2);",
+    "    float cosS = max(dot(h.n, ldir), 0.0);",
+    "    float cosL = max(dot(LIGHT_N, -ldir), 0.0);",
+    "    if (cosS > 0.0 && cosL > 0.0 && !occluded(h.p + h.n * 0.001, lp)) {",
+    "      col += tp * h.albedo * LIGHT_E * (cosS * cosL * LIGHT_AREA) / (PI * dist2);",
+    "    }",
+    "    vec3 ndir = cosineHemisphere(h.n, rng);",
+    "    tp *= h.albedo;",
+    "    if (bounce > 2) {",
+    "      float q = clamp(max(tp.x, max(tp.y, tp.z)), 0.05, 0.95);",
+    "      if (rand(rng) > q) break;",
+    "      tp /= q;",
+    "    }",
+    "    ray.o = h.p + h.n * 0.001;",
+    "    ray.d = ndir;",
+    "  }",
+    "  return col;",
+    "}",
+    "void main(){",
+    "  uint seed = uint(gl_FragCoord.x) * 1973u + uint(gl_FragCoord.y) * 9277u + uint(uFrameSeed) * 26699u + 1u;",
+    "  vec3 camPos = vec3(0.0, 0.0, 3.18);",
+    "  vec3 lookAt = vec3(0.0, -0.04, 0.0);",
+    "  vec3 ww = normalize(camPos - lookAt);",
+    "  vec3 uu = normalize(cross(vec3(0.0,1.0,0.0), ww));",
+    "  vec3 vv = cross(ww, uu);",
+    "  float tanHalf = 0.41421356237;",
+    "  vec3 sum = vec3(0.0);",
+    "  int spp = uSpp;",
+    "  if (spp < 1) spp = 1;",
+    "  if (spp > MAX_SPP) spp = MAX_SPP;",
+    "  int bounces = uBounces;",
+    "  if (bounces < 1) bounces = 1;",
+    "  if (bounces > MAX_BOUNCES) bounces = MAX_BOUNCES;",
+    "  for (int s = 0; s < MAX_SPP; s++){",
+    "    if (s >= spp) break;",
+    "    uint rng = seed + uint(s) * 3345527u;",
+    "    vec2 jitter = vec2(rand(rng), rand(rng));",
+    "    vec2 ndc = ((gl_FragCoord.xy + jitter) / uResolution) * 2.0 - 1.0;",
+    "    ndc.x *= uResolution.x / uResolution.y;",
+    "    Ray ray;",
+    "    ray.o = camPos;",
+    "    ray.d = normalize(uu * ndc.x * tanHalf + vv * ndc.y * tanHalf - ww);",
+    "    sum += pathTrace(ray, rng, bounces);",
+    "  }",
+    "  vec3 prev = uSampleCount > 0 ? texture(uAccum, vUv).rgb : vec3(0.0);",
+    "  float n0 = float(uSampleCount);",
+    "  float n1 = n0 + float(spp);",
+    "  vec3 avg = (prev * n0 + sum) / max(n1, 1.0);",
+    "  fragColor = vec4(avg, 1.0);",
+    "}"
+  ].join("\n");
+
+  var FS_DENOISE = [
+    "#version 300 es",
+    "precision highp float;",
+    "in vec2 vUv;",
+    "out vec4 fragColor;",
+    "uniform sampler2D uColor;",
+    "uniform vec2 uTexel;",
+    "uniform float uStep;",
+    "void main(){",
+    "  float k[5];",
+    "  k[0]=0.0625; k[1]=0.25; k[2]=0.375; k[3]=0.25; k[4]=0.0625;",
+    "  vec3 c = texture(uColor, vUv).rgb;",
+    "  vec3 acc = vec3(0.0);",
+    "  float wsum = 0.0;",
+    "  for (int y = -2; y <= 2; y++){",
+    "    for (int x = -2; x <= 2; x++){",
+    "      vec3 s = texture(uColor, vUv + vec2(float(x), float(y)) * uTexel * uStep).rgb;",
+    "      float w = k[x+2] * k[y+2];",
+    "      float lum = abs(dot(s - c, vec3(0.299, 0.587, 0.114)));",
+    "      w *= exp(-lum * 10.0);",
+    "      acc += s * w;",
+    "      wsum += w;",
+    "    }",
+    "  }",
+    "  fragColor = vec4(acc / max(wsum, 1e-6), 1.0);",
+    "}"
+  ].join("\n");
+
+  var FS_PRESENT = [
+    "#version 300 es",
+    "precision highp float;",
+    "in vec2 vUv;",
+    "out vec4 fragColor;",
+    "uniform sampler2D uColor;",
+    "uniform float uExposure;",
+    "vec3 aces(vec3 x){",
+    "  const float a=2.51,b=0.03,c=2.43,d=0.59,e=0.14;",
+    "  return clamp((x*(a*x+b))/(x*(c*x+d)+e), 0.0, 1.0);",
+    "}",
+    "void main(){",
+    "  vec3 hdr = texture(uColor, vUv).rgb * uExposure;",
+    "  vec3 ldr = aces(hdr);",
+    "  fragColor = vec4(pow(ldr, vec3(1.0/2.2)), 1.0);",
+    "}"
+  ].join("\n");
+
+  function compile(type, src, label) {
+    var sh = gl.createShader(type);
+    gl.shaderSource(sh, src);
+    gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+      var info = gl.getShaderInfoLog(sh) || "unknown compile error";
+      log("e", "shader_compile", label + ": " + info);
+      gl.deleteShader(sh);
+      return null;
+    }
+    return sh;
+  }
+
+  function makeProgram(vsSrc, fsSrc, label) {
+    var vs = compile(gl.VERTEX_SHADER, vsSrc, label + " VS");
+    var fs = compile(gl.FRAGMENT_SHADER, fsSrc, label + " FS");
+    if (!vs || !fs) return null;
+    var p = gl.createProgram();
+    gl.attachShader(p, vs);
+    gl.attachShader(p, fs);
+    gl.bindAttribLocation(p, 0, "aPos");
+    gl.linkProgram(p);
+    gl.deleteShader(vs);
+    gl.deleteShader(fs);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+      log("e", "shader_link", label + ": " + (gl.getProgramInfoLog(p) || "unknown link error"));
+      gl.deleteProgram(p);
+      return null;
+    }
+    var loc = {};
+    var n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+    for (var i = 0; i < n; i++) {
+      var u = gl.getActiveUniform(p, i);
+      loc[u.name] = gl.getUniformLocation(p, u.name);
+    }
+    return { prog: p, loc: loc };
+  }
+
+  function createTarget(w, h) {
+    var tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D, 0, colorFmt.internal, w, h, 0, colorFmt.format, colorFmt.type, null);
+    var fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    var st = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    if (st !== gl.FRAMEBUFFER_COMPLETE) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.deleteFramebuffer(fbo);
+      gl.deleteTexture(tex);
+      return null;
+    }
+    gl.clearColor(0, 0, 0, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    return { tex: tex, fbo: fbo, w: w, h: h };
+  }
+
+  function destroyTargets() {
+    if (!targets || !gl) return;
+    ["a", "b", "d0", "d1"].forEach(function (k) {
+      var t = targets[k];
+      if (!t) return;
+      gl.deleteFramebuffer(t.fbo);
+      gl.deleteTexture(t.tex);
+    });
+    targets = null;
+  }
+
+  function pickColorFormat() {
+    var extF = gl.getExtension("EXT_color_buffer_float");
+    var extH = gl.getExtension("EXT_color_buffer_half_float");
+    var cands = [];
+    if (extF || extH) {
+      cands.push({ internal: gl.RGBA16F, format: gl.RGBA, type: gl.HALF_FLOAT, name: "RGBA16F" });
+    }
+    if (extF) {
+      cands.push({ internal: gl.RGBA32F, format: gl.RGBA, type: gl.FLOAT, name: "RGBA32F" });
+    }
+    cands.push({ internal: gl.RGBA8, format: gl.RGBA, type: gl.UNSIGNED_BYTE, name: "RGBA8" });
+    for (var i = 0; i < cands.length; i++) {
+      colorFmt = cands[i];
+      var trial = createTarget(8, 8);
+      if (trial) {
+        gl.deleteFramebuffer(trial.fbo);
+        gl.deleteTexture(trial.tex);
+        backend.colorFormat = colorFmt.name;
+        log("o", "gpu", "Color buffer " + colorFmt.name);
+        return true;
+      }
+    }
+    log("e", "resource_load", "No renderable color format");
+    return false;
+  }
+
+  function allocTargets(w, h) {
+    destroyTargets();
+    var a = createTarget(w, h);
+    var b = createTarget(w, h);
+    var d0 = createTarget(w, h);
+    var d1 = createTarget(w, h);
+    if (!a || !b || !d0 || !d1) {
+      log("e", "resource_load", "Failed to allocate GPU targets at " + w + "x" + h);
+      return false;
+    }
+    targets = { a: a, b: b, d0: d0, d1: d1, w: w, h: h };
+    ping = 0;
+    return true;
+  }
+
+  function applyWorkload(wl, resetSamples) {
+    currentWl = wl;
+    canvas.width = wl.width;
+    canvas.height = wl.height;
+    if (!targets || targets.w !== wl.width || targets.h !== wl.height) {
+      if (!allocTargets(wl.width, wl.height)) return false;
+    }
+    if (resetSamples) resetAccum(true);
+    document.getElementById("hudWl").textContent =
+      wl.name + " " + wl.width + "x" + wl.height + " bounces=" + wl.bounces +
+      " spp=" + wl.spp + " denoise=" + (wl.denoise ? wl.denoiseMethod : "off");
+    selWl.value = wl.id;
+    return true;
+  }
+
+  function resetAccum(recordVerify) {
+    if (!gl || !targets) return;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, targets.a.fbo);
+    gl.viewport(0, 0, targets.w, targets.h);
+    gl.clearColor(0, 0, 0, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, targets.b.fbo);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    sampleCount = 0;
+    frameIndex = 0;
+    ping = 0;
+    if (recordVerify) {
+      var ok = sampleCount === 0;
+      verify.resetReturnsToZero = verify.resetReturnsToZero && ok;
+      verify.events.push({ time: nowIso(), kind: "reset", sampleCount: sampleCount, ok: ok });
+      if (!ok) log("e", "sample_verify", "Reset did not return sample count to 0");
+      else log("o", "sample_verify", "Reset sample count = 0");
+    }
+    verify.lastSampleCount = 0;
+  }
+
+  function loc(p, name) { return p.loc[name] || null; }
+
+  function drawQuad(prog) {
+    gl.useProgram(prog.prog);
+    gl.bindVertexArray(vao);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+
+  function traceFrame() {
+    if (!gl || !targets || backend.softwareRenderer) return;
+    var src = ping === 0 ? targets.a : targets.b;
+    var dst = ping === 0 ? targets.b : targets.a;
+    var p = programs.trace;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, dst.fbo);
+    gl.viewport(0, 0, targets.w, targets.h);
+    gl.useProgram(p.prog);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, src.tex);
+    gl.uniform1i(loc(p, "uAccum"), 0);
+    gl.uniform2f(loc(p, "uResolution"), targets.w, targets.h);
+    gl.uniform1i(loc(p, "uSampleCount"), sampleCount);
+    gl.uniform1i(loc(p, "uSpp"), currentWl.spp);
+    gl.uniform1i(loc(p, "uBounces"), currentWl.bounces);
+    gl.uniform1i(loc(p, "uFrameSeed"), (frameIndex * 1013904223) >>> 0);
+    drawQuad(p);
+    ping = 1 - ping;
+    var before = sampleCount;
+    sampleCount += currentWl.spp;
+    if (!paused && !document.hidden) {
+      var grew = sampleCount > before;
+      verify.increasedWhileRunning = verify.increasedWhileRunning && grew;
+      if (!grew) {
+        log("e", "sample_verify", "Sample count did not increase");
+        verify.events.push({ time: nowIso(), kind: "increase_fail", before: before, after: sampleCount });
+      }
+    }
+    verify.lastSampleCount = sampleCount;
+    frameIndex += 1;
+  }
+
+  function present() {
+    if (!gl || !targets) return;
+    var src = ping === 0 ? targets.a : targets.b;
+    var show = src;
+    if (currentWl.denoise) {
+      var d = programs.denoise;
+      gl.useProgram(d.prog);
+      gl.uniform2f(loc(d, "uTexel"), 1.0 / targets.w, 1.0 / targets.h);
+      var din = src;
+      var steps = [1.0, 2.0];
+      for (var i = 0; i < steps.length; i++) {
+        var dout = i === 0 ? targets.d0 : targets.d1;
+        gl.bindFramebuffer(gl.FRAMEBUFFER, dout.fbo);
+        gl.viewport(0, 0, targets.w, targets.h);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, din.tex);
+        gl.uniform1i(loc(d, "uColor"), 0);
+        gl.uniform1f(loc(d, "uStep"), steps[i]);
+        drawQuad(d);
+        din = dout;
+      }
+      show = din;
+    }
+    var pr = programs.present;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.useProgram(pr.prog);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, show.tex);
+    gl.uniform1i(loc(pr, "uColor"), 0);
+    gl.uniform1f(loc(pr, "uExposure"), 1.15);
+    drawQuad(pr);
+  }
+
+  function percentile(arr, p) {
+    if (!arr.length) return 0;
+    var a = arr.slice().sort(function (x, y) { return x - y; });
+    var idx = (a.length - 1) * p;
+    var lo = Math.floor(idx);
+    var hi = Math.ceil(idx);
+    if (lo === hi) return a[lo];
+    return a[lo] * (hi - idx) + a[hi] * (idx - lo);
+  }
+
+  function mean(arr) {
+    if (!arr.length) return 0;
+    var s = 0;
+    for (var i = 0; i < arr.length; i++) s += arr[i];
+    return s / arr.length;
+  }
+
+  function statsOf(frames) {
+    var valid = frames.filter(function (ms) { return ms > 0 && ms < 5000; });
+    return {
+      meanMs: mean(valid),
+      p50Ms: percentile(valid, 0.5),
+      p95Ms: percentile(valid, 0.95),
+      minMs: valid.length ? Math.min.apply(null, valid) : 0,
+      maxMs: valid.length ? Math.max.apply(null, valid) : 0,
+      validFrames: valid.length,
+      meanFps: valid.length ? 1000 / mean(valid) : 0
+    };
+  }
+
+  function envSnapshot() {
+    var br = parseBrowser(navigator.userAgent);
+    return {
+      timestamp: nowIso(),
+      userAgent: navigator.userAgent,
+      platform: navigator.platform,
+      language: navigator.language,
+      browserName: br.name,
+      browserVersion: br.version,
+      viewport: { innerWidth: window.innerWidth, innerHeight: window.innerHeight },
+      canvasCss: { width: canvas.clientWidth, height: canvas.clientHeight },
+      renderResolution: { width: canvas.width, height: canvas.height },
+      devicePixelRatio: window.devicePixelRatio,
+      gpu: gpuInfo,
+      webgl: {
+        version: gl ? gl.getParameter(gl.VERSION) : "",
+        shadingLanguage: gl ? gl.getParameter(gl.SHADING_LANGUAGE_VERSION) : "",
+        colorFormat: backend.colorFormat,
+        maxTextureSize: gl ? gl.getParameter(gl.MAX_TEXTURE_SIZE) : 0
+      },
+      powerPreference: "high-performance",
+      failIfMajorPerformanceCaveatAttempted: true,
+      caveatContext: backend.caveatContext,
+      backgroundThrottlePolicy: "pause-rendering-and-invalidate-benchmark-on-hidden",
+      visibilityState: document.visibilityState,
+      dprDoesNotScaleGpuWorkload: true,
+      camera: "fixed",
+      geometry: "fixed Cornell-box room + 2 AABBs + ceiling area light",
+      materials: "fixed Lambertian",
+      lights: "fixed ceiling quad"
+    };
+  }
+
+  function renderEnv() {
+    var e = envSnapshot();
+    var kv = document.getElementById("envKv");
+    kv.innerHTML = "";
+    var rows = [
+      ["Browser", e.browserName + " " + e.browserVersion],
+      ["Viewport", e.viewport.innerWidth + "x" + e.viewport.innerHeight],
+      ["DPR", String(e.devicePixelRatio)],
+      ["Render res", e.renderResolution.width + "x" + e.renderResolution.height + " (workload pixels, not DPR-scaled)"],
+      ["GPU", (e.gpu.unmaskedRenderer || e.gpu.renderer || "—")],
+      ["Throttle", e.backgroundThrottlePolicy]
+    ];
+    rows.forEach(function (r) {
+      var s = document.createElement("span"); s.textContent = r[0];
+      var d = document.createElement("div"); d.textContent = r[1];
+      kv.appendChild(s); kv.appendChild(d);
+    });
+    document.getElementById("gpuLine").textContent = "GPU: " + (e.gpu.unmaskedRenderer || e.gpu.renderer || "unavailable");
+  }
+
+  function buildReport() {
+    var wlReports = bench.results.slice();
+    var report = {
+      schemaVersion: "1.0",
+      title: "GPU Path Tracing Room Benchmark",
+      backend: backend,
+      environment: envSnapshot(),
+      protocol: {
+        warmupMs: WARMUP_MS,
+        measureMs: MEASURE_MS,
+        repeatsPerWorkload: REPEATS,
+        metric: "requestAnimationFrame CPU frame time (ms) of GPU path-tracer frames only",
+        softwareMixed: false
+      },
+      sampleCountVerification: {
+        progressiveIncreases: verify.increasedWhileRunning,
+        resetReturnsToZero: verify.resetReturnsToZero,
+        lastObservedSampleCount: verify.lastSampleCount,
+        events: verify.events.slice(-24)
+      },
+      errors: errors.slice(),
+      resourceLoading: {
+        externalResources: 0,
+        attempted: resourceLoadsAttempted,
+        errors: resourceLoadErrors,
+        note: "All shaders and geometry are inline; no CDN"
+      },
+      workloads: WORKLOADS.map(function (w) {
+        var found = null;
+        for (var i = 0; i < wlReports.length; i++) if (wlReports[i].id === w.id) found = wlReports[i];
+        return found || {
+          id: w.id,
+          name: w.name,
+          resolution: { width: w.width, height: w.height },
+          bounces: w.bounces,
+          sppPerFrame: w.spp,
+          denoise: { enabled: w.denoise, method: w.denoiseMethod },
+          runs: [],
+          aggregate: null,
+          skipped: backend.softwareRenderer ? "software_renderer_excluded" : "not_run"
+        };
+      })
+    };
+    lastReport = report;
+    jsonOut.value = JSON.stringify(report, null, 2);
+    return report;
+  }
+
+  function finishWorkloadRun(wl, runStats) {
+    var block = null;
+    for (var i = 0; i < bench.results.length; i++) if (bench.results[i].id === wl.id) block = bench.results[i];
+    if (!block) {
+      block = {
+        id: wl.id,
+        name: wl.name,
+        resolution: { width: wl.width, height: wl.height },
+        bounces: wl.bounces,
+        sppPerFrame: wl.spp,
+        denoise: { enabled: wl.denoise, method: wl.denoiseMethod },
+        warmupMs: WARMUP_MS,
+        measureMs: MEASURE_MS,
+        repeats: REPEATS,
+        runs: [],
+        aggregate: null
+      };
+      bench.results.push(block);
+    }
+    block.runs.push(runStats);
+    if (block.runs.length >= REPEATS) {
+      var means = block.runs.map(function (r) { return r.meanMs; });
+      var allValid = 0;
+      block.runs.forEach(function (r) { allValid += r.validFrames; });
+      block.aggregate = {
+        meanMs: mean(means),
+        p50Ms: percentile(means, 0.5),
+        p95Ms: percentile(means, 0.95),
+        validSamples: allValid,
+        meanFps: mean(block.runs.map(function (r) { return r.meanFps; })),
+        repeatsUsed: block.runs.length
+      };
+    }
+  }
+
+  function setPhaseText(t) {
+    document.getElementById("benchPhase").textContent = t;
+  }
+
+  function setBusy(b) {
+    document.getElementById("btnStart").disabled = b;
+    document.getElementById("btnPause").disabled = b;
+    document.getElementById("btnReset").disabled = b;
+    document.getElementById("btnBench").disabled = b;
+    selWl.disabled = b;
+  }
+
+  function startBench() {
+    if (!gl || backend.softwareRenderer) {
+      log("e", "benchmark", "Refusing to record GPU stats: no hardware GPU path-tracer context");
+      buildReport();
+      return;
+    }
+    bench.active = true;
+    bench.phase = "setup";
+    bench.wlIndex = 0;
+    bench.repeatIndex = 0;
+    bench.results = [];
+    bench.hiddenInvalid = false;
+    paused = false;
+    setBusy(true);
+    beginRun();
+  }
+
+  function beginRun() {
+    if (bench.wlIndex >= WORKLOADS.length) {
+      bench.active = false;
+      bench.phase = "idle";
+      setBusy(false);
+      progEl.style.width = "100%";
+      setPhaseText("complete");
+      buildReport();
+      log("o", "benchmark", "All workloads finished (3 repeats each)");
+      return;
+    }
+    var wl = WORKLOADS[bench.wlIndex];
+    applyWorkload(wl, true);
+    bench.phase = "warmup";
+    bench.phaseStart = performance.now();
+    bench.frames = [];
+    bench.hiddenInvalid = false;
+    setPhaseText("warmup " + wl.name + " repeat " + (bench.repeatIndex + 1) + "/" + REPEATS);
+    var total = WORKLOADS.length * REPEATS;
+    var done = bench.wlIndex * REPEATS + bench.repeatIndex;
+    progEl.style.width = (100 * done / total) + "%";
+  }
+
+  function onBenchFrame(dt, tnow) {
+    var wl = WORKLOADS[bench.wlIndex];
+    var elapsed = tnow - bench.phaseStart;
+    if (bench.phase === "warmup") {
+      if (elapsed >= WARMUP_MS) {
+        bench.phase = "measure";
+        bench.phaseStart = tnow;
+        bench.frames = [];
+        setPhaseText("measure " + wl.name + " repeat " + (bench.repeatIndex + 1) + "/" + REPEATS);
+      }
+      return;
+    }
+    if (bench.phase === "measure") {
+      if (!document.hidden && dt > 0) bench.frames.push(dt);
+      if (elapsed >= MEASURE_MS) {
+        var st = statsOf(bench.frames);
+        st.repeatIndex = bench.repeatIndex + 1;
+        st.hiddenInvalid = bench.hiddenInvalid;
+        st.sampleCountAtEnd = sampleCount;
+        st.validForGpuReport = !bench.hiddenInvalid && !backend.softwareRenderer && st.validFrames > 0;
+        if (!st.validForGpuReport) {
+          log("w", "benchmark", wl.name + " repeat " + st.repeatIndex + " discarded (hidden or invalid); retrying");
+          beginRun();
+          return;
+        }
+        finishWorkloadRun(wl, st);
+        bench.repeatIndex += 1;
+        if (bench.repeatIndex >= REPEATS) {
+          bench.repeatIndex = 0;
+          bench.wlIndex += 1;
+        }
+        beginRun();
+      }
+    }
+  }
+
+  function tick(t) {
+    rafId = requestAnimationFrame(tick);
+    if (document.hidden) {
+      lastT = t;
+      return;
+    }
+    if (!gl || !targets) return;
+    var dt = lastT ? (t - lastT) : 0;
+    lastT = t;
+    lastDt = dt;
+    if (dt > 0) fpsEma = fpsEma ? fpsEma * 0.9 + (1000 / dt) * 0.1 : 1000 / dt;
+
+    var shouldTrace = !paused || bench.active;
+    if (shouldTrace && !backend.softwareRenderer) {
+      traceFrame();
+    }
+    present();
+
+    document.getElementById("hudSamples").textContent = String(sampleCount);
+    document.getElementById("hudFrame").textContent = dt ? dt.toFixed(2) + " ms" : "—";
+    document.getElementById("hudFps").textContent = fpsEma ? fpsEma.toFixed(1) : "—";
+
+    if (bench.active) onBenchFrame(dt, t);
+  }
+
+  function fillWlUi() {
+    selWl.innerHTML = "";
+    var body = document.getElementById("wlBody");
+    body.innerHTML = "";
+    WORKLOADS.forEach(function (w) {
+      var o = document.createElement("option");
+      o.value = w.id; o.textContent = w.name;
+      selWl.appendChild(o);
+      var tr = document.createElement("tr");
+      tr.innerHTML = "<td>" + w.name + "</td><td>" + w.width + "x" + w.height + "</td><td>" +
+        w.bounces + "</td><td>" + w.spp + "</td><td>" + (w.denoise ? w.denoiseMethod : "off") + "</td>";
+      body.appendChild(tr);
+    });
+    selWl.value = currentWl.id;
+  }
+
+  function downloadText(filename, text, mime) {
+    var blob = new Blob([text], { type: mime });
+    var a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = filename;
+    a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); }, 1500);
+  }
+
+  function initGL() {
+    var attrs = {
+      alpha: false,
+      antialias: false,
+      depth: false,
+      stencil: false,
+      preserveDrawingBuffer: true,
+      powerPreference: "high-performance",
+      failIfMajorPerformanceCaveat: true,
+      desynchronized: false
+    };
+    gl = canvas.getContext("webgl2", attrs);
+    if (!gl) {
+      backend.caveatContext = true;
+      gl = canvas.getContext("webgl2", {
+        alpha: false, antialias: false, depth: false, stencil: false,
+        preserveDrawingBuffer: true, powerPreference: "high-performance"
+      });
+      if (gl) log("w", "context", "Context created without failIfMajorPerformanceCaveat");
+    }
+    if (!gl) {
+      log("e", "context", "WebGL2 unavailable");
+      document.getElementById("backendBadge").className = "badge bad";
+      document.getElementById("backendBadge").textContent = "NO WebGL2 — GPU path tracer unavailable";
+      return false;
+    }
+
+    canvas.addEventListener("webglcontextlost", function (e) {
+      e.preventDefault();
+      log("e", "context_lost", "WebGL2 context lost");
+      paused = true;
+      if (bench.active) bench.hiddenInvalid = true;
+      if (rafId) cancelAnimationFrame(rafId);
+    });
+    canvas.addEventListener("webglcontextrestored", function () {
+      log("w", "context_restored", "WebGL2 context restored; rebuilding GPU resources");
+      if (initAfterContext()) {
+        lastT = 0;
+        rafId = requestAnimationFrame(tick);
+      }
+    });
+
+    var dbg = gl.getExtension("WEBGL_debug_renderer_info");
+    gpuInfo.vendor = gl.getParameter(gl.VENDOR) || "";
+    gpuInfo.renderer = gl.getParameter(gl.RENDERER) || "";
+    if (dbg) {
+      gpuInfo.unmaskedVendor = gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) || "";
+      gpuInfo.unmaskedRenderer = gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) || "";
+    }
+    var soft = isSoftwareRenderer(gpuInfo.unmaskedVendor || gpuInfo.vendor, gpuInfo.unmaskedRenderer || gpuInfo.renderer);
+    backend.softwareRenderer = soft;
+    backend.mixedWithSoftware = false;
+    if (soft) {
+      log("e", "software_renderer", "Software/CPU rasterizer detected. GPU benchmark stats will not be recorded.");
+      document.getElementById("backendBadge").className = "badge bad";
+      document.getElementById("backendBadge").textContent = "SOFTWARE RENDERER — stats excluded";
+    } else {
+      document.getElementById("backendBadge").textContent = "WebGL2 GPU fragment path tracer (software excluded)";
+    }
+    return initAfterContext();
+  }
+
+  function initAfterContext() {
+    if (!gl) return false;
+    programs.trace = makeProgram(VS, FS_TRACE, "trace");
+    programs.denoise = makeProgram(VS, FS_DENOISE, "denoise");
+    programs.present = makeProgram(VS, FS_PRESENT, "present");
+    if (!programs.trace || !programs.denoise || !programs.present) {
+      log("e", "shader_compile", "Required GPU programs failed");
+      return false;
+    }
+    vao = gl.createVertexArray();
+    gl.bindVertexArray(vao);
+    var buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    if (!pickColorFormat()) return false;
+    if (!applyWorkload(currentWl, true)) return false;
+    log("o", "gpu", "Path tracer ready — " + (gpuInfo.unmaskedRenderer || gpuInfo.renderer));
+    return true;
+  }
+
+  document.getElementById("btnStart").addEventListener("click", function () {
+    paused = false;
+    log("o", "control", "Start / resume progressive sampling");
+  });
+  document.getElementById("btnPause").addEventListener("click", function () {
+    paused = true;
+    log("o", "control", "Paused at sample count " + sampleCount);
+  });
+  document.getElementById("btnReset").addEventListener("click", function () {
+    resetAccum(true);
+    present();
+    document.getElementById("hudSamples").textContent = "0";
+  });
+  document.getElementById("btnBench").addEventListener("click", startBench);
+  selWl.addEventListener("change", function () {
+    var id = selWl.value;
+    for (var i = 0; i < WORKLOADS.length; i++) if (WORKLOADS[i].id === id) applyWorkload(WORKLOADS[i], true);
+  });
+  document.getElementById("btnJson").addEventListener("click", function () {
+    var r = lastReport || buildReport();
+    downloadText("pt-room-bench-" + Date.now() + ".json", JSON.stringify(r, null, 2), "application/json");
+  });
+  document.getElementById("btnPng").addEventListener("click", function () {
+    present();
+    canvas.toBlob(function (blob) {
+      if (!blob) { log("e", "resource_load", "PNG export failed"); return; }
+      var a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = "pt-room-" + currentWl.id + "-" + sampleCount + "spp.png";
+      a.click();
+      setTimeout(function () { URL.revokeObjectURL(a.href); }, 1500);
+      log("o", "export", "PNG saved (" + currentWl.id + ", samples=" + sampleCount + ")");
+    }, "image/png");
+  });
+
+  fillWlUi();
+  if (initGL()) {
+    renderEnv();
+    paused = false;
+    rafId = requestAnimationFrame(tick);
+  } else {
+    renderEnv();
+    buildReport();
+  }
+})();
+</script>
+</body>
+</html>

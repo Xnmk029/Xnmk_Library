@@ -1,0 +1,1206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no"/>
+<title></title>
+<style>
+html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#7a9a94;cursor:none}
+canvas{display:block;width:100%;height:100%}
+#g{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#6d8c86;color:rgba(236,242,232,.38);font:300 13px/1.6 ui-sans-serif,system-ui,sans-serif;letter-spacing:.55em;text-transform:uppercase;user-select:none;cursor:pointer;z-index:2}
+#g span{opacity:.7}
+</style>
+</head>
+<body>
+<div id="g"><span>click</span></div>
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"}}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { RectAreaLightUniformsLib } from 'three/addons/lights/RectAreaLightUniformsLib.js';
+
+const CS = 22;
+const WATER_Y = 0.36;
+const CEIL_Y = 4.55;
+const EYE = 1.7;
+const LOAD_R = 2;
+const TILE_S = 4;
+
+const HALL=0, CORRIDOR=1, DEEP=2, SHALLOW=3, PLATFORM=4, STAIRS=5, PILLARS=6, CROSS=7;
+
+function u32(n){ return n >>> 0; }
+function hash2(x, z){
+  let h = u32(Math.imul(x|0, 374761393) + Math.imul(z|0, 668265263) + 0x9e3779b9);
+  h = u32(Math.imul(h ^ (h >>> 13), 1274126177));
+  return u32(h ^ (h >>> 16));
+}
+function rnd(x, z, k){ return hash2((x|0) + (k|0) * 19, (z|0) + (k|0) * 47) / 4294967296; }
+function roomType(cx, cz){
+  if (cx === 0 && cz === 0) return HALL;
+  const r = hash2(cx, cz) % 100;
+  if (r < 16) return HALL;
+  if (r < 32) return CORRIDOR;
+  if (r < 46) return DEEP;
+  if (r < 60) return SHALLOW;
+  if (r < 72) return PLATFORM;
+  if (r < 82) return STAIRS;
+  if (r < 92) return PILLARS;
+  return CROSS;
+}
+function gapW(cx, cz, dir){
+  let ax=cx, az=cz, bx=cx, bz=cz;
+  if (dir===0) az=cz-1;
+  else if (dir===1) bx=cx+1;
+  else if (dir===2) bz=cz+1;
+  else ax=cx-1;
+  const h = hash2(ax * 13 + bx * 7, az * 17 + bz * 11);
+  const t = h % 10;
+  if (t < 3) return CS;
+  if (t < 7) return 8.5;
+  return 5.2;
+}
+
+function makeNoise(n){
+  const a = new Float32Array(n*n);
+  for (let y=0;y<n;y++) for (let x=0;x<n;x++){
+    let v=0, amp=1, f=1, tot=0;
+    for (let o=0;o<5;o++){
+      const xi=x*f/n, yi=y*f/n;
+      const x0=Math.floor(xi), y0=Math.floor(yi);
+      const fx=xi-x0, fy=yi-y0;
+      const h00=rnd(x0,y0,o+3), h10=rnd(x0+1,y0,o+3), h01=rnd(x0,y0+1,o+3), h11=rnd(x0+1,y0+1,o+3);
+      const ux=fx*fx*(3-2*fx), uy=fy*fy*(3-2*fy);
+      v += (h00+(h10-h00)*ux+(h01-h00)*uy+(h00-h10-h01+h11)*ux*uy)*amp;
+      tot += amp; amp *= 0.5; f *= 2;
+    }
+    a[y*n+x] = v/tot;
+  }
+  return a;
+}
+
+function heightToNormal(h, n, str){
+  const out = new Uint8ClampedArray(n*n*4);
+  for (let y=0;y<n;y++) for (let x=0;x<n;x++){
+    const hL=h[y*n+((x-1+n)%n)], hR=h[y*n+((x+1)%n)];
+    const hD=h[((y-1+n)%n)*n+x], hU=h[((y+1)%n)*n+x];
+    let nx=-(hR-hL)*str, ny=-(hU-hD)*str, nz=1;
+    const l=Math.hypot(nx,ny,nz)||1;
+    const i=(y*n+x)*4;
+    out[i]=((nx/l)*0.5+0.5)*255;
+    out[i+1]=((ny/l)*0.5+0.5)*255;
+    out[i+2]=((nz/l)*0.5+0.5)*255;
+    out[i+3]=255;
+  }
+  return out;
+}
+
+function texFrom(data, n, srgb){
+  const t = new THREE.DataTexture(data, n, n);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.magFilter = THREE.LinearFilter;
+  t.minFilter = THREE.LinearMipmapLinearFilter;
+  t.generateMipmaps = true;
+  t.anisotropy = 8;
+  t.colorSpace = srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
+  t.needsUpdate = true;
+  return t;
+}
+
+function buildTileSet(kind){
+  const n=512, albedo=new Uint8ClampedArray(n*n*4), rough=new Uint8ClampedArray(n*n*4), ao=new Uint8ClampedArray(n*n*4);
+  const height=new Float32Array(n*n);
+  const noise=makeNoise(n);
+  const grout = kind==='concrete' ? 0.035 : 0.07;
+  for (let y=0;y<n;y++) for (let x=0;x<n;x++){
+    const u=x/n, v=y/n;
+    const px=u%1, py=v%1;
+    const gx=Math.min(px,1-px), gy=Math.min(py,1-py);
+    const gEdge=Math.min(gx,gy);
+    const inGrout = gEdge < grout;
+    const bevel = Math.min(1, gEdge/grout);
+    const nse=noise[y*n+x];
+    const chip = (nse>0.82 && gEdge<0.12) ? 1 : 0;
+    let hgt;
+    if (kind==='concrete'){
+      hgt = 0.45 + nse*0.22 + Math.sin(x*0.11)*0.02;
+    } else {
+      hgt = inGrout ? 0.18+nse*0.05 : 0.72 + (bevel-1)*0.08 + (nse-0.5)*0.06;
+      hgt -= chip*0.12;
+      const dome = Math.sin(Math.PI*Math.min(1,gEdge/0.45))*0.04;
+      if (!inGrout) hgt += dome;
+    }
+    height[y*n+x]=hgt;
+    const i=(y*n+x)*4;
+    let r,g,b, rf, aov;
+    if (kind==='concrete'){
+      const c=0.42+nse*0.1;
+      r=c*255; g=c*0.99*255; b=c*0.95*255;
+      rf=0.72+nse*0.2; aov=0.78+nse*0.18;
+    } else if (kind==='wall'){
+      const stain=Math.max(0,(nse-0.62)*1.4);
+      const wet=nse<0.22?0.08:0;
+      r=(0.89-stain*0.12-wet)*255;
+      g=(0.86-stain*0.08-wet)*255;
+      b=(0.76-stain*0.04-wet)*255;
+      if (inGrout){ r=168; g=162; b=148; }
+      rf = inGrout ? 0.78 : (0.12 + stain*0.25 + (nse<0.28? -0.07:0) + chip*0.3);
+      aov = inGrout ? 0.55 : 0.92 - (1-bevel)*0.12;
+    } else {
+      const stain=Math.max(0,(nse-0.58)*1.6);
+      const wet=nse<0.18?0.1:0;
+      const tileJ = (hash2(x>>4,y>>4)%100)/100;
+      r=(0.905 - stain*0.14 - wet + tileJ*0.02)*255;
+      g=(0.875 - stain*0.09 - wet + tileJ*0.015)*255;
+      b=(0.78 - stain*0.03 - wet)*255;
+      if (inGrout){ r=171; g=166; b=152; }
+      rf = inGrout ? 0.82 : Math.max(0.04, 0.11 + stain*0.28 - (nse<0.24?0.07:0) + chip*0.35);
+      aov = inGrout ? 0.52 : 0.94 - (1-bevel)*0.14;
+    }
+    albedo[i]=r; albedo[i+1]=g; albedo[i+2]=b; albedo[i+3]=255;
+    const rb=Math.max(0,Math.min(255,rf*255));
+    rough[i]=rb; rough[i+1]=rb; rough[i+2]=rb; rough[i+3]=255;
+    const ab=Math.max(0,Math.min(255,aov*255));
+    ao[i]=ab; ao[i+1]=ab; ao[i+2]=ab; ao[i+3]=255;
+  }
+  const nd = heightToNormal(height, n, kind==='concrete'? 6.5 : 9.0);
+  return {
+    map: texFrom(albedo,n,true),
+    normalMap: texFrom(nd,n,false),
+    roughnessMap: texFrom(rough,n,false),
+    aoMap: texFrom(ao,n,false)
+  };
+}
+
+const CAUSTIC_GLSL = `
+float hash11(float n){ return fract(sin(n)*43758.5453); }
+vec2 hash22(vec2 p){ p=vec2(dot(p,vec2(127.1,311.7)),dot(p,vec2(269.5,183.3))); return fract(sin(p)*43758.5453); }
+float caustic(vec2 p, float t){
+  vec2 q = p * 0.42;
+  float c = 0.0;
+  for (int i=0;i<3;i++){
+    float fi=float(i);
+    q += 0.18*vec2(sin(t*0.21+fi*1.7), cos(t*0.17+fi*2.3));
+    vec2 id=floor(q), f=fract(q);
+    float md=1.0;
+    for(int j=-1;j<=1;j++) for(int k=-1;k<=1;k++){
+      vec2 g=vec2(float(k),float(j));
+      vec2 o=hash22(id+g);
+      vec2 r=g+o-f;
+      md=min(md,dot(r,r));
+    }
+    c += 1.0/(1.0+md*18.0);
+    q *= 1.37;
+  }
+  float w = 0.55+0.45*sin(p.x*1.3+t*0.4)*sin(p.y*1.1-t*0.33);
+  return pow(c*0.38*w, 3.2)*3.4;
+}
+`;
+
+const WATER_VS = `
+uniform float uTime;
+uniform mat4 textureMatrix;
+varying vec3 vWorldPos;
+varying vec3 vViewPos;
+varying vec4 vReflUv;
+varying vec3 vN;
+vec3 waveN(vec2 xz, float t){
+  vec2 d1=normalize(vec2(1.0,0.35)), d2=normalize(vec2(-0.4,1.0)), d3=normalize(vec2(0.6,-0.75));
+  float a=0.011;
+  float s1=sin(dot(d1,xz)*2.4 - t*0.55);
+  float s2=sin(dot(d2,xz)*3.6 - t*0.42);
+  float s3=sin(dot(d3,xz)*5.5 - t*0.7);
+  vec3 n=vec3(-(d1.x*s1*2.4+d2.x*s2*3.6+d3.x*s3*5.5)*a, 1.0, -(d1.y*s1*2.4+d2.y*s2*3.6+d3.y*s3*5.5)*a);
+  return normalize(n);
+}
+void main(){
+  vec3 p = position;
+  float t=uTime;
+  p.y += 0.012*(sin(p.x*2.4+t*0.55)+sin(p.z*3.1-t*0.4)*0.6);
+  vec4 wp = modelMatrix * vec4(p,1.0);
+  vWorldPos = wp.xyz;
+  vN = waveN(wp.xz, t);
+  vViewPos = (modelViewMatrix * vec4(p,1.0)).xyz;
+  vReflUv = textureMatrix * vec4(p,1.0);
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(p,1.0);
+}
+`;
+
+const WATER_FS = `
+uniform sampler2D tReflection;
+uniform sampler2D tRefraction;
+uniform sampler2D tDepth;
+uniform float uTime;
+uniform float uWaterY;
+uniform vec2 uResolution;
+uniform float cameraNear;
+uniform float cameraFar;
+uniform vec3 uShallow;
+uniform vec3 uDeep;
+varying vec3 vWorldPos;
+varying vec3 vViewPos;
+varying vec4 vReflUv;
+varying vec3 vN;
+${CAUSTIC_GLSL}
+float linearDepth(float z){
+  float zN = z * 2.0 - 1.0;
+  return (2.0 * cameraNear * cameraFar) / (cameraFar + cameraNear - zN * (cameraFar - cameraNear));
+}
+void main(){
+  vec3 N = normalize(vN);
+  vec3 V = normalize(cameraPosition - vWorldPos);
+  if (!gl_FrontFacing){ N = -N; }
+  float ndv = max(dot(N, V), 0.0);
+  float fres = pow(1.0 - ndv, 5.0);
+  fres = mix(0.12, 0.92, fres);
+  vec2 distort = N.xz * 0.035;
+  vec2 ruv = vReflUv.xy / max(vReflUv.w, 1e-4) + distort;
+  ruv = clamp(ruv, 0.002, 0.998);
+  vec3 refl = texture2D(tReflection, ruv).rgb;
+  vec2 suv = gl_FragCoord.xy / uResolution + distort * 1.4;
+  suv = clamp(suv, 0.001, 0.999);
+  vec3 refr = texture2D(tRefraction, suv).rgb;
+  float sceneZ = linearDepth(texture2D(tDepth, suv).r);
+  float viewZ = max(-vViewPos.z, cameraNear);
+  float thick = max(sceneZ - viewZ, 0.0);
+  float absorb = 1.0 - exp(-thick * 0.62);
+  vec3 deepCol = mix(uShallow, uDeep, clamp(thick / 2.8, 0.0, 1.0));
+  refr *= exp(-vec3(0.55, 0.22, 0.16) * thick);
+  refr = mix(refr, deepCol, absorb);
+  float cau = caustic(vWorldPos.xz, uTime);
+  refr += cau * exp(-thick*0.4) * vec3(0.28, 0.42, 0.36);
+  vec3 specDir = normalize(V + normalize(vec3(0.15, 0.95, 0.22)));
+  float spec = pow(max(dot(N, specDir), 0.0), 220.0);
+  vec3 col = mix(refr, refl, gl_FrontFacing ? fres : 0.08);
+  col += spec * vec3(0.85, 0.9, 0.8) * (gl_FrontFacing ? 1.0 : 0.15);
+  if (!gl_FrontFacing){
+    col = mix(uDeep * 0.45, col, 0.35);
+    col *= vec3(0.45, 0.7, 0.68);
+  }
+  gl_FragColor = vec4(col, 1.0);
+}
+`;
+
+const POST_FS = `
+uniform sampler2D tDiffuse;
+uniform sampler2D tDepth;
+uniform sampler2D tNormal;
+uniform float uTime;
+uniform vec2 uResolution;
+uniform float cameraNear;
+uniform float cameraFar;
+uniform float uWaterY;
+uniform vec3 uCamPos;
+uniform vec4 uLights[4];
+uniform float uUnder;
+uniform mat4 uInvProj;
+uniform mat4 uInvView;
+uniform mat4 uProj;
+varying vec2 vUv;
+float linearDepth(float z){
+  float zN = z * 2.0 - 1.0;
+  return (2.0 * cameraNear * cameraFar) / (cameraFar + cameraNear - zN * (cameraFar - cameraNear));
+}
+vec3 viewPos(vec2 uv, float depth){
+  vec4 clip = vec4(uv * 2.0 - 1.0, depth * 2.0 - 1.0, 1.0);
+  vec4 view = uInvProj * clip;
+  return view.xyz / view.w;
+}
+void main(){
+  vec2 uv = vUv;
+  vec2 ca = (uv - 0.5) * 0.0028;
+  vec3 base;
+  base.r = texture2D(tDiffuse, uv + ca).r;
+  base.g = texture2D(tDiffuse, uv).g;
+  base.b = texture2D(tDiffuse, uv - ca).b;
+  float depth = texture2D(tDepth, uv).r;
+  float ld = linearDepth(depth);
+  vec3 vp = viewPos(uv, depth);
+  vec3 n = normalize(texture2D(tNormal, uv).xyz * 2.0 - 1.0);
+  vec3 wrld = (uInvView * vec4(vp, 1.0)).xyz;
+  float occ = 1.0;
+  vec2 off = 1.0 / uResolution;
+  for (int i=0;i<8;i++){
+    float a = float(i) * 2.399;
+    vec2 o = vec2(cos(a), sin(a)) * off * 3.5;
+    float zd = linearDepth(texture2D(tDepth, uv+o).r);
+    occ -= clamp((ld - zd) * 0.12, 0.0, 0.08);
+  }
+  occ = clamp(occ, 0.55, 1.0);
+  vec3 vdir = normalize(vp);
+  vec3 rdir = reflect(vdir, n);
+  vec3 ssr = vec3(0.0);
+  float ssrW = 0.0;
+  vec3 mpos = vp;
+  float stepL = mix(0.18, 0.55, clamp(ld/40.0, 0.0, 1.0));
+  if (n.z > -0.15 && ld < 55.0){
+    for (int i=0;i<18;i++){
+      mpos += rdir * stepL;
+      vec4 cp = uProj * vec4(mpos, 1.0);
+      vec2 su = cp.xy / cp.w * 0.5 + 0.5;
+      if (su.x<0.0||su.x>1.0||su.y<0.0||su.y>1.0) break;
+      float sz = linearDepth(texture2D(tDepth, su).r);
+      float mz = max(-mpos.z, 0.0);
+      if (mz > sz + 0.05 && mz < sz + 0.85){
+        ssr = texture2D(tDiffuse, su).rgb;
+        ssrW = 0.55 * (1.0 - float(i)/18.0);
+        ssrW *= smoothstep(0.0, 0.12, su.x) * smoothstep(1.0, 0.88, su.x);
+        ssrW *= smoothstep(0.0, 0.12, su.y) * smoothstep(1.0, 0.88, su.y);
+        break;
+      }
+    }
+  }
+  float wet = 1.0 - smoothstep(0.0, 1.15, max(wrld.y - uWaterY, 0.0));
+  base = mix(base, ssr, ssrW * wet * 0.55);
+  base *= occ;
+  vec3 rd = normalize(wrld - uCamPos);
+  float maxD = min(ld, 48.0);
+  vec3 scatter = vec3(0.0);
+  vec3 fogC = vec3(0.55, 0.70, 0.66);
+  for (int i=0;i<10;i++){
+    float fi = (float(i)+0.5)/10.0;
+    vec3 p = uCamPos + rd * maxD * fi;
+    float dens = 0.035 + 0.07 * exp(-abs(p.y - uWaterY) * 1.35);
+    dens *= 1.0 + 0.25 * exp(-abs(p.y - 2.2));
+    for (int k=0;k<4;k++){
+      float d = length(p - uLights[k].xyz);
+      scatter += uLights[k].w * vec3(0.92, 0.95, 0.82) * dens / (1.0 + d*d*1.8);
+    }
+    scatter += fogC * dens * 0.15;
+  }
+  scatter *= maxD * 0.085;
+  float fog = 1.0 - exp(-ld * 0.033);
+  fog = clamp(fog + 0.12 * (1.0 - exp(-ld*0.02)) * exp(-abs(wrld.y-uWaterY)*0.6), 0.0, 0.92);
+  vec3 col = mix(base, fogC * 0.92, fog);
+  col += scatter * (1.0 - fog * 0.35);
+  if (uUnder > 0.5){
+    col *= vec3(0.38, 0.62, 0.58);
+    col += vec3(0.02, 0.06, 0.05);
+    float cau = 0.0;
+    vec2 qp = wrld.xz * 0.35;
+    cau = 0.5 + 0.5 * sin(qp.x*3.0+uTime)*sin(qp.y*2.6-uTime*0.7);
+    col += cau * 0.06 * vec3(0.3, 0.55, 0.45);
+  }
+  col = mix(vec3(dot(col, vec3(0.2126,0.7152,0.0722))), col, 0.86);
+  col *= vec3(1.02, 1.0, 0.94);
+  float vig = smoothstep(1.15, 0.28, length((uv-0.5)*vec2(1.15,1.0)));
+  col *= mix(0.72, 1.0, vig);
+  float gn = fract(sin(dot(uv * uResolution + uTime*60.0, vec2(12.9898,78.233))) * 43758.5453);
+  col += (gn - 0.5) * 0.028;
+  gl_FragColor = vec4(col, 1.0);
+}
+`;
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.08;
+renderer.autoClear = true;
+document.body.appendChild(renderer.domElement);
+RectAreaLightUniformsLib.init();
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x7a9a94);
+scene.fog = null;
+
+const camera = new THREE.PerspectiveCamera(72, window.innerWidth / window.innerHeight, 0.07, 90);
+camera.position.set(0, EYE, 0);
+
+const clock = new THREE.Clock();
+const uTime = { value: 0 };
+
+function makeEnv(){
+  const envScene = new THREE.Scene();
+  const mat = new THREE.ShaderMaterial({
+    side: THREE.BackSide,
+    uniforms: {},
+    vertexShader: 'varying vec3 vP; void main(){ vP=position; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0); }',
+    fragmentShader: `
+      varying vec3 vP;
+      void main(){
+        vec3 d = normalize(vP);
+        float up = d.y * 0.5 + 0.5;
+        vec3 col = mix(vec3(0.42,0.50,0.47), vec3(0.78,0.82,0.74), up);
+        col += vec3(0.85,0.88,0.72) * pow(max(d.y,0.0), 10.0) * 1.6;
+        float bands = smoothstep(0.02,0.0, abs(fract(d.x*4.0+d.z*0.2)-0.5)-0.46) * pow(max(d.y,0.0),4.0);
+        col += bands * vec3(0.35,0.36,0.28);
+        gl_FragColor = vec4(col,1.0);
+      }`
+  });
+  envScene.add(new THREE.Mesh(new THREE.BoxGeometry(2,2,2), mat));
+  const pmrem = new THREE.PMREMGenerator(renderer);
+  const rt = pmrem.fromScene(envScene, 0.0, 0.1, 80);
+  pmrem.dispose();
+  return rt.texture;
+}
+scene.environment = makeEnv();
+scene.environmentIntensity = 0.42;
+
+const floorT = buildTileSet('floor');
+const wallT = buildTileSet('wall');
+const concT = buildTileSet('concrete');
+
+function pbrMat(set, physical){
+  const M = physical ? THREE.MeshPhysicalMaterial : THREE.MeshStandardMaterial;
+  const m = new M({
+    map: set.map,
+    normalMap: set.normalMap,
+    roughnessMap: set.roughnessMap,
+    aoMap: set.aoMap,
+    roughness: 0.35,
+    metalness: 0.0,
+    envMapIntensity: 0.55,
+    aoMapIntensity: 0.95,
+    normalScale: new THREE.Vector2(1.15, 1.15)
+  });
+  if (physical){
+    m.clearcoat = 0.45;
+    m.clearcoatRoughness = 0.22;
+    m.clearcoatNormalMap = set.normalMap;
+    m.clearcoatNormalScale = new THREE.Vector2(0.4, 0.4);
+  }
+  m.onBeforeCompile = (shader) => {
+    shader.uniforms.uTime = uTime;
+    shader.uniforms.uWaterY = { value: WATER_Y };
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\nvarying vec3 vWorldPos;')
+      .replace('#include <worldpos_vertex>', '#include <worldpos_vertex>\nvWorldPos = worldPosition.xyz;');
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', `#include <common>\nvarying vec3 vWorldPos;\nuniform float uTime;\nuniform float uWaterY;\n${CAUSTIC_GLSL}`)
+      .replace('#include <roughnessmap_fragment>',
+        `#include <roughnessmap_fragment>
+        float wetMask = 1.0 - smoothstep(0.02, 0.95, max(vWorldPos.y - uWaterY, 0.0));
+        roughnessFactor = mix(roughnessFactor, roughnessFactor * 0.22, wetMask * 0.88);
+        float wl = 1.0 - smoothstep(0.0, 0.11, abs(vWorldPos.y - uWaterY));
+        diffuseColor.rgb *= 1.0 - wl * 0.22;
+        diffuseColor.rgb *= 0.93 + 0.07 * fract(sin(dot(floor(vWorldPos.xz*4.0), vec2(12.7,78.1)))*43758.5);`)
+      .replace('#include <lights_fragment_end>',
+        `#include <lights_fragment_end>
+        if (vWorldPos.y < uWaterY - 0.015){
+          float dep = uWaterY - vWorldPos.y;
+          float ca = caustic(vWorldPos.xz, uTime);
+          float fade = exp(-dep * 0.28) * smoothstep(0.0, 0.12, dep);
+          vec3 ccol = vec3(0.32, 0.52, 0.46) * ca * fade;
+          reflectedLight.directDiffuse += ccol;
+          reflectedLight.indirectDiffuse += ccol * 0.45;
+          reflectedLight.directDiffuse *= exp(-vec3(0.18,0.08,0.06)*dep);
+        }`);
+  };
+  m.customProgramCacheKey = () => 'pool-pbr-v3';
+  return m;
+}
+
+const matFloor = pbrMat(floorT, true);
+const matWall = pbrMat(wallT, true);
+const matConc = pbrMat(concT, false);
+matConc.roughness = 0.82;
+matConc.envMapIntensity = 0.28;
+
+const matLightOff = new THREE.MeshBasicMaterial({ color: 0x6a6a62 });
+const matLightDim = new THREE.MeshStandardMaterial({
+  color: 0xe8e4d0, emissive: 0xf0edd8, emissiveIntensity: 2.4, roughness: 0.35, metalness: 0
+});
+
+function worldUV(geo, s){
+  s = s || TILE_S;
+  const p = geo.attributes.position, n = geo.attributes.normal, uv = geo.attributes.uv;
+  for (let i=0;i<p.count;i++){
+    const x=p.getX(i), y=p.getY(i), z=p.getZ(i);
+    const nx=Math.abs(n.getX(i)), ny=Math.abs(n.getY(i)), nz=Math.abs(n.getZ(i));
+    if (ny>=nx && ny>=nz) uv.setXY(i, x*s, z*s);
+    else if (nx>=nz) uv.setXY(i, z*s, y*s);
+    else uv.setXY(i, x*s, y*s);
+  }
+  uv.needsUpdate = true;
+}
+
+function boxGeo(w,h,d,x,y,z){
+  const g = new THREE.BoxGeometry(w,h,d);
+  g.translate(x,y,z);
+  worldUV(g);
+  return g;
+}
+function aabb(x,y,z,w,h,d){
+  const hw=w*0.5, hh=h*0.5, hd=d*0.5;
+  return { minx:x-hw, maxx:x+hw, miny:y-hh, maxy:y+hh, minz:z-hd, maxz:z+hd };
+}
+
+const hemi = new THREE.HemisphereLight(0xc5d6d0, 0x2e3a36, 0.28);
+scene.add(hemi);
+const amb = new THREE.AmbientLight(0x6e8078, 0.07);
+scene.add(amb);
+
+const dynLights = [];
+for (let i=0;i<4;i++){
+  const rl = new THREE.RectAreaLight(0xf0eed8, 0, 1.35, 0.48);
+  scene.add(rl);
+  const pl = new THREE.PointLight(0xe8ead0, 0, 14, 1.6);
+  scene.add(pl);
+  dynLights.push({ rl, pl });
+}
+
+const fixtures = [];
+const chunks = new Map();
+const chunkGroup = new THREE.Group();
+scene.add(chunkGroup);
+
+function addStairs(geos, floors, colliders, x0, z0, width, y0, y1, alongZ, dir){
+  const rise = y1 - y0;
+  const stepH = 0.17;
+  const n = Math.max(2, Math.ceil(Math.abs(rise) / stepH));
+  const sh = rise / n;
+  const sd = 0.34;
+  for (let i=0;i<n;i++){
+    const y = y0 + sh*(i+0.5);
+    const along = (i+0.5)*sd*dir;
+    const x = alongZ ? x0 : x0 + along;
+    const z = alongZ ? z0 + along : z0;
+    const w = alongZ ? width : sd;
+    const d = alongZ ? sd : width;
+    geos.push(boxGeo(w, Math.abs(sh)+0.02, d, x, y, z));
+    floors.push({ minx:x-w*0.5, maxx:x+w*0.5, minz:z-d*0.5, maxz:z+d*0.5, y: y+Math.abs(sh)*0.5 });
+  }
+}
+
+function addEdge(geos, colliders, ox, oz, dir, gap){
+  const T=0.32, H=CEIL_Y, hy=H*0.5, mid=CS*0.5;
+  if (gap >= CS-0.4){
+    if (dir===0||dir===2){
+      const z = dir===0 ? oz : oz+CS;
+      geos.push(boxGeo(CS, 0.28, T, ox+mid, H-0.14, z));
+    } else {
+      const x = dir===3 ? ox : ox+CS;
+      geos.push(boxGeo(T, 0.28, CS, x, H-0.14, oz+mid));
+    }
+    return;
+  }
+  const hg = gap*0.5;
+  if (dir===0 || dir===2){
+    const z = dir===0 ? oz : oz+CS;
+    const left = mid - hg;
+    if (left>0.25){
+      geos.push(boxGeo(left, H, T, ox+left*0.5, hy, z));
+      colliders.push(aabb(ox+left*0.5, hy, z, left, H, T));
+      geos.push(boxGeo(left, H, T, ox+CS-left*0.5, hy, z));
+      colliders.push(aabb(ox+CS-left*0.5, hy, z, left, H, T));
+    }
+    const lh=1.05;
+    geos.push(boxGeo(gap, lh, T, ox+mid, H-lh*0.5, z));
+    colliders.push(aabb(ox+mid, H-lh*0.5, z, gap, lh, T));
+  } else {
+    const x = dir===3 ? ox : ox+CS;
+    const left = mid - hg;
+    if (left>0.25){
+      geos.push(boxGeo(T, H, left, x, hy, oz+left*0.5));
+      colliders.push(aabb(x, hy, oz+left*0.5, T, H, left));
+      geos.push(boxGeo(T, H, left, x, hy, oz+CS-left*0.5));
+      colliders.push(aabb(x, hy, oz+CS-left*0.5, T, H, left));
+    }
+    const lh=1.05;
+    geos.push(boxGeo(T, lh, gap, x, H-lh*0.5, oz+mid));
+    colliders.push(aabb(x, H-lh*0.5, oz+mid, T, lh, gap));
+  }
+}
+
+function addColumn(geos, colliders, x, z, y0, y1){
+  const h = y1 - y0, cy = (y0+y1)*0.5, s=0.72;
+  geos.push(boxGeo(s, h, s, x, cy, z));
+  colliders.push(aabb(x, cy, z, s, h, s));
+  geos.push(boxGeo(0.92, 0.12, 0.92, x, y0+0.06, z));
+  geos.push(boxGeo(0.88, 0.1, 0.88, x, y1-0.05, z));
+}
+
+function addFloorSlab(geos, floors, x, z, w, d, y){
+  geos.push(boxGeo(w, 0.28, d, x, y-0.14, z));
+  floors.push({ minx:x-w*0.5, maxx:x+w*0.5, minz:z-d*0.5, maxz:z+d*0.5, y });
+}
+
+function addCoping(geos, x, z, w, d, y){
+  geos.push(boxGeo(w, 0.08, d, x, y, z));
+}
+
+function buildChunk(cx, cz){
+  const ox = cx * CS, oz = cz * CS;
+  const type = roomType(cx, cz);
+  const tileGeos=[], wallGeos=[], concGeos=[], lightGeosOn=[], lightGeosOff=[];
+  const colliders=[], floors=[];
+  const localFix=[];
+  const mid = CS * 0.5;
+  const cxw = ox + mid, czw = oz + mid;
+  const gaps = [gapW(cx,cz,0), gapW(cx,cz,1), gapW(cx,cz,2), gapW(cx,cz,3)];
+
+  let floorY = 0.0;
+  if (type === PLATFORM) floorY = 1.18;
+  else if (type === CORRIDOR && rnd(cx,cz,2) > 0.45) floorY = 0.52;
+  else if (type === SHALLOW) floorY = 0.08;
+  else if (type === STAIRS) floorY = 0.0;
+
+  for (let d=0;d<4;d++) addEdge(wallGeos, colliders, ox, oz, d, gaps[d]);
+
+  concGeos.push(boxGeo(CS, 0.32, CS, cxw, CEIL_Y+0.16, czw));
+  for (let i=0;i<3;i++){
+    const t = (i+1)/4;
+    concGeos.push(boxGeo(CS, 0.22, 0.38, cxw, CEIL_Y-0.08, oz + t*CS));
+    concGeos.push(boxGeo(0.38, 0.22, CS, ox + t*CS, CEIL_Y-0.08, czw));
+  }
+
+  const placeLight = (x, z, live) => {
+    const y = CEIL_Y - 0.06;
+    const g = boxGeo(1.32, 0.06, 0.46, x, y, z);
+    if (live) lightGeosOn.push(g); else lightGeosOff.push(g);
+    if (live){
+      const f = { x, y, z, on: true };
+      localFix.push(f);
+      fixtures.push(f);
+    }
+  };
+
+  if (type === HALL || type === SHALLOW || type === PILLARS){
+    addFloorSlab(tileGeos, floors, cxw, czw, CS-0.04, CS-0.04, floorY);
+    const cols = type===PILLARS ? 4 : 2;
+    const span = CS / (cols+1);
+    for (let i=1;i<=cols;i++) for (let j=1;j<=cols;j++){
+      if (type===HALL && i===1 && j===1 && rnd(cx,cz,i*10+j)<0.2) continue;
+      addColumn(wallGeos, colliders, ox+span*i, oz+span*j, floorY, CEIL_Y);
+    }
+    for (let i=0;i<3;i++) for (let j=0;j<3;j++){
+      const lx = ox + 4.2 + i*6.8, lz = oz + 4.2 + j*6.8;
+      const live = rnd(cx,cz, 30+i*3+j) > 0.16;
+      placeLight(lx, lz, live);
+    }
+  } else if (type === CORRIDOR){
+    const alongZ = rnd(cx,cz,5) > 0.5;
+    const hw = 2.55, hy = (CEIL_Y+floorY)*0.5, hh = CEIL_Y-floorY, og = 5.6, seg = (CS-og)*0.5;
+    if (alongZ){
+      addFloorSlab(tileGeos, floors, cxw, czw, hw*2, CS, floorY);
+      addFloorSlab(tileGeos, floors, cxw, czw, CS, og, floorY);
+      wallGeos.push(boxGeo(0.3, hh, seg, cxw-hw, hy, oz+seg*0.5));
+      wallGeos.push(boxGeo(0.3, hh, seg, cxw-hw, hy, oz+CS-seg*0.5));
+      wallGeos.push(boxGeo(0.3, hh, seg, cxw+hw, hy, oz+seg*0.5));
+      wallGeos.push(boxGeo(0.3, hh, seg, cxw+hw, hy, oz+CS-seg*0.5));
+      colliders.push(aabb(cxw-hw,hy,oz+seg*0.5,0.3,hh,seg));
+      colliders.push(aabb(cxw-hw,hy,oz+CS-seg*0.5,0.3,hh,seg));
+      colliders.push(aabb(cxw+hw,hy,oz+seg*0.5,0.3,hh,seg));
+      colliders.push(aabb(cxw+hw,hy,oz+CS-seg*0.5,0.3,hh,seg));
+    } else {
+      addFloorSlab(tileGeos, floors, cxw, czw, CS, hw*2, floorY);
+      addFloorSlab(tileGeos, floors, cxw, czw, og, CS, floorY);
+      wallGeos.push(boxGeo(seg, hh, 0.3, ox+seg*0.5, hy, czw-hw));
+      wallGeos.push(boxGeo(seg, hh, 0.3, ox+CS-seg*0.5, hy, czw-hw));
+      wallGeos.push(boxGeo(seg, hh, 0.3, ox+seg*0.5, hy, czw+hw));
+      wallGeos.push(boxGeo(seg, hh, 0.3, ox+CS-seg*0.5, hy, czw+hw));
+      colliders.push(aabb(ox+seg*0.5,hy,czw-hw,seg,hh,0.3));
+      colliders.push(aabb(ox+CS-seg*0.5,hy,czw-hw,seg,hh,0.3));
+      colliders.push(aabb(ox+seg*0.5,hy,czw+hw,seg,hh,0.3));
+      colliders.push(aabb(ox+CS-seg*0.5,hy,czw+hw,seg,hh,0.3));
+    }
+    for (let i=0;i<4;i++){
+      const t=(i+0.5)/4;
+      const lx = alongZ ? cxw : ox + t*CS;
+      const lz = alongZ ? oz + t*CS : czw;
+      placeLight(lx, lz, rnd(cx,cz,40+i) > 0.12);
+    }
+  } else if (type === DEEP){
+    const b = 2.7, inner = CS - b*2, deepY = -2.15;
+    addFloorSlab(tileGeos, floors, ox+mid, oz+b*0.5, CS, b, 0);
+    addFloorSlab(tileGeos, floors, ox+mid, oz+CS-b*0.5, CS, b, 0);
+    addFloorSlab(tileGeos, floors, ox+b*0.5, oz+mid, b, inner, 0);
+    addFloorSlab(tileGeos, floors, ox+CS-b*0.5, oz+mid, b, inner, 0);
+    addFloorSlab(tileGeos, floors, cxw, czw, inner, inner, deepY);
+    const ph = 0 - deepY, py = (0+deepY)*0.5;
+    const stairGap = 2.5, sideW = (inner - stairGap) * 0.5;
+    wallGeos.push(boxGeo(sideW, ph, 0.28, cxw - (stairGap + sideW) * 0.5, py, oz+b));
+    wallGeos.push(boxGeo(sideW, ph, 0.28, cxw + (stairGap + sideW) * 0.5, py, oz+b));
+    colliders.push(aabb(cxw - (stairGap + sideW) * 0.5, py, oz+b, sideW, ph, 0.28));
+    colliders.push(aabb(cxw + (stairGap + sideW) * 0.5, py, oz+b, sideW, ph, 0.28));
+    wallGeos.push(boxGeo(inner, ph, 0.28, cxw, py, oz+CS-b));
+    wallGeos.push(boxGeo(0.28, ph, inner, ox+b, py, czw));
+    wallGeos.push(boxGeo(0.28, ph, inner, ox+CS-b, py, czw));
+    colliders.push(aabb(cxw, py, oz+CS-b, inner, ph, 0.28));
+    colliders.push(aabb(ox+b, py, czw, 0.28, ph, inner));
+    colliders.push(aabb(ox+CS-b, py, czw, 0.28, ph, inner));
+    addCoping(tileGeos, cxw, oz+b, inner+0.2, 0.42, 0.04);
+    addCoping(tileGeos, cxw, oz+CS-b, inner+0.2, 0.42, 0.04);
+    addCoping(tileGeos, ox+b, czw, 0.42, inner+0.2, 0.04);
+    addCoping(tileGeos, ox+CS-b, czw, 0.42, inner+0.2, 0.04);
+    addStairs(tileGeos, floors, colliders, cxw, oz+b+0.2, 2.2, 0, deepY, true, 1);
+    addColumn(wallGeos, colliders, ox+b*0.5, oz+b*0.5, 0, CEIL_Y);
+    addColumn(wallGeos, colliders, ox+CS-b*0.5, oz+b*0.5, 0, CEIL_Y);
+    addColumn(wallGeos, colliders, ox+b*0.5, oz+CS-b*0.5, 0, CEIL_Y);
+    addColumn(wallGeos, colliders, ox+CS-b*0.5, oz+CS-b*0.5, 0, CEIL_Y);
+    for (let i=0;i<3;i++) for (let j=0;j<3;j++){
+      placeLight(ox+4+i*7, oz+4+j*7, rnd(cx,cz,50+i+j*5)>0.14);
+    }
+  } else if (type === PLATFORM){
+    const pw=6.2, pd=6.2;
+    addFloorSlab(tileGeos, floors, cxw, czw, pw, CS, floorY);
+    addFloorSlab(tileGeos, floors, cxw, czw, CS, pd, floorY);
+    addFloorSlab(tileGeos, floors, ox+2.4, oz+2.4, 4.2, 4.2, 0);
+    addFloorSlab(tileGeos, floors, ox+CS-2.4, oz+CS-2.4, 4.2, 4.2, 0);
+    wallGeos.push(boxGeo(pw, 0.14, CS, cxw, floorY+0.42, czw));
+    addStairs(tileGeos, floors, colliders, cxw, oz+4.5, 2.0, floorY, 0, true, 1);
+    addColumn(wallGeos, colliders, ox+5, oz+5, 0, CEIL_Y);
+    addColumn(wallGeos, colliders, ox+CS-5, oz+CS-5, 0, CEIL_Y);
+    for (let i=0;i<3;i++) placeLight(ox+5.5+i*5.5, czw, rnd(cx,cz,60+i)>0.1);
+  } else if (type === STAIRS){
+    const up = rnd(cx,cz,8)>0.5;
+    const yTop = up ? 1.18 : 0;
+    const yBot = up ? 0 : -1.35;
+    addFloorSlab(tileGeos, floors, cxw, oz+4, CS-0.2, 8, yTop);
+    addFloorSlab(tileGeos, floors, cxw, oz+CS-4, CS-0.2, 8, yBot);
+    addStairs(tileGeos, floors, colliders, cxw, oz+mid-1.2, 3.4, yTop, yBot, true, 1);
+    wallGeos.push(boxGeo(0.28, CEIL_Y, 8, ox+6, CEIL_Y*0.5, oz+4));
+    wallGeos.push(boxGeo(0.28, CEIL_Y, 8, ox+CS-6, CEIL_Y*0.5, oz+4));
+    colliders.push(aabb(ox+6, CEIL_Y*0.5, oz+4, 0.28, CEIL_Y, 8));
+    colliders.push(aabb(ox+CS-6, CEIL_Y*0.5, oz+4, 0.28, CEIL_Y, 8));
+    addColumn(wallGeos, colliders, ox+4.5, oz+4.5, yTop, CEIL_Y);
+    addColumn(wallGeos, colliders, ox+CS-4.5, oz+4.5, yTop, CEIL_Y);
+    for (let i=0;i<4;i++) placeLight(cxw, oz+3+i*5, rnd(cx,cz,70+i)>0.12);
+  } else if (type === CROSS){
+    const hw=2.7;
+    addFloorSlab(tileGeos, floors, cxw, czw, hw*2, CS, 0);
+    addFloorSlab(tileGeos, floors, cxw, czw, CS, hw*2, 0);
+    const pool=5.4, deepY=-1.55;
+    addFloorSlab(tileGeos, floors, cxw, czw, pool, pool, deepY);
+    const ph=0-deepY, py=(0+deepY)*0.5;
+    const sg = 1.8, sw = (pool - sg) * 0.5;
+    wallGeos.push(boxGeo(sw, ph, 0.24, cxw - (sg + sw) * 0.5, py, czw-pool*0.5));
+    wallGeos.push(boxGeo(sw, ph, 0.24, cxw + (sg + sw) * 0.5, py, czw-pool*0.5));
+    wallGeos.push(boxGeo(pool, ph, 0.24, cxw, py, czw+pool*0.5));
+    wallGeos.push(boxGeo(0.24, ph, pool, cxw-pool*0.5, py, czw));
+    wallGeos.push(boxGeo(0.24, ph, pool, cxw+pool*0.5, py, czw));
+    colliders.push(aabb(cxw - (sg + sw) * 0.5, py, czw-pool*0.5, sw, ph, 0.24));
+    colliders.push(aabb(cxw + (sg + sw) * 0.5, py, czw-pool*0.5, sw, ph, 0.24));
+    colliders.push(aabb(cxw, py, czw+pool*0.5, pool, ph, 0.24));
+    colliders.push(aabb(cxw-pool*0.5, py, czw, 0.24, ph, pool));
+    colliders.push(aabb(cxw+pool*0.5, py, czw, 0.24, ph, pool));
+    addStairs(tileGeos, floors, colliders, cxw, czw-pool*0.5+0.15, 1.6, 0, deepY, true, 1);
+    addColumn(wallGeos, colliders, ox+5.2, oz+5.2, 0, CEIL_Y);
+    addColumn(wallGeos, colliders, ox+CS-5.2, oz+5.2, 0, CEIL_Y);
+    addColumn(wallGeos, colliders, ox+5.2, oz+CS-5.2, 0, CEIL_Y);
+    addColumn(wallGeos, colliders, ox+CS-5.2, oz+CS-5.2, 0, CEIL_Y);
+    for (let i=0;i<2;i++) for (let j=0;j<2;j++) placeLight(ox+6+i*10, oz+6+j*10, rnd(cx,cz,80+i+j)>0.1);
+  }
+
+  const group = new THREE.Group();
+  const mk = (arr, mat) => {
+    if (!arr.length) return;
+    const m = mergeGeometries(arr, false);
+    if (!m) return;
+    m.setAttribute('uv2', m.attributes.uv.clone());
+    m.computeBoundingSphere();
+    const mesh = new THREE.Mesh(m, mat);
+    mesh.castShadow = false;
+    mesh.receiveShadow = false;
+    group.add(mesh);
+    for (const g of arr) g.dispose();
+  };
+  mk(tileGeos, matFloor);
+  mk(wallGeos, matWall);
+  mk(concGeos, matConc);
+  mk(lightGeosOn, matLightDim);
+  mk(lightGeosOff, matLightOff);
+
+  chunkGroup.add(group);
+  return { cx, cz, group, colliders, floors, localFix, type };
+}
+
+function key(cx,cz){ return cx+','+cz; }
+
+function disposeChunk(ch){
+  for (const f of ch.localFix){
+    const i = fixtures.indexOf(f);
+    if (i>=0) fixtures.splice(i,1);
+  }
+  ch.group.traverse(o=>{
+    if (o.geometry) o.geometry.dispose();
+  });
+  chunkGroup.remove(ch.group);
+}
+
+function syncChunks(px, pz){
+  const ccx = Math.floor(px / CS);
+  const ccz = Math.floor(pz / CS);
+  const need = new Set();
+  for (let dz=-LOAD_R; dz<=LOAD_R; dz++) for (let dx=-LOAD_R; dx<=LOAD_R; dx++){
+    need.add(key(ccx+dx, ccz+dz));
+    if (!chunks.has(key(ccx+dx, ccz+dz))){
+      chunks.set(key(ccx+dx, ccz+dz), buildChunk(ccx+dx, ccz+dz));
+    }
+  }
+  for (const [k, ch] of chunks){
+    if (!need.has(k)){
+      disposeChunk(ch);
+      chunks.delete(k);
+    }
+  }
+}
+
+function getFloorY(x, z){
+  const cx = Math.floor(x / CS), cz = Math.floor(z / CS);
+  const ch = chunks.get(key(cx,cz));
+  if (!ch) return 0;
+  let best = -99, found=false;
+  for (const f of ch.floors){
+    if (x>=f.minx && x<=f.maxx && z>=f.minz && z<=f.maxz && f.y > best && f.y < 8){
+      best = f.y; found=true;
+    }
+  }
+  return found ? best : 0;
+}
+
+function collideXZ(pos, rad, feetY){
+  const cx=Math.floor(pos.x/CS), cz=Math.floor(pos.z/CS);
+  const head = feetY + EYE;
+  for (let dz=-1;dz<=1;dz++) for (let dx=-1;dx<=1;dx++){
+    const ch = chunks.get(key(cx+dx, cz+dz));
+    if (!ch) continue;
+    for (const b of ch.colliders){
+      if (head < b.miny+0.05 || feetY > b.maxy-0.05) continue;
+      const nx = Math.max(b.minx, Math.min(pos.x, b.maxx));
+      const nz = Math.max(b.minz, Math.min(pos.z, b.maxz));
+      const dxw = pos.x - nx, dzw = pos.z - nz;
+      const d2 = dxw*dxw + dzw*dzw;
+      if (d2 < rad*rad){
+        const d = Math.sqrt(d2) || 0.0001;
+        const push = (rad - d) + 0.001;
+        pos.x += (dxw/d)*push;
+        pos.z += (dzw/d)*push;
+      }
+    }
+  }
+}
+
+const opaqueRT = new THREE.WebGLRenderTarget(1, 1, {
+  minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+  format: THREE.RGBAFormat, type: THREE.UnsignedByteType,
+  depthBuffer: true
+});
+opaqueRT.depthTexture = new THREE.DepthTexture();
+opaqueRT.depthTexture.format = THREE.DepthFormat;
+opaqueRT.depthTexture.type = THREE.UnsignedIntType;
+
+const reflRT = new THREE.WebGLRenderTarget(1, 1, {
+  minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter
+});
+const normalRT = new THREE.WebGLRenderTarget(1, 1, {
+  minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter
+});
+
+const reflCam = new THREE.PerspectiveCamera(72, 1, 0.1, 90);
+const textureMatrix = new THREE.Matrix4();
+const waterGeo = new THREE.PlaneGeometry(72, 72, 72, 72);
+waterGeo.rotateX(-Math.PI/2);
+const waterMat = new THREE.ShaderMaterial({
+  uniforms: {
+    uTime,
+    uWaterY: { value: WATER_Y },
+    tReflection: { value: reflRT.texture },
+    tRefraction: { value: opaqueRT.texture },
+    tDepth: { value: opaqueRT.depthTexture },
+    uResolution: { value: new THREE.Vector2(1,1) },
+    cameraNear: { value: 0.07 },
+    cameraFar: { value: 90 },
+    textureMatrix: { value: textureMatrix },
+    uShallow: { value: new THREE.Color(0x5e9a92) },
+    uDeep: { value: new THREE.Color(0x0a2a28) }
+  },
+  vertexShader: WATER_VS,
+  fragmentShader: WATER_FS,
+  side: THREE.DoubleSide
+});
+const waterMesh = new THREE.Mesh(waterGeo, waterMat);
+waterMesh.position.y = WATER_Y;
+scene.add(waterMesh);
+
+const normalMat = new THREE.MeshNormalMaterial();
+function resizeRT(){
+  const w = renderer.domElement.width, h = renderer.domElement.height;
+  opaqueRT.setSize(w, h);
+  normalRT.setSize(Math.max(1, w>>1), Math.max(1, h>>1));
+  reflRT.setSize(Math.max(1, w>>1), Math.max(1, h>>1));
+  waterMat.uniforms.uResolution.value.set(w, h);
+}
+
+const _clipQ = new THREE.Vector4();
+const _clipP = new THREE.Vector4();
+const _clipPlane = new THREE.Plane();
+function setObliqueClip(cam, plane){
+  _clipPlane.copy(plane).applyMatrix4(cam.matrixWorldInverse);
+  _clipP.set(_clipPlane.normal.x, _clipPlane.normal.y, _clipPlane.normal.z, _clipPlane.constant);
+  const m = cam.projectionMatrix;
+  _clipQ.x = (Math.sign(_clipP.x) + m.elements[8]) / m.elements[0];
+  _clipQ.y = (Math.sign(_clipP.y) + m.elements[9]) / m.elements[5];
+  _clipQ.z = -1;
+  _clipQ.w = (1 + m.elements[10]) / m.elements[14];
+  _clipP.multiplyScalar(2 / _clipP.dot(_clipQ));
+  m.elements[2] = _clipP.x;
+  m.elements[6] = _clipP.y;
+  m.elements[10] = _clipP.z + 1;
+  m.elements[14] = _clipP.w;
+}
+
+function updateReflection(){
+  reflCam.fov = camera.fov;
+  reflCam.aspect = camera.aspect;
+  reflCam.near = camera.near;
+  reflCam.far = camera.far;
+  reflCam.position.set(camera.position.x, 2*WATER_Y - camera.position.y, camera.position.z);
+  const e = new THREE.Euler().setFromQuaternion(camera.quaternion, 'YXZ');
+  e.x = -e.x; e.z = -e.z;
+  reflCam.quaternion.setFromEuler(e);
+  reflCam.updateMatrixWorld();
+  reflCam.updateProjectionMatrix();
+  const plane = new THREE.Plane(new THREE.Vector3(0,1,0), -WATER_Y);
+  setObliqueClip(reflCam, plane);
+  textureMatrix.set(
+    0.5,0,0,0.5,
+    0,0.5,0,0.5,
+    0,0,0.5,0.5,
+    0,0,0,1
+  );
+  textureMatrix.multiply(reflCam.projectionMatrix);
+  textureMatrix.multiply(reflCam.matrixWorldInverse);
+  textureMatrix.multiply(waterMesh.matrixWorld);
+}
+
+const composer = new THREE.EffectComposer(renderer);
+const renderPass = new THREE.RenderPass(scene, camera);
+composer.addPass(renderPass);
+const bloom = new THREE.UnrealBloomPass(new THREE.Vector2(1,1), 0.28, 0.7, 0.82);
+composer.addPass(bloom);
+
+const postUniforms = {
+  tDiffuse: { value: null },
+  tDepth: { value: opaqueRT.depthTexture },
+  tNormal: { value: normalRT.texture },
+  uTime,
+  uResolution: { value: new THREE.Vector2(1,1) },
+  cameraNear: { value: 0.07 },
+  cameraFar: { value: 90 },
+  uWaterY: { value: WATER_Y },
+  uCamPos: { value: new THREE.Vector3() },
+  uLights: { value: [new THREE.Vector4(), new THREE.Vector4(), new THREE.Vector4(), new THREE.Vector4()] },
+  uUnder: { value: 0 },
+  uInvProj: { value: new THREE.Matrix4() },
+  uInvView: { value: new THREE.Matrix4() },
+  uProj: { value: new THREE.Matrix4() }
+};
+const postPass = new ShaderPass({
+  uniforms: postUniforms,
+  vertexShader: 'varying vec2 vUv; void main(){ vUv=uv; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0); }',
+  fragmentShader: POST_FS
+});
+composer.addPass(postPass);
+
+function onResize(){
+  const w=window.innerWidth, h=window.innerHeight;
+  camera.aspect = w/h;
+  camera.updateProjectionMatrix();
+  const pr = renderer.getPixelRatio();
+  renderer.setSize(w,h);
+  composer.setSize(w,h);
+  bloom.setSize(w,h);
+  resizeRT();
+  postUniforms.uResolution.value.set(w*pr, h*pr);
+}
+window.addEventListener('resize', onResize);
+onResize();
+
+const keys = Object.create(null);
+window.addEventListener('keydown', e => { keys[e.code]=true; if (e.code==='Space'||e.code==='Tab') e.preventDefault(); });
+window.addEventListener('keyup', e => { keys[e.code]=false; });
+
+let locked=false, yaw=0, pitch=0;
+const player = { x: 2.5, y: 0, z: 2.5, vy:0 };
+const hint = document.getElementById('g');
+
+function lock(){
+  renderer.domElement.requestPointerLock();
+}
+hint.addEventListener('click', lock);
+renderer.domElement.addEventListener('click', () => { if (!locked) lock(); });
+document.addEventListener('pointerlockchange', () => {
+  locked = document.pointerLockElement === renderer.domElement;
+  if (locked){ hint.remove(); }
+  else {
+    if (!document.getElementById('g')){
+      const d=document.createElement('div');
+      d.id='g'; d.innerHTML='<span>click</span>';
+      d.addEventListener('click', lock);
+      document.body.appendChild(d);
+    }
+  }
+});
+document.addEventListener('mousemove', (e) => {
+  if (!locked) return;
+  yaw -= e.movementX * 0.0018;
+  pitch -= e.movementY * 0.0018;
+  pitch = Math.max(-1.42, Math.min(1.42, pitch));
+});
+
+let audioCtx=null, conv=null, lastStep=0, bob=0;
+function ensureAudio(){
+  if (audioCtx) return;
+  audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+  conv = audioCtx.createConvolver();
+  const len = audioCtx.sampleRate * 1.6;
+  const buf = audioCtx.createBuffer(2, len, audioCtx.sampleRate);
+  for (let c=0;c<2;c++){
+    const d=buf.getChannelData(c);
+    for (let i=0;i<len;i++) d[i] = (Math.random()*2-1) * Math.pow(1-i/len, 2.4) * (c?0.9:1);
+  }
+  conv.buffer = buf;
+  const dry = audioCtx.createGain(); dry.gain.value=0.18;
+  conv.connect(audioCtx.destination);
+}
+function footstep(wet){
+  if (!audioCtx) return;
+  const n = audioCtx.sampleRate * 0.07;
+  const buf = audioCtx.createBuffer(1, n, audioCtx.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i=0;i<n;i++){
+    d[i] = (Math.random()*2-1) * Math.exp(-i/(wet?180:120));
+  }
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  const bp = audioCtx.createBiquadFilter();
+  bp.type='bandpass';
+  bp.frequency.value = wet ? 420 : 780;
+  bp.Q.value = 0.7;
+  const g = audioCtx.createGain();
+  g.gain.value = wet ? 0.22 : 0.16;
+  src.connect(bp); bp.connect(g); g.connect(conv); g.connect(audioCtx.destination);
+  src.start();
+}
+
+function assignLights(px, pz){
+  const scored = fixtures.map(f => {
+    const dx=f.x-px, dz=f.z-pz;
+    return { f, d: dx*dx+dz*dz };
+  }).sort((a,b)=>a.d-b.d);
+  for (let i=0;i<4;i++){
+    const L = dynLights[i];
+    if (i < scored.length){
+      const f = scored[i].f;
+      const flick = (hash2((f.x*10)|0, ((uTime.value*7)|0) + ((f.z*10)|0)) % 100) > 97 ? 0.35 : 1;
+      const inten = 16 * flick;
+      L.rl.position.set(f.x, f.y, f.z);
+      L.rl.lookAt(f.x, f.y-1, f.z);
+      L.rl.width = 1.35; L.rl.height = 0.48;
+      L.rl.intensity = inten;
+      L.pl.position.set(f.x, f.y-0.2, f.z);
+      L.pl.intensity = 3.2 * flick;
+      postUniforms.uLights.value[i].set(f.x, f.y, f.z, 1.1*flick);
+    } else {
+      L.rl.intensity = 0; L.pl.intensity = 0;
+      postUniforms.uLights.value[i].set(0, -99, 0, 0);
+    }
+  }
+}
+
+syncChunks(player.x, player.z);
+player.y = getFloorY(player.x, player.z);
+
+let fpsEma=60, prCur=Math.min(window.devicePixelRatio, 1.5);
+const _invP = new THREE.Matrix4();
+const _invV = new THREE.Matrix4();
+const _euler = new THREE.Euler(0,0,0,'YXZ');
+
+function tick(){
+  requestAnimationFrame(tick);
+  const dt = Math.min(clock.getDelta(), 0.05);
+  uTime.value += dt;
+  fpsEma = fpsEma*0.92 + (1/Math.max(dt,1e-4))*0.08;
+  if (fpsEma < 42 && prCur > 1.0){
+    prCur = Math.max(1.0, prCur-0.08);
+    renderer.setPixelRatio(prCur);
+    onResize();
+  }
+
+  _euler.set(pitch, yaw, 0);
+  camera.quaternion.setFromEuler(_euler);
+
+  const fwd = new THREE.Vector3(0,0,-1).applyQuaternion(camera.quaternion); fwd.y=0; fwd.normalize();
+  const right = new THREE.Vector3(1,0,0).applyQuaternion(camera.quaternion); right.y=0; right.normalize();
+  let mx=0, mz=0;
+  if (keys['KeyW']||keys['ArrowUp']) mz+=1;
+  if (keys['KeyS']||keys['ArrowDown']) mz-=1;
+  if (keys['KeyA']||keys['ArrowLeft']) mx-=1;
+  if (keys['KeyD']||keys['ArrowRight']) mx+=1;
+  const moving = mx!==0 || mz!==0;
+  const fy = getFloorY(player.x, player.z);
+  const waterDepth = Math.max(0, WATER_Y - fy);
+  const wading = waterDepth > 0.05;
+  const submerged = camera.position.y < WATER_Y - 0.04;
+  let spd = 2.35;
+  if (keys['ShiftLeft']||keys['ShiftRight']) spd = 3.55;
+  if (wading) spd *= Math.max(0.42, 1 - waterDepth*0.28);
+  if (submerged) spd *= 0.55;
+  if (moving){
+    const len = Math.hypot(mx,mz);
+    mx/=len; mz/=len;
+    player.x += (fwd.x*mz + right.x*mx) * spd * dt;
+    player.z += (fwd.z*mz + right.z*mx) * spd * dt;
+  }
+  collideXZ(player, 0.28, fy);
+  const targetY = getFloorY(player.x, player.z);
+  player.y += (targetY - player.y) * Math.min(1, dt*14);
+  collideXZ(player, 0.28, player.y);
+
+  bob = moving ? Math.sin(uTime.value * (wading?7.2:9.4) * (spd/2.35)) * 0.028 * (spd/2.35) : bob*0.9;
+  camera.position.set(player.x, player.y + EYE + bob, player.z);
+  camera.updateMatrixWorld();
+
+  if (moving && locked){
+    ensureAudio();
+    const interval = wading ? 0.52 : 0.42;
+    if (uTime.value - lastStep > interval){
+      lastStep = uTime.value;
+      footstep(wading || submerged);
+    }
+  }
+
+  syncChunks(player.x, player.z);
+  waterMesh.position.x = player.x;
+  waterMesh.position.z = player.z;
+  waterMesh.position.y = WATER_Y;
+  assignLights(player.x, player.z);
+
+  postUniforms.uCamPos.value.copy(camera.position);
+  postUniforms.uUnder.value = submerged ? 1 : 0;
+  postUniforms.uInvProj.value.copy(camera.projectionMatrix).invert();
+  postUniforms.uInvView.value.copy(camera.matrixWorld);
+  postUniforms.uProj.value.copy(camera.projectionMatrix);
+
+  waterMesh.visible = false;
+  renderer.setRenderTarget(opaqueRT);
+  renderer.clear();
+  renderer.render(scene, camera);
+
+  scene.overrideMaterial = normalMat;
+  renderer.setRenderTarget(normalRT);
+  renderer.clear();
+  renderer.render(scene, camera);
+  scene.overrideMaterial = null;
+
+  updateReflection();
+  renderer.setRenderTarget(reflRT);
+  renderer.clear();
+  renderer.render(scene, reflCam);
+
+  waterMesh.visible = true;
+  renderer.setRenderTarget(null);
+  composer.render();
+}
+tick();
+</script>
+</body>
+</html>

@@ -25,5 +25,21 @@ class TranscriptScanTests(unittest.TestCase):
     def test_plain_text_root(self):
         self.assertTrue(scan_transcript('read F:/benchmark/secret.txt'))
 
+    def test_cli_reference_manifest_mime(self):
+        result = '29:       "content_type": "image/png",\n30:       "copyright": "Logitech"'
+        self.assertEqual(scan_transcript(json.dumps({'result': result})), [])
+        self.assertEqual(scan_transcript(json.dumps({'content_type': 'image/webp'})), [])
+
+    def test_cli_image_description(self):
+        result = '<type>image</type>\n<content>\nimage/webp image, 2203x1903 px, 190762 bytes\n</content>'
+        self.assertEqual(scan_transcript(json.dumps({'result': result})), [])
+
+    def test_mime_description_does_not_hide_real_path(self):
+        for result in ['"content_type": "image/png"\nread Image/png/reference.png',
+                       'image/webp image, 2203x1903 px, 190762 bytes\nread Image/secret.png',
+                       '"content_type": "Image/png/reference.png"']:
+            with self.subTest(result=result):
+                self.assertTrue(scan_transcript(json.dumps({'result': result})))
+
 
 if __name__ == '__main__': unittest.main(verbosity=2)

@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>目录重复文件检测器</title>
+  <style>
+    :root { color-scheme: light; font: 16px/1.6 system-ui, sans-serif; color: #203047; background: #f2f5fa; }
+    body { max-width: 1000px; margin: 40px auto; padding: 0 20px; }
+    h1 { font-size: 28px; margin-bottom: 4px; } h2 { font-size: 20px; }
+    .muted { color: #526277; } .panel { background: white; border: 1px solid #d7dfeb; border-radius: 12px; padding: 24px; margin: 20px 0; }
+    .actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 20px; }
+    button { padding: 10px 18px; border: 1px solid #2457c5; background: #2457c5; color: white; border-radius: 7px; font: inherit; cursor: pointer; }
+    button.secondary { color: #2457c5; background: white; } button:disabled { opacity: .55; cursor: wait; }
+    progress { width: 100%; height: 14px; } code, .path { overflow-wrap: anywhere; white-space: pre-wrap; }
+    #error { color: #a51c2a; white-space: pre-wrap; } details { border-top: 1px solid #d7dfeb; padding: 16px 0; } summary { cursor: pointer; font-weight: 600; }
+    .hash { font: 13px/1.7 ui-monospace, monospace; overflow-wrap: anywhere; color: #526277; } li { padding: 4px 0; }
+    @media(max-width: 600px) { body { margin: 20px auto; } .panel { padding: 16px; } }
+  </style>
+</head>
+<body>
+  <h1>目录重复文件检测器</h1>
+  <p class="muted">只读扫描 · SHA-256 与逐字节校验 · 单文件上限 8 MiB</p>
+  <section class="panel" aria-label="扫描操作">
+    <div>扫描根目录：<code id="root">正在连接服务…</code></div>
+    <p class="muted">递归扫描普通文件，不跟随符号链接或 junction。修改文件后可再次扫描。</p>
+    <form id="scan-form" class="actions">
+      <button id="scan" type="submit">开始扫描</button>
+      <button id="refresh" class="secondary" type="button">查看上次完整结果</button>
+    </form>
+    <p id="status" role="status" aria-live="polite">读取服务状态…</p>
+    <progress id="progress" max="1" value="0" aria-label="扫描进度"></progress>
+    <p id="error" role="alert"></p>
+  </section>
+  <section class="panel" aria-label="扫描结果">
+    <h2>最近一次完整扫描结果</h2>
+    <p id="summary" class="muted">正在读取…</p>
+    <div id="groups"></div>
+  </section>
+  <script>
+    const $ = id => document.getElementById(id);
+    let submitting = false;
+    let wasRunning = false;
+    async function api(url, options) {
+      const response = await fetch(url, { cache: 'no-store', ...options });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.error || '请求失败');
+      return body;
+    }
+    function render(result) {
+      $('summary').textContent = `成功读取 ${result.scanned} 个文件，跳过 ${result.skipped} 个文件；发现 ${result.groups.length} 组重复文件。`;
+      $('groups').replaceChildren();
+      if (!result.groups.length) {
+        const message = document.createElement('p');
+        message.textContent = '暂无重复分组。尚未扫描时，请点击“开始扫描”。';
+        $('groups').append(message);
+      }
+      result.groups.forEach((group, index) => {
+        const details = document.createElement('details');
+        const summary = document.createElement('summary');
+        summary.textContent = `分组 ${index + 1} · ${group.paths.length} 个文件 · 每份 ${group.size.toLocaleString()} 字节`;
+        const hash = document.createElement('p');
+        hash.className = 'hash';
+        hash.textContent = `SHA-256：${group.sha256}`;
+        const list = document.createElement('ul');
+        group.paths.forEach(path => {
+          const item = document.createElement('li');
+          item.className = 'path';
+          item.textContent = path;
+          list.append(item);
+        });
+        details.append(summary, hash, list);
+        $('groups').append(details);
+      });
+    }
+    async function refresh() { render(await api('/api/result')); }
+    async function updateStatus() {
+      const state = await api('/api/status');
+      $('root').textContent = state.root;
+      $('scan').disabled = state.running || submitting;
+      $('scan').textContent = state.running || submitting ? '扫描中…' : '开始扫描';
+      const phases = { idle: '等待扫描', discovering: '正在枚举目录', reading: '正在读取与校验', saving: '正在保存完整结果', complete: '扫描完成', failed: '扫描失败，上次完整结果已保留' };
+      $('status').textContent = `${phases[state.phase] || state.phase} · 已读取 ${state.scanned} · 已跳过 ${state.skipped} · 已发现 ${state.total} 个文件`;
+      if (state.running && state.phase === 'discovering') $('progress').removeAttribute('value');
+      else {
+        $('progress').max = state.total || 1;
+        $('progress').value = state.scanned + state.skipped;
+      }
+      if (state.error) $('error').textContent = state.error;
+      if (wasRunning && !state.running) await refresh();
+      wasRunning = state.running;
+    }
+    $('scan-form').addEventListener('submit', async event => {
+      event.preventDefault();
+      if (submitting) return;
+      submitting = true;
+      $('scan').disabled = true;
+      $('error').textContent = '';
+      try { render(await api('/api/scan', { method: 'POST' })); }
+      catch (error) { $('error').textContent = error.message; }
+      finally { submitting = false; await updateStatus().catch(error => { $('error').textContent = error.message; }); }
+    });
+    $('refresh').addEventListener('click', () => refresh().catch(error => { $('error').textContent = error.message; }));
+    async function poll() {
+      try { await updateStatus(); }
+      catch (error) { $('error').textContent = '无法连接服务：' + error.message; }
+      setTimeout(poll, 500);
+    }
+    refresh().catch(error => { $('error').textContent = error.message; });
+    poll();
+  </script>
+</body>
+</html>

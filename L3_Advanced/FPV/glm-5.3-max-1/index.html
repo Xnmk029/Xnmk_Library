@@ -1,0 +1,1235 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FPV 穿越机花飞模拟器 — SO(3) 自研动力学 / 模拟图传</title>
+<style>
+  html, body { margin:0; padding:0; width:100%; height:100%; overflow:hidden; background:#000; }
+  body { font-family: Consolas, "Courier New", monospace; }
+  #glcanvas { position:fixed; left:0; top:0; width:100vw; height:100vh; display:block; }
+  .osd {
+    position:fixed; z-index:5; color:#d9ffdb;
+    font: bold 15px/1.5 Consolas, "Courier New", monospace;
+    text-shadow: 0 0 6px rgba(0,0,0,.95), 1px 1px 0 #000;
+    user-select:none; pointer-events:none; white-space:pre;
+  }
+  #osd-tl { left:16px; top:12px; }
+  #osd-tr { right:16px; top:12px; text-align:right; }
+  #osd-bl { left:16px; bottom:14px; }
+  #osd-br { right:16px; bottom:14px; text-align:right; color:#9fd39f; font-size:12px; }
+  #osd-cross { left:50%; top:50%; transform:translate(-50%,-50%); font-size:20px; color:#e8ffe8; }
+  #osd-warn {
+    left:50%; top:26%; transform:translateX(-50%);
+    color:#ff4d4d; font-size:26px; letter-spacing:3px; display:none;
+    animation: blink 0.5s steps(2, start) infinite;
+  }
+  @keyframes blink { 50% { opacity:0.15; } }
+  #nosignal {
+    position:fixed; left:0; top:0; width:100%; height:100%; z-index:6;
+    background:#000; display:none; align-items:center; justify-content:center;
+    flex-direction:column; color:#c8c8c8; pointer-events:none;
+    animation: blink 1s steps(2, start) infinite;
+  }
+  #nosignal .big { font-size:52px; letter-spacing:10px; font-weight:bold; }
+  #nosignal .sub { margin-top:14px; font-size:15px; color:#8a8a8a; }
+  #gear {
+    position:fixed; right:12px; top:64px; z-index:9;
+    background:rgba(20,26,30,.7); color:#cfe8cf; border:1px solid #4a5a4a;
+    border-radius:5px; padding:5px 10px; cursor:pointer; font:bold 13px Consolas, monospace;
+  }
+  #gear:hover { background:rgba(40,56,44,.85); }
+  #menu {
+    position:fixed; right:0; top:0; bottom:0; width:352px; z-index:10;
+    background:rgba(10,14,18,.94); border-left:1px solid #3a4a3a;
+    color:#cfe3cf; overflow-y:auto; padding:12px 14px 24px 14px;
+    font-size:12px; display:none;
+  }
+  #menu h2 { font-size:15px; margin:4px 0 10px 0; color:#aef1ae; border-bottom:1px solid #3a4a3a; padding-bottom:6px; }
+  #menu h3 { font-size:13px; margin:14px 0 6px 0; color:#ffd28a; }
+  #menu .row { display:flex; align-items:center; margin:3px 0; gap:6px; }
+  #menu .row label { flex:0 0 132px; }
+  #menu .row .val { flex:0 0 58px; text-align:right; color:#9fd3ff; }
+  #menu input[type=range] { flex:1; min-width:90px; }
+  #menu select { background:#1c2428; color:#cfe3cf; border:1px solid #4a5a4a; padding:1px 3px; }
+  #menu button {
+    background:#28402c; color:#d9ffdb; border:1px solid #4a7a4a; border-radius:4px;
+    padding:4px 12px; cursor:pointer; margin:8px 6px 0 0; font:bold 12px Consolas, monospace;
+  }
+  #menu button:hover { background:#3a5a40; }
+  #menu .axline { display:flex; gap:6px; margin:2px 0; color:#8fbf8f; }
+  #menu .axline .bar { flex:1; height:8px; background:#141a14; border:1px solid #2c3a2c; position:relative; }
+  #menu .axline .bar i { position:absolute; left:50%; top:0; bottom:0; width:2px; background:#5adf5a; }
+  #menu .note { color:#7a9a7a; margin-top:6px; line-height:1.5; }
+  #booterr { position:fixed; left:10px; bottom:10px; z-index:99; color:#ff7a7a; background:rgba(0,0,0,.8); padding:8px; font-size:12px; display:none; max-width:70%; }
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+
+<div class="osd" id="osd-tl"></div>
+<div class="osd" id="osd-tr"></div>
+<div class="osd" id="osd-bl"></div>
+<div class="osd" id="osd-br"></div>
+<div class="osd" id="osd-cross">+</div>
+<div class="osd" id="osd-warn">FAILSAFE</div>
+
+<div id="nosignal"><div class="big">NO SIGNAL</div><div class="sub">5.8G VTX 信号丢失 / 超出图传距离 — 按 R 键复位</div></div>
+
+<button id="gear" title="设置 (Tab)">⚙ 设置 (Tab)</button>
+
+<div id="menu">
+  <h2>模拟器设置</h2>
+  <div id="sec-ch"><h3>通道映射 / 反向 (硬件遥控)</h3></div>
+  <div id="sec-axmon"><h3>遥控器原始轴监测</h3></div>
+  <div id="sec-pid"><h3>PID 参数微调 (角速率闭环)</h3></div>
+  <div id="sec-aero"><h3>气动物理参数</h3></div>
+  <div id="sec-rates"><h3>摇杆速率 (Acro)</h3></div>
+  <div id="sec-vtx"><h3>图传 / 相机</h3></div>
+  <div>
+    <button id="btn-save">保存设置</button>
+    <button id="btn-default">恢复默认</button>
+    <button id="btn-close">关闭</button>
+  </div>
+  <div class="note">
+    键盘: 方向键=俯仰/横滚 · W/S=油门 · A/D=偏航<br>
+    Enter=解锁/上锁(油门需归零) · R=复位 · Tab=本菜单<br>
+    手柄: Start(9)或LB(4)=解锁 · 插入手柄自动接管
+  </div>
+</div>
+
+<div id="booterr"></div>
+
+<script>
+'use strict';
+/* ============================================================================
+ * FPV 穿越机花飞模拟器 (单文件 / 零第三方依赖)
+ *  - 自研刚体动力学: SO(3) 姿态 + so(3) 李代数指数映射积分 (全程无欧拉角)
+ *  - 平动: 电机总推力 + 重力 + 与速度平方成正比的气体阻尼
+ *  - Acro 模式: 摇杆->目标角速度, 三轴 PID 力矩闭环
+ *  - 硬件遥控: Gamepad API 4通道, 可绑定轴向/反向
+ *  - 渲染: 手写 WebGL1, 场景渲到 FBO, 自定义后处理模拟 5.8G 模拟图传
+ *  - 距离驱动信号衰减: 雪花/撕裂/滚纹 -> 黑屏 + Failsafe
+ * ==========================================================================*/
+
+/* ------------------------------ 基础工具 -------------------------------- */
+function clamp(x, a, b){ return x < a ? a : (x > b ? b : x); }
+function deadband(x, d){
+  const ax = Math.abs(x);
+  if (ax <= d) return 0;
+  return Math.sign(x) * (ax - d) / (1 - d);
+}
+function expoIn(x, e){ return x * (1 - e + e * x * x); }
+
+/* --------------------------- SO(3) / so(3) 数学 ---------------------------
+ * 3x3 矩阵统一采用行主序 (row-major) 普通数组, R 将机体系向量映射到世界系:
+ *     v_world = m3MulV(R, v_body)
+ * 姿态演化: R <- Ortho( R * exp( [omega_body * dt]x ) )
+ * 即通过 so(3) 李代数的指数映射 (Rodrigues 公式) 精确积分, 不经过欧拉角。
+ * ------------------------------------------------------------------------ */
+function m3Ident(){ return [1,0,0, 0,1,0, 0,0,1]; }
+function m3Mul(a, b){
+  const o = new Array(9);
+  for (let r = 0; r < 3; r++){
+    const a0=a[r*3], a1=a[r*3+1], a2=a[r*3+2];
+    for (let c = 0; c < 3; c++){
+      o[r*3+c] = a0*b[c] + a1*b[3+c] + a2*b[6+c];
+    }
+  }
+  return o;
+}
+function m3MulV(m, v){
+  return [
+    m[0]*v[0] + m[1]*v[1] + m[2]*v[2],
+    m[3]*v[0] + m[4]*v[1] + m[5]*v[2],
+    m[6]*v[0] + m[7]*v[1] + m[8]*v[2]
+  ];
+}
+function m3T(m){ return [m[0],m[3],m[6], m[1],m[4],m[7], m[2],m[5],m[8]]; }
+function m3Det(m){
+  return m[0]*(m[4]*m[8]-m[5]*m[7]) - m[1]*(m[3]*m[8]-m[5]*m[6]) + m[2]*(m[3]*m[7]-m[4]*m[6]);
+}
+/* so(3) 李代数的 hat (反对称) 算子: [w]x */
+function hat(w){
+  return [ 0,   -w[2],  w[1],
+           w[2], 0,    -w[0],
+          -w[1], w[0],  0 ];
+}
+/* so(3) 指数映射: exp([w]x) = I + sin(θ)/θ [w]x + (1-cosθ)/θ² [w]x²  (Rodrigues) */
+function expSo3(w){
+  const th = Math.sqrt(w[0]*w[0] + w[1]*w[1] + w[2]*w[2]);
+  const W = hat(w);
+  if (th < 1e-9){
+    const W2 = m3Mul(W, W);
+    return [
+      1 + W[0] + 0.5*W2[0], W[1] + 0.5*W2[1],       W[2] + 0.5*W2[2],
+      W[3] + 0.5*W2[3],     1 + W[4] + 0.5*W2[4],   W[5] + 0.5*W2[5],
+      W[6] + 0.5*W2[6],     W[7] + 0.5*W2[7],       1 + W[8] + 0.5*W2[8]
+    ];
+  }
+  const a = Math.sin(th) / th;
+  const b = (1 - Math.cos(th)) / (th * th);
+  const W2 = m3Mul(W, W);
+  const o = new Array(9);
+  for (let i = 0; i < 9; i++) o[i] = (i % 4 === 0 ? 1 : 0) + a*W[i] + b*W2[i];
+  return o;
+}
+/* Gram-Schmidt 重正交化, 抑制浮点漂移, 保证 R 始终属于 SO(3) */
+function m3Ortho(m){
+  let r0x=m[0], r0y=m[1], r0z=m[2];
+  let n = Math.sqrt(r0x*r0x + r0y*r0y + r0z*r0z);
+  r0x/=n; r0y/=n; r0z/=n;
+  let r1x=m[3], r1y=m[4], r1z=m[5];
+  const d = r1x*r0x + r1y*r0y + r1z*r0z;
+  r1x -= d*r0x; r1y -= d*r0y; r1z -= d*r0z;
+  n = Math.sqrt(r1x*r1x + r1y*r1y + r1z*r1z);
+  r1x/=n; r1y/=n; r1z/=n;
+  const r2x = r0y*r1z - r0z*r1y;
+  const r2y = r0z*r1x - r0x*r1z;
+  const r2z = r0x*r1y - r0y*r1x;
+  return [r0x,r0y,r0z, r1x,r1y,r1z, r2x,r2y,r2z];
+}
+
+/* ------------------------- 4x4 矩阵 (列主序, GL) ------------------------- */
+function m4Ident(){ return new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]); }
+function m4Mul(a, b){
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++){
+    for (let r = 0; r < 4; r++){
+      o[c*4+r] = a[r]*b[c*4] + a[4+r]*b[c*4+1] + a[8+r]*b[c*4+2] + a[12+r]*b[c*4+3];
+    }
+  }
+  return o;
+}
+function m4Persp(fovy, aspect, near, far){
+  const f = 1 / Math.tan(fovy / 2);
+  const m = new Float32Array(16);
+  m[0] = f / aspect; m[5] = f;
+  m[10] = (far + near) / (near - far); m[11] = -1;
+  m[14] = 2 * far * near / (near - far);
+  return m;
+}
+function m4T(x, y, z){ const m = m4Ident(); m[12]=x; m[13]=y; m[14]=z; return m; }
+function m4Rx(a){ const c=Math.cos(a), s=Math.sin(a); return new Float32Array([1,0,0,0, 0,c,s,0, 0,-s,c,0, 0,0,0,1]); }
+function m4Ry(a){ const c=Math.cos(a), s=Math.sin(a); return new Float32Array([c,0,-s,0, 0,1,0,0, s,0,c,0, 0,0,0,1]); }
+function m4Rz(a){ const c=Math.cos(a), s=Math.sin(a); return new Float32Array([c,s,0,0, -s,c,0,0, 0,0,1,0, 0,0,0,1]); }
+/* 由相机旋转(行主序 Rcam: 相机系->世界系)与位置构建 view 矩阵: [R^T | -R^T p] */
+function m4View(Rc, p){
+  const m = new Float32Array(16);
+  for (let c = 0; c < 3; c++) for (let r = 0; r < 3; r++) m[c*4+r] = Rc[r*3+c];
+  m[12] = -(Rc[0]*p[0] + Rc[3]*p[1] + Rc[6]*p[2]);
+  m[13] = -(Rc[1]*p[0] + Rc[4]*p[1] + Rc[7]*p[2]);
+  m[14] = -(Rc[2]*p[0] + Rc[5]*p[1] + Rc[8]*p[2]);
+  m[15] = 1;
+  return m;
+}
+
+/* ------------------------------ PID 控制器 -------------------------------
+ * 角速率闭环: 误差 = 目标角速度 - 陀螺角速度
+ * D 项基于测量值(角速度微分)并低通滤波, I 项限幅抗积分饱和, 输出限幅为力矩
+ * ------------------------------------------------------------------------ */
+function PIDAxis(p, i, d, olim, ilim){
+  this.p = p; this.i = i; this.d = d;
+  this.olim = olim || 3.0;
+  this.ilim = ilim || 120.0;
+  this.reset();
+}
+PIDAxis.prototype.set = function(p, i, d){ this.p = p; this.i = i; this.d = d; };
+PIDAxis.prototype.reset = function(){ this.integ = 0; this.lastW = 0; this.dF = 0; };
+PIDAxis.prototype.update = function(err, w, dt){
+  const pT = this.p * err;
+  this.integ = clamp(this.integ + err * dt, -this.ilim, this.ilim);
+  const iT = this.i * this.integ;
+  const dM = (w - this.lastW) / dt;
+  this.lastW = w;
+  const alpha = dt / (dt + 0.006);            // D 项低通 (约 26Hz)
+  this.dF += (dM - this.dF) * alpha;
+  const dT = -this.d * this.dF;
+  return clamp(pT + iT + dT, -this.olim, this.olim);
+};
+
+/* --------------------------- 配置 (可被菜单修改) ------------------------- */
+const G = 9.81;
+const DEFAULT_CFG = {
+  mass: 0.68,          // kg
+  Ixx: 0.008, Iyy: 0.008, Izz: 0.014,  // kg*m^2 (x=俯仰轴/右, y=横滚轴/前, z=偏航轴/上)
+  maxThrust: 32.0,     // N (全油门总推力)
+  motorTau: 0.045,     // s 电机一阶响应时间常数
+  dragK: 0.09,         // N/(m/s)^2 平动平方阻尼
+  rotDrag: 0.010,      // N*m*s 旋转阻尼
+  rates: { pitch: 11, roll: 11, yaw: 6 },   // rad/s 满杆目标角速度
+  pid: {
+    pitch: { p: 0.18, i: 0.025, d: 0.004 },
+    roll:  { p: 0.18, i: 0.025, d: 0.004 },
+    yaw:   { p: 0.12, i: 0.030, d: 0.002 }
+  },
+  vtxRange: 230,       // m 图传有效距离
+  uptilt: 20,          // deg 相机仰角
+  ch: {  // Gamepad 轴绑定
+    roll:     { axis: 0, rev: false },
+    pitch:    { axis: 1, rev: false },
+    yaw:      { axis: 2, rev: false },
+    throttle: { axis: 3, rev: false }
+  }
+};
+let CFG = JSON.parse(JSON.stringify(DEFAULT_CFG));
+
+/* 油门->推力归一化曲线 (中段柔和, 顶端有劲) */
+function thrCurve(t){
+  t = clamp(t, 0, 1);
+  return t * t * (0.55 + 0.45 * t);
+}
+
+/* -------------------------------- 无人机 -------------------------------- */
+function makeDrone(){
+  return {
+    pos: [0, 0, 0.06], vel: [0, 0, 0],
+    R: m3Ident(),                       // SO(3) 姿态 (体->世界)
+    om: [0, 0, 0],                      // 机体系角速度 rad/s
+    thrN: 0,                            // 归一化实际推力(含电机滞后)
+    pid: {
+      pitch: new PIDAxis(0.18, 0.025, 0.004, 3.0, 120),
+      roll:  new PIDAxis(0.18, 0.025, 0.004, 3.0, 120),
+      yaw:   new PIDAxis(0.12, 0.030, 0.002, 1.5, 120)
+    }
+  };
+}
+const drone = makeDrone();
+
+const state = {
+  armed: false, crashed: false, failsafe: false, failsafeT: 0,
+  cap: 1.0, voltage: 16.8,
+  time: 0, frames: 0,
+  signal: 1, signalSmooth: 1,
+  dist: 0,
+  in: { roll: 0, pitch: 0, yaw: 0, throttle: 0 },
+  errors: []
+};
+
+function syncDronePids(){
+  const P = CFG.pid;
+  drone.pid.pitch.set(P.pitch.p, P.pitch.i, P.pitch.d);
+  drone.pid.roll.set(P.roll.p, P.roll.i, P.roll.d);
+  drone.pid.yaw.set(P.yaw.p, P.yaw.i, P.yaw.d);
+}
+function resetDrone(){
+  drone.pos = [0, 0, 0.06]; drone.vel = [0, 0, 0];
+  drone.R = m3Ident(); drone.om = [0, 0, 0]; drone.thrN = 0;
+  drone.pid.pitch.reset(); drone.pid.roll.reset(); drone.pid.yaw.reset();
+  state.armed = false; state.crashed = false;
+  state.failsafe = false; state.failsafeT = 0;
+  state.cap = 1.0; state.signal = 1; state.signalSmooth = 1;
+}
+
+/* ---------------------------- 物理积分核心 -------------------------------
+ * 半隐式欧拉 + 固定步长子步:
+ *   平动:  m*a = R*(0,0,T) + (0,0,-mg) - k*|v|*v
+ *   转动:  I*om' = tau_pid - om x (I*om) - c_r*om
+ *   姿态:  R <- Ortho( R * exp([om*dt]x) )    <-- SO(3) 精确积分
+ * 机体坐标系: +X 右, +Y 前, +Z 上 (推力沿 +Z)
+ * ------------------------------------------------------------------------ */
+function physStep(dr, dt){
+  const fs = state.failsafe;
+  const inRoll  = fs ? 0 : state.in.roll;
+  const inPitch = fs ? 0 : state.in.pitch;
+  const inYaw   = fs ? 0 : state.in.yaw;
+  const inThr   = (state.armed && !fs) ? state.in.throttle : 0;
+
+  /* 电机滞后 (一阶环节) */
+  const alpha = 1 - Math.exp(-dt / Math.max(1e-4, CFG.motorTau));
+  dr.thrN += (inThr - dr.thrN) * alpha;
+
+  /* 电池电压跌落带来的推力衰减 */
+  const sag = clamp((state.voltage - 11.0) / 4.0, 0.35, 1.0);
+  const T = CFG.maxThrust * thrCurve(dr.thrN) * sag;
+
+  /* ---- 平动: 总推力(沿机体Z) + 重力 + 速度平方气体阻尼 ---- */
+  const v = dr.vel;
+  const sp = Math.sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+  const kd = CFG.dragK * sp;
+  const Fx = dr.R[2] * T - kd * v[0];
+  const Fy = dr.R[5] * T - kd * v[1];
+  const Fz = dr.R[8] * T - CFG.mass * G - kd * v[2];
+  const inv_m = 1 / CFG.mass;
+  v[0] += Fx * inv_m * dt; v[1] += Fy * inv_m * dt; v[2] += Fz * inv_m * dt;
+  dr.pos[0] += v[0] * dt; dr.pos[1] += v[1] * dt; dr.pos[2] += v[2] * dt;
+
+  /* ---- Acro: 摇杆 -> 目标角速度 (机体系) ---- */
+  const tPitch = inPitch * CFG.rates.pitch;   // 绕 +X (右轴)
+  const tRoll  = inRoll  * CFG.rates.roll;    // 绕 +Y (前轴)
+  const tYaw   = -inYaw  * CFG.rates.yaw;     // 绕 +Z (上轴), 右手系下右偏航为负
+
+  /* ---- 三轴 PID 力矩闭环 ---- */
+  const om = dr.om;
+  const tauP = dr.pid.pitch.update(tPitch - om[0], om[0], dt);
+  const tauR = dr.pid.roll.update(tRoll  - om[1], om[1], dt);
+  const tauY = dr.pid.yaw.update(tYaw   - om[2], om[2], dt);
+
+  /* ---- 旋转动力学: I*om' = tau - om x (I*om) - c*om (欧拉方程) ---- */
+  const Ix = CFG.Ixx, Iy = CFG.Iyy, Iz = CFG.Izz;
+  const gx = om[1]*om[2]*(Iz - Iy);
+  const gy = om[2]*om[0]*(Ix - Iz);
+  const gz = om[0]*om[1]*(Iy - Ix);
+  om[0] += ((tauP + gx - CFG.rotDrag * om[0]) / Ix) * dt;
+  om[1] += ((tauR + gy - CFG.rotDrag * om[1]) / Iy) * dt;
+  om[2] += ((tauY + gz - CFG.rotDrag * om[2]) / Iz) * dt;
+
+  /* ---- SO(3) 姿态演化: so(3) 指数映射精确积分 ---- */
+  const E = expSo3([om[0]*dt, om[1]*dt, om[2]*dt]);
+  dr.R = m3Ortho(m3Mul(dr.R, E));
+
+  /* ---- 电池 ---- */
+  state.cap = Math.max(0, state.cap - dt * (0.004 + 0.020 * inThr * inThr));
+  state.voltage = 12.6 + 4.2 * state.cap - 0.9 * inThr;
+
+  /* ---- 地面碰撞 ---- */
+  if (dr.pos[2] < 0.06){
+    dr.pos[2] = 0.06;
+    if (v[2] < 0){
+      const imp = -v[2];
+      if (state.armed && imp > 7.0){ state.armed = false; state.crashed = true; }
+      v[2] = imp > 1.2 ? imp * 0.28 : 0;
+    }
+    const f = clamp(4.0 * dt, 0, 1);
+    v[0] *= 1 - f; v[1] *= 1 - f;
+    const g2 = clamp(6.0 * dt, 0, 1);
+    om[0] *= 1 - g2; om[1] *= 1 - g2; om[2] *= 1 - g2;
+  }
+}
+
+/* ------------------------------- 输入层 ---------------------------------- */
+const KB = { keys: {}, roll: 0, pitch: 0, yaw: 0, thr: 0 };
+let prevArmBtn = false;
+
+function pollGamepad(){
+  const pads = (typeof navigator !== 'undefined' && navigator.getGamepads) ? navigator.getGamepads() : [];
+  if (!pads) return null;
+  for (let i = 0; i < pads.length; i++){
+    const p = pads[i];
+    if (p && p.connected) return p;
+  }
+  return null;
+}
+function gpAxis(gp, idx){
+  if (idx < 0 || !gp || !gp.axes || idx >= gp.axes.length) return 0;
+  const v = Number(gp.axes[idx]);
+  return isFinite(v) ? clamp(v, -1, 1) : 0;
+}
+function applyCh(v, ch){
+  if (ch.axis < 0) return 0;
+  return ch.rev ? -v : v;
+}
+function kbRamp(cur, target, dt, rate){
+  const d = target - cur;
+  const m = rate * dt;
+  return cur + clamp(d, -m, m);
+}
+function pollInputs(dt){
+  const gp = pollGamepad();
+  let roll = 0, pitch = 0, yaw = 0, thr = 0;
+  let usingGp = false;
+  if (gp){
+    usingGp = true;
+    roll  = applyCh(gpAxis(gp, CFG.ch.roll.axis),     CFG.ch.roll);
+    pitch = applyCh(gpAxis(gp, CFG.ch.pitch.axis),    CFG.ch.pitch);
+    yaw   = applyCh(gpAxis(gp, CFG.ch.yaw.axis),      CFG.ch.yaw);
+    const tv = gpAxis(gp, CFG.ch.throttle.axis);
+    thr = (tv + 1) * 0.5;                        // 手柄轴: [-1,1] -> [0,1]
+    if (CFG.ch.throttle.rev) thr = 1 - thr;
+    const b = gp.buttons || [];
+    const armPressed = !!(b[9] && b[9].pressed) || !!(b[4] && b[4].pressed);
+    if (armPressed && !prevArmBtn) toggleArm();
+    prevArmBtn = armPressed;
+  }
+  /* 键盘 (无手柄时的后备 / 测试用) */
+  const K = KB.keys;
+  const tR = (K['ArrowRight']?1:0) - (K['ArrowLeft']?1:0);
+  const tP = (K['ArrowDown']?1:0) - (K['ArrowUp']?1:0);    // 上=推杆(低头), 下=拉杆(抬头)
+  const tY = (K['KeyD']?1:0) - (K['KeyA']?1:0);
+  const tT = (K['KeyW']?1:0) - (K['KeyS']?1:0);
+  const thrTarget = tT > 0 ? 1 : (tT < 0 ? 0 : KB.thr);
+  KB.roll  = kbRamp(KB.roll,  tR, dt, 5);
+  KB.pitch = kbRamp(KB.pitch, tP, dt, 5);
+  KB.yaw   = kbRamp(KB.yaw,   tY, dt, 5);
+  KB.thr   = kbRamp(KB.thr,   thrTarget, dt, 0.9);
+  if (!usingGp){ roll = KB.roll; pitch = KB.pitch; yaw = KB.yaw; thr = KB.thr; }
+
+  state.in.roll  = expoIn(deadband(clamp(roll, -1, 1), 0.02), 0.30);
+  state.in.pitch = expoIn(deadband(clamp(pitch, -1, 1), 0.02), 0.30);
+  state.in.yaw   = expoIn(deadband(clamp(yaw, -1, 1), 0.02), 0.45);
+  state.in.throttle = clamp(thr, 0, 1);
+}
+function toggleArm(){
+  if (state.armed){ state.armed = false; return; }
+  if (state.crashed) return;                     // 坠机后须按 R 复位
+  if (state.failsafe) return;
+  if (state.in.throttle < 0.07){ state.armed = true; }
+}
+
+/* ------------------------------- 渲染层 ---------------------------------- */
+const VS_MESH = [
+'attribute vec3 aPos; attribute vec3 aNor; attribute vec2 aUV;',
+'uniform mat4 uVP; uniform mat4 uModel; uniform mat3 uNrm;',
+'varying vec3 vN; varying vec2 vUV; varying vec3 vW;',
+'void main(){',
+'  vec4 w = uModel * vec4(aPos, 1.0);',
+'  vW = w.xyz; vN = uNrm * aNor; vUV = aUV;',
+'  gl_Position = uVP * w;',
+'}'].join('\n');
+
+const FS_MESH = [
+'precision mediump float;',
+'varying vec3 vN; varying vec2 vUV; varying vec3 vW;',
+'uniform vec3 uColor; uniform sampler2D uTex; uniform float uUseTex;',
+'uniform vec3 uSun; uniform vec3 uCamPos; uniform vec3 uFogCol; uniform float uFogD;',
+'uniform float uUnlit; uniform float uAlpha;',
+'void main(){',
+'  vec4 base = vec4(uColor, 1.0);',
+'  if (uUseTex > 0.5) base = texture2D(uTex, vUV);',
+'  if (uUnlit > 0.5){ gl_FragColor = vec4(base.rgb, uAlpha); return; }',
+'  vec3 n = normalize(vN);',
+'  float dif = max(dot(n, uSun), 0.0);',
+'  float amb = 0.38 + 0.14 * max(n.z, 0.0);',
+'  vec3 vdir = normalize(uCamPos - vW);',
+'  float spec = pow(max(dot(reflect(-uSun, n), vdir), 0.0), 24.0) * 0.15;',
+'  vec3 c = base.rgb * (amb + dif * 0.85) + spec;',
+'  float fog = 1.0 - exp(-length(uCamPos - vW) * uFogD);',
+'  gl_FragColor = vec4(mix(c, uFogCol, fog), 1.0);',
+'}'].join('\n');
+
+const VS_QUAD = [
+'attribute vec2 aPos; varying vec2 vUV;',
+'void main(){ vUV = aPos * 0.5 + 0.5; gl_Position = vec4(aPos, 0.0, 1.0); }'].join('\n');
+
+const FS_SKY = [
+'precision mediump float;',
+'varying vec2 vUV;',
+'uniform vec3 uFwd; uniform vec3 uRight; uniform vec3 uUp;',
+'uniform vec2 uTanA; uniform vec3 uSun;',
+'void main(){',
+'  vec2 ndc = vUV * 2.0 - 1.0;',
+'  vec3 rd = normalize(uFwd + uRight * ndc.x * uTanA.x + uUp * ndc.y * uTanA.y);',
+'  float h = rd.z;',
+'  vec3 sky = mix(vec3(0.78, 0.86, 0.94), vec3(0.24, 0.47, 0.82), pow(clamp(h, 0.0, 1.0), 0.55));',
+'  vec3 gnd = vec3(0.55, 0.59, 0.62);',
+'  vec3 col = mix(gnd, sky, smoothstep(-0.015, 0.02, h));',
+'  float sd = max(dot(rd, uSun), 0.0);',
+'  col += vec3(1.0, 0.92, 0.75) * (pow(sd, 700.0) * 1.0 + pow(sd, 8.0) * 0.10);',
+'  gl_FragColor = vec4(col, 1.0);',
+'}'].join('\n');
+
+/* 5.8G 模拟图传后处理: 雪花噪点 / 横向撕裂 / 滚动条纹 / 黑屏失联 */
+const FS_VTX = [
+'#ifdef GL_FRAGMENT_PRECISION_HIGH',
+'precision highp float;',
+'#else',
+'precision mediump float;',
+'#endif',
+'varying vec2 vUV;',
+'uniform sampler2D uScene;',
+'uniform float uTime; uniform float uSignal; uniform float uBlackout;',
+'uniform vec2 uRes;',
+'float hash21(vec2 p){',
+'  p = fract(p * vec2(123.34, 456.21));',
+'  p += dot(p, p + 45.32);',
+'  return fract(p.x * p.y);',
+'}',
+'void main(){',
+'  float s = clamp(uSignal, 0.0, 1.0);',
+'  float bad = 1.0 - s;',
+'  vec2 uv = vUV;',
+/* --- 横向撕裂 (Horizontal Tearing): 随机坏行整体左右错位 --- */
+'  float rowId = floor(uv.y * 72.0);',
+'  float tChunk = floor(uTime * 9.0);',
+'  float tearRnd = hash21(vec2(rowId, tChunk));',
+'  if (tearRnd > 1.0 - 0.38 * bad){',
+'    float mag = hash21(vec2(rowId, tChunk + 7.0)) - 0.5;',
+'    uv.x = fract(uv.x + mag * 0.5 * bad);',
+'  }',
+/* --- 信号很差时整帧水平抖动 --- */
+'  uv.x = fract(uv.x + (hash21(vec2(tChunk, 3.0)) - 0.5) * 0.12 * bad * bad);',
+'  vec3 col = texture2D(uScene, uv).rgb;',
+/* --- 不同步滚动条纹 (Rolling Bands) --- */
+'  float band = sin((uv.y + uTime * 0.35) * 12.566);',
+'  float bandMask = smoothstep(0.55, 1.0, band);',
+'  col *= 1.0 - bandMask * 0.30 * bad;',
+'  float band2 = sin((uv.y * 0.7 - uTime * 0.13) * 6.283);',
+'  col *= 1.0 + 0.07 * bad * band2;',
+/* --- 雪花噪点 (Static Noise) --- */
+'  float n = hash21(vUV * uRes * 0.5 + vec2(uTime * 91.7, uTime * 57.3));',
+'  col = mix(col, vec3(n * 0.9), bad * bad * 0.95 + 0.02);',
+'  col += vec3(step(0.985, hash21(vec2(tChunk, floor(uv.y * 180.0)))) * bad * 0.5);',
+/* --- 模拟味: 扫描线 / 轻微偏色 / 暗角 --- */
+'  col *= 0.90 + 0.10 * sin(vUV.y * uRes.y * 3.14159);',
+'  col = mix(col, col * vec3(1.04, 1.0, 0.94), 0.7);',
+'  col = col * 0.96 + 0.02;',
+'  vec2 vd = vUV - 0.5;',
+'  col *= 1.0 - dot(vd, vd) * 0.55;',
+'  gl_FragColor = vec4(col * uBlackout, 1.0);',
+'}'].join('\n');
+
+let gl = null, canvas = null;
+let progMesh = null, progSky = null, progPost = null;
+let quadBuf = null, groundTex = null, sceneTarget = null;
+const SUN = (function(){ const s = [0.35, 0.5, 0.75]; const n = Math.sqrt(s[0]*s[0]+s[1]*s[1]+s[2]*s[2]); return [s[0]/n, s[1]/n, s[2]/n]; })();
+const FOG_COL = [0.75, 0.84, 0.92];
+const FOG_D = 0.0055;
+const FOV_V = 80 * Math.PI / 180;
+/* FPV 相机安装: 体坐标 +Y 为前, 相机绕自身X轴仰角, CAM_MOUNT 为基座旋转(行主序) */
+const CAM_MOUNT = [-1,0,0, 0,0,1, 0,1,0];
+let SCENE = [];
+
+function compileShader(type, src){
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)){
+    const log = gl.getShaderInfoLog(sh) || '';
+    throw new Error('shader compile failed: ' + log);
+  }
+  return sh;
+}
+function makeProgram(vs, fs, attribs){
+  const p = gl.createProgram();
+  gl.attachShader(p, compileShader(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compileShader(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)){
+    throw new Error('program link failed: ' + (gl.getProgramInfoLog(p) || ''));
+  }
+  const info = { prog: p, u: {}, a: {} };
+  for (let i = 0; i < attribs.length; i++) info.a[attribs[i]] = gl.getAttribLocation(p, attribs[i]);
+  info.uLoc = function(name){
+    if (!(name in this.u)) this.u[name] = gl.getUniformLocation(this.prog, name);
+    return this.u[name];
+  };
+  return info;
+}
+
+/* ------------------------------ 网格构建 --------------------------------- */
+function buildBox(sx, sy, sz){
+  const x = sx/2, y = sy/2, z = sz/2;
+  const faces = [
+    { n:[1,0,0],  v:[[x,-y,-z],[x,y,-z],[x,y,z],[x,-y,z]] },
+    { n:[-1,0,0], v:[[-x,-y,-z],[-x,-y,z],[-x,y,z],[-x,y,-z]] },
+    { n:[0,1,0],  v:[[-x,y,-z],[-x,y,z],[x,y,z],[x,y,-z]] },
+    { n:[0,-1,0], v:[[-x,-y,-z],[x,-y,-z],[x,-y,z],[-x,-y,z]] },
+    { n:[0,0,1],  v:[[-x,-y,z],[x,-y,z],[x,y,z],[-x,y,z]] },
+    { n:[0,0,-1], v:[[-x,-y,-z],[-x,y,-z],[-x,y,-z],[-x,-y,-z]] }
+  ];
+  const pos = [], nor = [], uv = [], idx = [];
+  const fuv = [[0,0],[1,0],[1,1],[0,1]];
+  for (let f = 0; f < faces.length; f++){
+    const fc = faces[f], base = pos.length / 3;
+    for (let i = 0; i < 4; i++){
+      pos.push(fc.v[i][0], fc.v[i][1], fc.v[i][2]);
+      nor.push(fc.n[0], fc.n[1], fc.n[2]);
+      uv.push(fuv[i][0], fuv[i][1]);
+    }
+    idx.push(base, base+1, base+2, base, base+2, base+3);
+  }
+  return { pos, nor, uv, idx };
+}
+function buildTorus(R, r, nR, nT){
+  const pos = [], nor = [], uv = [], idx = [];
+  for (let i = 0; i < nR; i++){
+    const u = i / nR * Math.PI * 2, cu = Math.cos(u), su = Math.sin(u);
+    for (let j = 0; j < nT; j++){
+      const v = j / nT * Math.PI * 2, cv = Math.cos(v), sv = Math.sin(v);
+      pos.push((R + r*cv)*cu, (R + r*cv)*su, r*sv);
+      nor.push(cv*cu, cv*su, sv);
+      uv.push(i/nR*6, j/nT*2);
+    }
+  }
+  for (let i = 0; i < nR; i++){
+    for (let j = 0; j < nT; j++){
+      const a = i*nT + j, b = ((i+1)%nR)*nT + j;
+      idx.push(a, b, a+1, b, b+1, a+1);
+    }
+  }
+  return { pos, nor, uv, idx };
+}
+function buildCylinder(r0, r1, h, seg){
+  const pos = [], nor = [], uv = [], idx = [];
+  const slope = (r0 - r1) / Math.max(h, 1e-6);
+  for (let i = 0; i <= seg; i++){
+    const t = i / seg * Math.PI * 2, c = Math.cos(t), s = Math.sin(t);
+    const nl = Math.sqrt(1 + slope*slope);
+    pos.push(r0*c, r0*s, 0);   nor.push(c/nl, s/nl, slope/nl); uv.push(i/seg*4, 0);
+    pos.push(r1*c, r1*s, h);   nor.push(c/nl, s/nl, slope/nl); uv.push(i/seg*4, 1);
+  }
+  for (let i = 0; i < seg; i++){
+    const a = i*2;
+    idx.push(a, a+2, a+1, a+1, a+2, a+3);
+  }
+  function cap(rr, z, nz){
+    if (rr <= 1e-6) return;
+    const base = pos.length / 3;
+    pos.push(0, 0, z); nor.push(0, 0, nz); uv.push(0.5, 0.5);
+    for (let i = 0; i <= seg; i++){
+      const t = i / seg * Math.PI * 2, c = Math.cos(t), s = Math.sin(t);
+      pos.push(rr*c, rr*s, z); nor.push(0, 0, nz); uv.push(0.5 + 0.5*c, 0.5 + 0.5*s);
+    }
+    for (let i = 0; i < seg; i++){
+      if (nz > 0) idx.push(base, base+1+i, base+2+i);
+      else idx.push(base, base+2+i, base+1+i);
+    }
+  }
+  cap(r0, 0, -1); cap(r1, h, 1);
+  return { pos, nor, uv, idx };
+}
+function buildDisc(r, seg){
+  const pos = [0,0,0], nor = [0,0,1], uv = [0.5,0.5], idx = [];
+  for (let i = 0; i <= seg; i++){
+    const t = i / seg * Math.PI * 2, c = Math.cos(t), s = Math.sin(t);
+    pos.push(r*c, r*s, 0); nor.push(0,0,1); uv.push(0.5 + 0.5*c, 0.5 + 0.5*s);
+  }
+  for (let i = 0; i < seg; i++) idx.push(0, 1+i, 2+i);
+  return { pos, nor, uv, idx };
+}
+function buildPlane(size, uvScale){
+  return {
+    pos: [-size,-size,0, size,-size,0, size,size,0, -size,size,0],
+    nor: [0,0,1, 0,0,1, 0,0,1, 0,0,1],
+    uv: [0,0, uvScale,0, uvScale,uvScale, 0,uvScale],
+    idx: [0,1,2, 0,2,3]
+  };
+}
+function makeGLMesh(data){
+  const n = data.pos.length / 3;
+  const inter = new Float32Array(n * 8);
+  for (let i = 0; i < n; i++){
+    inter[i*8+0] = data.pos[i*3]; inter[i*8+1] = data.pos[i*3+1]; inter[i*8+2] = data.pos[i*3+2];
+    inter[i*8+3] = data.nor[i*3]; inter[i*8+4] = data.nor[i*3+1]; inter[i*8+5] = data.nor[i*3+2];
+    inter[i*8+6] = data.uv[i*2];  inter[i*8+7] = data.uv[i*2+1];
+  }
+  const vbo = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  gl.bufferData(gl.ARRAY_BUFFER, inter, gl.STATIC_DRAW);
+  const ibo = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(data.idx), gl.STATIC_DRAW);
+  return { vbo, ibo, count: data.idx.length };
+}
+/* 程序化地面纹理 (纯 JS 生成, 无任何外部资源) */
+function makeGroundTexture(){
+  const S = 256, data = new Uint8Array(S*S*4);
+  for (let y = 0; y < S; y++){
+    for (let x = 0; x < S; x++){
+      const checker = ((x >> 5) + (y >> 5)) & 1;
+      let r = checker ? 84 : 68, g = checker ? 96 : 78, b = checker ? 58 : 48;
+      if (x % 64 < 2 || y % 64 < 2){ r = 148; g = 158; b = 108; }        // 参照网格线
+      const n = ((x*137 + y*149) ^ (x*61 + y*67)) & 15;                   // 噪点
+      r -= n*0.5; g -= n*0.5; b -= n*0.4;
+      const o = (y*S + x) * 4;
+      data[o] = clamp(r,0,255); data[o+1] = clamp(g,0,255); data[o+2] = clamp(b,0,255); data[o+3] = 255;
+    }
+  }
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, S, S, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  return tex;
+}
+function makeTarget(w, h){
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  const rb = gl.createRenderbuffer();
+  gl.bindRenderbuffer(gl.RENDERBUFFER, rb);
+  gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, w, h);
+  const fb = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, rb);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return { fb, tex, rb, w, h };
+}
+function destroyTarget(t){
+  if (!t || !gl) return;
+  if (gl.deleteFramebuffer) gl.deleteFramebuffer(t.fb);
+  if (gl.deleteTexture) gl.deleteTexture(t.tex);
+  if (gl.deleteRenderbuffer) gl.deleteRenderbuffer(t.rb);
+}
+
+/* ------------------------------ 场景搭建 --------------------------------- */
+function buildScene(){
+  SCENE = [];
+  const orange = [1.0, 0.36, 0.06], cyan = [0.10, 0.75, 0.95], yellow = [1.0, 0.85, 0.10];
+  const white = [0.92, 0.92, 0.90], gray = [0.62, 0.60, 0.57], red = [0.95, 0.15, 0.15];
+
+  /* 地表 (带纹理 + 远景雾) */
+  SCENE.push({ mesh: makeGLMesh(buildPlane(300, 100)), model: m4T(0,0,0), color:[1,1,1], useTex:1 });
+
+  /* 起飞坪 (高对比橙白同心环) */
+  SCENE.push({ mesh: makeGLMesh(buildDisc(1.5, 40)), model: m4T(0,0,0.012), color: orange, unlit:1, alpha:1 });
+  SCENE.push({ mesh: makeGLMesh(buildDisc(1.1, 40)), model: m4T(0,0,0.016), color: white, unlit:1, alpha:1 });
+
+  /* 环形门 x4 (洞口沿飞行路线, 高对比色) */
+  const torus = buildTorus(1.25, 0.11, 30, 14);
+  SCENE.push({ mesh: makeGLMesh(torus), model: m4Mul(m4T(0, 18, 2.0), m4Rx(Math.PI/2)), color: orange });
+  SCENE.push({ mesh: makeGLMesh(torus), model: m4Mul(m4Mul(m4T(14, 40, 2.2), m4Rz(0.35)), m4Rx(Math.PI/2)), color: cyan });
+  SCENE.push({ mesh: makeGLMesh(torus), model: m4Mul(m4T(0, 65, 4.5), m4Rx(Math.PI/2)), color: yellow });
+  SCENE.push({ mesh: makeGLMesh(torus), model: m4Mul(m4Mul(m4T(-12, 85, 3.2), m4Rz(-0.5)), m4Rx(Math.PI/2)), color: red });
+
+  /* 立柱阵 (视觉参照) */
+  const pillars = [
+    [-8,12],[7,26],[-10,38],[9,52],[-7,60],[12,70],[-14,55],[5,80],[-6,95],[10,100]
+  ];
+  for (let i = 0; i < pillars.length; i++){
+    const col = [cyan, yellow, white][i % 3];
+    SCENE.push({ mesh: makeGLMesh(buildCylinder(0.42, 0.42, 5, 18)),
+                 model: m4T(pillars[i][0], pillars[i][1], 0), color: col });
+    SCENE.push({ mesh: makeGLMesh(buildCylinder(0.05, 0.55, 0.9, 14)),
+                 model: m4T(pillars[i][0], pillars[i][1], 5), color: red });
+  }
+
+  /* 可穿越墙体废墟 A */
+  SCENE.push({ mesh: makeGLMesh(buildBox(0.6, 7, 3.0)), model: m4T(-18, 30, 1.5), color: gray });
+  SCENE.push({ mesh: makeGLMesh(buildBox(0.6, 1.0, 0.8)), model: m4T(-18, 28.5, 3.4), color: gray });
+  SCENE.push({ mesh: makeGLMesh(buildBox(0.6, 5, 2.4)), model: m4T(-18, 36, 1.2), color: gray });
+  SCENE.push({ mesh: makeGLMesh(buildBox(0.6, 4.2, 0.7)), model: m4T(-18, 33, 3.55), color: [0.75,0.73,0.70] });
+  /* 墙体废墟 B (带旋转朝向, 中间留穿越门洞) */
+  const wb = m4Mul(m4T(17, 56, 0), m4Rz(0.28));
+  SCENE.push({ mesh: makeGLMesh(buildBox(0.6, 6, 2.6)), model: m4Mul(wb, m4T(0, -1.5, 1.3)), color: gray });
+  SCENE.push({ mesh: makeGLMesh(buildBox(0.6, 6, 2.2)), model: m4Mul(wb, m4T(0, 1.5, 1.1)), color: gray });
+  SCENE.push({ mesh: makeGLMesh(buildBox(0.6, 2.6, 0.6)), model: m4Mul(wb, m4T(0, 0, 3.0)), color: [0.75,0.73,0.70] });
+
+  /* 边界标志锥 */
+  for (let i = -2; i <= 2; i++){
+    SCENE.push({ mesh: makeGLMesh(buildCylinder(0.5, 0.02, 1.4, 12)),
+                 model: m4T(i*20, -6, 0), color: orange });
+  }
+}
+
+/* ------------------------------ 相机与绘制 ------------------------------- */
+const CAM = { pos:[0,0,0], Rc: m3Ident(), vp: m4Ident(), fwd:[0,1,0], right:[1,0,0], up:[0,0,1], tanA:[1,1] };
+function updateCamera(){
+  const up = CFG.uptilt * Math.PI / 180;
+  const c = Math.cos(up), s = Math.sin(up);
+  const tilt = [1,0,0, 0,c,-s, 0,s,c];              // 相机仰角绕自身X轴
+  const Rc = m3Mul(drone.R, m3Mul(CAM_MOUNT, tilt));
+  CAM.Rc = Rc;
+  CAM.pos = [drone.pos[0], drone.pos[1], drone.pos[2] + 0.02];
+  /* 相机世界三轴 (Rc 的列) */
+  CAM.right = [Rc[0], Rc[3], Rc[6]];
+  CAM.up    = [Rc[1], Rc[4], Rc[7]];
+  CAM.fwd   = [-Rc[2], -Rc[5], -Rc[8]];
+  const aspect = (canvas.width || 16) / Math.max(1, canvas.height || 9);
+  const tanF = Math.tan(FOV_V / 2);
+  CAM.tanA = [tanF * aspect, tanF];
+  const proj = m4Persp(FOV_V, aspect, 0.05, 900);
+  const view = m4View(Rc, CAM.pos);
+  CAM.vp = m4Mul(proj, view);
+}
+function drawQuad(prog){
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+  gl.enableVertexAttribArray(prog.a.aPos);
+  gl.vertexAttribPointer(prog.a.aPos, 2, gl.FLOAT, false, 0, 0);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+function drawMesh(item){
+  const p = progMesh;
+  gl.bindBuffer(gl.ARRAY_BUFFER, item.mesh.vbo);
+  gl.enableVertexAttribArray(p.a.aPos);
+  gl.enableVertexAttribArray(p.a.aNor);
+  gl.enableVertexAttribArray(p.a.aUV);
+  gl.vertexAttribPointer(p.a.aPos, 3, gl.FLOAT, false, 32, 0);
+  gl.vertexAttribPointer(p.a.aNor, 3, gl.FLOAT, false, 32, 12);
+  gl.vertexAttribPointer(p.a.aUV,  2, gl.FLOAT, false, 32, 24);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, item.mesh.ibo);
+  gl.uniformMatrix4fv(p.uLoc('uModel'), false, item.model);
+  const nrm = new Float32Array(9);
+  for (let c = 0; c < 3; c++) for (let r = 0; r < 3; r++) nrm[c*3+r] = item.model[c*4+r];
+  gl.uniformMatrix3fv(p.uLoc('uNrm'), false, nrm);
+  gl.uniform3fv(p.uLoc('uColor'), item.color);
+  gl.uniform1f(p.uLoc('uUseTex'), item.useTex || 0);
+  gl.uniform1f(p.uLoc('uUnlit'), item.unlit || 0);
+  gl.uniform1f(p.uLoc('uAlpha'), item.alpha === undefined ? 1 : item.alpha);
+  gl.drawElements(gl.TRIANGLES, item.mesh.count, gl.UNSIGNED_SHORT, 0);
+}
+let shadowMesh = null;
+function renderFrame(){
+  const w = canvas.width || 640, h = canvas.height || 360;
+  /* --- 场景 -> FBO --- */
+  gl.bindFramebuffer(gl.FRAMEBUFFER, sceneTarget ? sceneTarget.fb : null);
+  gl.viewport(0, 0, w, h);
+  gl.clearColor(FOG_COL[0], FOG_COL[1], FOG_COL[2], 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.disable(gl.DEPTH_TEST);
+  gl.depthMask(false);
+  gl.disable(gl.BLEND);
+
+  /* 天空穹顶 */
+  gl.useProgram(progSky.prog);
+  gl.uniform3fv(progSky.uLoc('uFwd'), CAM.fwd);
+  gl.uniform3fv(progSky.uLoc('uRight'), CAM.right);
+  gl.uniform3fv(progSky.uLoc('uUp'), CAM.up);
+  gl.uniform2fv(progSky.uLoc('uTanA'), CAM.tanA);
+  gl.uniform3fv(progSky.uLoc('uSun'), SUN);
+  drawQuad(progSky);
+
+  /* 实体网格 */
+  gl.enable(gl.DEPTH_TEST);
+  gl.depthMask(true);
+  gl.useProgram(progMesh.prog);
+  gl.uniformMatrix4fv(progMesh.uLoc('uVP'), false, CAM.vp);
+  gl.uniform3fv(progMesh.uLoc('uSun'), SUN);
+  gl.uniform3fv(progMesh.uLoc('uCamPos'), CAM.pos);
+  gl.uniform3fv(progMesh.uLoc('uFogCol'), FOG_COL);
+  gl.uniform1f(progMesh.uLoc('uFogD'), FOG_D);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, groundTex);
+  gl.uniform1i(progMesh.uLoc('uTex'), 0);
+  for (let i = 0; i < SCENE.length; i++) drawMesh(SCENE[i]);
+
+  /* 无人机地面投影阴影 (unlit 半透明圆盘, 非均匀缩放无碍) */
+  if (shadowMesh){
+    const alt = Math.max(0, drone.pos[2] - 0.06);
+    const sc = (0.55 + alt * 0.05) / 0.55;
+    const SM = new Float32Array([sc,0,0,0, 0,sc,0,0, 0,0,1,0, drone.pos[0],drone.pos[1],0.02,1]);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.depthMask(false);
+    drawMesh({ mesh: shadowMesh, model: SM, color: [0,0,0], unlit: 1, alpha: clamp(0.42 - alt * 0.02, 0.04, 0.42) });
+    gl.depthMask(true);
+    gl.disable(gl.BLEND);
+  }
+
+  /* --- VTX 后处理 -> 屏幕 --- */
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, w, h);
+  gl.disable(gl.DEPTH_TEST);
+  gl.useProgram(progPost.prog);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, sceneTarget ? sceneTarget.tex : null);
+  gl.uniform1i(progPost.uLoc('uScene'), 0);
+  gl.uniform1f(progPost.uLoc('uTime'), state.time);
+  gl.uniform1f(progPost.uLoc('uSignal'), state.signalSmooth);
+  gl.uniform1f(progPost.uLoc('uBlackout'), state.failsafe ? 0 : 1);
+  gl.uniform2f(progPost.uLoc('uRes'), w, h);
+  drawQuad(progPost);
+}
+
+/* ------------------------------- VTX 信号 -------------------------------- */
+function updateSignal(dt){
+  const dx = drone.pos[0], dy = drone.pos[1], dz = drone.pos[2] - 0.06;
+  const d = Math.sqrt(dx*dx + dy*dy + dz*dz);
+  state.dist = d;
+  let s;
+  if (d >= CFG.vtxRange) s = 0;
+  else s = clamp(1 - Math.pow(d / CFG.vtxRange, 1.5) + 0.05 * Math.sin(state.time * 2.7), 0, 1);
+  state.signal = s;
+  state.signalSmooth += (s - state.signalSmooth) * clamp(dt * 8, 0, 1);
+  if (s <= 0.02){
+    state.failsafeT += dt;
+    if (state.failsafeT > 0.25 && !state.failsafe){
+      state.failsafe = true;
+      /* 失控瞬间轻微翻滚扰动 */
+      drone.om[0] += (Math.random() - 0.5) * 3;
+      drone.om[1] += (Math.random() - 0.5) * 3;
+    }
+  } else {
+    state.failsafeT = 0;
+    if (state.failsafe && s > 0.15) state.failsafe = false;
+  }
+}
+
+/* -------------------------------- OSD ------------------------------------ */
+const $id = function(id){ return document.getElementById(id); };
+function sigBars(s){
+  const n = Math.round(clamp(s, 0, 1) * 5);
+  let bars = '';
+  for (let i = 0; i < 5; i++) bars += (i < n ? '\u25AE' : '\u25AF');
+  return bars;
+}
+function updateOSD(){
+  const speed = Math.hypot(drone.vel[0], drone.vel[1], drone.vel[2]) * 3.6;
+  const armTxt = state.armed ? 'ARMED *' : (state.crashed ? 'CRASHED' : 'DISARMED');
+  $id('osd-tl').textContent =
+    armTxt + '  ACRO\n' +
+    state.voltage.toFixed(1) + 'V' + (state.voltage < 13.4 ? ' LOW' : '');
+  $id('osd-tr').textContent =
+    'RSSI ' + sigBars(state.signalSmooth) + ' ' + Math.round(state.signalSmooth * 100) + '%\n' +
+    'DIST ' + state.dist.toFixed(0) + 'm';
+  $id('osd-bl').textContent =
+    'SPD ' + speed.toFixed(0) + 'km/h\n' +
+    'ALT ' + drone.pos[2].toFixed(1) + 'm   THR ' + Math.round(state.in.throttle * 100) + '%';
+  let msg = '';
+  if (state.failsafe) msg = '\u63D0\u793A: \u4FE1\u53F7\u4E22\u5931 \u6309 R \u590D\u4F4D';
+  else if (state.crashed) msg = '\u5760\u673A! \u6309 R \u590D\u4F4D';
+  else if (!state.armed && state.in.throttle >= 0.07) msg = '\u6CB9\u95E8\u9700\u5F52\u96F6\u624D\u80FD\u89E3\u9501';
+  else if (!state.armed) msg = 'Enter/Start \u89E3\u9501';
+  $id('osd-br').textContent = msg;
+  $id('osd-warn').style.display = state.failsafe ? 'block' : 'none';
+  $id('nosignal').style.display = state.failsafe ? 'flex' : 'none';
+}
+
+/* ------------------------------ 设置菜单 ---------------------------------- */
+const MENU_CTRLS = [];
+function getPath(obj, path){
+  const ks = path.split('.');
+  let o = obj;
+  for (let i = 0; i < ks.length; i++) o = o[ks[i]];
+  return o;
+}
+function setPath(obj, path, val){
+  const ks = path.split('.');
+  let o = obj;
+  for (let i = 0; i < ks.length - 1; i++) o = o[ks[i]];
+  o[ks[ks.length - 1]] = val;
+}
+function el(tag, cls, html){
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (html !== undefined) e.innerHTML = html;
+  return e;
+}
+function addSlider(parent, path, label, min, max, step, fmt){
+  const row = el('div', 'row');
+  const lab = el('label'); lab.textContent = label;
+  const inp = el('input'); inp.type = 'range'; inp.min = min; inp.max = max; inp.step = step;
+  const val = el('span', 'val');
+  inp.value = getPath(CFG, path);
+  val.textContent = fmt(getPath(CFG, path));
+  inp.addEventListener('input', function(){
+    const v = parseFloat(inp.value);
+    setPath(CFG, path, v);
+    val.textContent = fmt(v);
+    syncDronePids();
+  });
+  row.appendChild(lab); row.appendChild(inp); row.appendChild(val);
+  parent.appendChild(row);
+  MENU_CTRLS.push({ inp, val, path, fmt });
+}
+function f0(x){ return x.toFixed(0); }
+function f1(x){ return x.toFixed(1); }
+function f2(x){ return x.toFixed(2); }
+function f3(x){ return x.toFixed(3); }
+function f4(x){ return x.toFixed(4); }
+
+const CH_LABELS = { roll:'\u6A2A\u6EDA Roll', pitch:'\u4FEF\u4EF0 Pitch', yaw:'\u504F\u822A Yaw', throttle:'\u6CB9\u95E8 Throttle' };
+let axMonEls = [];
+
+function refreshMenu(){
+  for (let i = 0; i < MENU_CTRLS.length; i++){
+    const c = MENU_CTRLS[i];
+    c.inp.value = getPath(CFG, c.path);
+    c.val.textContent = c.fmt(getPath(CFG, c.path));
+  }
+}
+function buildMenu(){
+  /* 通道映射与反向 */
+  const secCh = $id('sec-ch');
+  const CH_KEYS = ['roll', 'pitch', 'yaw', 'throttle'];
+  for (let i = 0; i < CH_KEYS.length; i++){
+    const k = CH_KEYS[i];
+    const row = el('div', 'row');
+    const lab = el('label'); lab.textContent = CH_LABELS[k];
+    const sel = el('select');
+    let optHtml = '<option value="-1">\u65E0</option>';
+    for (let a = 0; a < 8; a++) optHtml += '<option value="' + a + '">\u8F74 ' + a + '</option>';
+    sel.innerHTML = optHtml;
+    sel.value = String(CFG.ch[k].axis);
+    sel.addEventListener('change', function(){ CFG.ch[k].axis = parseInt(sel.value, 10); });
+    const rev = el('input'); rev.type = 'checkbox'; rev.checked = !!CFG.ch[k].rev;
+    rev.addEventListener('change', function(){ CFG.ch[k].rev = rev.checked; });
+    const revLab = el('span'); revLab.textContent = '\u53CD\u5411';
+    row.appendChild(lab); row.appendChild(sel); row.appendChild(rev); row.appendChild(revLab);
+    secCh.appendChild(row);
+  }
+  /* 轴监测 */
+  const secAx = $id('sec-axmon');
+  axMonEls = [];
+  for (let a = 0; a < 6; a++){
+    const line = el('div', 'axline');
+    const nm = el('span'); nm.style.flex = '0 0 34px'; nm.textContent = 'A' + a;
+    const bar = el('div', 'bar');
+    const fill = el('i');
+    bar.appendChild(fill);
+    const num = el('span'); num.style.flex = '0 0 46px'; num.style.textAlign = 'right';
+    line.appendChild(nm); line.appendChild(bar); line.appendChild(num);
+    secAx.appendChild(line);
+    axMonEls.push({ fill, num });
+  }
+  /* PID */
+  const secPid = $id('sec-pid');
+  addSlider(secPid, 'pid.pitch.p', '\u4FEF\u4EF0 P', 0, 0.6, 0.005, f3);
+  addSlider(secPid, 'pid.pitch.i', '\u4FEF\u4EF0 I', 0, 0.12, 0.001, f3);
+  addSlider(secPid, 'pid.pitch.d', '\u4FEF\u4EF0 D', 0, 0.02, 0.0005, f4);
+  addSlider(secPid, 'pid.roll.p',  '\u6A2A\u6EDA P', 0, 0.6, 0.005, f3);
+  addSlider(secPid, 'pid.roll.i',  '\u6A2A\u6EDA I', 0, 0.12, 0.001, f3);
+  addSlider(secPid, 'pid.roll.d',  '\u6A2A\u6EDA D', 0, 0.02, 0.0005, f4);
+  addSlider(secPid, 'pid.yaw.p',   '\u504F\u822A P', 0, 0.6, 0.005, f3);
+  addSlider(secPid, 'pid.yaw.i',   '\u504F\u822A I', 0, 0.12, 0.001, f3);
+  addSlider(secPid, 'pid.yaw.d',   '\u504F\u822A D', 0, 0.02, 0.0005, f4);
+  /* 气动物理 */
+  const secAero = $id('sec-aero');
+  addSlider(secAero, 'dragK',     '\u5E73\u52A8\u963B\u5C3C k [N/(m/s)\u00B2]', 0, 0.3, 0.005, f3);
+  addSlider(secAero, 'maxThrust', '\u6700\u5927\u603B\u63A8\u529B [N]', 5, 60, 0.5, f1);
+  addSlider(secAero, 'mass',      '\u8D28\u91CF [kg]', 0.3, 2.0, 0.01, f2);
+  addSlider(secAero, 'motorTau',  '\u7535\u673A\u54CD\u5E94\u65F6\u95F4 [s]', 0.01, 0.15, 0.005, f3);
+  addSlider(secAero, 'rotDrag',   '\u65CB\u8F6C\u963B\u5C3C [N\u00B7m\u00B7s]', 0, 0.05, 0.001, f3);
+  /* 摇杆速率 */
+  const secRates = $id('sec-rates');
+  addSlider(secRates, 'rates.pitch', '\u4FEF\u4EF0\u6EE1\u6746\u901F\u7387 [rad/s]', 3, 20, 0.5, f2);
+  addSlider(secRates, 'rates.roll',  '\u6A2A\u6EDA\u6EE1\u6746\u901F\u7387 [rad/s]', 3, 20, 0.5, f2);
+  addSlider(secRates, 'rates.yaw',   '\u504F\u822A\u6EE1\u6746\u901F\u7387 [rad/s]', 2, 12, 0.5, f2);
+  /* VTX / 相机 */
+  const secVtx = $id('sec-vtx');
+  addSlider(secVtx, 'vtxRange', '\u56FE\u4F20\u8DDD\u79BB [m]', 50, 600, 5, f0);
+  addSlider(secVtx, 'uptilt',   '\u76F8\u673A\u4EF0\u89D2 [\u00B0]', 0, 35, 1, f0);
+
+  $id('btn-save').addEventListener('click', saveCfg);
+  $id('btn-default').addEventListener('click', function(){
+    CFG = JSON.parse(JSON.stringify(DEFAULT_CFG));
+    syncDronePids();
+    try { localStorage.removeItem('fpvsim_cfg_v1'); } catch (e) {}
+    refreshMenu();
+  });
+  $id('btn-close').addEventListener('click', function(){ $id('menu').style.display = 'none'; });
+}
+function saveCfg(){
+  try { localStorage.setItem('fpvsim_cfg_v1', JSON.stringify(CFG)); } catch (e) {}
+}
+function loadCfg(){
+  try {
+    const s = localStorage.getItem('fpvsim_cfg_v1');
+    if (!s) return;
+    const c = JSON.parse(s);
+    const merge = function(dst, src){
+      for (const k in src){
+        if (src[k] && typeof src[k] === 'object' && dst[k] && typeof dst[k] === 'object') merge(dst[k], src[k]);
+        else if (k in dst && typeof src[k] === typeof dst[k]) dst[k] = src[k];
+      }
+    };
+    merge(CFG, c);
+  } catch (e) {}
+}
+
+/* -------------------------------- 初始化 --------------------------------- */
+function resize(){
+  const dpr = (typeof window !== 'undefined' && window.devicePixelRatio) ? window.devicePixelRatio : 1;
+  const cw = canvas.clientWidth || (typeof window !== 'undefined' && window.innerWidth) || 1024;
+  const chh = canvas.clientHeight || (typeof window !== 'undefined' && window.innerHeight) || 640;
+  const w = Math.max(320, Math.floor(cw * Math.min(dpr, 2)));
+  const h = Math.max(240, Math.floor(chh * Math.min(dpr, 2)));
+  if (canvas.width !== w || canvas.height !== h){
+    canvas.width = w; canvas.height = h;
+    if (gl && sceneTarget) destroyTarget(sceneTarget);
+    if (gl) sceneTarget = makeTarget(w, h);
+  }
+}
+function initGL(){
+  canvas = $id('glcanvas');
+  gl = canvas.getContext('webgl', { antialias: true }) || canvas.getContext('experimental-webgl');
+  if (!gl) throw new Error('WebGL unavailable');
+  progMesh = makeProgram(VS_MESH, FS_MESH, ['aPos', 'aNor', 'aUV']);
+  progSky  = makeProgram(VS_QUAD, FS_SKY, ['aPos']);
+  progPost = makeProgram(VS_QUAD, FS_VTX, ['aPos']);
+  quadBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+  groundTex = makeGroundTexture();
+  buildScene();
+  shadowMesh = makeGLMesh(buildDisc(0.55, 24));
+  resize();
+}
+
+/* ------------------------------- 主循环 ----------------------------------- */
+const PDT = 0.002;            // 物理固定步长 (500 Hz)
+let accum = 0, lastT = -1, loopErrors = 0;
+
+function updateAxMon(){
+  const gp = pollGamepad();
+  for (let a = 0; a < axMonEls.length; a++){
+    const m = axMonEls[a];
+    if (!m) continue;
+    let v = 0;
+    if (gp && gp.axes && a < gp.axes.length) v = clamp(Number(gp.axes[a]) || 0, -1, 1);
+    if (m.fill && m.fill.style) m.fill.style.left = (50 + v * 49) + '%';
+    if (m.num) m.num.textContent = v.toFixed(2);
+  }
+}
+
+function frame(tms){
+  try {
+    let dt = 0.016;
+    if (lastT >= 0) dt = clamp((tms - lastT) / 1000, 0, 0.05);
+    lastT = tms;
+    state.time += dt;
+    state.frames++;
+
+    pollInputs(dt);
+    updateSignal(dt);
+
+    accum += dt;
+    let steps = 0;
+    while (accum >= PDT && steps < 64){ physStep(drone, PDT); accum -= PDT; steps++; }
+    if (accum > 1) accum = 0;
+
+    updateCamera();
+    renderFrame();
+    updateOSD();
+    updateAxMon();
+  } catch (e) {
+    state.errors.push(String((e && e.stack) || e));
+    loopErrors++;
+  }
+  if (loopErrors < 4) requestAnimationFrame(frame);
+}
+
+function toggleMenu(){
+  const m = $id('menu');
+  if (m) m.style.display = (m.style.display === 'block') ? 'none' : 'block';
+}
+
+function boot(){
+  try {
+    loadCfg();
+    syncDronePids();
+    initGL();
+    buildMenu();
+    if (typeof window !== 'undefined' && window.addEventListener){
+      window.addEventListener('resize', resize);
+      window.addEventListener('keydown', function(e){
+        KB.keys[e.code] = true;
+        if (e.code === 'Tab'){ e.preventDefault(); toggleMenu(); }
+        if (e.code === 'Enter'){ toggleArm(); }
+        if (e.code === 'KeyR'){ resetDrone(); }
+        if (e.code === 'Escape'){ $id('menu').style.display = 'none'; }
+      });
+      window.addEventListener('keyup', function(e){ KB.keys[e.code] = false; });
+    }
+    const gear = $id('gear');
+    if (gear && gear.addEventListener) gear.addEventListener('click', toggleMenu);
+    requestAnimationFrame(frame);
+  } catch (e) {
+    state.errors.push(String((e && e.stack) || e));
+    const be = $id('booterr');
+    if (be){ be.style.display = 'block'; be.textContent = 'init failed: ' + e; }
+  }
+}
+
+/* ------------------------------ 调试/测试接口 ------------------------------ */
+const API = {
+  M3: { m3Ident: m3Ident, m3Mul: m3Mul, m3MulV: m3MulV, m3T: m3T, m3Det: m3Det, hat: hat, expSo3: expSo3, m3Ortho: m3Ortho },
+  PIDAxis: PIDAxis, CFG: CFG, drone: drone, state: state,
+  physStep: physStep, thrCurve: thrCurve, makeDrone: makeDrone, resetDrone: resetDrone,
+  pollInputs: pollInputs, pollGamepad: pollGamepad, toggleArm: toggleArm,
+  updateSignal: updateSignal, expSo3: expSo3
+};
+try { globalThis.__FPV__ = API; } catch (e) {}
+
+boot();
+</script>
+</body>
+</html>

@@ -2,6 +2,8 @@
 
 Godot 原生工程已接入可选 profile native-godot-v1，支持仓库外组卷、独立运行验收、完整目录归档与失败样本保留。操作见 [GODOT_RUNS.md](GODOT_RUNS.md)。它提供轻量工程运行隔离，OS 访问权限仍为 unverified。
 
+Blender 产品建模已接入 native-blender-v1，支持原题面与锁定参考图白名单组卷、原生 .blend 副本验收、尺寸/资源检查及完整工程归档。操作见 [BLENDER_RUNS.md](BLENDER_RUNS.md)；视觉评分人工填写，OS/MCP 读取隔离仍为 unverified。
+
 给受测模型做**临时性**测试。2.0 的核心变化：**受测方仅见题面原文**——
 没有纪律条款、没有作答契约、没有 result.json 要求、没有 rubric 摘要。
 组卷使用仓库外目录，完整性由 harness 快照 diff 与 transcript 扫描观测。目录位置本身不限制读取权限；真正的文件访问隔离须由宿主落实。登记的输入 profile 可额外携带白名单题图。
@@ -62,6 +64,31 @@ sandbox/
     └── <交付物>           # 模型产出；收卷时孤立主交付 → answer.<ext>
 ```
 
+## 登记题面（PROMPT_REGISTRY.json，可选）
+
+默认派发 `<project>/PROJECT_PROMPT.md`。若某项目的**正式排名题面**不是它（例如
+`L1_Basic/BilibiliUserscript` 的排名轨道是受控回放题 `prompts/REPLAY_V2.md`，
+而 `PROJECT_PROMPT.md` 是冻结的历史入口），可在项目根放一个登记文件：
+
+```json
+{
+  "schemaVersion": 1,
+  "dispatchPrompt": "prompts/REPLAY_V2.md",
+  "sha256": "<该文件的 sha256；不符即拒绝派发>",
+  "inputFiles": ["fixtures/CONTRACT.md"],
+  "note": "为什么该项目改发登记题面"
+}
+```
+
+- `dispatchPrompt` 与 `inputFiles` 都必须落在项目目录内；`sha256` 用于钉住字节，
+  题面被改动而登记未同步时，`prepare_run.py` 直接报错而不是悄悄换题。
+- `inputFiles` 会随题面一起拷进 workdir（题面声明"可以阅读 CONTRACT.md"时二者必须同发），
+  并被记录进 `meta.input_files`；**它们是被给定的输入，不是模型交付物**，
+  故 `list_deliverables` 会排除它们，收卷不会把它们当答案。
+- 未放登记文件的项目行为完全不变（仍发 `PROJECT_PROMPT.md`）。
+- `meta.prompt_source` / `meta.prompt_registered` 记录实际派发了哪一份题面；
+  `collect_run.py` 的题面 SHA 闸门也比对**实际派发的那一份**。
+
 ## 为什么不再有纪律文本
 
 1.x 用「dir + 七条纪律」隔离：受测输入里约 70% 是治理文本（评测意识注入、
@@ -104,3 +131,10 @@ sandbox/
 
 用户要求暂缓人工复审后，使用 `scripts/iteration_cli.py prepare/execute/summarize` 对同一 r6 的 12 条件进行独立 CLI 测试。
 具体通道、预算和证据规则见 [测试计划](../Vision/iteration/20260921/cli-review/20260929/PLAN.zh.md)；本轮与无工具 API 主测分列，不能替代人类盲审。
+# Godot 续作题输入（2026-10-16）
+
+`native-godot-v1` 新增可选 `prompt_and_locked_archives`：`PROMPT_REGISTRY.json` 登记公开 ZIP，`BENCH_PROFILE.json.locked_inputs` 冻结名称、SHA-256 与字节数，prepare/review/collect 共同校验。候选只接收正式题面和登记输入；解压源码可编辑，输入 ZIP 原样保留。旧 prompt_only 路径不变，OS 隔离仍为 unverified。详见 [GODOT_RUNS.md](GODOT_RUNS.md)。
+
+# Blender 纯文字变体（2026-10-18）
+
+Blender 原生 profile 允许明确登记 `input_payload: prompt_only` 和 `input_files: {}` 的纯文字变体；该条件只发题面，沿用原生验收与收卷，和带图条件分列。首个文字变体为 `NativeWorkflowBench/BlenderMXMaster3STextOnly`。

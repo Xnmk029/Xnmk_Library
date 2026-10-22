@@ -18,7 +18,7 @@ from pathlib import Path
 
 from sandbox_lib import (
     ROOT, PROMPT_FILE, PROMPT_MD, FORBIDDEN_DIR_NAMES, AGENT_STATE_NAMES,
-    load_json, load_meta, dump_json, now_iso, sha256_file, scan_transcript,
+    load_json, load_meta, dump_json, now_iso, sha256_file, scan_transcript, registered_prompt,
 )
 from vision_profile import safe_tree, no_links, safe_slug
 
@@ -36,9 +36,10 @@ def payload(project: Path) -> dict | None:
     config = load_json(path)
     if config.get("profile") != PROFILE:
         return None
-    if config.get("input_payload") != "prompt_only":
-        raise RuntimeError("native Godot profile currently accepts prompt-only input")
-    return {
+    mode = config.get("input_payload")
+    if mode not in {"prompt_only", "prompt_and_locked_archives"}:
+        raise RuntimeError("unsupported native Godot input payload")
+    result = {
         "profile": PROFILE,
         "benchmark_id": config["benchmark_id"],
         "engine_version": config["engine_version"],
@@ -48,6 +49,22 @@ def payload(project: Path) -> dict | None:
         "visual_review": "pending",
         "runtime_validation": "pending",
     }
+    registered = registered_prompt(project)
+    if mode == "prompt_only":
+        if registered["inputs"]:
+            raise RuntimeError("prompt-only Godot registration cannot add inputs")
+    else:
+        locked = config.get("locked_inputs", {})
+        paths = registered["inputs"]
+        if not locked or len({p.name for p in paths}) != len(paths) or set(locked) != {p.name for p in paths}:
+            raise RuntimeError("locked Godot archive names must exactly match registered inputs")
+        for src in paths:
+            no_links(src)
+            expected = locked[src.name]
+            if src.suffix.lower() != ".zip" or expected != {"sha256": sha256_file(src), "size": src.stat().st_size}:
+                raise RuntimeError("locked Godot archive changed: " + src.name)
+        result.update(input_payload=mode, locked_inputs=locked)
+    return result
 
 
 def files(workdir: Path) -> dict:
@@ -77,14 +94,21 @@ def integrity(meta: dict, harness: Path, transcript: str | None = None) -> list[
             raise RuntimeError("workdir is inside the benchmark repository")
         rows.append(("H1", "PASS", "External workdir; this is not an OS permission verdict."))
         before = load_json(harness / "snapshot.json")
-        if set(before) != {PROMPT_FILE}:
-            raise RuntimeError("prepare snapshot must contain exactly the original prompt")
+        locked = meta.get("locked_inputs", {})
+        if set(before) != {PROMPT_FILE, *locked}:
+            raise RuntimeError("prepare snapshot must contain exactly the prompt and locked inputs")
+        for name, expected in locked.items():
+            path = workdir / name
+            if before.get(name) != expected or not path.is_file() or {"sha256": sha256_file(path), "size": path.stat().st_size} != expected:
+                raise RuntimeError("locked input was changed or removed: " + name)
         prompt = workdir / PROMPT_FILE
         if not prompt.is_file() or sha256_file(prompt) != meta["prompt_sha256"] or sha256_file(prompt) != before[PROMPT_FILE]["sha256"]:
             raise RuntimeError("original PROMPT.md was modified or removed")
         registration = payload(ROOT / meta["project_rel"])
         if not registration or registration["profile_config_sha256"] != meta["profile_config_sha256"]:
             raise RuntimeError("registered profile changed after preparation")
+        if registration.get("locked_inputs", {}) != locked:
+            raise RuntimeError("locked input registration changed after preparation")
         if sha256_file(ROOT / meta["project_rel"] / PROMPT_MD) != meta["prompt_sha256"]:
             raise RuntimeError("formal prompt changed after preparation")
         banned = {value.lower() for value in FORBIDDEN_DIR_NAMES | AGENT_STATE_NAMES}

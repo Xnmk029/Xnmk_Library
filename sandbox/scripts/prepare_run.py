@@ -19,6 +19,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 from pathlib import Path
 
@@ -40,6 +41,7 @@ from sandbox_lib import (  # noqa: E402
     new_run_id,
     now_iso,
     project_rel,
+    registered_prompt,
     resolve_project_dir,
     sha256_file,
     snapshot_dir,
@@ -54,8 +56,12 @@ def prepare(project_arg: str, model: str, dry_run: bool = False) -> dict:
     if not profile:
         from godot_profile import payload as godot_payload
         profile = godot_payload(project_dir)
+    if not profile:
+        from blender_profile import payload as blender_payload
+        profile = blender_payload(project_dir)
     rel = project_rel(project_dir)
-    prompt_path = project_dir / PROMPT_MD
+    registered = registered_prompt(project_dir)
+    prompt_path = registered["prompt"]
     prompt_sha = sha256_file(prompt_path)
     req = extract_requirements(prompt_path.read_text(encoding="utf-8"))
 
@@ -92,8 +98,16 @@ def prepare(project_arg: str, model: str, dry_run: bool = False) -> dict:
     harness.mkdir(parents=True, exist_ok=False)
 
     (workdir / PROMPT_FILE).write_bytes(prompt_path.read_bytes())
+    staged_inputs: list[str] = []
+    for src in registered["inputs"]:
+        name = src.name
+        shutil.copyfile(src, workdir / name)
+        staged_inputs.append(name)
     if profile and profile.get("profile") == "bare-vision-v1":
         stage(project_dir, workdir, profile)
+    if profile and profile.get("profile") == "native-blender-v1":
+        from blender_profile import stage as blender_stage
+        blender_stage(project_dir, workdir, profile)
 
     meta = {
         "run_id": run_id,
@@ -102,7 +116,9 @@ def prepare(project_arg: str, model: str, dry_run: bool = False) -> dict:
         "project_rel": rel,
         "created_at": now_iso(),
         "prompt_sha256": prompt_sha,
-        "prompt_source": rel + "/" + PROMPT_MD,
+        "prompt_source": registered["source"],
+        "prompt_registered": registered["registered"],
+        "input_files": staged_inputs,
         "protocol_version": PROTOCOL_VERSION,
         "mode": "bare",
         "isolation": "external-empty-dir+observation",

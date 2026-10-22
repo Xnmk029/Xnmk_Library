@@ -58,3 +58,8 @@ py -3.14 -m unittest discover -s sandbox/scripts -p test_godot_profile.py -v
 ```
 
 这些是工程 fixtures，不调用受测模型，不产生排行榜分数。现有 v1 草地预览可以作为复杂资源导入的工程样本；它不满足 v2 全部视觉需求，不能据此标记 v2 基准完成。
+# 续作输入扩展（2026-10-16）
+
+`NativeWorkflowBench/GodotGameDemo` 使用 `prompt_and_locked_archives`。正式题面与两个 ZIP 在 prepare 时复制至外部目录；ZIP 的 SHA-256/字节数冻结在 `BENCH_PROFILE.json.locked_inputs`，来源与文件清单只存宿主 `RELEASE.json`。候选可修改解压后的源码，不能修改输入 ZIP；初始快照不能夹带其他文件。旧 GodotShader 的 `prompt_only` 不变。
+
+本轮是模型复用自身上一轮代码的续作条件，与从零开发分列。SQLite 固定官方 v4.6 Windows x86_64 二进制，已通过 Godot 4.5.1 的绑定参数、提交、回滚、关闭重开探针。自动验收仍仅证明导入/GPU 启动；双维度通关、持久化、UI、草地与水面要求需独立证据评分，未评保持 null。目录与输入哈希不证明宿主读取隔离。
